@@ -146,6 +146,23 @@ SQLite holds metadata, the segment manifest, FTS5 workspace-symbol search, and t
 symbol/document/target dictionaries. The references/rename hot path never touches a
 SQLite occurrence table; occurrences live only in mmap postings.
 
+### 3.4 LSP/BSP protocol-stack note (lsp4j 1.0.0)
+
+`mtags-interfaces` (required by the Scala 3 presentation compiler artifact)
+forces `org.eclipse.lsp4j` to 1.0.0 by coursier eviction; bsp4j 2.2.0-M2 was
+built against lsp4j-jsonrpc 0.20.1 but runs correctly on 1.0.0 (proven by
+`ls.doctor.BspLauncherCompatTest` and the `ls.core.LsEndToEndTest` suite).
+Two lsp4j-1.0.0 constraints shape `ls.core.ScalaLs`:
+
+1. One object may not implement `TextDocumentService` and `WorkspaceService`
+   together (both declare `diagnostic`); the server uses `@JsonDelegate`
+   inner service objects instead.
+2. Scala 3's default `-Xmixin-force-forwarders` copies lsp4j's
+   `@JsonRequest`/`@JsonNotification` annotations onto synthetic forwarders,
+   which the jsonrpc endpoint scanners reject as duplicate RPC methods. The
+   `core` module compiles with `-Xmixin-force-forwarders:false`; any Scala
+   class implementing lsp4j interfaces outside `core` needs the same flag.
+
 ## 4. Query orchestrator: three paths, three consistency levels
 
 Every request is routed through exactly one of three paths (plan 10):

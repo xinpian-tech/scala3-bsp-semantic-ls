@@ -38,7 +38,9 @@ stdenvNoCC.mkDerivation {
 
   buildPhase = ''
     runHook preBuild
-    mill -i core.assembly
+    # --no-daemon: the daemon path would resolve mill-runner-daemon from the
+    # network, which the sandbox forbids and the ivy lock does not carry.
+    mill --no-daemon core.assembly
     runHook postBuild
   '';
 

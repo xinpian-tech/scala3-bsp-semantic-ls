@@ -98,19 +98,30 @@ also exposed as `passthru.ivyCache`).
 Supported regeneration command (run from the repo root):
 
 ```bash
-nix develop -c mif run -p . -o nix/ivy-lock.nix
+nix develop -c ./scripts/regen-ivy-lock.sh
 ```
 
-plan 15.3 also lists the mill-ivy-fetcher README variant:
+The script wraps `mif fetch` + `mif codegen` (plan 15.3's `mif run -p . -o
+nix/ivy-lock.nix` in spirit) with three determinism guards that plain
+`mif run` lacks:
 
-```bash
-nix shell '.#mill' '.#mill-ivy-fetcher' -c mif run -p . -o nix/ivy-lock.nix
-```
+1. Mill's launcher resolves its own runtime (`mill-runner-daemon` and
+   friends) through the coursier cache derived from java's `user.home` —
+   *not* `$HOME`/`$COURSIER_CACHE`. On a machine with a warm cache those
+   artifacts would silently not enter the lock and the sandboxed
+   `nix build` would then fail resolving them. The script points
+   `user.home` at a cold directory and merges launcher downloads into the
+   cache `mif codegen` hashes.
+2. The mill daemon does not start reliably inside the project copy mif
+   works on; a PATH shim forces `mill --no-daemon`.
+3. A stale `out/mill-launcher` resolved-classpath file lets the launcher
+   skip resolution entirely, so the script hands mif a clean copy of
+   `build.mill` + `modules/` only.
 
-**This variant does not work against the current flake** because it does not export
-`.#mill` / `.#mill-ivy-fetcher` packages (only `packages.default`). It is a *planned*
-alternative that would require exposing those two packages; until then, use the
-`nix develop -c` form.
+plan 15.3 also lists the mill-ivy-fetcher README variant
+(`nix shell '.#mill' '.#mill-ivy-fetcher' -c mif run ...`); the flake exports
+the `mill` and `mill-ivy-fetcher` packages it needs, but prefer the script for
+the determinism guards above.
 
 The four lock rules (plan 15.3) — all mandatory:
 
@@ -122,8 +133,8 @@ The four lock rules (plan 15.3) — all mandatory:
 ```
 
 Rule 3 is implemented by `scripts/check-ivy-lock.sh`: it runs inside `nix develop`
-(needs `mill` + `mif` on PATH), regenerates the lock into a temp dir with
-`mif run -p . -o "$tmp/ivy-lock.nix"`, and `diff`s it against the committed
+(needs `mill` + `mif` on PATH), regenerates the lock via
+`scripts/regen-ivy-lock.sh`, and `diff`s the result against the committed
 `nix/ivy-lock.nix`, failing on any drift or if the lock file is missing.
 
 ## 4. CI minimal command set (plan 15.5)

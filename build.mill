@@ -35,6 +35,15 @@ trait LsModule extends ScalaModule {
     Task.env.get("JAVA_HOME").map(p => PathRef(os.Path(p), quick = true))
   }
 
+  // lsp4j declares gson as the range [2.9.1,3.0); range resolution needs
+  // remote maven-metadata and breaks the offline Nix build, so pin it.
+  override def mapDependencies = Task.Anon { (d: coursier.Dependency) =>
+    if d.module.organization.value == "com.google.code.gson"
+      && d.module.name.value == "gson"
+    then d.withVersion("2.13.2")
+    else d
+  }
+
   def scalacOptions = Seq(
     "-deprecation",
     "-feature",
