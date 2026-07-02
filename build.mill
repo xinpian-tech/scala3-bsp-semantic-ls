@@ -122,6 +122,13 @@ object core extends LsModule {
   def moduleDeps = Seq(indexModel, semanticdb, sqliteFfm, postings, bsp, pc, rename, doctor)
   def mvnDeps = Seq(Deps.lsp4j, Deps.lsp4jJsonrpc)
   def mainClass = Some("ls.core.Main")
+
+  // Scala 3 (default -Xmixin-force-forwarders:true) generates forwarders for
+  // lsp4j's annotated Java default methods and COPIES their @JsonRequest /
+  // @JsonNotification annotations; lsp4j's jsonrpc method scan then rejects
+  // the service object with "Duplicate RPC method". Applies to core and its
+  // tests (both implement lsp4j service interfaces in Scala).
+  override def scalacOptions = super.scalacOptions() ++ Seq("-Xmixin-force-forwarders:false")
   object test extends LsTests {
     // Reuses the in-process fake BSP server from bsp's tests and generates
     // real SemanticDB fixtures with scalac for end-to-end LSP tests.
@@ -135,6 +142,7 @@ object bench extends LsModule {
   def dirName = "ls-bench"
   def moduleDeps = Seq(core)
   def mainClass = Some("ls.bench.BenchMain")
+  object test extends LsTests
 
   /** CI smoke benchmark: tiny corpus, asserts the harness itself works. */
   def smoke() = Task.Command {
