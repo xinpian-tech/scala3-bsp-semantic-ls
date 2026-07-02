@@ -122,7 +122,12 @@ object core extends LsModule {
   def moduleDeps = Seq(indexModel, semanticdb, sqliteFfm, postings, bsp, pc, rename, doctor)
   def mvnDeps = Seq(Deps.lsp4j, Deps.lsp4jJsonrpc)
   def mainClass = Some("ls.core.Main")
-  object test extends LsTests
+  object test extends LsTests {
+    // Reuses the in-process fake BSP server from bsp's tests and generates
+    // real SemanticDB fixtures with scalac for end-to-end LSP tests.
+    def moduleDeps = super.moduleDeps ++ Seq(build.bsp.test)
+    override def mvnDeps = Task { super.mvnDeps() ++ Seq(Deps.scala3Compiler) }
+  }
 }
 
 /** Benchmark + JFR harness. */

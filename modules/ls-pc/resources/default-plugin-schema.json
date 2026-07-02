@@ -1,0 +1,39 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://scala3-bsp-semantic-ls/default-plugin-schema.json",
+  "title": "scala3-bsp-semantic-ls PC plugin configuration",
+  "description": "Schema for .scala3-bsp-semantic-ls/pc-plugins.json. Configures PC-only compiler plugins and PC service plugins. Everything here affects only the presentation compiler worker: it never reaches the build server, never affects SemanticDB generation, and can never write SQLite or mmap postings.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "compilerPlugins": {
+      "description": "Scala 3 compiler plugins loaded only into the presentation compiler (plan 14.2). Each entry becomes -Xplugin:<jar> arguments plus -P:<plugin>:<option> arguments appended to PC compiler options.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["jars"],
+        "properties": {
+          "jars": {
+            "description": "Absolute paths of the plugin jar(s). Each jar becomes one -Xplugin:<jar> argument. Missing jars fail the plugin's self-test (reported by the doctor) without crashing the language server.",
+            "type": "array",
+            "minItems": 1,
+            "items": { "type": "string" }
+          },
+          "options": {
+            "description": "Plugin options in scalac -P payload form, i.e. \"<pluginName>:<option>\". Each entry becomes one -P:<pluginName>:<option> argument.",
+            "type": "array",
+            "items": { "type": "string" }
+          }
+        }
+      },
+      "default": []
+    },
+    "servicePluginJars": {
+      "description": "Jars providing ls.pc.PcServicePlugin implementations, discovered via java.util.ServiceLoader (META-INF/services/ls.pc.PcServicePlugin) in an isolated class loader. A plugin that fails its load self-test or throws in a hook is disabled and reported by the doctor; it never fails PC requests.",
+      "type": "array",
+      "items": { "type": "string" },
+      "default": []
+    }
+  }
+}
