@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Thin launcher: the real Mill comes from the Nix flake dev shell
+# (millVersions.mill_1_1_2 via mill-ivy-fetcher's mill-overlay).
+# No network bootstrap here on purpose: outside `nix develop` this project
+# does not build.
+set -euo pipefail
+
+if command -v mill >/dev/null 2>&1; then
+  exec mill "$@"
+fi
+
+echo "error: mill not found on PATH." >&2
+echo "Enter the flake dev shell first:  nix develop" >&2
+echo "Or run through nix directly:      nix develop -c mill $*" >&2
+exit 1

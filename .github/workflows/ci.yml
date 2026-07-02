@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: cachix/install-nix-action@v31
+        with:
+          nix_path: nixpkgs=channel:nixos-unstable
+
+      - name: nix flake check
+        run: nix flake check
+
+      - name: compile
+        run: nix develop -c mill __.compile
+
+      - name: test
+        run: nix develop -c mill __.test
+
+      - name: bench smoke
+        run: nix develop -c mill bench.smoke
+
+      - name: ivy lock freshness
+        run: nix develop -c ./scripts/check-ivy-lock.sh

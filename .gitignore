@@ -1,0 +1,13 @@
+out/
+.bloop/
+.metals/
+.bsp/
+.scala-build/
+.idea/
+.vscode/
+result
+result-*
+.direnv/
+.envrc.local
+.scala3-bsp-semantic-ls/
+mill-java-opts
