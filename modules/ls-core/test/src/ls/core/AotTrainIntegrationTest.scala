@@ -10,11 +10,13 @@ import scala.concurrent.duration.{Duration, DurationInt}
 import scala.jdk.CollectionConverters.*
 
 /** AOT-training integration test, gated on `LS_AOT_IT=1` and script-driven like
-  * [[RealBspIntegrationTest]]. Positive: `scripts/aot-train.sh`
-  * produces a non-empty cache, a follow-up `Main --version` with `-XX:AOTCache`
-  * exits 0, and a headless `Main --doctor` with `-XX:AOTCache` reports
-  * `AOT cache: loaded`. Negative: `Main --aot-train` over a workspace with no
-  * `.bsp` exits cleanly without hanging.
+  * [[RealBspIntegrationTest]]. Positive: install a REAL Mill BSP connection in a
+  * sample-workspace copy, then `scripts/aot-train.sh` runs the strict real-BSP
+  * training (compile + reindex + non-empty index queries) and produces a
+  * non-empty cache; a follow-up `Main --version` with `-XX:AOTCache` exits 0 and
+  * a headless `Main --doctor` with `-XX:AOTCache` reports `AOT cache: loaded`.
+  * Negative: `Main --aot-train` over a workspace with no `.bsp` exits cleanly
+  * without hanging.
   *
   * Run with:  nix develop -c ./scripts/it-aot.sh
   */
@@ -57,21 +59,32 @@ class AotTrainIntegrationTest extends munit.FunSuite:
     val javaBin: String =
       Path.of(System.getProperty("java.home")).resolve("bin").resolve("java").toString
 
-  test("aot-train produces a loadable cache the doctor reports"):
+  test("aot-train produces a loadable cache from the real BSP workload"):
     assume(enabled, "set LS_AOT_IT=1 to run the AOT training integration test")
     val jar = env.jar
-    val ws = Files.createTempDirectory("ls-aot-it-ws-")
+    val ws = Files.createTempDirectory("ls-aot-it-ws-").toRealPath()
     copyTree(env.repoRoot.resolve("it").resolve("sample-workspace"), ws)
+
+    // install a REAL Mill BSP connection so the training run drives the strict
+    // real-BSP workload (compile + reindex + SemanticDB-backed queries).
+    val (installRc, installLog) = runProcess(Vector("mill", "--no-daemon", "mill.bsp.BSP/install"), ws, 10)
+    assert(installRc == 0, s"mill.bsp.BSP/install failed:\n$installLog")
+    assert(
+      Files.isRegularFile(ws.resolve(".bsp").resolve("mill-bsp.json")),
+      s"mill.bsp.BSP/install did not write .bsp/mill-bsp.json:\n$installLog"
+    )
     val out = Files.createTempDirectory("ls-aot-it-out-").resolve("aot-cache.bin")
 
-    // build the cache via the production script (record -> create two-step)
+    // build the cache via the production script; .bsp presence makes it strict.
     val (trainRc, trainLog) = runProcess(
       Vector("bash", env.repoRoot.resolve("scripts").resolve("aot-train.sh").toString,
         "--workspace", ws.toString, "--out", out.toString),
       env.repoRoot,
       15
     )
-    assert(trainRc == 0, s"aot-train.sh failed:\n$trainLog")
+    assert(trainRc == 0, s"aot-train.sh (strict real-BSP) failed:\n$trainLog")
+    // the strict workload must have compiled, reindexed docs, and queried the index
+    assert(trainLog.contains("strict real-BSP training"), s"training was not strict:\n$trainLog")
     assert(Files.isRegularFile(out), s"cache not produced:\n$trainLog")
     assert(Files.size(out) > 0L, s"cache is empty:\n$trainLog")
 

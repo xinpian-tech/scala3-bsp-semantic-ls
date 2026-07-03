@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# AOT-training integration test (plan §16.3 / AC-14): builds an AOT cache with
-# scripts/aot-train.sh and asserts a cached boot loads it and the doctor reports
-# it. Gated on LS_AOT_IT=1 and skipped in ordinary test runs.
+# AOT-training integration test: builds an AOT cache with scripts/aot-train.sh
+# over a real Mill BSP workspace and asserts a cached boot loads it and the
+# doctor reports it. Gated on LS_AOT_IT=1 and skipped in ordinary test runs.
 #
 # Usage:  nix develop -c ./scripts/it-aot.sh
 #

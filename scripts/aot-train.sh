@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
-# AOT cache training (plan §16.3 / AC-14): build the server assembly jar, then
-# run the JDK-25 two-step (record -> create) against a workspace to produce a
-# non-empty AOT cache. The launcher consumes it via LS_AOT_CACHE (nix wrapper)
-# or -XX:AOTCache=<path> directly.
+# AOT cache training: build the server assembly jar, then run the JDK-25 two-step
+# (record -> create) against a workspace to produce a non-empty AOT cache. The
+# launcher consumes it via LS_AOT_CACHE (nix wrapper) or -XX:AOTCache=<path>
+# directly.
+#
+# When the workspace has a BSP connection (.bsp/), the training run is strict: it
+# drives a real build compile + reindex and fails unless the SemanticDB index is
+# populated and queryable. Without .bsp it degrades gracefully.
 #
 # Usage:  nix develop -c ./scripts/aot-train.sh [--workspace <dir>] [--out <file>]
 #
@@ -41,13 +45,20 @@ conf="$tmp/aot.conf"
 # usable under it (native access for the SQLite FFM layer, compact headers).
 runflags=(--enable-native-access=ALL-UNNAMED -XX:+UseCompactObjectHeaders)
 
+# A workspace with a BSP connection trains the strict real-BSP workload.
+appargs=(--aot-train "$workspace")
+if [ -d "$workspace/.bsp" ]; then
+  appargs+=(--require-index)
+  echo "aot-train: .bsp present -> strict real-BSP training"
+fi
+
 echo "aot-train: run 1/2 (record) over $workspace"
 java -XX:AOTMode=record -XX:AOTConfiguration="$conf" \
-  "${runflags[@]}" -jar "$jar" --aot-train "$workspace"
+  "${runflags[@]}" -jar "$jar" "${appargs[@]}"
 
 echo "aot-train: run 2/2 (create) -> $out"
 java -XX:AOTMode=create -XX:AOTConfiguration="$conf" -XX:AOTCache="$out" \
-  "${runflags[@]}" -jar "$jar" --aot-train "$workspace"
+  "${runflags[@]}" -jar "$jar" "${appargs[@]}"
 
 [ -s "$out" ] || { echo "aot-train: cache was not produced: $out" >&2; exit 1; }
 echo "aot-train: AOT cache created: $out ($(wc -c < "$out") bytes)"
