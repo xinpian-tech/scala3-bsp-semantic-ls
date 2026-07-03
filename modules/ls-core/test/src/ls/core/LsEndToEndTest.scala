@@ -375,6 +375,34 @@ class LsEndToEndTest extends munit.FunSuite:
       snapshotId(executeCommand(ScalaLs.Commands.Doctor)).exists(id => snapshotBefore.forall(_ < id))
     }
 
+  test("two save-driven re-ingests leave exactly one segment dir and no compaction debt"):
+    val _ = env.initResult
+    val services = env.server.currentState.ready.get
+    val segmentsDir = services.snapshots.segmentsDir
+
+    def segmentDirCount: Int =
+      if !java.nio.file.Files.isDirectory(segmentsDir) then 0
+      else
+        val stream = java.nio.file.Files.list(segmentsDir)
+        try stream.iterator().asScala.count(_.getFileName.toString.startsWith("segment-"))
+        finally stream.close()
+
+    // Drive two save -> debounced compile -> re-ingest -> publish cycles, waiting
+    // for each via non-retaining counters (never holding a snapshot across a publish).
+    for _ <- 1 to 2 do
+      val compilesBefore = env.bspServer.compileRequests.get
+      val ingestsBefore = env.server.completedIngests
+      docsService.didSave(new DidSaveTextDocumentParams(textDoc(E2eFixture.useUri)))
+      eventually("save-driven compile ran")(env.bspServer.compileRequests.get > compilesBefore)
+      eventually("save-driven ingest published")(env.server.completedIngests > ingestsBefore)
+
+    // The publish tail reclaimed each superseded segment (no manual janitor call here).
+    assertEquals(segmentDirCount, 1, s"expected one segment dir in $segmentsDir")
+    assert(
+      executeCommand(ScalaLs.Commands.Doctor).contains("compaction pending: 0"),
+      "doctor should report no compaction debt after drained re-ingests"
+    )
+
   test("shutdown tears down the BSP session"):
     val _ = env.initResult
     env.proxy.shutdown().get(60, TimeUnit.SECONDS)

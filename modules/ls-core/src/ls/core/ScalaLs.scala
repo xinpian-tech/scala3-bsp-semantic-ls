@@ -62,6 +62,7 @@ final class ScalaLs(val config: ScalaLs.Config = ScalaLs.Config())
   @volatile private var lastCompletionTarget: Option[String] = None
   private val readyLatch = new CountDownLatch(1)
   private val shuttingDown = new AtomicBoolean(false)
+  private val ingestCounter = new java.util.concurrent.atomic.AtomicLong(0L)
 
   private def daemon(name: String): java.util.concurrent.ThreadFactory = r =>
     val t = new Thread(r, name)
@@ -125,6 +126,12 @@ final class ScalaLs(val config: ScalaLs.Config = ScalaLs.Config())
     readyLatch.countDown()
 
   private[core] def currentState: WorkspaceState = state
+
+  /** Test/embedding hook: count of completed background (save-driven) ingests.
+    * Non-retaining, so callers can await a re-ingest cycle without holding a
+    * postings snapshot.
+    */
+  private[core] def completedIngests: Long = ingestCounter.get
 
   override def shutdown(): CompletableFuture[Object] =
     if !shuttingDown.compareAndSet(false, true) then
@@ -233,6 +240,7 @@ final class ScalaLs(val config: ScalaLs.Config = ScalaLs.Config())
         try
           val report = s.orchestrator.ingest(s.workspaceTargets)
           log(Bootstrap.ingestSummary(report))
+          ingestCounter.incrementAndGet()
         catch case NonFatal(t) => log(s"background ingest failed: $t")
     }
 
