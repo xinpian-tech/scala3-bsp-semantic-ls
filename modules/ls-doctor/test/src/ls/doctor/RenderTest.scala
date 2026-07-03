@@ -59,7 +59,9 @@ class RenderTest extends munit.FunSuite:
     Files.write(sdbDir.resolve("A.scala.semanticdb"), Array[Byte](1))
     val semanticdb = SemanticdbSection.fromModel(
       model,
-      Some(DocFreshnessStats.of(fresh = 1, stale = 1, missing = 1, uris = Vector("src/a/B.scala")))
+      Some(DocFreshnessStats.of(fresh = 1, stale = 1, missing = 1, uris = Vector("src/a/B.scala"))),
+      generatedSourceCount = 2L,
+      staleTargets = Vector("bsp://ws/app")
     )
 
     // PC plugins: real PcPluginManager report with loaded/failed entries
@@ -100,9 +102,7 @@ class RenderTest extends munit.FunSuite:
           activeSegmentPath = Some(tmp.resolve("postings/segments/segment-000001").toString),
           documentCount = 1L,
           symbolCount = 2L,
-          walSizeBytes = 4096L,
-          generatedDocumentCount = 2L,
-          staleTargets = Vector("bsp://ws/app")
+          walSizeBytes = 4096L
         )
       ),
       postings = SectionState.Ready(
@@ -168,13 +168,13 @@ class RenderTest extends munit.FunSuite:
       "  stale docs (md5 mismatch): 1",
       "  missing docs: 1",
       "  stale/missing uris: src/a/B.scala",
+      "  generated source status: 2",
+      "  stale targets: 1 (bsp://ws/app)",
       "  database: ",
       "  WAL: enabled (journal_mode=wal)",
       "  FTS: enabled (workspace_symbols_fts present)",
       "  manifest generation: segment 1",
       "  documents: 1",
-      "  generated source status: 2",
-      "  stale targets: 1 (bsp://ws/app)",
       "  symbols: 2",
       "  wal size: 4096 bytes",
       "  active segments: 1 of 1",
@@ -193,6 +193,31 @@ class RenderTest extends munit.FunSuite:
     keyLines.foreach { k =>
       assert(text.contains(k), s"key line '$k' missing in:\n$text")
     }
+
+  // Returns the indented body lines under a top-level `<heading>:` line, up to
+  // the next top-level heading (a non-indented, non-empty line).
+  private def sectionBody(text: String, heading: String): Vector[String] =
+    val lines = text.linesIterator.toVector
+    val start = lines.indexWhere(_ == s"$heading:")
+    assert(start >= 0, s"heading '$heading:' not found in:\n$text")
+    val rest = lines.drop(start + 1)
+    val end = rest.indexWhere(l => l.nonEmpty && !l.startsWith(" "))
+    if end < 0 then rest else rest.take(end)
+
+  test("render: generated status and stale targets live under SemanticDB, not SQLite"):
+    val text = Doctor.render(fullInput)
+    val semanticdb = sectionBody(text, "SemanticDB").mkString("\n")
+    assert(
+      semanticdb.contains("generated source status: 2"),
+      s"'generated source status' not under SemanticDB:\n$semanticdb"
+    )
+    assert(
+      semanticdb.contains("stale targets: 1 (bsp://ws/app)"),
+      s"'stale targets' not under SemanticDB:\n$semanticdb"
+    )
+    val sqlite = sectionBody(text, "SQLite").mkString("\n")
+    assert(!sqlite.contains("generated source status"), s"leaked into SQLite:\n$sqlite")
+    assert(!sqlite.contains("stale targets"), s"leaked into SQLite:\n$sqlite")
 
   test("render: no 'null' leaks anywhere"):
     val text = Doctor.render(fullInput)
@@ -230,10 +255,13 @@ class RenderTest extends munit.FunSuite:
     assertEquals(root.getAsJsonObject("bsp").get("serverName").getAsString, "Fake BSP")
     assertEquals(root.getAsJsonObject("runtime").get("javaVersion").getAsString.take(2), "25")
     assertEquals(root.getAsJsonObject("postings").get("compactionPending").getAsInt, 1)
-    assertEquals(root.getAsJsonObject("sqlite").get("generatedDocumentCount").getAsLong, 2L)
-    val staleJson = root.getAsJsonObject("sqlite").getAsJsonArray("staleTargets")
+    // generated/stale live under the semanticdb section, not sqlite
+    assertEquals(root.getAsJsonObject("semanticdb").get("generatedSourceCount").getAsLong, 2L)
+    val staleJson = root.getAsJsonObject("semanticdb").getAsJsonArray("staleTargets")
     assertEquals(staleJson.size(), 1)
     assertEquals(staleJson.get(0).getAsString, "bsp://ws/app")
+    assert(!root.getAsJsonObject("sqlite").has("generatedSourceCount"), "sqlite must not carry generated status")
+    assert(!root.getAsJsonObject("sqlite").has("staleTargets"), "sqlite must not carry stale targets")
 
   test("renderJson: string escaping round-trips quotes and newlines"):
     val nasty = PcPluginsSection(

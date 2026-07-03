@@ -99,12 +99,18 @@ final case class SemanticdbRootStatus(
     semanticdbFileCount: Int
 )
 
-/** SemanticDB section (plan 19): roots with existence and file counts plus
-  * (when precomputed) document freshness statistics.
+/** SemanticDB doctor section: roots with existence and file counts, plus
+  * (when precomputed) document freshness statistics, plus the store-derived
+  * generated-source count and per-target staleness (both reported in this
+  * SemanticDB area of the report).
   */
 final case class SemanticdbSection(
     roots: Vector[SemanticdbRootStatus],
-    freshness: Option[DocFreshnessStats]
+    freshness: Option[DocFreshnessStats],
+    /** Active documents flagged `generated = 1` (from `documents.generated`). */
+    generatedSourceCount: Long,
+    /** bspIds (sorted, distinct) of targets owning ≥1 stale doc. */
+    staleTargets: Vector[String]
 )
 
 object SemanticdbSection:
@@ -115,22 +121,59 @@ object SemanticdbSection:
 
   /** Gathers root existence + `.semanticdb` file counts via
     * [[SemanticdbLocator]]; `stats` (when provided) comes precomputed from
-    * the ingest layer so gathering stays cheap.
+    * the ingest layer so gathering stays cheap. `generatedSourceCount` and
+    * `staleTargets` are supplied by the caller (ls-core, from the MetaStore).
     */
-  def gather(targets: Vector[TargetRoot], stats: Option[DocFreshnessStats]): SectionState[SemanticdbSection] =
-    SectionState.attempt("SemanticDB")(build(targets, stats))
+  def gather(
+      targets: Vector[TargetRoot],
+      stats: Option[DocFreshnessStats],
+      generatedSourceCount: Long = 0L,
+      staleTargets: Vector[String] = Vector.empty
+  ): SectionState[SemanticdbSection] =
+    SectionState.attempt("SemanticDB")(build(targets, stats, generatedSourceCount, staleTargets))
 
   /** Derives the [[TargetRoot]]s from a BSP project model (indexable targets
     * only) and gathers.
     */
-  def fromModel(model: BspProjectModel, stats: Option[DocFreshnessStats]): SectionState[SemanticdbSection] =
+  def fromModel(
+      model: BspProjectModel,
+      stats: Option[DocFreshnessStats],
+      generatedSourceCount: Long = 0L,
+      staleTargets: Vector[String] = Vector.empty
+  ): SectionState[SemanticdbSection] =
     SectionState.attempt("SemanticDB"):
       val targets = model.indexableTargets.flatMap { t =>
         t.semanticdbRoot.map(root => TargetRoot(t.bspId, root))
       }
-      build(targets, stats)
+      build(targets, stats, generatedSourceCount, staleTargets)
 
-  private def build(targets: Vector[TargetRoot], stats: Option[DocFreshnessStats]): SemanticdbSection =
+  /** bspIds (sorted, distinct) of targets with at least one active document
+    * whose source file exists but no longer matches the stored md5. The md5
+    * comparison lives here (ls-doctor depends on ls-semanticdb) so the SQLite
+    * store never re-hashes sources. Per-document I/O errors and missing sources
+    * count as not-stale — a missing source is a separate condition, not md5
+    * staleness. Never throws.
+    */
+  def staleTargets(digests: Vector[ActiveDocumentDigest]): Vector[String] =
+    digests.iterator
+      .filter(isStale)
+      .map(_.bspId)
+      .toVector
+      .distinct
+      .sorted
+
+  private def isStale(d: ActiveDocumentDigest): Boolean =
+    try
+      val source = Path.of(d.sourceroot).resolve(d.uri)
+      Files.isRegularFile(source) && !Md5.validate(Files.readString(source), d.md5).isFresh
+    catch case NonFatal(_) => false
+
+  private def build(
+      targets: Vector[TargetRoot],
+      stats: Option[DocFreshnessStats],
+      generatedSourceCount: Long,
+      staleTargets: Vector[String]
+  ): SemanticdbSection =
     val roots = targets.sortBy(_.bspId).map { t =>
       try
         val locator = SemanticdbLocator(t.targetroot)
@@ -145,7 +188,7 @@ object SemanticdbSection:
         case NonFatal(_) =>
           SemanticdbRootStatus(t.bspId, t.targetroot.toString, exists = false, semanticdbFileCount = 0)
     }
-    SemanticdbSection(roots, stats)
+    SemanticdbSection(roots, stats, generatedSourceCount, staleTargets)
 
 /** SQLite section (plan 19): WAL + FTS status, manifest generation, counts. */
 final case class SqliteSection(
@@ -161,13 +204,7 @@ final case class SqliteSection(
     /** Rows in `symbol_intern`. */
     symbolCount: Long,
     /** Size of the `-wal` sidecar file in bytes. */
-    walSizeBytes: Long,
-    /** Active documents flagged `generated = 1`. */
-    generatedDocumentCount: Long,
-    /** bspIds of targets that have at least one active document whose source
-      * file exists but no longer matches the stored md5 (sorted, distinct).
-      */
-    staleTargets: Vector[String]
+    walSizeBytes: Long
 )
 
 object SqliteSection:
@@ -197,29 +234,8 @@ object SqliteSection:
         activeSegmentPath = active.map(_.path),
         documentCount = documentCount,
         symbolCount = meta.symbolCount(),
-        walSizeBytes = meta.walSizeBytes,
-        generatedDocumentCount = meta.generatedDocumentCount(),
-        staleTargets = staleTargets(meta.activeDocumentDigests())
+        walSizeBytes = meta.walSizeBytes
       )
-
-  /** bspIds (sorted, distinct) of targets with at least one active document
-    * whose source file exists but whose md5 no longer matches the stored md5.
-    * Per-document I/O errors and missing sources count as not-stale — a missing
-    * source is a separate condition, not md5 staleness. Never throws.
-    */
-  private def staleTargets(digests: Vector[ActiveDocumentDigest]): Vector[String] =
-    digests.iterator
-      .filter(isStale)
-      .map(_.bspId)
-      .toVector
-      .distinct
-      .sorted
-
-  private def isStale(d: ActiveDocumentDigest): Boolean =
-    try
-      val source = Path.of(d.sourceroot).resolve(d.uri)
-      Files.isRegularFile(source) && !Md5.validate(Files.readString(source), d.md5).isFresh
-    catch case NonFatal(_) => false
 
 /** One segment_manifest row as shown by the doctor. */
 final case class PostingsSegmentInfo(segmentId: Long, path: String, active: Boolean)

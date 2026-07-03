@@ -30,12 +30,14 @@ class StoreSectionsTest extends munit.FunSuite:
         assertEquals(section.databasePath, s.meta.db.path)
         assertEquals(section.walSizeBytes, s.meta.walSizeBytes)
         assert(section.walSizeBytes >= 0L, s"wal size was ${section.walSizeBytes}")
-        // base fixture: the only doc is non-generated and its source is absent
-        // (resolves to a missing path), so it is neither generated nor stale.
-        assertEquals(section.generatedDocumentCount, 0L)
-        assertEquals(section.staleTargets, Vector.empty[String])
 
-  store.test("SqliteSection: generated-source count and per-target staleness from documents"): s =>
+  store.test("generated-source count and per-target staleness base case: none generated, none stale"): s =>
+    // base fixture: the only doc is non-generated and its source is absent
+    // (resolves to a missing path), so it is neither generated nor stale.
+    assertEquals(s.meta.generatedDocumentCount(), 0L)
+    assertEquals(SemanticdbSection.staleTargets(s.meta.activeDocumentDigests()), Vector.empty[String])
+
+  store.test("generated-source count and per-target staleness from documents"): s =>
     // A second target with a real sourceroot on disk under the store root.
     val sourceroot = s.root.resolve("srcB")
     val targetB = s.meta.upsertTarget(
@@ -79,14 +81,11 @@ class StoreSectionsTest extends munit.FunSuite:
       readonly = false
     )
 
-    SqliteSection.gather(s.meta) match
-      case SectionState.Unavailable(reason) => fail(s"unexpectedly unavailable: $reason")
-      case SectionState.Ready(section) =>
-        // exactly the one generated doc (G); the base doc and the stale doc are not generated
-        assertEquals(section.generatedDocumentCount, 1L)
-        // exactly the one target with a stale-md5 doc; the generated doc is fresh and the base
-        // target's source is absent (missing, not stale)
-        assertEquals(section.staleTargets, Vector("bsp://ws/b"))
+    // exactly the one generated doc (G); the base doc and the stale doc are not generated
+    assertEquals(s.meta.generatedDocumentCount(), 1L)
+    // exactly the one target with a stale-md5 doc; the generated doc is fresh and the base
+    // target's source is absent (missing, not stale)
+    assertEquals(SemanticdbSection.staleTargets(s.meta.activeDocumentDigests()), Vector("bsp://ws/b"))
 
   store.test("PostingsSection: active segment, snapshot id and counts"): s =>
     PostingsSection.gather(s.meta, s.manager) match

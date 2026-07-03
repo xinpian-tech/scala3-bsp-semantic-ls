@@ -41,7 +41,13 @@ object DoctorCommand:
         case Some(m) => BspSection.gather(m, s.serverInfo)
         case None => SectionState.Unavailable("no BSP connection"),
       semanticdb = s.model match
-        case Some(m) => SemanticdbSection.fromModel(m, None)
+        case Some(m) =>
+          SemanticdbSection.fromModel(
+            m,
+            stats = None,
+            generatedSourceCount = s.meta.generatedDocumentCount(),
+            staleTargets = SemanticdbSection.staleTargets(s.meta.activeDocumentDigests())
+          )
         case None => SectionState.Unavailable("no BSP connection"),
       sqlite = SqliteSection.gather(s.meta),
       postings = PostingsSection.gather(s.meta, s.snapshots),

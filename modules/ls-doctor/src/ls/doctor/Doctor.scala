@@ -84,7 +84,11 @@ object Doctor:
           s"stale docs (md5 mismatch): ${f.stale}",
           s"missing docs: ${f.missing}"
         ) ++ uris
-    (s"semanticdb roots: ${s.roots.length}" +: rootLines) ++ freshnessLines
+    val statusLines = Vector(
+      s"generated source status: ${s.generatedSourceCount}",
+      s"stale targets: ${noneOrList(s.staleTargets)}"
+    )
+    (s"semanticdb roots: ${s.roots.length}" +: rootLines) ++ freshnessLines ++ statusLines
 
   private def sqliteLines(s: SqliteSection): Vector[String] =
     val manifest = (s.activeSegmentId, s.activeSegmentPath) match
@@ -97,8 +101,6 @@ object Doctor:
       s"FTS: ${enabledDisabled(s.ftsEnabled)} (workspace_symbols_fts ${if s.ftsEnabled then "present" else "absent"})",
       s"manifest generation: $manifest",
       s"documents: ${s.documentCount}",
-      s"generated source status: ${s.generatedDocumentCount}",
-      s"stale targets: ${noneOrList(s.staleTargets)}",
       s"symbols: ${s.symbolCount}",
       s"wal size: ${s.walSizeBytes} bytes"
     )
@@ -228,7 +230,12 @@ object Doctor:
           "missing" -> num(f.missing),
           "uris" -> arr(f.uris.map(str))
         )
-    obj("roots" -> arr(roots), "freshness" -> freshness)
+    obj(
+      "roots" -> arr(roots),
+      "freshness" -> freshness,
+      "generatedSourceCount" -> num(s.generatedSourceCount),
+      "staleTargets" -> arr(s.staleTargets.map(str))
+    )
 
   private def sqliteJson(s: SqliteSection): String =
     obj(
@@ -239,8 +246,6 @@ object Doctor:
       "activeSegmentId" -> s.activeSegmentId.map(num).getOrElse("null"),
       "activeSegmentPath" -> optStr(s.activeSegmentPath),
       "documentCount" -> num(s.documentCount),
-      "generatedDocumentCount" -> num(s.generatedDocumentCount),
-      "staleTargets" -> arr(s.staleTargets.map(str)),
       "symbolCount" -> num(s.symbolCount),
       "walSizeBytes" -> num(s.walSizeBytes)
     )
