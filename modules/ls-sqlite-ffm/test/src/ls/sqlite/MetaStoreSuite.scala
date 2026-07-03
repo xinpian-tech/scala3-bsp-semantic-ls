@@ -299,6 +299,47 @@ class MetaStoreSuite extends munit.FunSuite with TempDbFixture:
     finally store.close()
   }
 
+  tempDir.test("workspaceSymbolNameExists ignores inactive documents and inactive targets") { dir =>
+    val store = open(dir)
+    try
+      val activeTarget = newTarget(store)
+      def seed(target: TargetId, doc: DocId, name: String): Unit =
+        val (_, ws, meta) =
+          indexSymbol(store, target, doc, 1L, s"pkg/$name#", name, None, None, SymKind.Object)
+        store.replaceSymbolMetadata(doc, Seq(meta))
+        store.replaceWorkspaceSymbols(doc, Seq(ws))
+
+      // active document under an active target: found
+      val (activeDoc, _) =
+        store.upsertDocument(activeTarget, "file:///ws/Active.scala", "/sdb/Active", 1L, "m", false, false)
+      seed(activeTarget, activeDoc, "ActiveThing")
+      assert(store.workspaceSymbolNameExists("ActiveThing"), "an active row must be found")
+
+      // matching row on an INACTIVE document (active target): not found
+      val (inactiveDoc, _) =
+        store.upsertDocument(activeTarget, "file:///ws/InactiveDoc.scala", "/sdb/InactiveDoc", 1L, "m", false, false)
+      seed(activeTarget, inactiveDoc, "InactiveDocThing")
+      store.db.withWriteTransaction {
+        store.db.prepare("UPDATE documents SET active = 0 WHERE doc_id = ?").bindLong(1, inactiveDoc.value).run()
+      }
+      assert(
+        !store.workspaceSymbolNameExists("InactiveDocThing"),
+        "a row on an inactive document must not count as indexed"
+      )
+
+      // matching row on a document under an INACTIVE target: not found
+      val inactiveTarget =
+        store.upsertTarget("bsp://ws/target?id=inactive", "3.8.4", "cp0", "opt0", "/ws/out/semanticdb", "/ws", active = false)
+      val (inactiveTargetDoc, _) =
+        store.upsertDocument(inactiveTarget, "file:///ws/InactiveTarget.scala", "/sdb/InactiveTarget", 1L, "m", false, false)
+      seed(inactiveTarget, inactiveTargetDoc, "InactiveTargetThing")
+      assert(
+        !store.workspaceSymbolNameExists("InactiveTargetThing"),
+        "a row on an inactive target must not count as indexed"
+      )
+    finally store.close()
+  }
+
   tempDir.test("workspaceSymbolSearch supports prefix and multi-token queries") { dir =>
     val store = open(dir)
     try

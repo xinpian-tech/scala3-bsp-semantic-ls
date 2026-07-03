@@ -544,12 +544,13 @@ final class MetaStore(val db: Db) extends AutoCloseable:
   def workspaceSymbolSearch(query: String, limit: Int): Vector[WorkspaceSymbolHit] =
     readers.withReader(conn => workspaceSymbolSearchOn(conn, query, limit))
 
-  /** Whether the persisted index holds a workspace symbol with this EXACT
-    * display name. Unlike [[workspaceSymbolSearch]] (a ranked, `limit`-bounded
-    * FTS prefix + fuzzy query), this is a direct membership check, so a symbol
-    * ranked outside a search window is never missed. Backs the PC-only overlay's
-    * "is this name already indexed?" classification. Runs on a borrowed
-    * read-only connection.
+  /** Whether the persisted index holds an ACTIVE workspace symbol with this
+    * EXACT display name. Unlike [[workspaceSymbolSearch]] (a ranked,
+    * `limit`-bounded FTS prefix + fuzzy query), this is a direct membership
+    * check, so a symbol ranked outside a search window is never missed; and it
+    * requires the owning document and target to be active, so a stale inactive
+    * row never counts. Backs the PC-only overlay's "is this name already
+    * indexed?" classification. Runs on a borrowed read-only connection.
     */
   def workspaceSymbolNameExists(displayName: String): Boolean =
     if displayName.isEmpty then false
@@ -562,7 +563,8 @@ final class MetaStore(val db: Db) extends AutoCloseable:
               |JOIN symbol_metadata m
               |  ON m.symbol_id = r.symbol_id AND m.target_id = r.target_id AND m.doc_id = r.doc_id
               |JOIN documents d ON d.doc_id = r.doc_id
-              |WHERE m.display_name = ?
+              |JOIN targets t ON t.target_id = r.target_id
+              |WHERE m.display_name = ? AND d.active = 1 AND t.active = 1
               |LIMIT 1""".stripMargin
           )
           .bindText(1, displayName)
