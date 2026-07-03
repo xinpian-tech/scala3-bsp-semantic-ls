@@ -104,6 +104,86 @@ class RenameSuite extends munit.FunSuite:
     val spans = fx.tokenSpans("a/src/pkga/Over.scala", "fmt")
     assertEquals(spanSet(plan, "a/src/pkga/Over.scala"), Set(spans(0), spans(2)), plan.toString)
 
+  test("rename an inline def edits its definition and every call site across targets"):
+    val plan = rename("a/src/pkga/Inline.scala", "twice", 0, "doubled")
+    assertEquals(
+      spanSet(plan, "a/src/pkga/Inline.scala"),
+      fx.tokenSpans("a/src/pkga/Inline.scala", "twice").toSet,
+      plan.toString
+    )
+    assertEquals(
+      spanSet(plan, "b/src/pkgb/UseB.scala"),
+      fx.tokenSpans("b/src/pkgb/UseB.scala", "twice").toSet
+    )
+    assertEquals(plan.edits.keySet, Set("a/src/pkga/Inline.scala", "b/src/pkgb/UseB.scala"))
+
+  test("rename a private method edits its definition and in-file uses only"):
+    val plan = rename("a/src/pkga/Private.scala", "helper", 0, "compute")
+    assertEquals(
+      spanSet(plan, "a/src/pkga/Private.scala"),
+      fx.tokenSpans("a/src/pkga/Private.scala", "helper").toSet
+    )
+    assertEquals(plan.edits.keySet, Set("a/src/pkga/Private.scala"))
+
+  test("rename a private val edits its definition and in-file uses only"):
+    val plan = rename("a/src/pkga/Private.scala", "state", 0, "seed")
+    assertEquals(
+      spanSet(plan, "a/src/pkga/Private.scala"),
+      fx.tokenSpans("a/src/pkga/Private.scala", "state").toSet
+    )
+    assertEquals(plan.edits.keySet, Set("a/src/pkga/Private.scala"))
+
+  test("rename a nested local def touches only its document"):
+    val plan = rename("a/src/pkga/LocalDef.scala", "loop", 0, "step")
+    assertEquals(
+      spanSet(plan, "a/src/pkga/LocalDef.scala"),
+      fx.tokenSpans("a/src/pkga/LocalDef.scala", "loop").toSet
+    )
+    assertEquals(plan.edits.keySet, Set("a/src/pkga/LocalDef.scala"))
+
+  test("rename a val member edits its definition and cross-file uses"):
+    val plan = rename("a/src/pkga/Named.scala", "title", 0, "name")
+    assertEquals(
+      spanSet(plan, "a/src/pkga/Named.scala"),
+      fx.tokenSpans("a/src/pkga/Named.scala", "title").toSet,
+      plan.toString
+    )
+    assertEquals(
+      spanSet(plan, "b/src/pkgb/UseB.scala"),
+      fx.tokenSpans("b/src/pkgb/UseB.scala", "title").toSet
+    )
+    assertEquals(plan.edits.keySet, Set("a/src/pkga/Named.scala", "b/src/pkgb/UseB.scala"))
+
+  test("rename a top-level def edits its definition and cross-file uses"):
+    val plan = rename("a/src/pkga/TopLevel.scala", "topHelper", 0, "topDouble")
+    assertEquals(
+      spanSet(plan, "a/src/pkga/TopLevel.scala"),
+      fx.tokenSpans("a/src/pkga/TopLevel.scala", "topHelper").toSet
+    )
+    assertEquals(
+      spanSet(plan, "b/src/pkgb/UseB.scala"),
+      fx.tokenSpans("b/src/pkgb/UseB.scala", "topHelper").toSet
+    )
+
+  test("rename an extension method edits its definition and call sites across targets"):
+    val plan = rename("a/src/pkga/Core.scala", "shout", 0, "yell")
+    assertEquals(
+      spanSet(plan, "a/src/pkga/Core.scala"),
+      fx.tokenSpans("a/src/pkga/Core.scala", "shout").toSet
+    )
+    assertEquals(
+      spanSet(plan, "a/src/pkga/Impl.scala"),
+      fx.tokenSpans("a/src/pkga/Impl.scala", "shout").toSet
+    )
+    assertEquals(
+      spanSet(plan, "b/src/pkgb/UseB.scala"),
+      fx.tokenSpans("b/src/pkgb/UseB.scala", "shout").toSet
+    )
+    assertEquals(
+      plan.edits.keySet,
+      Set("a/src/pkga/Core.scala", "a/src/pkga/Impl.scala", "b/src/pkgb/UseB.scala")
+    )
+
   test("keyword new name is backtick-quoted"):
     val plan = rename("a/src/pkga/Vars.scala", "tmp", 0, "type")
     assert(plan.edits("a/src/pkga/Vars.scala").forall(_.newText == "`type`"), plan.toString)
@@ -176,6 +256,24 @@ class RenameSuite extends munit.FunSuite:
     val err = rejection("a/src/pkga/ReadonlyUse.scala", "Gadget", 0, "Gizmo")
     assert(err.isInstanceOf[LsError.RenameRejected], err.toString)
     assertEquals(compiler.calls.toList, Nil)
+
+  test("rename an opaque type edits the type, companion, and its uses (v1 merge policy)"):
+    val plan = rename("a/src/pkga/Opaque.scala", "UserId", 0, "AccountId")
+    assertEquals(
+      spanSet(plan, "a/src/pkga/Opaque.scala"),
+      fx.tokenSpans("a/src/pkga/Opaque.scala", "UserId").toSet,
+      plan.toString
+    )
+    assertEquals(plan.edits.keySet, Set("a/src/pkga/Opaque.scala"))
+
+  test("rename of an external library symbol is rejected as outside the workspace"):
+    // cursor on a `List` reference: the symbol is defined in the standard
+    // library, so it must reject rather than edit only the in-workspace uses.
+    val err = rejection("a/src/pkga/Externals.scala", "List", 0, "Seq")
+    err match
+      case LsError.RenameRejected(reasons) =>
+        assert(reasons.exists(_.contains("outside the workspace")), reasons.toString)
+      case other => fail(s"expected RenameRejected, got $other")
 
   test("dependency sources are rejected"):
     val err = rejection("dep/src/pkgdep/DepThing.scala", "DepThing", 0, "Other")

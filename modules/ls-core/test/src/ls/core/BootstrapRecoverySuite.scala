@@ -27,6 +27,68 @@ class BootstrapRecoverySuite extends munit.FunSuite:
       docOccurrences = Vector(Vector(DocOcc(0, Span(0, 0, 0, 1), 0)))
     )
 
+  private def deleteRecursively(p: java.nio.file.Path): Unit =
+    if Files.exists(p) then
+      val stream = Files.walk(p)
+      try stream.sorted(java.util.Comparator.reverseOrder()).forEach(q => Files.delete(q))
+      finally stream.close()
+
+  test("a manifest pointing at a deleted segment degrades gracefully and heals on the next ingest"):
+    val ws = Files.createTempDirectory("ls-boot-missing-seg-")
+    ws.toFile.deleteOnExit()
+    val storage = Bootstrap.storageRootOf(ws)
+    Files.createDirectories(storage)
+    val postingsRoot = storage.resolve("postings")
+
+    // persist a store whose manifest activates a segment, then delete its dir
+    val segDir = SegmentWriter.write(postingsRoot, 1L, minimalSegment)
+    val meta = MetaStore.open(storage.resolve("meta.sqlite"))
+    meta.db.withWriteTransaction {
+      val id = meta.insertSegment(segDir.toString, createdAtMs = 1L, minEpoch = 1L, maxEpoch = 1L, checksum = 0L)
+      meta.activateSegment(id)
+    }
+    meta.close()
+    deleteRecursively(segDir)
+    assert(!Files.exists(segDir), "the active segment dir must be gone before boot")
+
+    // boot: graceful degrade (Ready, not a hard crash) with a recovery note
+    locally:
+      val docs = new DocumentStore
+      val overlay = new PcOverlay(docs)
+      val state = Bootstrap.run(ws, Bootstrap.Config(connectBsp = (_, _) => None, log = _ => ()), docs, overlay)
+      try
+        val services =
+          state.ready.getOrElse(fail(s"boot must degrade to Ready, got: ${state.statusLine}"))
+        assert(
+          services.notes.exists(_.contains("could not be recovered")),
+          services.notes.mkString("\n")
+        )
+        // the doctor still renders without crashing
+        assert(Doctor.render(DoctorCommand.input(services)).nonEmpty)
+      finally state.ready.foreach(_.close())
+
+    // heal: a fresh segment is written + activated (as the next ingest would);
+    // re-boot recovers it cleanly
+    val meta2 = MetaStore.open(storage.resolve("meta.sqlite"))
+    val freshDir = SegmentWriter.write(postingsRoot, 2L, minimalSegment)
+    meta2.db.withWriteTransaction {
+      val id = meta2.insertSegment(freshDir.toString, createdAtMs = 2L, minEpoch = 1L, maxEpoch = 1L, checksum = 0L)
+      meta2.activateSegment(id)
+    }
+    meta2.close()
+
+    locally:
+      val docs = new DocumentStore
+      val overlay = new PcOverlay(docs)
+      val healed = Bootstrap.run(ws, Bootstrap.Config(connectBsp = (_, _) => None, log = _ => ()), docs, overlay)
+      try
+        val services = healed.ready.getOrElse(fail(healed.statusLine))
+        assert(
+          services.notes.exists(_.contains("recovered postings segment")),
+          services.notes.mkString("\n")
+        )
+      finally healed.ready.foreach(_.close())
+
   test("startup recovery preserves a divergent current.json and the doctor reports it divergent"):
     val ws = Files.createTempDirectory("ls-boot-recovery-")
     ws.toFile.deleteOnExit()

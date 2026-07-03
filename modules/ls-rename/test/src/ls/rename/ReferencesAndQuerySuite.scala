@@ -142,6 +142,43 @@ class ReferencesAndQuerySuite extends munit.FunSuite:
     assert(containsToken(r, "a/src/pkga/Impl.scala", "defaultCore", 0), r.locations.toString)
     assert(containsToken(r, "b/src/pkgb/UseB.scala", "defaultCore", 0), r.locations.toString)
 
+  test("given references include the using-clause argument site"):
+    val r = refs("a/src/pkga/Core.scala", "defaultCore", nth = 0)
+    // `render(using defaultCore)` in Using.scala is an explicit argument site
+    assert(containsToken(r, "a/src/pkga/Using.scala", "defaultCore", 0), r.locations.toString)
+
+  test("inline def references reach call sites across targets"):
+    val r = refs("a/src/pkga/Inline.scala", "twice", nth = 0)
+    assert(containsToken(r, "a/src/pkga/Inline.scala", "twice", 1), r.locations.toString) // twice(1)
+    assert(containsToken(r, "b/src/pkgb/UseB.scala", "twice", 0), r.locations.toString) // Inlines.twice(21)
+
+  test("top-level def references reach cross-file uses"):
+    val r = refs("a/src/pkga/TopLevel.scala", "topHelper", nth = 0)
+    assert(containsToken(r, "b/src/pkgb/UseB.scala", "topHelper", 0), r.locations.toString)
+
+  test("private member references stay inside the defining file"):
+    val r = refs("a/src/pkga/Private.scala", "helper", nth = 0, includeDeclaration = true)
+    assertEquals(r.locations.map(_.uri).distinct, Vector("a/src/pkga/Private.scala"))
+    assertEquals(
+      locsIn(r, "a/src/pkga/Private.scala").map(_.span).toSet,
+      fx.tokenSpans("a/src/pkga/Private.scala", "helper").toSet,
+      r.locations.toString
+    )
+
+  test("nested local def references stay inside the document"):
+    val r = refs("a/src/pkga/LocalDef.scala", "loop", nth = 0, includeDeclaration = true)
+    assertEquals(r.locations.map(_.uri).distinct, Vector("a/src/pkga/LocalDef.scala"))
+    assertEquals(
+      locsIn(r, "a/src/pkga/LocalDef.scala").map(_.span).toSet,
+      fx.tokenSpans("a/src/pkga/LocalDef.scala", "loop").toSet,
+      r.locations.toString
+    )
+
+  test("opaque type references include the type-annotation use"):
+    val r = refs("a/src/pkga/Opaque.scala", "UserId", nth = 0, includeDeclaration = true)
+    // `val sample: UserId` is a type reference to the opaque type
+    assert(containsToken(r, "a/src/pkga/Opaque.scala", "UserId", 3), r.locations.toString)
+
   // ------------------------------------------------------------ includeDeclaration
 
   test("includeDeclaration adds the definition site and only then"):

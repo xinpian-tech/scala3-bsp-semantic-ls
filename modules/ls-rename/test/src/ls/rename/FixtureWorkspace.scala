@@ -193,6 +193,64 @@ object FixtureWorkspace:
         |object Beta:
         |  val al = Alpha(5)
         |""".stripMargin,
+    "a/src/pkga/Inline.scala" ->
+      """package pkga
+        |
+        |object Inlines:
+        |  inline def twice(x: Int): Int = x + x
+        |  val here: Int = twice(1)
+        |""".stripMargin,
+    "a/src/pkga/Private.scala" ->
+      """package pkga
+        |
+        |class Secretive:
+        |  private val state: Int = 1
+        |  private def helper(n: Int): Int = n + state
+        |  def use: Int = helper(state)
+        |""".stripMargin,
+    "a/src/pkga/LocalDef.scala" ->
+      """package pkga
+        |
+        |object LocalDefs:
+        |  def countdown(n: Int): Int =
+        |    def loop(m: Int): Int = if m <= 0 then 0 else m + loop(m - 1)
+        |    loop(n)
+        |""".stripMargin,
+    "a/src/pkga/Using.scala" ->
+      """package pkga
+        |
+        |object Rendering:
+        |  def render(using c: Core): String = c.ping
+        |  val rendered: String = render(using defaultCore)
+        |""".stripMargin,
+    "a/src/pkga/TopLevel.scala" ->
+      """package pkga
+        |
+        |def topHelper(n: Int): Int = n * 2
+        |val topConst: Int = 42
+        |""".stripMargin,
+    "a/src/pkga/Opaque.scala" ->
+      """package pkga
+        |
+        |object Ids:
+        |  opaque type UserId = Long
+        |  object UserId:
+        |    def wrap(l: Long): UserId = l
+        |  val sample: UserId = UserId.wrap(7L)
+        |""".stripMargin,
+    "a/src/pkga/Named.scala" ->
+      """package pkga
+        |
+        |class Named(val title: String):
+        |  def shown: String = "[" + title + "]"
+        |""".stripMargin,
+    "a/src/pkga/Externals.scala" ->
+      """package pkga
+        |
+        |object UsesList:
+        |  val xs: List[Int] = List(1, 2, 3)
+        |  val total: Int = xs.sum
+        |""".stripMargin,
     "shared/src/shared/Shared.scala" ->
       """package shared
         |
@@ -213,6 +271,10 @@ object FixtureWorkspace:
         |  def loud(c: Core): String = c.shout
         |  val g2: Core = pkga.defaultCore
         |  val s: String = shared.SharedThing.tag
+        |  val twiced: Int = pkga.Inlines.twice(21)
+        |  val named: Named = Named("b")
+        |  val theTitle: String = named.title
+        |  val topUse: Int = pkga.topHelper(pkga.topConst)
         |""".stripMargin,
     // ---------------- target C (disconnected, reuses names) ----------------
     "c/src/pkga/CopyCore.scala" ->

@@ -36,6 +36,32 @@ class RenameMutationSuite extends munit.FunSuite:
         case _ => ()
     finally stack.close()
 
+  test("fresh-snapshot stale index: the cursor document itself is edited after compile"):
+    val fx = FixtureWorkspace.cloneFixture()
+    val stack = FixtureWorkspace.newStack()
+    try
+      stack.orchestrator.ingest(FixtureWorkspace.workspaceFor(fx))
+      // mutate the CURSOR document after ingest so its source no longer matches
+      // the ingested SemanticDB; the post-compile resolve is non-Snapshot and the
+      // rename must reject with StaleIndex on the cursor document itself rather
+      // than emit edits against a stale snapshot.
+      val alpha = fx.sourcePath("a/src/pkga/Alpha.scala")
+      Files.write(
+        alpha,
+        (fx.sourceText("a/src/pkga/Alpha.scala") + "\n// edited after compile\n")
+          .getBytes(StandardCharsets.UTF_8)
+      )
+      val engine = RenameEngine(stack.orchestrator, StubCompiler())
+      val (line, ch) = fx.cursor("a/src/pkga/Alpha.scala", "Alpha", 0)
+      val err = intercept[LsException](
+        engine.rename("a/src/pkga/Alpha.scala", line, ch, "Omega")
+      )
+      assert(err.error.isInstanceOf[LsError.StaleIndex], err.error.toString)
+      err.error match
+        case LsError.StaleIndex(uri) => assertEquals(uri, "a/src/pkga/Alpha.scala")
+        case _ => ()
+    finally stack.close()
+
   test("shared-source disagreement between targets is rejected"):
     val fx = FixtureWorkspace.cloneFixture()
     val stack = FixtureWorkspace.newStack()

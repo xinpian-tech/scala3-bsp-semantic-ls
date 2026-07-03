@@ -93,6 +93,11 @@ class ScalacIntegrationSuite extends munit.FunSuite:
         |
         |object ExportUse:
         |  val use = Api.work(1)
+        |""".stripMargin,
+    "src/fix/Derives.scala" ->
+      """package fix
+        |
+        |case class Coord(x: Int, y: Int) derives CanEqual
         |""".stripMargin
   )
 
@@ -345,6 +350,18 @@ class ScalacIntegrationSuite extends munit.FunSuite:
       s"expected UnsupportedSymbolFamily, mask=0x${profile.unsafeReasonMask.toHexString}"
     )
     assert(!profile.isSafe)
+
+  test("derives clause: the case class is defined and the derived given is synthetic-only"):
+    // Characterization (real scalac 3): `derives CanEqual` synthesizes a
+    // `derived$CanEqual` given and the `CanEqual` type-class reference only in
+    // the SemanticDB synthetics payload, which this parser skips (plan 4.3). So
+    // the derives clause contributes NO non-synthetic occurrence; the case class
+    // itself is defined normally.
+    val doc = normalizedDoc("src/fix/Derives.scala")
+    val syms = doc.occurrences.map(_.key.semanticSymbol).toSet
+    assert(syms.contains("fix/Coord#"), clues(syms))
+    assert(!syms.exists(_.contains("CanEqual")), clues(syms))
+    assert(!syms.exists(_.contains("derived")), clues(syms))
 
   test("synthetic-only case-class copy has no definition occurrence but a defined owner"):
     // characterization input (real scalac 3): the synthesized `copy` carries a
