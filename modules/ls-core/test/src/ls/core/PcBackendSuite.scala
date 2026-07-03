@@ -161,6 +161,39 @@ class PcBackendSuite extends munit.FunSuite:
       assert(s.pc.workerAlive.isDefined, s.pc.workerAlive.toString)
     finally s.close()
 
+  test("forked mode does not load configured PC plugins in the main process (in-process does)"):
+    val ws = Files.createTempDirectory("ls-core-forked-plugin-iso")
+    // a present, valid (empty) plugin config in the conventional location
+    val cfgFile = ls.pc.PcPluginConfigLoader.defaultPath(ws)
+    Files.createDirectories(cfgFile.getParent)
+    Files.writeString(cfgFile, """{"compilerPlugins": []}""")
+
+    def boot(mode: PcBackendMode): WorkspaceState =
+      val docs = new DocumentStore
+      Bootstrap.run(ws, Bootstrap.Config(connectBsp = (_, _) => None, pcBackendMode = mode), docs, new PcOverlay(docs))
+
+    // Forked: the config is passed to the child, so the MAIN process must NOT load
+    // plugins (else a plugin crash on load defeats process isolation).
+    val forked = boot(PcBackendMode.Forked)
+    val fs = forked.ready.getOrElse(fail(s"forked bootstrap not ready: ${forked.statusLine}"))
+    try
+      assert(fs.pc.isInstanceOf[ForkedPcBackend], fs.pc.getClass.getName)
+      assert(
+        !fs.notes.exists(_.contains("applied PC plugin config")),
+        s"forked mode must not load configured plugins in the main process: ${fs.notes}"
+      )
+    finally fs.close()
+
+    // In-process: the same present config IS loaded in this JVM.
+    val inproc = boot(PcBackendMode.InProcess)
+    val is = inproc.ready.getOrElse(fail(s"in-process bootstrap not ready: ${inproc.statusLine}"))
+    try
+      assert(
+        is.notes.exists(_.contains("applied PC plugin config")),
+        s"in-process mode should load the present plugin config: ${is.notes}"
+      )
+    finally is.close()
+
   test("Bootstrap defaults to the in-process backend (no BSP)"):
     val ws = Files.createTempDirectory("ls-core-inproc-bootstrap")
     val docs = new DocumentStore

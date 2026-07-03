@@ -265,6 +265,26 @@ class LsEndToEndTest extends munit.FunSuite:
     val message = ex.getCause.asInstanceOf[ResponseErrorException].getResponseError.getMessage
     assert(message.contains("has no SemanticDB output"), message)
 
+  test("SemanticDB is mandatory: a stale persisted row cannot serve a live non-indexable target"):
+    val _ = env.initResult
+    val s = env.server.currentState.ready.get
+    val cFile = "c/src/C.scala"
+    // c is a live BSP target that emits no SemanticDB (non-indexable) yet owns its uri.
+    assert(s.uriToTarget.contains(ws.fileUri(cFile)), s"fixture should own $cFile")
+    // Simulate "-Xsemanticdb removed after an earlier ingest": inject a STALE but
+    // ACTIVE persisted document row for c's (sourceroot-relative) uri. The on-disk
+    // fallback must NOT let this stale row answer a request the live model says is
+    // non-indexable.
+    val tid = s.meta.upsertTarget(
+      "bsp://workspace/c", "3.8.4", "cp", "opt", "/no-sdb-root", ws.root.toString, active = true
+    )
+    s.meta.upsertDocument(tid, cFile, "/nonexistent.semanticdb", 0L, "stale-md5", false, false)
+    assert(s.meta.documentsByUri(cFile).exists(_.active), "seeded an active doc for c")
+    val params = new ReferenceParams(textDoc(cFile), new Position(0, 6), new ReferenceContext(true))
+    val ex = intercept[ExecutionException](docsService.references(params).get(60, TimeUnit.SECONDS))
+    val message = ex.getCause.asInstanceOf[ResponseErrorException].getResponseError.getMessage
+    assert(message.contains("has no SemanticDB output"), s"stale row must not bypass NoSemanticdb: $message")
+
   test("workspace/symbol finds the fixture class with a real file location"):
     val _ = env.initResult
     val result = wsService.symbol(new WorkspaceSymbolParams("Core")).get(60, TimeUnit.SECONDS)

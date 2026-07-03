@@ -214,20 +214,21 @@ object Bootstrap:
       )
       val pluginConfigFile = PcPluginConfigLoader.defaultPath(workspaceRoot)
       val havePluginConfig = Files.isRegularFile(pluginConfigFile)
-      if havePluginConfig then
-        try
-          pluginManager.applyConfig(PcPluginConfigLoader.load(pluginConfigFile))
-          notes += s"applied PC plugin config $pluginConfigFile"
-        catch
-          case NonFatal(t) =>
-            notes += s"PC plugin config $pluginConfigFile could not be loaded: ${describe(t)}"
-
-      // PC backend selection (plan 5.2): in-process runs the PC in this JVM
-      // over the facade; forked spawns an isolated child (ls.pc.PcWorkerMain)
-      // that loads its own plugins from --plugin-config, so a plugin crash
-      // can never reach the main LS index.
+      // PC backend selection: in-process runs the PC in this JVM over the facade;
+      // forked spawns an isolated child (ls.pc.PcWorkerMain) that loads its OWN
+      // plugins from --plugin-config. Configured plugins are loaded in the main
+      // process ONLY for in-process mode — a plugin that wedges, exits, or hits a
+      // JVM-fatal fault on load must never reach the main LS when forked, so the
+      // process-isolation guarantee holds.
       val pc: PcBackend = config.pcBackendMode match
         case PcBackendMode.InProcess =>
+          if havePluginConfig then
+            try
+              pluginManager.applyConfig(PcPluginConfigLoader.load(pluginConfigFile))
+              notes += s"applied PC plugin config $pluginConfigFile"
+            catch
+              case NonFatal(t) =>
+                notes += s"PC plugin config $pluginConfigFile could not be loaded: ${describe(t)}"
           new InProcessPcBackend(new PcFacade(pluginManager, settings))
         case PcBackendMode.Forked =>
           val workerArgs =
