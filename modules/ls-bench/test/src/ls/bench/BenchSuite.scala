@@ -50,13 +50,19 @@ class BenchSuite extends munit.FunSuite:
     for expected <- List(
         "scala3-bsp-semantic-ls bench (tiny)",
         "segment: write=",
-        "workspace/symbol fts",
+        "workspace/symbol fts (prefix)",
+        "workspace/symbol fuzzy",
         "references hot (all targets)",
         "references hot (pruned)",
+        "references medium (all targets)",
         "references rare (all targets)",
         "references rare (pruned)",
         "symbolAt (doc postings)",
         "doc scan (full)",
+        "sqlite-ffm-call-overhead:",
+        "ns/call",
+        "occurrence-set:",
+        "occurrences verified against ground truth",
         "consistency: all checks passed"
       )
     do assert(report.contains(expected), s"missing '$expected' in:\n$report")

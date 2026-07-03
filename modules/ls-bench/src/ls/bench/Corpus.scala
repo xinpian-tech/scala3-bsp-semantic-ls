@@ -39,6 +39,11 @@ final class CorpusTruth(
     refCountOf.zipWithIndex.sortBy(-_._1).take(n).map(_._2).toVector
   def rareGroups(n: Int): Vector[Int] =
     refCountOf.zipWithIndex.filter(_._1 > 0).sortBy(_._1).take(n).map(_._2).toVector
+  /** `n` groups from the middle of the reference-count rank distribution. */
+  def midGroups(n: Int): Vector[Int] =
+    val ranked = refCountOf.zipWithIndex.filter(_._1 > 0).sortBy(-_._1).map(_._2).toVector
+    val start = math.max(0, (ranked.length - n) / 2)
+    ranked.slice(start, start + n)
 
 /** Synthetic corpus generator working DIRECTLY at the storage layer — no
   * scalac involved (plan 18.3: benchmarks measure the index machinery, not

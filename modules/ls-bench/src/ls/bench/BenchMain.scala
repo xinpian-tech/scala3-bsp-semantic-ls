@@ -128,6 +128,20 @@ object BenchMain:
           hits.length.toLong
         }
 
+        // --- workspace/symbol fuzzy fallback: camel-hump forms the FTS prefix
+        // misses (e.g. "Sym5" -> "s5"), forcing the sidecar subsequence search ---
+        def fuzzyForm(name: String): String =
+          name.take(1).toLowerCase + name.dropWhile(!_.isDigit)
+        val fuzzyQueries = Vector.tabulate(queries) { q =>
+          val r = (q.toLong * q.toLong % s).toInt
+          fuzzyForm(corpus.displayNames(r))
+        }
+        val fuzzy = Metrics.measure(fuzzyQueries) { query =>
+          val hits = meta.workspaceSymbolSearch(query, 50)
+          check(hits.nonEmpty, s"fuzzy query '$query' returned no hits")
+          hits.length.toLong
+        }
+
         // --- reference scans (hot + rare, with and without pruning) ---
         val hot = corpus.hotGroups(math.min(16, s))
         val rare = corpus.rareGroups(math.min(16, s))
@@ -146,9 +160,12 @@ object BenchMain:
             sink.count
           }
 
+        val mid = corpus.midGroups(math.min(16, s))
+        check(mid.nonEmpty, "corpus produced no mid-rank groups")
         val hotAll = scanRefs(hot, allTargets, corpus.refCountOf(_), "references hot (all targets)")
         val hotPruned =
           scanRefs(hot, onlyTarget0, corpus.refCountPerTarget(_)(0), "references hot (pruned)")
+        val midAll = scanRefs(mid, allTargets, corpus.refCountOf(_), "references medium (all targets)")
         val rareAll = scanRefs(rare, allTargets, corpus.refCountOf(_), "references rare (all targets)")
         val rarePruned =
           scanRefs(rare, onlyTarget0, corpus.refCountPerTarget(_)(0), "references rare (pruned)")
@@ -183,6 +200,50 @@ object BenchMain:
           sink.count
         }
 
+        // --- SQLite FFM call-overhead microbench (ns/call) ---
+        // A tight prepared-statement loop; the per-call cost is dominated by the
+        // FFM boundary crossing, not query complexity. symbol_metadata has one
+        // row per symbol, so the returned count is the ground-truth invariant.
+        val ffmCalls = math.max(queries * 4, 2000)
+        val ffmStart = System.nanoTime()
+        var ffmSum = 0L
+        var fc = 0
+        while fc < ffmCalls do
+          ffmSum += meta.db
+            .prepare("SELECT count(*) FROM symbol_metadata")
+            .queryOne(_.columnLong(0))
+            .getOrElse(-1L)
+          fc += 1
+        val ffmNsPerCall = (System.nanoTime() - ffmStart) / ffmCalls
+        check(
+          ffmSum == s.toLong * ffmCalls,
+          s"ffm microbench: symbol_metadata count drifted (sum=$ffmSum, expected ${s.toLong * ffmCalls})"
+        )
+
+        // --- occurrence-set preservation gate: the published segment must
+        // reproduce the generated ground truth exactly (write -> read invariant).
+        // Compare the (doc, packedStart, packedEnd, flags) multiset. ---
+        val expectedOccs = scala.collection.mutable.HashMap.empty[(Int, Int, Int, Int), Int]
+        for (occs, doc) <- corpus.data.docOccurrences.zipWithIndex; o <- occs do
+          val key = (
+            doc,
+            ls.index.Span.pack(o.span.startLine, o.span.startChar),
+            ls.index.Span.pack(o.span.endLine, o.span.endChar),
+            o.flags
+          )
+          expectedOccs.update(key, expectedOccs.getOrElse(key, 0) + 1)
+        val scannedOccs = scala.collection.mutable.HashMap.empty[(Int, Int, Int, Int), Int]
+        for d <- 0 until params.docs do
+          val sink = new CollectingOccSink
+          snap.scanDocOccurrences(ls.index.DocOrd(d), sink)
+          sink.keys.foreach(k => scannedOccs.update(k, scannedOccs.getOrElse(k, 0) + 1))
+        check(
+          scannedOccs == expectedOccs,
+          s"occurrence-set mismatch: scanned ${scannedOccs.valuesIterator.sum} occurrences " +
+            s"(${scannedOccs.size} distinct), expected ${expectedOccs.valuesIterator.sum} (${expectedOccs.size} distinct)"
+        )
+        val occVerified = expectedOccs.valuesIterator.sum
+
         // --- report ---
         out.println(s"scala3-bsp-semantic-ls bench ($mode)")
         out.println(
@@ -195,13 +256,17 @@ object BenchMain:
         )
         out.println()
         out.println(Metrics.header)
-        out.println(Metrics.row("workspace/symbol fts", fts))
+        out.println(Metrics.row("workspace/symbol fts (prefix)", fts))
+        out.println(Metrics.row("workspace/symbol fuzzy", fuzzy))
         out.println(Metrics.row("references hot (all targets)", hotAll))
         out.println(Metrics.row("references hot (pruned)", hotPruned))
+        out.println(Metrics.row("references medium (all targets)", midAll))
         out.println(Metrics.row("references rare (all targets)", rareAll))
         out.println(Metrics.row("references rare (pruned)", rarePruned))
         out.println(Metrics.row("symbolAt (doc postings)", symbolAt))
         out.println(Metrics.row("doc scan (full)", docScan))
+        out.println(f"sqlite-ffm-call-overhead: $ffmNsPerCall%d ns/call (${ffmCalls}%d calls)")
+        out.println(f"occurrence-set: $occVerified%d occurrences verified against ground truth")
 
         val failures = errors.result()
         if failures.isEmpty then
@@ -228,6 +293,21 @@ object BenchMain:
         packedEnd: Int,
         flags: Int
     ): Unit = count += 1
+
+  /** Collects (doc, packedStart, packedEnd, flags) keys for the occurrence-set
+    * preservation gate.
+    */
+  private final class CollectingOccSink extends OccurrenceSink:
+    val keys: scala.collection.mutable.ArrayBuffer[(Int, Int, Int, Int)] =
+      scala.collection.mutable.ArrayBuffer.empty
+    override def accept(
+        docOrd: Int,
+        targetOrd: Int,
+        docEpoch: Int,
+        packedStart: Int,
+        packedEnd: Int,
+        flags: Int
+    ): Unit = keys += ((docOrd, packedStart, packedEnd, flags))
 
   private def sizeOf(dir: Path): Long =
     val stream = Files.walk(dir)
