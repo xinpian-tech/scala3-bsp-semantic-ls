@@ -85,7 +85,8 @@ final case class IngestReport(
 final class IngestPipeline(
     val meta: MetaStore,
     val manager: SnapshotManager,
-    universeId: Long = 0L
+    universeId: Long = 0L,
+    walCheckpointThresholdBytes: Long = MetaStore.DefaultWalThresholdBytes
 ):
 
   private final case class PrimaryDoc(
@@ -341,7 +342,7 @@ final class IngestPipeline(
     // readers are left for a later pass.
     manager.deleteSuperseded()
     // Keep the SQLite WAL bounded without ever blocking the writer.
-    try meta.checkpoint()
+    try meta.checkpoint(walCheckpointThresholdBytes)
     catch case scala.util.control.NonFatal(t) => ()
 
     IngestReport(

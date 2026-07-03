@@ -139,9 +139,10 @@ final class Db private (
     val truncate =
       if !(passive.fullyCheckpointed && walFileSizeBytes > walThresholdBytes) then None
       else
+        val prevTimeout = prepare("PRAGMA busy_timeout").queryOne(_.columnInt(0)).getOrElse(5000)
         exec("PRAGMA busy_timeout=0")
         try Some(checkpoint(CheckpointMode.Truncate))
-        finally exec("PRAGMA busy_timeout=5000")
+        finally exec(s"PRAGMA busy_timeout=$prevTimeout")
     CheckpointOutcome(passive, truncate)
 
   /** Finalizes all cached statements and closes the connection. Idempotent. */

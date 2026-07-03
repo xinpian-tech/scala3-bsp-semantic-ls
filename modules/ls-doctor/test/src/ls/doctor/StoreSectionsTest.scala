@@ -26,6 +26,8 @@ class StoreSectionsTest extends munit.FunSuite:
         assertEquals(section.documentCount, 1L)
         assertEquals(section.symbolCount, 2L)
         assertEquals(section.databasePath, s.meta.db.path)
+        assertEquals(section.walSizeBytes, s.meta.walSizeBytes)
+        assert(section.walSizeBytes >= 0L, s"wal size was ${section.walSizeBytes}")
 
   store.test("PostingsSection: active segment, snapshot id and counts"): s =>
     PostingsSection.gather(s.meta, s.manager) match
