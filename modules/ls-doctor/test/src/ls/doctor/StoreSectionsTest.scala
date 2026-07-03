@@ -2,6 +2,8 @@ package ls.doctor
 
 import java.nio.file.Files
 
+import ls.semanticdb.Md5
+
 import DoctorTestSupport.*
 
 /** SQLite + Postings sections gathered from a real temp MetaStore and
@@ -28,6 +30,63 @@ class StoreSectionsTest extends munit.FunSuite:
         assertEquals(section.databasePath, s.meta.db.path)
         assertEquals(section.walSizeBytes, s.meta.walSizeBytes)
         assert(section.walSizeBytes >= 0L, s"wal size was ${section.walSizeBytes}")
+        // base fixture: the only doc is non-generated and its source is absent
+        // (resolves to a missing path), so it is neither generated nor stale.
+        assertEquals(section.generatedDocumentCount, 0L)
+        assertEquals(section.staleTargets, Vector.empty[String])
+
+  store.test("SqliteSection: generated-source count and per-target staleness from documents"): s =>
+    // A second target with a real sourceroot on disk under the store root.
+    val sourceroot = s.root.resolve("srcB")
+    val targetB = s.meta.upsertTarget(
+      bspId = "bsp://ws/b",
+      scalaVersion = "3.8.4",
+      classpathHash = "chB",
+      optionsHash = "ohB",
+      semanticdbRoot = s.root.resolve("sdbB").toString,
+      sourceroot = sourceroot.toString,
+      active = true
+    )
+
+    // Stale doc: the source file on disk differs from the stored md5.
+    val staleRel = "pkg/B.scala"
+    val staleFile = sourceroot.resolve(staleRel)
+    Files.createDirectories(staleFile.getParent)
+    Files.writeString(staleFile, "object B // current content on disk")
+    s.meta.upsertDocument(
+      targetId = targetB,
+      uri = staleRel,
+      semanticdbPath = s.root.resolve("sdbB/META-INF/semanticdb/pkg/B.scala.semanticdb").toString,
+      semanticdbMtimeMs = 1L,
+      md5 = Md5.computeHex("object B // an OLDER version that was indexed"),
+      generated = false,
+      readonly = false
+    )
+
+    // Generated doc: flagged generated, and fresh (source md5 matches stored).
+    val genRel = "pkg/G.scala"
+    val genFile = sourceroot.resolve(genRel)
+    val genText = "object G // generated"
+    Files.createDirectories(genFile.getParent)
+    Files.writeString(genFile, genText)
+    s.meta.upsertDocument(
+      targetId = targetB,
+      uri = genRel,
+      semanticdbPath = s.root.resolve("sdbB/META-INF/semanticdb/pkg/G.scala.semanticdb").toString,
+      semanticdbMtimeMs = 1L,
+      md5 = Md5.computeHex(genText),
+      generated = true,
+      readonly = false
+    )
+
+    SqliteSection.gather(s.meta) match
+      case SectionState.Unavailable(reason) => fail(s"unexpectedly unavailable: $reason")
+      case SectionState.Ready(section) =>
+        // exactly the one generated doc (G); the base doc and the stale doc are not generated
+        assertEquals(section.generatedDocumentCount, 1L)
+        // exactly the one target with a stale-md5 doc; the generated doc is fresh and the base
+        // target's source is absent (missing, not stale)
+        assertEquals(section.staleTargets, Vector("bsp://ws/b"))
 
   store.test("PostingsSection: active segment, snapshot id and counts"): s =>
     PostingsSection.gather(s.meta, s.manager) match

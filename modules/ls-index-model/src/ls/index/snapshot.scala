@@ -68,8 +68,10 @@ trait IndexSnapshot:
   def scanRenameEdits(group: RenameGroupOrd, sink: OccurrenceSink): Unit
   def scanDocOccurrences(doc: DocOrd, sink: OccurrenceSink): Unit
   /** The editable subset of [[scanDocOccurrences]]: only occurrences carrying
-    * the [[OccFlags.Editable]] bit (excludes generated/readonly/dependency and
-    * synthetic occurrences), for rename-scoped per-document work.
+    * the [[OccFlags.Editable]] bit, for rename-scoped per-document work.
+    * Occurrences without that bit (generated, readonly, and dependency doc
+    * occurrences) are excluded. The filter is purely on the Editable bit: it
+    * does not additionally drop a synthetic occurrence that is itself editable.
     */
   def scanDocEditable(doc: DocOrd, sink: OccurrenceSink): Unit
 

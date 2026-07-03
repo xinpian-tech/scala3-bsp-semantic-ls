@@ -100,7 +100,9 @@ class RenderTest extends munit.FunSuite:
           activeSegmentPath = Some(tmp.resolve("postings/segments/segment-000001").toString),
           documentCount = 1L,
           symbolCount = 2L,
-          walSizeBytes = 4096L
+          walSizeBytes = 4096L,
+          generatedDocumentCount = 2L,
+          staleTargets = Vector("bsp://ws/app")
         )
       ),
       postings = SectionState.Ready(
@@ -171,6 +173,8 @@ class RenderTest extends munit.FunSuite:
       "  FTS: enabled (workspace_symbols_fts present)",
       "  manifest generation: segment 1",
       "  documents: 1",
+      "  generated source status: 2",
+      "  stale targets: 1 (bsp://ws/app)",
       "  symbols: 2",
       "  wal size: 4096 bytes",
       "  active segments: 1 of 1",
@@ -226,6 +230,10 @@ class RenderTest extends munit.FunSuite:
     assertEquals(root.getAsJsonObject("bsp").get("serverName").getAsString, "Fake BSP")
     assertEquals(root.getAsJsonObject("runtime").get("javaVersion").getAsString.take(2), "25")
     assertEquals(root.getAsJsonObject("postings").get("compactionPending").getAsInt, 1)
+    assertEquals(root.getAsJsonObject("sqlite").get("generatedDocumentCount").getAsLong, 2L)
+    val staleJson = root.getAsJsonObject("sqlite").getAsJsonArray("staleTargets")
+    assertEquals(staleJson.size(), 1)
+    assertEquals(staleJson.get(0).getAsString, "bsp://ws/app")
 
   test("renderJson: string escaping round-trips quotes and newlines"):
     val nasty = PcPluginsSection(

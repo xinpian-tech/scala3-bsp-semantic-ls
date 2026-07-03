@@ -97,6 +97,8 @@ object Doctor:
       s"FTS: ${enabledDisabled(s.ftsEnabled)} (workspace_symbols_fts ${if s.ftsEnabled then "present" else "absent"})",
       s"manifest generation: $manifest",
       s"documents: ${s.documentCount}",
+      s"generated source status: ${s.generatedDocumentCount}",
+      s"stale targets: ${noneOrList(s.staleTargets)}",
       s"symbols: ${s.symbolCount}",
       s"wal size: ${s.walSizeBytes} bytes"
     )
@@ -237,6 +239,8 @@ object Doctor:
       "activeSegmentId" -> s.activeSegmentId.map(num).getOrElse("null"),
       "activeSegmentPath" -> optStr(s.activeSegmentPath),
       "documentCount" -> num(s.documentCount),
+      "generatedDocumentCount" -> num(s.generatedDocumentCount),
+      "staleTargets" -> arr(s.staleTargets.map(str)),
       "symbolCount" -> num(s.symbolCount),
       "walSizeBytes" -> num(s.walSizeBytes)
     )

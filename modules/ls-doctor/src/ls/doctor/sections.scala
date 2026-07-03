@@ -10,8 +10,8 @@ import ch.epfl.scala.bsp4j.InitializeBuildResult
 import ls.bsp.BspProjectModel
 import ls.pc.{CompilerPluginStatus, DisabledPlugin, PcPluginStatusReport, ServicePluginStatus}
 import ls.postings.SnapshotManager
-import ls.semanticdb.SemanticdbLocator
-import ls.sqlite.MetaStore
+import ls.semanticdb.{Md5, SemanticdbLocator}
+import ls.sqlite.{ActiveDocumentDigest, MetaStore}
 
 /** Availability wrapper for one doctor section: a section that cannot be
   * gathered (subsystem not connected, resource threw) renders as
@@ -161,7 +161,13 @@ final case class SqliteSection(
     /** Rows in `symbol_intern`. */
     symbolCount: Long,
     /** Size of the `-wal` sidecar file in bytes. */
-    walSizeBytes: Long
+    walSizeBytes: Long,
+    /** Active documents flagged `generated = 1`. */
+    generatedDocumentCount: Long,
+    /** bspIds of targets that have at least one active document whose source
+      * file exists but no longer matches the stored md5 (sorted, distinct).
+      */
+    staleTargets: Vector[String]
 )
 
 object SqliteSection:
@@ -191,8 +197,29 @@ object SqliteSection:
         activeSegmentPath = active.map(_.path),
         documentCount = documentCount,
         symbolCount = meta.symbolCount(),
-        walSizeBytes = meta.walSizeBytes
+        walSizeBytes = meta.walSizeBytes,
+        generatedDocumentCount = meta.generatedDocumentCount(),
+        staleTargets = staleTargets(meta.activeDocumentDigests())
       )
+
+  /** bspIds (sorted, distinct) of targets with at least one active document
+    * whose source file exists but whose md5 no longer matches the stored md5.
+    * Per-document I/O errors and missing sources count as not-stale — a missing
+    * source is a separate condition, not md5 staleness. Never throws.
+    */
+  private def staleTargets(digests: Vector[ActiveDocumentDigest]): Vector[String] =
+    digests.iterator
+      .filter(isStale)
+      .map(_.bspId)
+      .toVector
+      .distinct
+      .sorted
+
+  private def isStale(d: ActiveDocumentDigest): Boolean =
+    try
+      val source = Path.of(d.sourceroot).resolve(d.uri)
+      Files.isRegularFile(source) && !Md5.validate(Files.readString(source), d.md5).isFresh
+    catch case NonFatal(_) => false
 
 /** One segment_manifest row as shown by the doctor. */
 final case class PostingsSegmentInfo(segmentId: Long, path: String, active: Boolean)

@@ -38,6 +38,19 @@ final case class DocumentRow(
     readonly: Boolean
 )
 
+/** One active document paired with its target's bspId + sourceroot, for the
+  * doctor's generated-source and per-target staleness reporting. `uri` is
+  * relative to `sourceroot` (the SemanticDB TextDocument uri), matching ingest;
+  * `md5` is the SemanticDB document md5 recorded at ingest time.
+  */
+final case class ActiveDocumentDigest(
+    bspId: String,
+    sourceroot: String,
+    uri: String,
+    md5: String,
+    generated: Boolean
+)
+
 final case class SymbolMetadataRow(
     symbolId: SymbolId,
     targetId: TargetId,
@@ -247,6 +260,32 @@ final class MetaStore(val db: Db) extends AutoCloseable:
     )
       .bindText(1, uri)
       .queryAll(readDocument)
+
+  /** Active documents joined to their target's bspId + sourceroot, ordered by
+    * bspId then uri. Read-only; callers that need staleness resolve each
+    * source path themselves (this store never re-hashes sources).
+    */
+  def activeDocumentDigests(): Vector[ActiveDocumentDigest] =
+    db.prepare(
+      """SELECT t.bsp_id, t.sourceroot, d.uri, d.md5, d.generated
+        |FROM documents d JOIN targets t ON t.target_id = d.target_id
+        |WHERE d.active = 1
+        |ORDER BY t.bsp_id, d.uri""".stripMargin
+    ).queryAll(st =>
+      ActiveDocumentDigest(
+        bspId = st.columnText(0),
+        sourceroot = st.columnText(1),
+        uri = st.columnText(2),
+        md5 = st.columnText(3),
+        generated = st.columnBool(4)
+      )
+    )
+
+  /** Count of active documents flagged `generated = 1`. */
+  def generatedDocumentCount(): Long =
+    db.prepare("SELECT count(*) FROM documents WHERE active = 1 AND generated = 1")
+      .queryOne(_.columnLong(0))
+      .getOrElse(0L)
 
   private def readDocument(st: Statement): DocumentRow =
     DocumentRow(
