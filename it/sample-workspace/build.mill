@@ -1,0 +1,28 @@
+//| mill-version: 1.1.2
+//| mill-jvm-version: system
+package build
+
+import mill.*
+import mill.scalalib.*
+
+/** Minimal REAL Mill workspace for the real-BSP integration test
+  * (modules/ls-core/test/src/ls/core/RealBspIntegrationTest.scala).
+  *
+  * Two Scala 3 modules, `b` depends on `a`. Both generate SemanticDB with
+  * `-Xsemanticdb` and `-sourceroot <workspace root>` so the language server
+  * can index them exactly like any user build that follows plan section 4.2.
+  */
+trait SampleModule extends ScalaModule {
+  def scalaVersion = "3.8.4"
+  def scalacOptions = Seq(
+    "-Xsemanticdb",
+    "-sourceroot",
+    mill.api.BuildCtx.workspaceRoot.toString
+  )
+}
+
+object a extends SampleModule
+
+object b extends SampleModule {
+  def moduleDeps = Seq(a)
+}
