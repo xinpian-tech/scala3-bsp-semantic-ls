@@ -73,6 +73,15 @@ class ScalacIntegrationSuite extends munit.FunSuite:
         |class Dog extends Animal:
         |  def sound: String = "woof"
         |""".stripMargin,
+    "src/fix/Copy.scala" ->
+      """package fix
+        |
+        |case class Pt(x: Int, y: Int)
+        |
+        |object CopyUse:
+        |  val p = Pt(1, 2)
+        |  val q = p.copy(x = 3)
+        |""".stripMargin,
     "src/fix/Export.scala" ->
       """package fix
         |
@@ -336,6 +345,39 @@ class ScalacIntegrationSuite extends munit.FunSuite:
       s"expected UnsupportedSymbolFamily, mask=0x${profile.unsafeReasonMask.toHexString}"
     )
     assert(!profile.isSafe)
+
+  test("synthetic-only case-class copy has no definition occurrence but a defined owner"):
+    // characterization input (real scalac 3): the synthesized `copy` carries a
+    // Method symbol and a reference at the call site, but NO definition
+    // occurrence of its own (scalac emits `def copy` only in the skipped
+    // synthetics payload); its owner (the case class) IS defined here
+    val doc = normalizedDoc("src/fix/Copy.scala")
+    val copyKey = SymbolKey.global("fix/Pt#copy().")
+    assert(doc.symbols.exists(_.key == copyKey), clues(doc.symbols.map(_.key.semanticSymbol)))
+    assertEquals(doc.occurrences.count(o => o.key == copyKey && o.role == Role.Definition), 0)
+    assert(doc.occurrences.exists(o => o.key == copyKey && o.role == Role.Reference), "copy call site")
+    assert(
+      doc.occurrences.exists(o => o.key == SymbolKey.global("fix/Pt#") && o.role == Role.Definition),
+      "owner Pt# must be defined in the workspace"
+    )
+
+  test("synthetic-only symbol is flagged UnsafeReason.SyntheticOnly at ingest (not External)"):
+    val profile = fixture.batch.renameProfileOf(SymbolKey.global("fix/Pt#copy().")).get
+    assert(
+      (profile.unsafeReasonMask & UnsafeReason.SyntheticOnly) != 0L,
+      s"expected SyntheticOnly, mask=0x${profile.unsafeReasonMask.toHexString}"
+    )
+    assert(!profile.isExternal, "a synthesized member of a workspace type is not external")
+    assert(!profile.isSafe)
+
+  test("a symbol with an editable definition is NOT flagged synthetic-only"):
+    // the case-class field accessor has a real definition occurrence
+    val xProfile = fixture.batch.renameProfileOf(SymbolKey.global("fix/Pt#x.")).get
+    assertEquals(xProfile.unsafeReasonMask & UnsafeReason.SyntheticOnly, 0L, clues(xProfile))
+    // a truly external library symbol stays External, never synthetic-only
+    val intProfile = fixture.batch.renameProfileOf(SymbolKey.global("scala/Int#")).get
+    assertEquals(intProfile.unsafeReasonMask & UnsafeReason.SyntheticOnly, 0L)
+    assert(intProfile.isExternal)
 
   test("normalization is deterministic"):
     val docs2 = fixture.raw.values.toVector

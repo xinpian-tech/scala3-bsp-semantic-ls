@@ -147,6 +147,16 @@ class RenameSuite extends munit.FunSuite:
         assert(reasons.exists(_.contains("exported symbol")), reasons.toString)
       case other => fail(s"expected RenameRejected, got $other")
 
+  test("synthetic-only symbol is rejected with the synthetic-only reason"):
+    // cursor on the `copy` call site: the synthesized case-class `copy` has no
+    // editable non-synthetic definition, so it must reject with the concrete
+    // synthetic reason rather than the generic "no editable occurrences".
+    val err = rejection("a/src/pkga/Copyable.scala", "copy", 0, "duplicate")
+    err match
+      case LsError.RenameRejected(reasons) =>
+        assert(reasons.exists(_.contains("synthetic")), reasons.toString)
+      case other => fail(s"expected RenameRejected, got $other")
+
   test("occurrences in generated sources are rejected"):
     val err = rejection("a/src/pkga/Widget.scala", "Widget", 0, "Gizmo")
     err match

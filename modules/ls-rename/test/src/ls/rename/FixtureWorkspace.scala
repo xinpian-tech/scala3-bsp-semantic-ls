@@ -178,6 +178,15 @@ object FixtureWorkspace:
         |object ExportedUse:
         |  val r = ForwarderOwner.exported(3)
         |""".stripMargin,
+    "a/src/pkga/Copyable.scala" ->
+      """package pkga
+        |
+        |case class Copyable(id: Int)
+        |
+        |object CopyableUse:
+        |  val c = Copyable(1)
+        |  val d = c.copy(id = 2)
+        |""".stripMargin,
     "a/src/pkga/Beta.scala" ->
       """package pkga
         |
