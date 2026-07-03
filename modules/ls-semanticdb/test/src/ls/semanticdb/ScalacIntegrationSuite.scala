@@ -72,6 +72,18 @@ class ScalacIntegrationSuite extends munit.FunSuite:
         |
         |class Dog extends Animal:
         |  def sound: String = "woof"
+        |""".stripMargin,
+    "src/fix/Export.scala" ->
+      """package fix
+        |
+        |object Impl:
+        |  def work(x: Int): Int = x
+        |
+        |object Api:
+        |  export Impl.work
+        |
+        |object ExportUse:
+        |  val use = Api.work(1)
         |""".stripMargin
   )
 
@@ -284,6 +296,46 @@ class ScalacIntegrationSuite extends munit.FunSuite:
     assert(after.hasGeneratedOccurrences)
     assert((after.unsafeReasonMask & UnsafeReason.GeneratedOccurrence) != 0L)
     assert(after.editableOccurrenceCount < before.editableOccurrenceCount)
+
+  test("export SemanticDB shape: forwarder symbol exists with no definition occurrence"):
+    // characterization input for the export rule (real scalac 3 output):
+    val doc = normalizedDoc("src/fix/Export.scala")
+    val bySym = doc.symbols.map(s => s.key.semanticSymbol -> s).toMap
+    // the `export Impl.work` forwarder is a distinct Method symbol under Api,
+    // carrying NO overriddenSymbols
+    val fwd = bySym.getOrElse("fix/Api.work().", fail("no forwarder symbol", clues(bySym.keys.toVector)))
+    assertEquals(fwd.kind, SymKind.Method)
+    assertEquals(fwd.displayName, "work")
+    assertEquals(fwd.overriddenSymbols, Nil)
+    // the original method exists too
+    assert(bySym.contains("fix/Impl.work()."), clues(bySym.keys.toVector))
+    // the forwarder has NO definition occurrence (synthesized), while the
+    // original does — this is the signal the rule keys on
+    def defOccsOf(sym: String) =
+      doc.occurrences.filter(o => o.key == SymbolKey.global(sym) && o.role == Role.Definition)
+    assert(defOccsOf("fix/Api.work().").isEmpty, "forwarder must have no definition occurrence")
+    assert(defOccsOf("fix/Impl.work().").nonEmpty, "original must have a definition occurrence")
+    // the export clause references the exported-from object (Impl), and the
+    // `Api.work(1)` call site references the forwarder symbol
+    assert(
+      doc.occurrences.exists(o => o.key == SymbolKey.global("fix/Impl.") && o.role == Role.Reference),
+      "export clause should reference Impl"
+    )
+    assert(
+      doc.occurrences.exists(o => o.key == SymbolKey.global("fix/Api.work().") && o.role == Role.Reference),
+      "Api.work(1) should reference the forwarder"
+    )
+
+  test("export forwarder call sites join the original's ref group"):
+    assertEquals(refGroup("fix/Api.work()."), refGroup("fix/Impl.work()."), clues(allGlobalSymbols))
+
+  test("export forwarder marks the rename group UnsupportedSymbolFamily"):
+    val profile = fixture.batch.renameProfileOf(SymbolKey.global("fix/Impl.work().")).get
+    assert(
+      (profile.unsafeReasonMask & UnsafeReason.UnsupportedSymbolFamily) != 0L,
+      s"expected UnsupportedSymbolFamily, mask=0x${profile.unsafeReasonMask.toHexString}"
+    )
+    assert(!profile.isSafe)
 
   test("normalization is deterministic"):
     val docs2 = fixture.raw.values.toVector

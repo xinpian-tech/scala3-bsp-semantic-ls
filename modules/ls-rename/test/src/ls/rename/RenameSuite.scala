@@ -137,6 +137,16 @@ class RenameSuite extends munit.FunSuite:
         assert(reasons.exists(_.contains("override")), reasons.toString)
       case other => fail(s"expected RenameRejected, got $other")
 
+  test("rename of an exported symbol is rejected with the exported-symbol reason"):
+    // cursor on the `exported` definition (nth=0 whole-word occurrence); it is
+    // re-exported via `export OriginalOwner.exported`, so it must reject rather
+    // than partially edit and miss the forwarder.
+    val err = rejection("a/src/pkga/Exported.scala", "exported", 0, "renamed")
+    err match
+      case LsError.RenameRejected(reasons) =>
+        assert(reasons.exists(_.contains("exported symbol")), reasons.toString)
+      case other => fail(s"expected RenameRejected, got $other")
+
   test("occurrences in generated sources are rejected"):
     val err = rejection("a/src/pkga/Widget.scala", "Widget", 0, "Gizmo")
     err match

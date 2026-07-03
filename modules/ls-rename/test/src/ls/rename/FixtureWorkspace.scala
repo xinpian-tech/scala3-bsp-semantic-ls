@@ -166,6 +166,18 @@ object FixtureWorkspace:
         |
         |case class Alpha(a: Int)
         |""".stripMargin,
+    "a/src/pkga/Exported.scala" ->
+      """package pkga
+        |
+        |object OriginalOwner:
+        |  def exported(n: Int): Int = n + 1
+        |
+        |object ForwarderOwner:
+        |  export OriginalOwner.exported
+        |
+        |object ExportedUse:
+        |  val r = ForwarderOwner.exported(3)
+        |""".stripMargin,
     "a/src/pkga/Beta.scala" ->
       """package pkga
         |

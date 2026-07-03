@@ -1,6 +1,6 @@
 package ls.semanticdb
 
-import ls.index.{NormalizedDocument, SymbolKey, UnsafeReason}
+import ls.index.{NormalizedDocument, Role, SymbolKey, SymKind, UnsafeReason}
 import scala.collection.mutable
 
 /** Exact alias groups for one ingest batch.
@@ -107,6 +107,45 @@ object AliasGroupBuilder:
         case Some(_) => ()
         case None => ()
 
+    // 2b. Export forwarders. Scala 3 `export B.m` synthesizes a forwarder
+    //     method `A.m` in the exporting object: it carries a Method symbol but
+    //     NO definition occurrence (no defining source token — the source shows
+    //     `export B.m`), while the real `B.m` has one. So a Method symbol with
+    //     no definition occurrence whose descriptor matches a definition-having
+    //     Method under a different owner is a forwarder for that method. Union
+    //     the forwarder into the original's group and remember it so the group
+    //     is flagged UnsupportedSymbolFamily (exports are not safely renameable
+    //     — a rename would have to touch the export clause and every forwarder).
+    val definedKeys: Set[SymbolKey] =
+      docs.iterator
+        .flatMap(_.occurrences)
+        .filter(_.role == Role.Definition)
+        .map(_.key)
+        .toSet
+    def descriptorOf(sym: String): Option[(String, String)] =
+      SymbolStrings.splitLast(sym).map((owner, _) => (owner, sym.substring(owner.length)))
+    // definition-having methods indexed by their descriptor (name + signature)
+    val definedMethodByDescriptor: Map[String, Vector[SymbolKey]] =
+      keys.iterator
+        .filter(k => !k.isLocal && definedKeys.contains(k))
+        .filter(k => infoByKey.get(k).exists(_.kind == SymKind.Method))
+        .flatMap(k => descriptorOf(k.semanticSymbol).map { case (owner, desc) => (desc, owner, k) })
+        .toVector
+        .groupMap(_._1)(t => t._3)
+    val forwarderKeys = mutable.LinkedHashSet.empty[SymbolKey]
+    for (key, i) <- keys.iterator.zipWithIndex if !key.isLocal do
+      if infoByKey.get(key).exists(_.kind == SymKind.Method) && !definedKeys.contains(key) then
+        descriptorOf(key.semanticSymbol) match
+          case Some((owner, desc)) =>
+            definedMethodByDescriptor.getOrElse(desc, Vector.empty).find { orig =>
+              descriptorOf(orig.semanticSymbol).exists(_._1 != owner)
+            } match
+              case Some(orig) =>
+                forwarderKeys += key
+                uf.union(i, indexOf(orig))
+              case None => ()
+          case None => ()
+
     // 3. Assemble groups; iteration over sorted keys keeps output ordered by
     //    minimal member.
     val byRoot = mutable.LinkedHashMap.empty[Int, mutable.ArrayBuffer[SymbolKey]]
@@ -125,10 +164,13 @@ object AliasGroupBuilder:
         .map(SymbolKey.global)
         .toSet
     val semanticMask: Vector[Long] = groups.map { g =>
-      val flagged = g.exists { k =>
+      var mask = 0L
+      val overrideFlagged = g.exists { k =>
         infoByKey.get(k).exists(_.overriddenSymbols.nonEmpty) || overriddenTargets.contains(k)
       }
-      if flagged then UnsafeReason.OverrideFamily else 0L
+      if overrideFlagged then mask |= UnsafeReason.OverrideFamily
+      if g.exists(forwarderKeys.contains) then mask |= UnsafeReason.UnsupportedSymbolFamily
+      mask
     }
 
     AliasGroups(

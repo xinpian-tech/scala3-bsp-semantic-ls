@@ -105,6 +105,16 @@ class ReferencesAndQuerySuite extends munit.FunSuite:
     assert(!locs.contains(Loc("a/src/pkga/Over.scala", fmtSpans(1))), "other overload def")
     assert(!locs.contains(Loc("a/src/pkga/Over.scala", fmtSpans(3))), "fmt(\"x\") call")
 
+  test("references through an export forwarder are found"):
+    // cursor on the OriginalOwner.exported definition; references must include
+    // the ForwarderOwner.exported(3) forwarder call site (nth=2 whole-word
+    // "exported": 0=def, 1=export clause, 2=call)
+    val r = refs("a/src/pkga/Exported.scala", "exported", nth = 0)
+    assert(
+      containsToken(r, "a/src/pkga/Exported.scala", "exported", 2),
+      r.locations.toString
+    )
+
   test("var getter and setter are unified"):
     val r = refs("a/src/pkga/Vars.scala", "value", nth = 1) // read: c.value + 1
     val spans = fx.tokenSpans("a/src/pkga/Vars.scala", "value")
