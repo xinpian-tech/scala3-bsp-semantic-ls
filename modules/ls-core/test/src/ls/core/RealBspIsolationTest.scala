@@ -1,7 +1,5 @@
 package ls.core
 
-import java.io.{BufferedReader, InputStreamReader}
-import java.nio.charset.StandardCharsets
 import java.nio.file.{Files, Path}
 import java.util.concurrent.TimeUnit
 
@@ -25,7 +23,7 @@ import org.eclipse.lsp4j.*
   */
 class RealBspIsolationTest extends munit.FunSuite:
 
-  import RealBspFixture.{consumerUri, enabled}
+  import RealBspFixture.{consumerUri, enabled, javaBin, runFlags, runProcess}
 
   override def munitTimeout: Duration = 900.seconds
 
@@ -86,10 +84,6 @@ class RealBspIsolationTest extends munit.FunSuite:
 
   // -------------------------------------------------------------------- E9
 
-  private val runFlags = Vector("--enable-native-access=ALL-UNNAMED", "-XX:+UseCompactObjectHeaders")
-  private def javaBin: String =
-    Path.of(System.getProperty("java.home")).resolve("bin").resolve("java").toString
-
   test("E9 an AOT-trained boot loads the cache and stays queryable"):
     assume(sys.env.get("LS_AOT_IT").contains("1"), "set LS_AOT_IT=1 (run scripts/it-aot.sh)")
     val jar = sys.env
@@ -136,29 +130,3 @@ class RealBspIsolationTest extends munit.FunSuite:
     )
     assert(dRc == 0, s"--doctor with -XX:AOTCache failed:\n$dLog")
     assert(dLog.contains("AOT cache: loaded"), s"doctor did not report a loaded cache:\n$dLog")
-
-  /** Runs a command in `cwd`, returning (exitCode, combined output). A timeout
-    * forcibly kills the process and yields exit code -1 (so a hang fails loudly).
-    */
-  private def runProcess(cmd: Vector[String], cwd: Path, timeoutMinutes: Int): (Int, String) =
-    val pb = new ProcessBuilder(cmd.asJava)
-    pb.directory(cwd.toFile)
-    pb.redirectErrorStream(true)
-    val process = pb.start()
-    val output = new StringBuilder
-    val reader = new BufferedReader(new InputStreamReader(process.getInputStream, StandardCharsets.UTF_8))
-    val pump = new Thread(
-      () =>
-        var line = reader.readLine()
-        while line != null do
-          output.append(line).append('\n')
-          line = reader.readLine()
-      ,
-      "real-bsp-aot-output"
-    )
-    pump.setDaemon(true)
-    pump.start()
-    val finished = process.waitFor(timeoutMinutes.toLong, TimeUnit.MINUTES)
-    if !finished then process.destroyForcibly()
-    pump.join(5000)
-    ((if finished then process.exitValue() else -1), output.toString)

@@ -22,12 +22,10 @@ trace="docs/traceability.md"
 
 # (1) Every test class named in traceability.md must exist as a real suite. Test
 #     classes are referenced as bare `XxxSuite` / `XxxTest` identifiers.
-missing_classes=0
 while IFS= read -r cls; do
   [ -n "$cls" ] || continue
   if ! grep -rqE "(class|object) ${cls}\b" modules/*/test/src --include=*.scala; then
     err "traceability names test class '${cls}' but no such suite exists"
-    missing_classes=$((missing_classes + 1))
   fi
 done < <(grep -oE '\b[A-Z][A-Za-z0-9]*(Suite|Test)\b' "$trace" | sort -u)
 

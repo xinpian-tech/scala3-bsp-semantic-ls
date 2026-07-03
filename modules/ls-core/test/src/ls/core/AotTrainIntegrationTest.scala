@@ -1,13 +1,10 @@
 package ls.core
 
-import java.io.{BufferedReader, InputStreamReader}
-import java.nio.charset.StandardCharsets
-import java.nio.file.attribute.BasicFileAttributes
-import java.nio.file.{Files, FileVisitResult, Path, SimpleFileVisitor, StandardCopyOption}
-import java.util.concurrent.TimeUnit
+import java.nio.file.{Files, Path}
 
 import scala.concurrent.duration.{Duration, DurationInt}
-import scala.jdk.CollectionConverters.*
+
+import RealBspFixture.{copyTree, javaBin, repoRoot, runFlags, runProcess}
 
 /** AOT-training integration test, gated on `LS_AOT_IT=1` and script-driven like
   * [[RealBspIntegrationTest]]. Positive: install a REAL Mill BSP connection in a
@@ -26,23 +23,7 @@ class AotTrainIntegrationTest extends munit.FunSuite:
 
   private val enabled = sys.env.get("LS_AOT_IT").contains("1")
 
-  // Runtime flags must match the production launcher and scripts/aot-train.sh
-  // so the cache built there is accepted here.
-  private val runFlags = Vector("--enable-native-access=ALL-UNNAMED", "-XX:+UseCompactObjectHeaders")
-
   private object env:
-    lazy val repoRoot: Path =
-      def containsSample(p: Path) = Files.isDirectory(p.resolve("it").resolve("sample-workspace"))
-      val fromEnv = (sys.env.get("LS_REPO_ROOT") ++ sys.env.get("MILL_WORKSPACE_ROOT"))
-        .map(Path.of(_).toAbsolutePath.normalize)
-        .find(containsSample)
-      fromEnv.getOrElse {
-        var p: Path | Null = Path.of("").toAbsolutePath
-        while p != null && !containsSample(p.nn) do p = p.nn.getParent
-        assert(p != null, "it/sample-workspace not found: set LS_REPO_ROOT to the repository root")
-        p.nn
-      }
-
     /** The pre-built server assembly jar. scripts/it-aot.sh builds it and passes
       * its path in LS_AOT_ASSEMBLY_JAR; the test must never invoke `mill` itself
       * (a nested `mill` inside the outer `mill core.test` run deadlocks on the
@@ -56,14 +37,11 @@ class AotTrainIntegrationTest extends munit.FunSuite:
       assert(Files.isRegularFile(j), s"assembly jar not found at $j (run scripts/it-aot.sh)")
       j
 
-    val javaBin: String =
-      Path.of(System.getProperty("java.home")).resolve("bin").resolve("java").toString
-
   test("aot-train produces a loadable cache from the real BSP workload"):
     assume(enabled, "set LS_AOT_IT=1 to run the AOT training integration test")
     val jar = env.jar
     val ws = Files.createTempDirectory("ls-aot-it-ws-").toRealPath()
-    copyTree(env.repoRoot.resolve("it").resolve("sample-workspace"), ws)
+    copyTree(repoRoot.resolve("it").resolve("sample-workspace"), ws)
 
     // install a REAL Mill BSP connection so the training run drives the strict
     // real-BSP workload (compile + reindex + SemanticDB-backed queries).
@@ -77,9 +55,9 @@ class AotTrainIntegrationTest extends munit.FunSuite:
 
     // build the cache via the production script; .bsp presence makes it strict.
     val (trainRc, trainLog) = runProcess(
-      Vector("bash", env.repoRoot.resolve("scripts").resolve("aot-train.sh").toString,
+      Vector("bash", repoRoot.resolve("scripts").resolve("aot-train.sh").toString,
         "--workspace", ws.toString, "--out", out.toString),
-      env.repoRoot,
+      repoRoot,
       15
     )
     assert(trainRc == 0, s"aot-train.sh (strict real-BSP) failed:\n$trainLog")
@@ -90,17 +68,17 @@ class AotTrainIntegrationTest extends munit.FunSuite:
 
     // a follow-up boot with the cache loads it and exits cleanly
     val (versionRc, versionLog) = runProcess(
-      Vector(env.javaBin) ++ runFlags ++ Vector(s"-XX:AOTCache=$out", "-jar", jar.toString, "--version"),
-      env.repoRoot,
+      Vector(javaBin) ++ runFlags ++ Vector(s"-XX:AOTCache=$out", "-jar", jar.toString, "--version"),
+      repoRoot,
       5
     )
     assert(versionRc == 0, s"--version with -XX:AOTCache failed:\n$versionLog")
 
     // the doctor, run in a JVM that loaded the cache, reports it as loaded
     val (doctorRc, doctorLog) = runProcess(
-      Vector(env.javaBin) ++ runFlags ++
+      Vector(javaBin) ++ runFlags ++
         Vector(s"-XX:AOTCache=$out", "-jar", jar.toString, "--doctor", ws.toString),
-      env.repoRoot,
+      repoRoot,
       5
     )
     assert(doctorRc == 0, s"--doctor with -XX:AOTCache failed:\n$doctorLog")
@@ -112,53 +90,9 @@ class AotTrainIntegrationTest extends munit.FunSuite:
     val bare = Files.createTempDirectory("ls-aot-it-nobsp-")
     Files.writeString(bare.resolve("Empty.scala"), "package p\nobject Empty\n")
     val (rc, log) = runProcess(
-      Vector(env.javaBin) ++ runFlags ++
+      Vector(javaBin) ++ runFlags ++
         Vector("-jar", jar.toString, "--aot-train", bare.toString, "--in-process-pc"),
-      env.repoRoot,
+      repoRoot,
       5
     )
     assert(rc == 0, s"--aot-train over a no-.bsp workspace did not exit cleanly:\n$log")
-
-  // ------------------------------------------------------------- plumbing
-
-  private def copyTree(from: Path, to: Path): Unit =
-    val skipped = Set("out", ".bsp", ".scala3-bsp-semantic-ls")
-    Files.walkFileTree(
-      from,
-      new SimpleFileVisitor[Path]:
-        override def preVisitDirectory(dir: Path, attrs: BasicFileAttributes): FileVisitResult =
-          if dir != from && skipped.contains(dir.getFileName.toString) then FileVisitResult.SKIP_SUBTREE
-          else
-            Files.createDirectories(to.resolve(from.relativize(dir).toString))
-            FileVisitResult.CONTINUE
-        override def visitFile(file: Path, attrs: BasicFileAttributes): FileVisitResult =
-          Files.copy(file, to.resolve(from.relativize(file).toString), StandardCopyOption.REPLACE_EXISTING)
-          FileVisitResult.CONTINUE
-    )
-    ()
-
-  /** Runs a command in `cwd`, returning (exitCode, combined output). A timeout
-    * forcibly kills the process and yields exit code -1 (so a hang fails loudly).
-    */
-  private def runProcess(cmd: Vector[String], cwd: Path, timeoutMinutes: Int): (Int, String) =
-    val pb = new ProcessBuilder(cmd.asJava)
-    pb.directory(cwd.toFile)
-    pb.redirectErrorStream(true)
-    val process = pb.start()
-    val output = new StringBuilder
-    val reader = new BufferedReader(new InputStreamReader(process.getInputStream, StandardCharsets.UTF_8))
-    val pump = new Thread(
-      () =>
-        var line = reader.readLine()
-        while line != null do
-          output.append(line).append('\n')
-          line = reader.readLine()
-      ,
-      "aot-it-output"
-    )
-    pump.setDaemon(true)
-    pump.start()
-    val finished = process.waitFor(timeoutMinutes.toLong, TimeUnit.MINUTES)
-    if !finished then process.destroyForcibly()
-    pump.join(5000)
-    ((if finished then process.exitValue() else -1), output.toString)

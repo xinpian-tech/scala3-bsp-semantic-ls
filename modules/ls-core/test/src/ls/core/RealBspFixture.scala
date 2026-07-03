@@ -173,6 +173,41 @@ object RealBspFixture:
       s"'${cmd.mkString(" ")}' in $cwd ${if finished then s"exited ${process.exitValue()}" else "timed out"}:\n$output"
     )
 
+  /** Runs an arbitrary command in `cwd`, returning (exitCode, combined output).
+    * A timeout forcibly kills the process and yields exit code -1 (so a hang
+    * fails loudly). Shared by the AOT suites that shell out to the launcher.
+    */
+  def runProcess(cmd: Vector[String], cwd: Path, timeoutMinutes: Int): (Int, String) =
+    val pb = new ProcessBuilder(cmd.asJava)
+    pb.directory(cwd.toFile)
+    pb.redirectErrorStream(true)
+    val process = pb.start()
+    val output = new StringBuilder
+    val reader = new BufferedReader(new InputStreamReader(process.getInputStream, StandardCharsets.UTF_8))
+    val pump = new Thread(
+      () =>
+        var line = reader.readLine()
+        while line != null do
+          output.append(line).append('\n')
+          line = reader.readLine()
+      ,
+      "real-bsp-it-runprocess-output"
+    )
+    pump.setDaemon(true)
+    pump.start()
+    val finished = process.waitFor(timeoutMinutes.toLong, TimeUnit.MINUTES)
+    if !finished then process.destroyForcibly()
+    pump.join(5000)
+    ((if finished then process.exitValue() else -1), output.toString)
+
+  /** JVM runtime flags the AOT suites pass to the launcher; must match the
+    * production launcher and scripts/aot-train.sh so a cache built there loads.
+    */
+  val runFlags: Vector[String] = Vector("--enable-native-access=ALL-UNNAMED", "-XX:+UseCompactObjectHeaders")
+
+  /** The `java` launcher of the test JVM. */
+  def javaBin: String = Path.of(System.getProperty("java.home")).resolve("bin").resolve("java").toString
+
 /** One booted language server over the real `mill --bsp` for a given workspace
   * copy: LSP pipes, initialize, and (via [[readyIndex]]) the first compile +
   * reindex that a real editor session goes through. Also exposes the recording
