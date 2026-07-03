@@ -1,10 +1,13 @@
 package ls.core
 
 import java.io.{FileDescriptor, FileOutputStream, PrintStream}
+import java.nio.file.Path
 
 import scala.util.control.NonFatal
 
 import org.eclipse.lsp4j.launch.LSPLauncher
+
+import ls.doctor.{Doctor, DoctorInput}
 
 /** stdio LSP entry point.
   *
@@ -15,10 +18,12 @@ import org.eclipse.lsp4j.launch.LSPLauncher
   *
   * Flags:
   * {{{
-  *   --version         print the version and exit
-  *   --in-process-pc   run the presentation compiler in this JVM (default)
-  *   --forked-pc       run the presentation compiler in an isolated child JVM
-  *                     (plan 5.2 process isolation; opt-in for now)
+  *   --version             print the version and exit
+  *   --doctor [<dir>]      print the offline doctor report and exit
+  *   --aot-train <dir>     run the headless AOT training workload and exit
+  *   --in-process-pc       run the presentation compiler in this JVM (default)
+  *   --forked-pc           run the presentation compiler in an isolated child JVM
+  *                         (process isolation; opt-in for now)
   * }}}
   */
 object Main:
@@ -32,10 +37,28 @@ object Main:
 
   private val knownFlags = Set("--in-process-pc", "--forked-pc")
 
+  /** The value following `flag`, if present. */
+  private def valueAfter(args: Array[String], flag: String): Option[String] =
+    val i = args.indexOf(flag)
+    if i >= 0 && i + 1 < args.length then Some(args(i + 1)) else None
+
   def main(args: Array[String]): Unit =
     if args.contains("--version") then
       println(s"${ScalaLs.ServerName} ${ScalaLs.ServerVersion}")
       return
+    if args.contains("--doctor") then
+      // Offline doctor: Runtime + Nix facts only (every subsystem section is
+      // "unavailable: not connected"). The Runtime section reports the AOT
+      // cache status from this JVM's own -XX:AOTCache flag.
+      val root = valueAfter(args, "--doctor").map(Path.of(_)).getOrElse(Path.of(".")).toAbsolutePath.normalize
+      println(Doctor.render(DoctorInput.offline(root)))
+      return
+    if args.contains("--aot-train") then
+      valueAfter(args, "--aot-train") match
+        case Some(dir) => sys.exit(AotTrain.run(Path.of(dir)))
+        case None =>
+          System.err.println("--aot-train requires a workspace directory argument")
+          sys.exit(2)
     val unknown = args.filterNot(knownFlags.contains)
     if unknown.nonEmpty then
       System.err.println(s"warning: ignoring unknown arguments: ${unknown.mkString(" ")}")

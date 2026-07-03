@@ -200,7 +200,7 @@ use the same `ALL-UNNAMED` spelling.
 |---|---|---|
 | FFM API | `ls-sqlite-ffm` binds the SQLite C API (`sqlite3_open_v2`, `sqlite3_prepare_v3`, `sqlite3_bind_*`, `sqlite3_step`, `sqlite3_column_*`, `sqlite3_reset`, `sqlite3_clear_bindings`, `sqlite3_finalize`, `sqlite3_close_v2`) against the library at `LS_SQLITE_LIB` | `--enable-native-access=ALL-UNNAMED` (wrapper and test forkArgs) |
 | MemorySegment mmap | `ls-postings` maps immutable postings segments read-only via `FileChannel.map -> MemorySegment` under a snapshot-owned `Arena` | none beyond JDK 25 |
-| AOT cache | faster cold start / first request; training runs cover LSP+BSP initialize, SQLite open, hot statements, snapshot load, SemanticDB parse, workspace/symbol, references, PC init, completion | set `LS_AOT_CACHE=<path>` at launch → wrapper adds `-XX:AOTCache=<path>` (plan suggests `.scala3-bsp-semantic-ls/aot-cache.bin`) |
+| AOT cache | faster cold start / first request | build with `scripts/aot-train.sh --workspace <dir> --out <path>` — the headless `Main --aot-train` workload exercises LSP/BSP initialize, the SQLite + snapshot store open, a SemanticDB-backed workspace/symbol and references query, and a PC completion, and the script runs the JDK-25 `-XX:AOTMode=record`→`create` two-step. Then set `LS_AOT_CACHE=<path>` at launch → wrapper adds `-XX:AOTCache=<path>` (default `.scala3-bsp-semantic-ls/aot-cache.bin`); the doctor's Runtime section reports `AOT cache: loaded/missing` |
 | Compact Object Headers | lower heap pressure on the object-dense ingest/query workload | `-XX:+UseCompactObjectHeaders` (always on in the wrapper) |
 | JFR profiling | bench/JFR harness (`bench` module) | JDK 25 built-in |
 
