@@ -90,6 +90,61 @@ class HandBuiltCorpusTest extends munit.FunSuite:
   private def sortedOrdOf(callerOrd: Int): Int =
     snapshot.symbolOrdOf(data.symbols(callerOrd).semanticSymbol).get.ord
 
+  /** Collects (packedStart, flags) for a doc, via either the full or the
+    * editable scan.
+    */
+  private def collectDoc(snap: PostingsSnapshot, doc: Int, editableOnly: Boolean): Vector[(Int, Int)] =
+    val out = Vector.newBuilder[(Int, Int)]
+    val sink = new OccurrenceSink:
+      def accept(docOrd: Int, targetOrd: Int, docEpoch: Int, packedStart: Int, packedEnd: Int, flags: Int): Unit =
+        out += ((packedStart, flags))
+    if editableOnly then snap.scanDocEditable(DocOrd(doc), sink)
+    else snap.scanDocOccurrences(DocOrd(doc), sink)
+    out.result()
+
+  test("scanDocEditable yields exactly the editable subset of scanDocOccurrences"):
+    val corpus = SegmentData(
+      docs = Vector(SegmentDoc("file:///e/E.scala", docId = 1, epoch = 1, targetOrd = 0)),
+      targets = Vector(1L),
+      symbols = Vector(SegmentSymbol("e/E#", symbolId = 1, refGroupOrd = 0, renameGroupOrd = -1, defTargetOrd = 0)),
+      refOccurrences = Vector(Vector(GroupOcc(0, 1, 0, Span(0, 0, 0, 1), 0))),
+      defOccurrences = Vector(Vector.empty),
+      renameOccurrences = Vector.empty,
+      renameProfiles = Vector.empty,
+      docOccurrences = Vector(
+        Vector(
+          DocOcc(0, Span(0, 0, 0, 1), OccFlags.Definition), // not editable
+          DocOcc(0, Span(1, 0, 1, 1), OccFlags.Editable), // editable
+          DocOcc(0, Span(2, 0, 2, 1), OccFlags.Generated), // not editable
+          DocOcc(0, Span(3, 0, 3, 1), OccFlags.Editable | OccFlags.Definition), // editable
+          DocOcc(0, Span(4, 0, 4, 1), OccFlags.Readonly), // not editable
+          DocOcc(0, Span(5, 0, 5, 1), 0) // not editable
+        )
+      )
+    )
+    val dir = SegmentWriter.write(tempRoot("editable"), segmentId = 1, corpus, createdAtMs = 1L)
+    val snap = new PostingsSnapshot(SegmentReader.open(dir))
+    try
+      val all = collectDoc(snap, 0, editableOnly = false)
+      val editable = collectDoc(snap, 0, editableOnly = true)
+      val bruteForce = all.filter((_, flags) => OccFlags.has(flags, OccFlags.Editable))
+      assertEquals(editable, bruteForce, "scanDocEditable must equal the editable filter of scanDocOccurrences")
+      // Editable is a STRICT subset here (non-editable occurrences exist and are excluded),
+      // so the test fails if scanDocEditable ever emits the full doc set.
+      assertEquals(all.length, 6)
+      assertEquals(editable.length, 2)
+      assert(editable.forall((_, flags) => OccFlags.has(flags, OccFlags.Editable)))
+      val editableStarts = editable.map(_._1).toSet
+      assertEquals(editableStarts, Set(Span.pack(1, 0), Span.pack(3, 0)))
+      // Negative: definition-only, generated, readonly and plain occurrences are excluded.
+      assert(!editableStarts.contains(Span.pack(0, 0)), "definition-only excluded")
+      assert(!editableStarts.contains(Span.pack(2, 0)), "generated excluded")
+      assert(!editableStarts.contains(Span.pack(4, 0)), "readonly excluded")
+      assert(!editableStarts.contains(Span.pack(5, 0)), "plain excluded")
+    finally
+      snap.markSuperseded()
+      snap.release()
+
   test("header fields round-trip"):
     assertEquals(snapshot.snapshotId, 7L)
     assertEquals(snapshot.reader.createdAtMs, 123456789L)

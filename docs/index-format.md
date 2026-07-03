@@ -247,6 +247,12 @@ Doc postings carry no per-record `target_ord`/`doc_epoch`: a v1 segment
 stores exactly one (current-epoch) postings run per document, and scans
 report the doc dictionary's `target_ord` and `epoch`.
 
+**Editable doc view**: `IndexSnapshot.scanDocEditable(doc, sink)` is a filtered
+scan over this same file, not a separate materialization — records already carry
+the `OccFlags.Editable` bit, so the reader emits only records with that bit set
+(the editable subset of `scanDocOccurrences`). A dedicated `doc -> editable`
+postings file is deliberately not written.
+
 **symbol-at-position rule**: containment is start-inclusive and
 end-inclusive on packed positions
 (`packed_start <= packed(query) <= packed_end`, matching

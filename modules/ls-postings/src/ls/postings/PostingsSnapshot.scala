@@ -167,5 +167,8 @@ final class PostingsSnapshot private[postings] (val reader: SegmentReader) exten
   override def scanDocOccurrences(doc: DocOrd, sink: OccurrenceSink): Unit =
     reader.scanDoc(doc.ord, sink)
 
+  override def scanDocEditable(doc: DocOrd, sink: OccurrenceSink): Unit =
+    reader.scanDoc(doc.ord, sink, requireEditable = true)
+
   override def renameProfileOf(group: RenameGroupOrd): RenameProfile =
     reader.renameProfileOf(group.ord)

@@ -257,7 +257,7 @@ final class SegmentReader private (
     * doc-postings records carry no per-record target/epoch columns; the doc
     * dictionary values are passed to the sink.
     */
-  def scanDoc(docOrd: Int, sink: OccurrenceSink): Unit =
+  def scanDoc(docOrd: Int, sink: OccurrenceSink, requireEditable: Boolean = false): Unit =
     val off = docEntryOff(docOrd)
     val first = docIdx.get(LeLong, off + 32)
     val count = docIdx.get(LeInt, off + 40)
@@ -267,14 +267,16 @@ final class SegmentReader private (
     var k = 0L
     while k < count do
       val r = first + k
-      sink.accept(
-        docOrd,
-        targetOrd,
-        epoch,
-        docPost.get(LeInt, colStart + 4L * r),
-        docPost.get(LeInt, colEnd + 4L * r),
-        docPost.get(LeInt, colFlags + 4L * r)
-      )
+      val flags = docPost.get(LeInt, colFlags + 4L * r)
+      if !requireEditable || OccFlags.has(flags, OccFlags.Editable) then
+        sink.accept(
+          docOrd,
+          targetOrd,
+          epoch,
+          docPost.get(LeInt, colStart + 4L * r),
+          docPost.get(LeInt, colEnd + 4L * r),
+          flags
+        )
       k += 1
 
   /** Exact symbol-at-position over the doc interval block index. The smallest

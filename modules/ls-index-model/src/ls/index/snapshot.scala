@@ -67,6 +67,11 @@ trait IndexSnapshot:
   def scanDefinitions(group: RefGroupOrd, sink: OccurrenceSink): Unit
   def scanRenameEdits(group: RenameGroupOrd, sink: OccurrenceSink): Unit
   def scanDocOccurrences(doc: DocOrd, sink: OccurrenceSink): Unit
+  /** The editable subset of [[scanDocOccurrences]]: only occurrences carrying
+    * the [[OccFlags.Editable]] bit (excludes generated/readonly/dependency and
+    * synthetic occurrences), for rename-scoped per-document work.
+    */
+  def scanDocEditable(doc: DocOrd, sink: OccurrenceSink): Unit
 
   def renameProfileOf(group: RenameGroupOrd): RenameProfile
 
