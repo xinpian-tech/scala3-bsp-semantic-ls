@@ -133,19 +133,32 @@ object SemanticdbSection:
     SectionState.attempt("SemanticDB")(build(targets, stats, generatedSourceCount, staleTargets))
 
   /** Derives the [[TargetRoot]]s from a BSP project model (indexable targets
-    * only) and gathers.
+    * only) and gathers with caller-supplied generated/staleness values.
     */
   def fromModel(
       model: BspProjectModel,
       stats: Option[DocFreshnessStats],
-      generatedSourceCount: Long = 0L,
-      staleTargets: Vector[String] = Vector.empty
+      generatedSourceCount: Long,
+      staleTargets: Vector[String]
   ): SectionState[SemanticdbSection] =
     SectionState.attempt("SemanticDB"):
-      val targets = model.indexableTargets.flatMap { t =>
-        t.semanticdbRoot.map(root => TargetRoot(t.bspId, root))
-      }
-      build(targets, stats, generatedSourceCount, staleTargets)
+      build(rootsOf(model), stats, generatedSourceCount, staleTargets)
+
+  /** Production gather: reads the generated-source count and per-target
+    * staleness from the MetaStore INSIDE the SemanticDB failure boundary, so a
+    * store failure degrades this section to `unavailable` rather than crashing
+    * the whole doctor report. This is the wiring `DoctorCommand` uses.
+    */
+  def fromModel(
+      model: BspProjectModel,
+      stats: Option[DocFreshnessStats],
+      meta: MetaStore
+  ): SectionState[SemanticdbSection] =
+    SectionState.attempt("SemanticDB"):
+      build(rootsOf(model), stats, meta.generatedDocumentCount(), staleTargets(meta.activeDocumentDigests()))
+
+  private def rootsOf(model: BspProjectModel): Vector[TargetRoot] =
+    model.indexableTargets.flatMap(t => t.semanticdbRoot.map(root => TargetRoot(t.bspId, root)))
 
   /** bspIds (sorted, distinct) of targets with at least one active document
     * whose source file exists but no longer matches the stored md5. The md5
