@@ -13,6 +13,7 @@ object UnsafeReason:
   inline val SharedSourceDisagreement = 1L << 6
   inline val UnsupportedSymbolFamily = 1L << 7
   inline val DependencySource = 1L << 8
+  inline val OpaqueType = 1L << 9
 
   def explain(mask: Long): List[String] =
     val msgs = List.newBuilder[String]
@@ -34,6 +35,8 @@ object UnsafeReason:
       msgs += "symbol family (e.g. apply/unapply, exported symbol) is not safely renameable"
     if (mask & DependencySource) != 0 then
       msgs += "symbol has occurrences in dependency sources"
+    if (mask & OpaqueType) != 0 then
+      msgs += "opaque type rename is not supported (conservative policy)"
     msgs.result()
 
 /** Precomputed at ingest; consulted at rename request time. */

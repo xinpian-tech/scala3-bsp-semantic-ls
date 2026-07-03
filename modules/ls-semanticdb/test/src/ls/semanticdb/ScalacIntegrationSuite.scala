@@ -98,6 +98,13 @@ class ScalacIntegrationSuite extends munit.FunSuite:
       """package fix
         |
         |case class Coord(x: Int, y: Int) derives CanEqual
+        |""".stripMargin,
+    "src/fix/Opaque.scala" ->
+      """package fix
+        |
+        |object Ids:
+        |  opaque type UserId = Long
+        |  val sample: UserId = 7L
         |""".stripMargin
   )
 
@@ -362,6 +369,21 @@ class ScalacIntegrationSuite extends munit.FunSuite:
     assert(syms.contains("fix/Coord#"), clues(syms))
     assert(!syms.exists(_.contains("CanEqual")), clues(syms))
     assert(!syms.exists(_.contains("derived")), clues(syms))
+
+  test("opaque type carries the Opaque property and its rename group is flagged unsafe"):
+    val userId = allGlobalSymbols
+      .find(s => s.contains("UserId") && s.endsWith("#"))
+      .getOrElse(fail(s"no UserId type symbol in ${allGlobalSymbols.filter(_.contains("UserId"))}"))
+    val info = normalizedDoc("src/fix/Opaque.scala").symbols
+      .find(_.key.semanticSymbol == userId)
+      .getOrElse(fail(s"no symbol info for $userId"))
+    assert((info.properties & SymProps.Opaque) != 0, s"properties=0x${info.properties.toHexString}")
+    val profile = fixture.batch.renameProfileOf(SymbolKey.global(userId)).get
+    assert(
+      (profile.unsafeReasonMask & UnsafeReason.OpaqueType) != 0L,
+      s"mask=0x${profile.unsafeReasonMask.toHexString}"
+    )
+    assert(!profile.isSafe)
 
   test("synthetic-only case-class copy has no definition occurrence but a defined owner"):
     // characterization input (real scalac 3): the synthesized `copy` carries a

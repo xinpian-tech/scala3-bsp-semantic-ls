@@ -318,11 +318,12 @@ Initial policy:
   group's `unsafeReasonMask`, e.g. `UnsafeReason.UnsupportedSymbolFamily`,
   `UnsafeReason.OverrideFamily`).
 
-Opaque type (v1 behavior): an `opaque type T` and its companion `object T` share the
-name and merge into one group under the v1 policy, so renaming the opaque type edits
-the type definition, the companion, and every in-file `T` use together (a single-file
-edit set when `T` is not referenced cross-file). This is a merge, not a rejection —
-distinct from the `override`/`exported`/synthetic families, which reject.
+Opaque type (v1 behavior): an `opaque type T` and its companion `object T` merge into
+one group for *references* (references find the type, the companion, and every use),
+but *rename* is conservatively **rejected** (`UnsafeReason.OpaqueType`) — renaming an
+opaque type together with its companion and uses cannot be proven safe in v1. This
+matches the `override` / `exported` / synthetic families, which also reject. The
+opaque property is read from SemanticDB (`SymProps.Opaque`) at ingest.
 
 ## 8. References flow (plan 12)
 
@@ -545,22 +546,25 @@ No Java 25, no runtime support.
 ## 13. Correctness-case coverage (plan §18.1)
 
 Every plan §18.1 references/rename correctness case is pinned by ≥1 real-scalac test
-(fixtures compiled with `-Xsemanticdb`), asserting exact reference spans and rename
-edit spans or the exact rejection reason.
+(fixtures compiled with `-Xsemanticdb`). The safe families assert the exact reference
+span set and the exact rename edit spans; the unsafe families (external, opaque,
+exported, override, synthetic) assert the exact rejection reason; and the
+synthetics-skip families (case-class `copy`, `derives`) assert the characterization
+that scalac emits them only in the skipped synthetics payload (plan 4.3).
 
 | plan §18.1 case | test(s) |
 |-----------------|---------|
 | export forwarder | `ScalacIntegrationSuite` export-shape/ref-group/rename-group cases; `ReferencesAndQuerySuite` "references through an export forwarder are found"; `RenameSuite` "rename of an exported symbol is rejected with the exported-symbol reason" |
-| inline def | `ReferencesAndQuerySuite` "inline def references reach call sites across targets"; `RenameSuite` "rename an inline def edits its definition and every call site across targets" |
+| inline def | `ReferencesAndQuerySuite` "inline def references are exactly the definition and both call sites"; `RenameSuite` "rename an inline def edits its definition and every call site across targets" |
 | macro-generated (case-class copy) | `ScalacIntegrationSuite` "synthetic-only case-class copy…"; `RenameSuite` "synthetic-only symbol is rejected with the synthetic-only reason" |
-| macro-generated (`derives`) | `ScalacIntegrationSuite` "derives clause: the case class is defined and the derived given is synthetic-only" |
-| private member | `ReferencesAndQuerySuite` "private member references stay inside the defining file"; `RenameSuite` "rename a private method/val edits its definition and in-file uses only" |
+| macro-generated (`derives`) | `ScalacIntegrationSuite` "derives clause: the case class is defined and the derived given is synthetic-only" (characterization: the derived given is emitted only in the skipped synthetics payload, plan 4.3) |
+| private member | `ReferencesAndQuerySuite` "private member references are exactly the in-file definition and uses"; `RenameSuite` "rename a private method/val edits its definition and in-file uses only" |
 | local val / local def | `ReferencesAndQuerySuite` "local val…" / "nested local def references stay inside the document"; `RenameSuite` "rename local val touches only its document" / "rename a nested local def touches only its document" |
-| val member getter | `RenameSuite` "rename a val member edits its definition and cross-file uses" |
+| val member getter | `ReferencesAndQuerySuite` "cross-file val member references are exactly the definition and cross-file use"; `RenameSuite` "rename a val member edits its definition and cross-file uses" |
 | var getter/setter | `ReferencesAndQuerySuite` "var getter and setter are unified"; `RenameSuite` "rename var renames getter, setter site and definition together" |
-| given / using | `ReferencesAndQuerySuite` "given references by name" and "given references include the using-clause argument site" |
-| top-level def/val | `ReferencesAndQuerySuite` "top-level def references reach cross-file uses"; `RenameSuite` "rename a top-level def edits its definition and cross-file uses" |
-| opaque type | `ReferencesAndQuerySuite` "opaque type references include the type-annotation use"; `RenameSuite` "rename an opaque type edits the type, companion, and its uses (v1 merge policy)" |
+| given / using | `ReferencesAndQuerySuite` "given references are exactly the by-name uses including the using-clause site" |
+| top-level def/val | `ReferencesAndQuerySuite` "top-level def and val references are exactly their definitions and cross-file uses"; `RenameSuite` "rename a top-level def/val edits its definition and cross-file uses" |
+| opaque type | `ReferencesAndQuerySuite` "opaque type references are exactly the type, companion, and all in-file uses"; `ScalacIntegrationSuite` "opaque type carries the Opaque property and its rename group is flagged unsafe"; `RenameSuite` "rename of an opaque type is rejected (conservative policy)" |
 | extension method | `ReferencesAndQuerySuite` "extension method references cross targets"; `RenameSuite` "rename an extension method edits its definition and call sites across targets" |
 | external symbol reject | `RenameSuite` "rename of an external library symbol is rejected as outside the workspace" |
 | fresh-snapshot stale index | `RenameMutationSuite` "fresh-snapshot stale index: the cursor document itself is edited after compile" |

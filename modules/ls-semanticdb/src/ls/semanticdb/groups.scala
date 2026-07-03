@@ -1,6 +1,6 @@
 package ls.semanticdb
 
-import ls.index.{NormalizedDocument, Role, SymbolKey, SymKind, UnsafeReason}
+import ls.index.{NormalizedDocument, Role, SymbolKey, SymKind, SymProps, UnsafeReason}
 import scala.collection.mutable
 
 /** Exact alias groups for one ingest batch.
@@ -170,6 +170,11 @@ object AliasGroupBuilder:
       }
       if overrideFlagged then mask |= UnsafeReason.OverrideFamily
       if g.exists(forwarderKeys.contains) then mask |= UnsafeReason.UnsupportedSymbolFamily
+      // Opaque types: rename is conservatively rejected (resolved policy). An
+      // `opaque type T` merges with its companion and all uses, but renaming it
+      // cannot be proven safe in v1, so the group is flagged unsafe outright.
+      if g.exists(k => infoByKey.get(k).exists(i => (i.properties & SymProps.Opaque) != 0)) then
+        mask |= UnsafeReason.OpaqueType
       mask
     }
 

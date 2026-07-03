@@ -164,6 +164,19 @@ class RenameSuite extends munit.FunSuite:
       spanSet(plan, "b/src/pkgb/UseB.scala"),
       fx.tokenSpans("b/src/pkgb/UseB.scala", "topHelper").toSet
     )
+    assertEquals(plan.edits.keySet, Set("a/src/pkga/TopLevel.scala", "b/src/pkgb/UseB.scala"))
+
+  test("rename a top-level val edits its definition and cross-file uses"):
+    val plan = rename("a/src/pkga/TopLevel.scala", "topConst", 0, "topValue")
+    assertEquals(
+      spanSet(plan, "a/src/pkga/TopLevel.scala"),
+      fx.tokenSpans("a/src/pkga/TopLevel.scala", "topConst").toSet
+    )
+    assertEquals(
+      spanSet(plan, "b/src/pkgb/UseB.scala"),
+      fx.tokenSpans("b/src/pkgb/UseB.scala", "topConst").toSet
+    )
+    assertEquals(plan.edits.keySet, Set("a/src/pkga/TopLevel.scala", "b/src/pkgb/UseB.scala"))
 
   test("rename an extension method edits its definition and call sites across targets"):
     val plan = rename("a/src/pkga/Core.scala", "shout", 0, "yell")
@@ -257,14 +270,14 @@ class RenameSuite extends munit.FunSuite:
     assert(err.isInstanceOf[LsError.RenameRejected], err.toString)
     assertEquals(compiler.calls.toList, Nil)
 
-  test("rename an opaque type edits the type, companion, and its uses (v1 merge policy)"):
-    val plan = rename("a/src/pkga/Opaque.scala", "UserId", 0, "AccountId")
-    assertEquals(
-      spanSet(plan, "a/src/pkga/Opaque.scala"),
-      fx.tokenSpans("a/src/pkga/Opaque.scala", "UserId").toSet,
-      plan.toString
-    )
-    assertEquals(plan.edits.keySet, Set("a/src/pkga/Opaque.scala"))
+  test("rename of an opaque type is rejected (conservative policy)"):
+    // cursor on the opaque type definition; the opaque type + companion + uses
+    // cannot be proven safe to rename in v1, so it must reject outright.
+    val err = rejection("a/src/pkga/Opaque.scala", "UserId", 0, "AccountId")
+    err match
+      case LsError.RenameRejected(reasons) =>
+        assert(reasons.exists(_.contains("opaque")), reasons.toString)
+      case other => fail(s"expected RenameRejected, got $other")
 
   test("rename of an external library symbol is rejected as outside the workspace"):
     // cursor on a `List` reference: the symbol is defined in the standard

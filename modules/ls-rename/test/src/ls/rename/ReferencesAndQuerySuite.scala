@@ -142,28 +142,74 @@ class ReferencesAndQuerySuite extends munit.FunSuite:
     assert(containsToken(r, "a/src/pkga/Impl.scala", "defaultCore", 0), r.locations.toString)
     assert(containsToken(r, "b/src/pkgb/UseB.scala", "defaultCore", 0), r.locations.toString)
 
-  test("given references include the using-clause argument site"):
-    val r = refs("a/src/pkga/Core.scala", "defaultCore", nth = 0)
-    // `render(using defaultCore)` in Using.scala is an explicit argument site
-    assert(containsToken(r, "a/src/pkga/Using.scala", "defaultCore", 0), r.locations.toString)
+  test("given references are exactly the by-name uses including the using-clause site"):
+    val r = refs("a/src/pkga/Core.scala", "defaultCore", nth = 0) // references only
+    val useFiles = Set("a/src/pkga/Impl.scala", "b/src/pkgb/UseB.scala", "a/src/pkga/Using.scala")
+    for uri <- useFiles do
+      assertEquals(
+        locsIn(r, uri).map(_.span).toSet,
+        fx.tokenSpans(uri, "defaultCore").toSet,
+        s"$uri: ${r.locations}"
+      )
+    assertEquals(r.locations.map(_.uri).toSet, useFiles, r.locations.toString)
 
-  test("inline def references reach call sites across targets"):
-    val r = refs("a/src/pkga/Inline.scala", "twice", nth = 0)
-    assert(containsToken(r, "a/src/pkga/Inline.scala", "twice", 1), r.locations.toString) // twice(1)
-    assert(containsToken(r, "b/src/pkgb/UseB.scala", "twice", 0), r.locations.toString) // Inlines.twice(21)
-
-  test("top-level def references reach cross-file uses"):
-    val r = refs("a/src/pkga/TopLevel.scala", "topHelper", nth = 0)
-    assert(containsToken(r, "b/src/pkgb/UseB.scala", "topHelper", 0), r.locations.toString)
-
-  test("private member references stay inside the defining file"):
-    val r = refs("a/src/pkga/Private.scala", "helper", nth = 0, includeDeclaration = true)
-    assertEquals(r.locations.map(_.uri).distinct, Vector("a/src/pkga/Private.scala"))
+  test("inline def references are exactly the definition and both call sites"):
+    val r = refs("a/src/pkga/Inline.scala", "twice", nth = 0, includeDeclaration = true)
     assertEquals(
-      locsIn(r, "a/src/pkga/Private.scala").map(_.span).toSet,
-      fx.tokenSpans("a/src/pkga/Private.scala", "helper").toSet,
+      locsIn(r, "a/src/pkga/Inline.scala").map(_.span).toSet,
+      fx.tokenSpans("a/src/pkga/Inline.scala", "twice").toSet,
       r.locations.toString
     )
+    assertEquals(
+      locsIn(r, "b/src/pkgb/UseB.scala").map(_.span).toSet,
+      fx.tokenSpans("b/src/pkgb/UseB.scala", "twice").toSet
+    )
+    assertEquals(
+      r.locations.map(_.uri).toSet,
+      Set("a/src/pkga/Inline.scala", "b/src/pkgb/UseB.scala")
+    )
+
+  test("top-level def and val references are exactly their definitions and cross-file uses"):
+    for token <- Vector("topHelper", "topConst") do
+      val r = refs("a/src/pkga/TopLevel.scala", token, nth = 0, includeDeclaration = true)
+      assertEquals(
+        locsIn(r, "a/src/pkga/TopLevel.scala").map(_.span).toSet,
+        fx.tokenSpans("a/src/pkga/TopLevel.scala", token).toSet,
+        s"$token: ${r.locations}"
+      )
+      assertEquals(
+        locsIn(r, "b/src/pkgb/UseB.scala").map(_.span).toSet,
+        fx.tokenSpans("b/src/pkgb/UseB.scala", token).toSet,
+        s"$token cross-file"
+      )
+      assertEquals(
+        r.locations.map(_.uri).toSet,
+        Set("a/src/pkga/TopLevel.scala", "b/src/pkgb/UseB.scala"),
+        token
+      )
+
+  test("cross-file val member references are exactly the definition and cross-file use"):
+    val r = refs("a/src/pkga/Named.scala", "title", nth = 0, includeDeclaration = true)
+    assertEquals(
+      locsIn(r, "a/src/pkga/Named.scala").map(_.span).toSet,
+      fx.tokenSpans("a/src/pkga/Named.scala", "title").toSet,
+      r.locations.toString
+    )
+    assertEquals(
+      locsIn(r, "b/src/pkgb/UseB.scala").map(_.span).toSet,
+      fx.tokenSpans("b/src/pkgb/UseB.scala", "title").toSet
+    )
+    assertEquals(r.locations.map(_.uri).toSet, Set("a/src/pkga/Named.scala", "b/src/pkgb/UseB.scala"))
+
+  test("private member references are exactly the in-file definition and uses"):
+    for token <- Vector("helper", "state") do
+      val r = refs("a/src/pkga/Private.scala", token, nth = 0, includeDeclaration = true)
+      assertEquals(r.locations.map(_.uri).distinct, Vector("a/src/pkga/Private.scala"), token)
+      assertEquals(
+        locsIn(r, "a/src/pkga/Private.scala").map(_.span).toSet,
+        fx.tokenSpans("a/src/pkga/Private.scala", token).toSet,
+        s"$token: ${r.locations}"
+      )
 
   test("nested local def references stay inside the document"):
     val r = refs("a/src/pkga/LocalDef.scala", "loop", nth = 0, includeDeclaration = true)
@@ -174,10 +220,14 @@ class ReferencesAndQuerySuite extends munit.FunSuite:
       r.locations.toString
     )
 
-  test("opaque type references include the type-annotation use"):
+  test("opaque type references are exactly the type, companion, and all in-file uses"):
     val r = refs("a/src/pkga/Opaque.scala", "UserId", nth = 0, includeDeclaration = true)
-    // `val sample: UserId` is a type reference to the opaque type
-    assert(containsToken(r, "a/src/pkga/Opaque.scala", "UserId", 3), r.locations.toString)
+    assertEquals(r.locations.map(_.uri).distinct, Vector("a/src/pkga/Opaque.scala"))
+    assertEquals(
+      locsIn(r, "a/src/pkga/Opaque.scala").map(_.span).toSet,
+      fx.tokenSpans("a/src/pkga/Opaque.scala", "UserId").toSet,
+      r.locations.toString
+    )
 
   // ------------------------------------------------------------ includeDeclaration
 
