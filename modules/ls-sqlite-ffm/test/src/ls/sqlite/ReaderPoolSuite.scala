@@ -64,6 +64,36 @@ class ReaderPoolSuite extends munit.FunSuite with TempDbFixture:
       store.close()
   }
 
+  tempDir.test("close wakes a borrower already queued in borrow(), instead of hanging") { dir =>
+    val store = initStore(dir)
+    val pool = ReaderPool.open(store.db.path, store.db.sqlite, size = 1)
+    val held = pool.borrow() // hold the only connection
+    val error = new AtomicReference[Throwable]()
+    val blocked = new Thread(() => {
+      try
+        pool.borrow()
+        ()
+      catch case t: Throwable => error.set(t)
+    })
+    blocked.setDaemon(true)
+    blocked.start()
+    // the second borrow must be parked: no connection is available
+    blocked.join(300)
+    assert(blocked.isAlive, "the second borrow must block while the only connection is held")
+    // shut down WITHOUT returning the held connection
+    pool.close()
+    // close must wake the parked borrower rather than leaving it hung forever
+    blocked.join(5000)
+    assert(!blocked.isAlive, "close must wake the queued borrower")
+    assert(
+      error.get() != null && error.get().isInstanceOf[IllegalStateException],
+      s"queued borrower should fail with IllegalStateException, got ${error.get()}"
+    )
+    // the still-held connection was closed by the pool too
+    intercept[IllegalStateException](held.prepare("SELECT 1"))
+    store.close()
+  }
+
   tempDir.test("close frees every connection: post-close borrow and borrowed-connection use throw") { dir =>
     val store = initStore(dir)
     val pool = ReaderPool.open(store.db.path, store.db.sqlite, size = 2)
