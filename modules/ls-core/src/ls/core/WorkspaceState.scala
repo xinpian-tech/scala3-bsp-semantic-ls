@@ -118,7 +118,11 @@ object Bootstrap:
       /** Sink for LSP diagnostics; the server wires it to its LanguageClient so
         * build diagnostics reach the editor. Defaults to dropping notifications.
         */
-      publishDiagnostics: org.eclipse.lsp4j.PublishDiagnosticsParams => Unit = _ => ()
+      publishDiagnostics: org.eclipse.lsp4j.PublishDiagnosticsParams => Unit = _ => (),
+      /** Invoked when the build server reports that build targets changed; the
+        * server reloads its project model and re-ingests. Defaults to a no-op.
+        */
+      onBuildTargetsChanged: () => Unit = () => ()
   )
 
   def defaultConnect(root: Path, handlers: BspClientHandlers): Option[BspSession] =
@@ -213,6 +217,7 @@ object Bootstrap:
       val diagnosticRouter = DiagnosticRouter(config.publishDiagnostics)
       val handlers = BspClientHandlers(
         onDiagnostics = diagnosticRouter.accept,
+        onDidChangeBuildTarget = _ => config.onBuildTargetsChanged(),
         onLogMessage = p => config.log(s"bsp: ${p.getMessage}"),
         onServerStderr = line => config.log(s"bsp-stderr: $line")
       )
@@ -236,51 +241,13 @@ object Bootstrap:
         case None =>
           notes += "no BSP connection: global index features stay on the recovered index; PC is disabled"
         case Some(s) =>
-          serverInfo = Some(s.initialize())
-          val m = ProjectModelLoader.load(s)
-          model = Some(m)
-          workspaceTargets = WorkspaceTargets.fromBsp(m)
-          uriToTarget = m.uriToTarget.map((uri, bspId) => Uris.normalize(uri) -> bspId)
-          if m.targets.isEmpty then notes += "BSP project model has no Scala 3 targets"
-
-          // PC target registration: classpath comes from the raw
-          // buildTarget/scalacOptions response (BspTarget itself does not
-          // carry the classpath), plus the target's own class directory.
-          val classpathOf: Map[String, Vector[Path]] =
-            if m.targets.isEmpty then Map.empty
-            else
-              try
-                s.buildTargetScalacOptions(m.targets.map(_.bspId))
-                  .map { item =>
-                    val entries = Option(item.getClasspath)
-                      .map(_.asScala.toVector)
-                      .getOrElse(Vector.empty)
-                      .flatMap(u =>
-                        try Some(Path.of(URI.create(u)))
-                        catch case NonFatal(_) => None
-                      )
-                    item.getTarget.getUri -> entries
-                  }
-                  .toMap
-              catch
-                case NonFatal(t) =>
-                  notes += s"buildTarget/scalacOptions classpath fetch failed: ${describe(t)}"
-                  Map.empty
-          for t <- m.targets do
-            val classpath = (classpathOf.getOrElse(t.bspId, Vector.empty) :+ t.classDirectory).distinct
-            val cfg = PcTargetConfig(
-              bspId = t.bspId,
-              classpath = classpath,
-              scalacOptions = pcOptions(t.scalacOptions),
-              sourceDirs = Vector.empty,
-              scalaVersion = t.scalaVersion
-            )
-            pc.registerTarget(cfg)
-            pcConfigs = pcConfigs.updated(t.bspId, cfg)
-
-          m.unavailableTargets.foreach(t =>
-            notes += LsError.IndexUnavailable(t.bspId).message
-          )
+          val loaded = loadModel(s, pc, initialize = true, config.log)
+          serverInfo = loaded.serverInfo
+          model = Some(loaded.model)
+          workspaceTargets = loaded.workspaceTargets
+          pcConfigs = loaded.pcConfigs
+          uriToTarget = loaded.uriToTarget
+          loaded.notes.foreach(notes += _)
 
           // --- initial ingest ---
           if workspaceTargets.targets.isEmpty then
@@ -339,6 +306,88 @@ object Bootstrap:
         quietly(theSnapshots.close())
         quietly(theMeta.close())
         WorkspaceState.Failed(describe(t))
+
+  /** Model-derived state loaded from the BSP session, shared by initial
+    * bootstrap and the `buildTarget/didChange` reload.
+    */
+  private[core] final case class ModelLoad(
+      serverInfo: Option[InitializeBuildResult],
+      model: BspProjectModel,
+      workspaceTargets: WorkspaceTargets,
+      pcConfigs: Map[String, PcTargetConfig],
+      uriToTarget: Map[String, String],
+      notes: Vector[String]
+  )
+
+  /** Loads the BSP project model, registers PC targets with their classpaths,
+    * and gathers supplementary project info. `initialize` runs `build/initialize`
+    * (only at first bootstrap; a reload keeps the existing session). Does not
+    * ingest — the caller decides.
+    */
+  private[core] def loadModel(
+      session: BspSession,
+      pc: PcFacade,
+      initialize: Boolean,
+      log: String => Unit
+  ): ModelLoad =
+    val notes = Vector.newBuilder[String]
+    val serverInfo = if initialize then Some(session.initialize()) else None
+    val m = ProjectModelLoader.load(session)
+    val workspaceTargets = WorkspaceTargets.fromBsp(m)
+    val uriToTarget = m.uriToTarget.map((uri, bspId) => Uris.normalize(uri) -> bspId)
+    if m.targets.isEmpty then notes += "BSP project model has no Scala 3 targets"
+
+    // PC target registration: classpath comes from the raw buildTarget/scalacOptions
+    // response (BspTarget itself does not carry the classpath), plus each target's
+    // own class directory.
+    val classpathOf: Map[String, Vector[Path]] =
+      if m.targets.isEmpty then Map.empty
+      else
+        try
+          session
+            .buildTargetScalacOptions(m.targets.map(_.bspId))
+            .map { item =>
+              val entries = Option(item.getClasspath)
+                .map(_.asScala.toVector)
+                .getOrElse(Vector.empty)
+                .flatMap(u =>
+                  try Some(Path.of(URI.create(u)))
+                  catch case NonFatal(_) => None
+                )
+              item.getTarget.getUri -> entries
+            }
+            .toMap
+        catch
+          case NonFatal(t) =>
+            notes += s"buildTarget/scalacOptions classpath fetch failed: ${describe(t)}"
+            Map.empty
+    var pcConfigs = Map.empty[String, PcTargetConfig]
+    for t <- m.targets do
+      val classpath = (classpathOf.getOrElse(t.bspId, Vector.empty) :+ t.classDirectory).distinct
+      val cfg = PcTargetConfig(
+        bspId = t.bspId,
+        classpath = classpath,
+        scalacOptions = pcOptions(t.scalacOptions),
+        sourceDirs = Vector.empty,
+        scalaVersion = t.scalaVersion
+      )
+      pc.registerTarget(cfg)
+      pcConfigs = pcConfigs.updated(t.bspId, cfg)
+
+    m.unavailableTargets.foreach(t => notes += LsError.IndexUnavailable(t.bspId).message)
+
+    // Supplementary project facts, best-effort and capability-gated (never crash).
+    val indexableIds = workspaceTargets.targets.map(_.bspId)
+    try
+      session
+        .dependencySources(indexableIds)
+        .foreach(items => notes += s"dependency sources: ${items.length} targets")
+      session
+        .outputPaths(indexableIds)
+        .foreach(items => notes += s"output paths: ${items.length} targets")
+    catch case NonFatal(t) => notes += s"supplementary BSP info failed: ${describe(t)}"
+
+    ModelLoad(serverInfo, m, workspaceTargets, pcConfigs, uriToTarget, notes.result())
 
   def ingestSummary(report: IngestReport): String =
     s"ingest: segment ${report.segmentId}, ${report.docsIndexed} docs " +

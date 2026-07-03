@@ -134,6 +134,34 @@ final class BspSession private[bsp] (
     if advertised then serverInverseSources(uri)
     else model.uriToTarget.get(uri).toVector
 
+  /** buildTarget/dependencySources when the server advertises the capability.
+    * Best-effort: not advertised or a failed request yields None and never
+    * crashes the caller (the data is supplementary, plan section 4.1).
+    */
+  def dependencySources(bspIds: Vector[String]): Option[Vector[DependencySourcesItem]] =
+    capabilityGated(bspIds, _.getDependencySourcesProvider, "buildTarget/dependencySources") {
+      val params = new DependencySourcesParams(idsOf(bspIds))
+      listOf("buildTarget/dependencySources", request("buildTarget/dependencySources")(_.buildTargetDependencySources(params)).getItems)
+    }
+
+  /** buildTarget/outputPaths when advertised; best-effort like [[dependencySources]]. */
+  def outputPaths(bspIds: Vector[String]): Option[Vector[OutputPathsItem]] =
+    capabilityGated(bspIds, _.getOutputPathsProvider, "buildTarget/outputPaths") {
+      val params = new OutputPathsParams(idsOf(bspIds))
+      listOf("buildTarget/outputPaths", request("buildTarget/outputPaths")(_.buildTargetOutputPaths(params)).getItems)
+    }
+
+  private def capabilityGated[A](
+      bspIds: Vector[String],
+      provider: BuildServerCapabilities => java.lang.Boolean,
+      method: String
+  )(call: => Vector[A]): Option[Vector[A]] =
+    val advertised = serverCapabilities.exists(caps => Option(provider(caps)).exists(_.booleanValue))
+    if bspIds.isEmpty || !advertised then None
+    else
+      try Some(call)
+      catch case _: BspException => None
+
   /** Graceful buildShutdown + build/exit, then stream/process teardown. Each
     * step is best-effort and bounded by `config.shutdownTimeout`.
     */

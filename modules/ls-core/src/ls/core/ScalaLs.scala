@@ -63,6 +63,7 @@ final class ScalaLs(val config: ScalaLs.Config = ScalaLs.Config())
   private val readyLatch = new CountDownLatch(1)
   private val shuttingDown = new AtomicBoolean(false)
   private val ingestCounter = new java.util.concurrent.atomic.AtomicLong(0L)
+  private val pendingModelReload = new AtomicBoolean(false)
 
   private def daemon(name: String): java.util.concurrent.ThreadFactory = r =>
     val t = new Thread(r, name)
@@ -97,9 +98,11 @@ final class ScalaLs(val config: ScalaLs.Config = ScalaLs.Config())
 
   override def initialized(params: InitializedParams): Unit =
     val root = workspaceRoot.getOrElse(Path.of(".").toAbsolutePath.normalize)
-    // Route BSP build diagnostics to the connected LSP client.
+    // Route BSP build diagnostics to the connected LSP client, and reload the
+    // project model when the build server reports target changes.
     val bootstrapConfig = config.bootstrap.copy(
-      publishDiagnostics = p => client.foreach(_.publishDiagnostics(p))
+      publishDiagnostics = p => client.foreach(_.publishDiagnostics(p)),
+      onBuildTargetsChanged = () => onBuildTargetsChanged()
     )
     val t = new Thread(
       () =>
@@ -109,6 +112,9 @@ final class ScalaLs(val config: ScalaLs.Config = ScalaLs.Config())
         state = result
         result.ready.foreach(replayOpenBuffers)
         readyLatch.countDown()
+        // Apply any build-targets change that arrived before bootstrap finished.
+        if result.ready.isDefined && pendingModelReload.getAndSet(false) then
+          submitIndex(() => reloadBuildModel())
         config.bootstrap.log(s"bootstrap finished: ${result.statusLine}"),
       "ls-core-bootstrap"
     )
@@ -252,6 +258,70 @@ final class ScalaLs(val config: ScalaLs.Config = ScalaLs.Config())
     do
       try s.pc.didOpen(bspId, uri, text)
       catch case NonFatal(t) => log(s"pc didOpen replay failed for $uri: $t")
+
+  private def submitIndex(task: Runnable): Unit =
+    try indexExecutor.execute(task)
+    catch case _: java.util.concurrent.RejectedExecutionException => ()
+
+  /** Build server reported that build targets changed. When the server is
+    * bootstrapped, reload the project model on the index executor; before that,
+    * buffer a single pending reload that is drained once bootstrap publishes
+    * Ready (so a change is never dropped and never crashes bootstrap).
+    */
+  private def onBuildTargetsChanged(): Unit =
+    if shuttingDown.get() then return
+    if state.ready.isDefined then submitIndex(() => reloadBuildModel())
+    else pendingModelReload.set(true)
+
+  /** Refetch the BSP project model and republish an updated `Ready` reusing the
+    * durable stores, then re-ingest. Runs on the single index executor.
+    */
+  private def reloadBuildModel(): Unit =
+    state.ready.foreach { s =>
+      s.session match
+        case None => ()
+        case Some(session) =>
+          try
+            val loaded = Bootstrap.loadModel(session, s.pc, initialize = false, log)
+            val sourceroots =
+              loaded.workspaceTargets.targets.map(_.sourceroot) ++
+                s.meta.allTargets().map(t => Path.of(t.sourceroot))
+            val uris = WorkspaceUris(sourceroots, s.orchestrator)
+            val updated = new CoreServices(
+              workspaceRoot = s.workspaceRoot,
+              storageRoot = s.storageRoot,
+              meta = s.meta,
+              snapshots = s.snapshots,
+              pipeline = s.pipeline,
+              orchestrator = s.orchestrator,
+              references = s.references,
+              highlights = s.highlights,
+              rename = s.rename,
+              compiler = s.compiler,
+              session = s.session,
+              serverInfo = s.serverInfo,
+              model = Some(loaded.model),
+              workspaceTargets = loaded.workspaceTargets,
+              pc = s.pc,
+              pcConfigs = loaded.pcConfigs,
+              uriToTarget = loaded.uriToTarget,
+              uris = uris,
+              notes = s.notes
+            )
+            state = WorkspaceState.Ready(updated)
+            overlay.install(FacadePcQueries(updated.pc), updated.uris.toFileUri)
+            replayOpenBuffers(updated)
+            if updated.workspaceTargets.targets.nonEmpty then
+              scheduleBuildJob(Vector.empty, compileFirst = false)
+            log("reloaded BSP build target model after buildTarget/didChange")
+          catch case NonFatal(t) => log(s"build target model reload failed: $t")
+    }
+
+  /** Test hook: fire the build-targets-changed handler directly. */
+  private[core] def onBuildTargetsChangedForTest(): Unit = onBuildTargetsChanged()
+
+  /** Test hook: whether a pre-bootstrap build-targets change is buffered. */
+  private[core] def pendingModelReloadForTest: Boolean = pendingModelReload.get
 
   // ----------------------------------------------------------- shared helpers
 

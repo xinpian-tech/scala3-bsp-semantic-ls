@@ -27,7 +27,9 @@ final class FakeBuildServer(
     bSourceFile: Path,
     cSourceFile: Path,
     val semanticdbOverride: Path,
-    advertiseInverseSources: Boolean
+    advertiseInverseSources: Boolean,
+    advertiseDependencySources: Boolean = false,
+    advertiseOutputPaths: Boolean = false
 ) extends BuildServer
     with ScalaBuildServer:
 
@@ -38,6 +40,9 @@ final class FakeBuildServer(
   val shutdownRequested = new AtomicBoolean(false)
   val exitReceived = new AtomicBoolean(false)
   val inverseSourcesCalls = new AtomicInteger(0)
+  val workspaceBuildTargetsCalls = new AtomicInteger(0)
+  val dependencySourcesCalls = new AtomicInteger(0)
+  val outputPathsCalls = new AtomicInteger(0)
 
   def idOf(name: String): String = s"bsp://workspace/$name"
   val brokenId: String = idOf("broken")
@@ -83,6 +88,8 @@ final class FakeBuildServer(
     val caps = new BuildServerCapabilities()
     caps.setCompileProvider(new CompileProvider(java.util.List.of("scala")))
     caps.setInverseSourcesProvider(advertiseInverseSources)
+    caps.setDependencySourcesProvider(advertiseDependencySources)
+    caps.setOutputPathsProvider(advertiseOutputPaths)
     CompletableFuture.completedFuture(
       new InitializeBuildResult("fake-bsp-server", "0.0.1", Bsp4j.PROTOCOL_VERSION, caps)
     )
@@ -96,6 +103,7 @@ final class FakeBuildServer(
   override def onBuildExit(): Unit = exitReceived.set(true)
 
   override def workspaceBuildTargets(): CompletableFuture[WorkspaceBuildTargetsResult] =
+    workspaceBuildTargetsCalls.incrementAndGet()
     val targets = java.util.List.of(
       buildTarget("a", List("scala"), Nil, scala3Data),
       buildTarget("b", List("scala"), List("a"), scala3Data),
@@ -212,7 +220,14 @@ final class FakeBuildServer(
   override def workspaceReload(): CompletableFuture[Object] = unsupported("workspace/reload")
   override def buildTargetDependencySources(
       params: DependencySourcesParams
-  ): CompletableFuture[DependencySourcesResult] = unsupported("buildTarget/dependencySources")
+  ): CompletableFuture[DependencySourcesResult] =
+    if !advertiseDependencySources then unsupported("buildTarget/dependencySources")
+    else
+      dependencySourcesCalls.incrementAndGet()
+      val items = params.getTargets.asScala.map { id =>
+        new DependencySourcesItem(id, java.util.List.of(s"file:///dep/${id.getUri.stripPrefix("bsp://workspace/")}-sources.jar"))
+      }
+      CompletableFuture.completedFuture(new DependencySourcesResult(items.asJava))
   override def buildTargetDependencyModules(
       params: DependencyModulesParams
   ): CompletableFuture[DependencyModulesResult] = unsupported("buildTarget/dependencyModules")
@@ -221,7 +236,14 @@ final class FakeBuildServer(
   ): CompletableFuture[ResourcesResult] = unsupported("buildTarget/resources")
   override def buildTargetOutputPaths(
       params: OutputPathsParams
-  ): CompletableFuture[OutputPathsResult] = unsupported("buildTarget/outputPaths")
+  ): CompletableFuture[OutputPathsResult] =
+    if !advertiseOutputPaths then unsupported("buildTarget/outputPaths")
+    else
+      outputPathsCalls.incrementAndGet()
+      val items = params.getTargets.asScala.map { id =>
+        new OutputPathsItem(id, java.util.List.of(new OutputPathItem(s"file:///out/${id.getUri.stripPrefix("bsp://workspace/")}", OutputPathItemKind.DIRECTORY)))
+      }
+      CompletableFuture.completedFuture(new OutputPathsResult(items.asJava))
   override def buildTargetRun(params: RunParams): CompletableFuture[RunResult] =
     unsupported("buildTarget/run")
   override def buildTargetTest(params: TestParams): CompletableFuture[TestResult] =

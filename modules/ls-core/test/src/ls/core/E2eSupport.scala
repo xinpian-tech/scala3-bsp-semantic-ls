@@ -203,6 +203,18 @@ final class ClasspathAugmentingServer(
     */
   def stageCompile(scenario: CompileScenario): Unit = stagedCompile.set(Some(scenario))
 
+  /** Push a server-initiated `buildTarget/didChange` to the client. */
+  def sendDidChange(targetName: String): Unit =
+    underlying.client.onBuildTargetDidChange(
+      new ch.epfl.scala.bsp4j.DidChangeBuildTarget(
+        java.util.List.of(
+          new ch.epfl.scala.bsp4j.BuildTargetEvent(
+            new ch.epfl.scala.bsp4j.BuildTargetIdentifier(s"bsp://workspace/$targetName")
+          )
+        )
+      )
+    )
+
   override def buildTargetCompile(params: CompileParams): CompletableFuture[CompileResult] =
     compileRequests.incrementAndGet()
     val status = stagedCompile.getAndSet(None) match

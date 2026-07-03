@@ -403,6 +403,17 @@ class LsEndToEndTest extends munit.FunSuite:
       "doctor should report no compaction debt after drained re-ingests"
     )
 
+  test("buildTarget/didChange reloads the model and re-ingests"):
+    val _ = env.initResult
+    val loadsBefore = env.fake.workspaceBuildTargetsCalls.get
+    val ingestsBefore = env.server.completedIngests
+    env.bspServer.sendDidChange("a")
+    eventually("workspaceBuildTargets refetched")(env.fake.workspaceBuildTargetsCalls.get > loadsBefore)
+    eventually("re-ingest ran after reload")(env.server.completedIngests > ingestsBefore)
+    // The server stays queryable after the reload.
+    val symbols = wsService.symbol(new WorkspaceSymbolParams("Core")).get(60, TimeUnit.SECONDS)
+    assert(symbols.isRight && symbols.getRight.asScala.exists(_.getName == "Core"))
+
   test("shutdown tears down the BSP session"):
     val _ = env.initResult
     env.proxy.shutdown().get(60, TimeUnit.SECONDS)

@@ -46,7 +46,11 @@ class BspSessionTest extends munit.FunSuite:
       try stream.sorted(Comparator.reverseOrder()).forEach(p => Files.deleteIfExists(p))
       finally stream.close()
 
-  private def withFixture[A](advertiseInverseSources: Boolean = true)(body: BspFixture => A): A =
+  private def withFixture[A](
+      advertiseInverseSources: Boolean = true,
+      advertiseDependencySources: Boolean = false,
+      advertiseOutputPaths: Boolean = false
+  )(body: BspFixture => A): A =
     val workspaceRoot = Files.createTempDirectory("ls-bsp-fake-ws")
     val serverExecutor = Executors.newCachedThreadPool { (r: Runnable) =>
       val t = new Thread(r, "fake-bsp-server")
@@ -77,7 +81,9 @@ class BspSessionTest extends munit.FunSuite:
         bSourceFile,
         cSourceFile,
         semanticdbOverride,
-        advertiseInverseSources
+        advertiseInverseSources,
+        advertiseDependencySources,
+        advertiseOutputPaths
       )
 
       // client <- server pipe and client -> server pipe.
@@ -265,6 +271,33 @@ class BspSessionTest extends munit.FunSuite:
       assertEquals(fx.session.inverseSources(uri, model), Vector(fx.fake.idOf("c")))
       assertEquals(fx.session.inverseSources("file:///nowhere/X.scala", model), Vector.empty[String])
       assertEquals(fx.fake.inverseSourcesCalls.get(), 0)
+    }
+  }
+
+  test("dependencySources and outputPaths are attempted when advertised") {
+    withFixture(advertiseDependencySources = true, advertiseOutputPaths = true) { fx =>
+      val ids = Vector(fx.fake.idOf("a"), fx.fake.idOf("b"))
+      val deps = fx.session.dependencySources(ids)
+      assert(deps.isDefined, "dependencySources should be attempted when advertised")
+      assertEquals(deps.get.length, 2)
+      assertEquals(fx.fake.dependencySourcesCalls.get(), 1)
+      val outputs = fx.session.outputPaths(ids)
+      assert(outputs.isDefined, "outputPaths should be attempted when advertised")
+      assertEquals(outputs.get.length, 2)
+      assertEquals(fx.fake.outputPathsCalls.get(), 1)
+    }
+  }
+
+  test("dependencySources and outputPaths are None (no crash) when not advertised") {
+    withFixture() { fx =>
+      val ids = Vector(fx.fake.idOf("a"))
+      assertEquals(fx.session.dependencySources(ids), None)
+      assertEquals(fx.session.outputPaths(ids), None)
+      // The server is never called when the capability is absent.
+      assertEquals(fx.fake.dependencySourcesCalls.get(), 0)
+      assertEquals(fx.fake.outputPathsCalls.get(), 0)
+      // Empty id sets are also None.
+      assertEquals(fx.session.dependencySources(Vector.empty), None)
     }
   }
 
