@@ -6,8 +6,25 @@ import java.util.Comparator
 
 import scala.util.control.NonFatal
 
-import ls.index.{OccurrenceSink, TargetBitset}
-import ls.postings.{PostingsSnapshot, SegmentReader, SegmentWriter, SnapshotManager}
+import java.io.File
+
+import scala.jdk.CollectionConverters.*
+
+import ls.bsp.{BspCompileOutcome, ProjectModelLoader}
+import ls.index.{OccurrenceSink, Span, TargetBitset}
+import ls.pc.{
+  PcFacade,
+  PcPluginInitContext,
+  PcPluginManager,
+  PcRequest,
+  PcServicePlugin,
+  PcSettings,
+  PcTargetConfig
+}
+import org.eclipse.lsp4j.CompletionList
+import ls.postings.{SegmentReader, SegmentWriter, SnapshotManager}
+import ls.rename.{CompileService, QueryOrchestrator, ReferencesEngine, RenameEngine}
+import ls.rename.ingest.{IngestPipeline, TargetSpec, WorkspaceTargets}
 import ls.sqlite.MetaStore
 
 /** Benchmark + JFR harness over the real storage layer (plan 18.3 / Phase 10).
@@ -60,7 +77,7 @@ object BenchMain:
 
     val dir = Files.createTempDirectory("ls-bench-")
     try
-      val exit = runBench(mode, params, queries, dir, out)
+      val exit = runBench(mode, params, queries, dir, out, args.contains("--inject-failure"))
       recording.zip(jfrPath).foreach { (r, path) =>
         if path.getParent != null then Files.createDirectories(path.getParent)
         r.dump(path)
@@ -80,7 +97,8 @@ object BenchMain:
       params: CorpusParams,
       queries: Int,
       dir: Path,
-      out: PrintStream
+      out: PrintStream,
+      injectFailure: Boolean
   ): Int =
     val errors = Vector.newBuilder[String]
     def check(cond: Boolean, msg: => String): Unit = if !cond then errors += msg
@@ -132,13 +150,20 @@ object BenchMain:
         // misses (e.g. "Sym5" -> "s5"), forcing the sidecar subsequence search ---
         def fuzzyForm(name: String): String =
           name.take(1).toLowerCase + name.dropWhile(!_.isDigit)
-        val fuzzyQueries = Vector.tabulate(queries) { q =>
-          val r = (q.toLong * q.toLong % s).toInt
-          fuzzyForm(corpus.displayNames(r))
+        // Plan: (fuzzy-form query, expected exact displayName). Expected symbols
+        // are constrained to the candidate-pull-visible range (the fuzzy pull is
+        // capped at 5000) so the ground-truth check holds even in --full.
+        val fuzzyVisible = math.min(s, 4000)
+        val fuzzyPlan = Vector.tabulate(queries) { q =>
+          val r = (q.toLong * q.toLong % fuzzyVisible).toInt
+          (fuzzyForm(corpus.displayNames(r)), corpus.displayNames(r))
         }
-        val fuzzy = Metrics.measure(fuzzyQueries) { query =>
+        val fuzzy = Metrics.measure(fuzzyPlan) { (query, expected) =>
           val hits = meta.workspaceSymbolSearch(query, 50)
-          check(hits.nonEmpty, s"fuzzy query '$query' returned no hits")
+          check(
+            hits.exists(_.displayName == expected),
+            s"fuzzy '$query' missed expected '$expected' (got ${hits.take(5).map(_.displayName)})"
+          )
           hits.length.toLong
         }
 
@@ -244,6 +269,160 @@ object BenchMain:
         )
         val occVerified = expectedOccs.valuesIterator.sum
 
+        // ================= ingest-path rows (real IngestPipeline) =================
+        // Ingest-path rows: real IngestPipeline timing, cold/warm start,
+        // rename, and the occurrence-set
+        // gate re-run against the IngestPipeline-produced segment.
+        val ingestLines = Vector.newBuilder[String]
+        val tiers: Vector[(String, SdbCorpusParams)] = mode match
+          case "full" =>
+            Vector(
+              ("semanticdb-ingest-1k", SdbCorpusParams(200, 1000, 1000, 5, 3, 2)),
+              ("semanticdb-ingest-10k", SdbCorpusParams(1000, 10000, 1000, 20, 3, 2)),
+              ("semanticdb-ingest-100k", SdbCorpusParams(4000, 100000, 1000, 50, 3, 2))
+            )
+          case "tiny" => Vector(("semanticdb-ingest-1k", SdbCorpusParams(20, 60, 30, 3, 3, 2)))
+          case _ => Vector(("semanticdb-ingest-1k", SdbCorpusParams(200, 1000, 1000, 5, 3, 2)))
+
+        // Generate + ingest each tier; keep the first (smoke) store open for the
+        // cold/warm/rename rows, close the rest.
+        var keepMeta: MetaStore = null
+        var keepMgr: SnapshotManager = null
+        var keepOrch: QueryOrchestrator = null
+        var keepCorpus: SdbCorpusTruth = null
+        var keepIngestMs: Double = 0.0
+        for (((label, cp), idx) <- tiers.zipWithIndex) do
+          val cdir = Files.createTempDirectory(dir, s"$label-")
+          val corpus = SemanticdbCorpus.generate(cp, cdir.resolve("corpus"))
+          val imeta = MetaStore.open(cdir.resolve("meta.sqlite"))
+          val imgr = SnapshotManager(cdir.resolve("postings"))
+          val ipipe = IngestPipeline(imeta, imgr)
+          val iorch = QueryOrchestrator(imeta, imgr, ipipe)
+          val ws = WorkspaceTargets(
+            Vector(TargetSpec(bspId = "bench", semanticdbRoot = corpus.semanticdbRoot, sourceroot = corpus.sourceroot))
+          )
+          val t0 = System.nanoTime()
+          val rep = iorch.ingest(ws)
+          val ingestMs = (System.nanoTime() - t0) / 1e6
+          check(rep.docsIndexed == cp.docs, s"$label: docsIndexed ${rep.docsIndexed} != ${cp.docs}")
+          check(rep.symbolCount == cp.symbols, s"$label: symbolCount ${rep.symbolCount} != ${cp.symbols}")
+          check(rep.docsStale == 0, s"$label: ${rep.docsStale} stale docs (md5 mismatch)")
+          check(rep.docsSkipped == 0, s"$label: ${rep.docsSkipped} skipped docs (missing source)")
+          check(rep.refGroupCount == rep.renameGroupCount, s"$label: ref/rename group counts differ")
+          check(rep.refGroupCount == cp.symbols, s"$label: refGroupCount ${rep.refGroupCount} != ${cp.symbols}")
+          val wsRows = imeta.db
+            .prepare("SELECT count(*) FROM workspace_symbol_rows")
+            .queryOne(_.columnLong(0))
+            .getOrElse(-1L)
+          check(wsRows == cp.symbols.toLong, s"$label: workspace_symbol_rows $wsRows != ${cp.symbols}")
+          val docsPerSec = if ingestMs <= 0 then 0L else (cp.docs / (ingestMs / 1000.0)).toLong
+          ingestLines += f"$label%-32s ${ingestMs}%10.1f ms  $docsPerSec%10d docs/s"
+          if idx == 0 then
+            keepMeta = imeta; keepMgr = imgr; keepOrch = iorch; keepCorpus = corpus; keepIngestMs = ingestMs
+          else { imgr.close(); imeta.close() }
+
+        // occurrence-set gate on the INGEST output (not just the direct segment)
+        val iSnap = keepMgr.current().getOrElse(throw IllegalStateException("no ingest snapshot"))
+        val expectedIngestOccs = scala.collection.mutable.HashMap.empty[(Int, Int, Int), Int]
+        for (occs <- keepCorpus.docOccKeys; k <- occs) do
+          expectedIngestOccs.update(k, expectedIngestOccs.getOrElse(k, 0) + 1)
+        val scannedIngestOccs = scala.collection.mutable.HashMap.empty[(Int, Int, Int), Int]
+        for d <- 0 until keepCorpus.params.docs do
+          val sink = new CollectingOccSink
+          iSnap.scanDocOccurrences(ls.index.DocOrd(d), sink)
+          sink.keys.foreach(k => scannedIngestOccs.update((k._2, k._3, k._4), scannedIngestOccs.getOrElse((k._2, k._3, k._4), 0) + 1))
+        check(
+          scannedIngestOccs == expectedIngestOccs,
+          s"ingest occurrence-set mismatch: scanned ${scannedIngestOccs.valuesIterator.sum}, expected ${expectedIngestOccs.valuesIterator.sum}"
+        )
+        iSnap.release()
+
+        // cold/warm start. Cold = the fresh ingest plus the first successful
+        // references query; warm = a process-restart simulation.
+        val refEngine = ReferencesEngine(keepOrch)
+        val coldQueryStart = System.nanoTime()
+        val coldHits = refEngine.references(keepCorpus.hot.cursorUri, keepCorpus.hot.cursorLine, keepCorpus.hot.cursorChar, includeDeclaration = true)
+        val coldMs = keepIngestMs + (System.nanoTime() - coldQueryStart) / 1e6
+        check(
+          coldHits.locations.length == keepCorpus.probeSymbolOccurrences,
+          s"cold-start: references ${coldHits.locations.length} != ${keepCorpus.probeSymbolOccurrences}"
+        )
+        val warmMs = warmRestart(keepCorpus, check)
+
+        // rename small (rare) / large (hot)
+        val renameEngine = RenameEngine(keepOrch, NoopCompiler)
+        def renameRow(t: RenameTruth): Metrics.Result =
+          val samples = if mode == "full" then 10 else if mode == "tiny" then 2 else 6
+          Metrics.measure(Vector.fill(samples)(0)) { _ =>
+            val plan = renameEngine.rename(t.cursorUri, t.cursorLine, t.cursorChar, "Renamed")
+            check(
+              plan.occurrenceCount == t.occurrenceCount,
+              s"rename '${t.displayName}': occurrenceCount ${plan.occurrenceCount} != ${t.occurrenceCount}"
+            )
+            check(
+              plan.edits.map((u, e) => u -> e.map(_.span).toSet).toMap == t.editsByUri,
+              s"rename '${t.displayName}': edit spans differ from ground truth"
+            )
+            plan.occurrenceCount.toLong
+          }
+        val renameSmall = renameRow(keepCorpus.rare)
+        val renameLarge = renameRow(keepCorpus.hot)
+
+        // BSP import: time ProjectModelLoader.load against a fake N-target server.
+        val bspLines = Vector.newBuilder[String]
+        val bspSizes = if mode == "tiny" then Vector(2, 4) else Vector(5, 50, 200)
+        for size <- bspSizes do
+          val bdir = Files.createTempDirectory(dir, s"bsp-$size-")
+          val (session, closeBsp) = BenchBspServer.connect(bdir, size)
+          try
+            val bt0 = System.nanoTime()
+            val model = ProjectModelLoader.load(session)
+            val bms = (System.nanoTime() - bt0) / 1e6
+            check(model.targets.length == size, s"bsp-import-$size: ${model.targets.length} targets != $size")
+            check(model.uriToTarget.size == size, s"bsp-import-$size: ${model.uriToTarget.size} source uris != $size")
+            check(model.targets.forall(_.semanticdbRoot.isDefined), s"bsp-import-$size: a target lacks a semanticdb root")
+            check(model.targets.forall(_.sourceroot.isDefined), s"bsp-import-$size: a target lacks a sourceroot")
+            val depEdges = model.targets.map(_.directDeps.length).sum
+            check(depEdges == size - 1, s"bsp-import-$size: $depEdges dep edges != ${size - 1}")
+            bspLines += f"bsp-import-$size%-32s ${bms}%10.1f ms"
+          finally closeBsp()
+
+        // PC completion percentiles + plugin overhead.
+        val libClasspath = System
+          .getProperty("java.class.path", "")
+          .split(File.pathSeparatorChar)
+          .toVector
+          .filter { e =>
+            val nm = Path.of(e).getFileName.toString
+            nm.endsWith(".jar") && (nm.startsWith("scala-library") || nm.startsWith("scala3-library"))
+          }
+          .map(Path.of(_))
+        check(libClasspath.nonEmpty, "pc: no scala library jar on the classpath")
+        val pcText = "object B:\n  val xs = List(1)\n  val ys = xs.\n"
+        val pcCol = "  val ys = xs.".length
+        def measurePc(withPlugin: Boolean): Metrics.Result =
+          val gen = Files.createTempDirectory(dir, "pc-gen-")
+          val pm = new PcPluginManager(PcPluginInitContext(None, gen))
+          if withPlugin then pm.register(new BenchPassthroughPlugin)
+          val facade = new PcFacade(pm, PcSettings(None, gen, 4, 90000L))
+          try
+            facade.registerTarget(PcTargetConfig("bench-pc", libClasspath, Vector.empty))
+            val uri = "file:///bench/PcBuffer.scala"
+            facade.didOpen("bench-pc", uri, pcText)
+            val warm = facade.completion(uri, 2, pcCol) // first completion compiles
+            check(
+              warm.getItems.asScala.exists(_.getLabel.startsWith("map")),
+              s"pc completion${if withPlugin then " (plugin)" else ""}: no 'map' item"
+            )
+            val samples = if mode == "full" then 200 else if mode == "tiny" then 20 else 100
+            Metrics.measure(Vector.fill(samples)(0)) { _ =>
+              facade.completion(uri, 2, pcCol).getItems.size.toLong
+            }
+          finally facade.shutdown()
+        val pcCompletion = measurePc(withPlugin = false)
+        val pcWithPlugin = measurePc(withPlugin = true)
+        val pcPluginOverheadMs = pcWithPlugin.p50Ms - pcCompletion.p50Ms
+
         // --- report ---
         out.println(s"scala3-bsp-semantic-ls bench ($mode)")
         out.println(
@@ -267,7 +446,20 @@ object BenchMain:
         out.println(Metrics.row("doc scan (full)", docScan))
         out.println(f"sqlite-ffm-call-overhead: $ffmNsPerCall%d ns/call (${ffmCalls}%d calls)")
         out.println(f"occurrence-set: $occVerified%d occurrences verified against ground truth")
+        out.println()
+        ingestLines.result().foreach(out.println)
+        out.println(f"${"cold-start"}%-32s ${coldMs}%10.1f ms  (ingest + first references query)")
+        out.println(f"${"warm-start"}%-32s ${warmMs}%10.1f ms  (reopen + publish + first references query)")
+        out.println(Metrics.row("rename small (rare)", renameSmall))
+        out.println(Metrics.row("rename large (hot)", renameLarge))
+        bspLines.result().foreach(out.println)
+        out.println(Metrics.row("pc completion", pcCompletion))
+        out.println(f"pc plugin overhead: $pcPluginOverheadMs%.3f ms (p50 delta)")
+        keepMgr.close()
+        keepMeta.close()
 
+        // Negative-path hook: prove a ground-truth mismatch forces a non-zero exit.
+        if injectFailure then check(false, "injected ground-truth mismatch (negative test)")
         val failures = errors.result()
         if failures.isEmpty then
           out.println()
@@ -308,6 +500,52 @@ object BenchMain:
         packedEnd: Int,
         flags: Int
     ): Unit = keys += ((docOrd, packedStart, packedEnd, flags))
+
+  /** No-op compile service for the rename bench (rename is FreshRequired and
+    * compiles the affected domain before re-ingesting; the compile is a no-op
+    * because the SemanticDB corpus is already on disk).
+    */
+  private object NoopCompiler extends CompileService:
+    override def compile(targets: Seq[String]): BspCompileOutcome = BspCompileOutcome.Ok(None)
+
+  /** Pass-through PC service plugin: its `afterCompletion` hook is invoked but
+    * returns the completion list unchanged, so labels are preserved and the
+    * measured delta is the plugin-dispatch overhead.
+    */
+  private final class BenchPassthroughPlugin extends PcServicePlugin:
+    def id: String = "bench-passthrough"
+    override def afterCompletion(req: PcRequest, result: CompletionList): CompletionList = result
+
+  /** Warm-start (process-restart) simulation: open a fresh store over the same
+    * on-disk directory, recover the manifest-active segment, publish it, and time
+    * to the first successful references query.
+    */
+  private def warmRestart(corpus: SdbCorpusTruth, check: (Boolean, => String) => Unit): Double =
+    val storeDir = corpus.root.getParent
+    val start = System.nanoTime()
+    val wmeta = MetaStore.open(storeDir.resolve("meta.sqlite"))
+    val wmgr = SnapshotManager(storeDir.resolve("postings"))
+    try
+      wmeta.activeSegment() match
+        case Some(seg) =>
+          val reader = SegmentReader.open(java.nio.file.Path.of(seg.path))
+          wmgr.publish(reader, recordCurrentFile = false)
+        case None => check(false, "warm-start: no active segment in manifest")
+      val engine = ReferencesEngine(QueryOrchestrator(wmeta, wmgr, IngestPipeline(wmeta, wmgr)))
+      val hits = engine.references(
+        corpus.hot.cursorUri,
+        corpus.hot.cursorLine,
+        corpus.hot.cursorChar,
+        includeDeclaration = true
+      )
+      check(
+        hits.locations.length == corpus.probeSymbolOccurrences,
+        s"warm-start: references ${hits.locations.length} != ${corpus.probeSymbolOccurrences}"
+      )
+      (System.nanoTime() - start) / 1e6
+    finally
+      wmgr.close()
+      wmeta.close()
 
   private def sizeOf(dir: Path): Long =
     val stream = Files.walk(dir)

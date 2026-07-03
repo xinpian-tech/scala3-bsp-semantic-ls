@@ -63,9 +63,27 @@ class BenchSuite extends munit.FunSuite:
         "ns/call",
         "occurrence-set:",
         "occurrences verified against ground truth",
+        "semanticdb-ingest-1k",
+        "cold-start",
+        "warm-start",
+        "rename small (rare)",
+        "rename large (hot)",
+        "bsp-import-",
+        "pc completion",
+        "pc plugin overhead:",
         "consistency: all checks passed"
       )
     do assert(report.contains(expected), s"missing '$expected' in:\n$report")
+
+  test("a ground-truth mismatch makes the bench exit non-zero"):
+    val buffer = new ByteArrayOutputStream()
+    val exit = BenchMain.run(
+      Array("--tiny", "--inject-failure"),
+      new PrintStream(buffer, true, StandardCharsets.UTF_8)
+    )
+    val report = buffer.toString(StandardCharsets.UTF_8)
+    assertNotEquals(exit, 0, report)
+    assert(report.contains("consistency:") && report.contains("FAILED"), report)
 
   test("--smoke exits 0 in-process"):
     val buffer = new ByteArrayOutputStream()
