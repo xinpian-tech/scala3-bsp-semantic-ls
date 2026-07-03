@@ -336,6 +336,10 @@ final class IngestPipeline(
           catch case c: Throwable => t.addSuppressed(c)
           throw t
     manager.publish(reader)
+    // Reclaim drained superseded segment directories so a long-running server
+    // does not leak one directory per re-ingest; snapshots still held by
+    // readers are left for a later pass.
+    manager.deleteSuperseded()
 
     IngestReport(
       segmentId = segmentId,

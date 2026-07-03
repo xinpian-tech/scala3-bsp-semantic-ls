@@ -244,5 +244,6 @@ class ReferencesAndQuerySuite extends munit.FunSuite:
     val r2 = refs("a/src/pkga/Item.scala", "Item", nth = 0).locations
     assertEquals(r2, r1, "identical corpus must produce identical references")
 
-    val deleted = stack.manager.deleteSuperseded()
-    assert(deleted.nonEmpty, "old segment directory should be reclaimed once drained")
+    // The publish tail already reclaimed the drained old segment, so a manual
+    // pass finds nothing left.
+    assertEquals(stack.manager.deleteSuperseded(), Nil, "old segment auto-reclaimed at publish tail")

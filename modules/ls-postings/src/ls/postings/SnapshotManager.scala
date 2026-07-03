@@ -107,6 +107,40 @@ final class SnapshotManager(val root: Path):
     requeue.result().foreach(retired.add)
     deleted.result()
 
+  /** Startup janitor: removes writer `tmp-*` debris directly under `root` and
+    * any `segment-*` directory that is not `keep` (the manifest-active segment
+    * as recorded in SQLite). The kept path is never deleted, even when it could
+    * not be opened or is absent (a diverged manifest). When `keep` is None
+    * every segment directory is treated as orphan debris. Returns the deleted
+    * directories.
+    *
+    * This complements [[deleteSuperseded]]: that one reclaims in-memory retired
+    * snapshots whose arenas have drained; this one reclaims on-disk leftovers
+    * from a previous process that have no live snapshot.
+    */
+  def cleanupOrphans(keep: Option[Path]): List[Path] =
+    val keepNorm = keep.map(_.toAbsolutePath.normalize)
+    val deleted = List.newBuilder[Path]
+    def listChildren(dir: Path): List[Path] =
+      if !Files.isDirectory(dir) then Nil
+      else
+        val stream = Files.list(dir)
+        try stream.iterator().asScala.toList
+        finally stream.close()
+    // writer scratch debris under root
+    for p <- listChildren(root) if p.getFileName.toString.startsWith("tmp-") do
+      SegmentWriter.deleteRecursively(p)
+      deleted += p
+    // orphan published segment directories
+    for
+      p <- listChildren(segmentsDir)
+      if p.getFileName.toString.startsWith("segment-")
+      if !keepNorm.contains(p.toAbsolutePath.normalize)
+    do
+      SegmentWriter.deleteRecursively(p)
+      deleted += p
+    deleted.result()
+
   /** Unpublishes and schedules the current snapshot for close-on-drain. The
     * segment directory is not deleted (it is the durable index).
     */

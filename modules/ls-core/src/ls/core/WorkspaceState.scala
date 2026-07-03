@@ -165,17 +165,27 @@ object Bootstrap:
     var liveSession: BspSession | Null = null
     try
       // --- startup recovery: publish the active segment without re-ingesting ---
-      theMeta.activeSegment() match
-        case Some(seg) =>
-          try
-            val reader = SegmentReader.open(Path.of(seg.path))
-            theSnapshots.publish(reader)
-            notes += s"recovered postings segment ${seg.segmentId} (${seg.path})"
-          catch
-            case NonFatal(t) =>
-              notes += s"active segment ${seg.segmentId} could not be recovered: ${describe(t)}; a re-ingest will rebuild it"
-        case None =>
-          notes += "no active postings segment; first ingest will create one"
+      val activeSegmentPath =
+        theMeta.activeSegment() match
+          case Some(seg) =>
+            val path = Path.of(seg.path)
+            try
+              val reader = SegmentReader.open(path)
+              theSnapshots.publish(reader)
+              notes += s"recovered postings segment ${seg.segmentId} (${seg.path})"
+            catch
+              case NonFatal(t) =>
+                notes += s"active segment ${seg.segmentId} could not be recovered: ${describe(t)}; a re-ingest will rebuild it"
+            Some(path)
+          case None =>
+            notes += "no active postings segment; first ingest will create one"
+            None
+
+      // --- startup janitor: reclaim orphan segment dirs and writer debris left
+      // by a previous process, never touching the manifest-active segment ---
+      val reclaimed = theSnapshots.cleanupOrphans(activeSegmentPath)
+      if reclaimed.nonEmpty then
+        notes += s"startup janitor reclaimed ${reclaimed.length} orphan segment director${if reclaimed.length == 1 then "y" else "ies"}"
 
       val pipeline = IngestPipeline(theMeta, theSnapshots)
       val orchestrator = QueryOrchestrator(theMeta, theSnapshots, pipeline, overlay)
