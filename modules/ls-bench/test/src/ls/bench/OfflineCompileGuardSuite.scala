@@ -34,17 +34,37 @@ class OfflineCompileGuardSuite extends munit.FunSuite:
       "--self-test"
     )
     pb.environment().put("OFFLINE_COMPILE_CMD", stub.toString)
+    // the guard isolates HOME; the stub compares against this original value
+    pb.environment().put("ORIG_HOME", Option(pb.environment().get("HOME")).getOrElse("/nonexistent-orig-home"))
     pb.redirectErrorStream(true)
     val proc = pb.start()
     val output = new String(proc.getInputStream.readAllBytes())
     (proc.waitFor(), output)
 
-  test("--self-test passes when the injected unlocked dependency makes the offline compile fail"):
+  // Stub that keeps its teeth ONLY under an isolated cold cache: it fails when
+  // the unlocked dep is present (cold cache cannot resolve it), but models a
+  // warm/leaky cache silently resolving it (exit 0) when the guard failed to
+  // isolate HOME/XDG_CACHE_HOME/COURSIER_*/user.home. So reverting the script's
+  // env isolation flips this to a passing compile and the self-test fails.
+  private val toothedUnderIsolation =
+    """isolated() {
+      |  [[ -n "${HOME:-}" && "$HOME" != "${ORIG_HOME:-}" \
+      |     && "$XDG_CACHE_HOME" == "$HOME/.cache" \
+      |     && -n "${COURSIER_CACHE:-}" \
+      |     && "$COURSIER_MODE" == "offline" \
+      |     && "$JAVA_TOOL_OPTIONS" == *"-Duser.home=$HOME"* ]]
+      |}
+      |if isolated; then
+      |  if grep -q 'definitely-not-locked' build.mill; then exit 1; else exit 0; fi
+      |else
+      |  exit 0
+      |fi""".stripMargin
+
+  test("--self-test passes only when the guard isolates a cold cache and the unlocked dep fails"):
     val dir = Files.createTempDirectory("offline-guard-ok")
-    // realistic stub: offline resolution fails when the unlocked dep is present
-    val stub = stubCompile(dir, "if grep -q 'definitely-not-locked' build.mill; then exit 1; else exit 0; fi")
+    val stub = stubCompile(dir, toothedUnderIsolation)
     val (code, out) = runSelfTest(stub)
-    assertEquals(code, 0, s"self-test should pass (guard rejected the unlocked dep):\n$out")
+    assertEquals(code, 0, s"self-test should pass (cold-cache guard rejected the unlocked dep):\n$out")
 
   test("--self-test fails when the offline compile does NOT reject the unlocked dependency"):
     val dir = Files.createTempDirectory("offline-guard-toothless")
