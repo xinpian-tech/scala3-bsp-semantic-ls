@@ -52,9 +52,24 @@ final class QueryOrchestrator(
     val meta: MetaStore,
     val snapshots: SnapshotManager,
     val pipeline: IngestPipeline,
-    val overlay: DirtyBufferOverlay = NoopOverlay
+    val overlay: DirtyBufferOverlay = NoopOverlay,
+    /** When set (the production default), a symbol-at-cursor resolution that
+      * falls to the RawSemanticDBPath persists the refreshed document
+      * synchronously (a full-generation republish) before returning, so the
+      * next query for that uri resolves from the snapshot. When clear, the raw
+      * path only serves and flags `needsReindex` (eventual heal via a later
+      * ingest).
+      */
+    syncWriteThrough: Boolean = true
 ):
   @volatile private var currentWorkspace: Option[WorkspaceTargets] = None
+  @volatile private var lastWriteThroughThread: String | Null = null
+
+  /** Name of the thread that ran the most recent raw-path write-through, or
+    * None if none has run. Test seam proving write-through executes inline on
+    * the calling (single index-executor) thread, never off it.
+    */
+  def lastWriteThroughThreadName: Option[String] = Option(lastWriteThroughThread)
 
   /** Runs a full-generation ingest and remembers the workspace description
     * for target-graph pruning.
@@ -94,7 +109,28 @@ final class QueryOrchestrator(
     else
       val fromSnapshot: Option[CursorSymbol] =
         snapshots.withCurrent(snap => snapshotCursor(snap, uri, line, character)).flatten
-      fromSnapshot.getOrElse(rawSemanticdbCursor(uri, line, character))
+      fromSnapshot match
+        case Some(hit) => hit
+        case None =>
+          // RawSemanticDBPath: serve from the parsed .semanticdb, then
+          // synchronously persist the refreshed document so the next query for
+          // this uri resolves from the snapshot.
+          val cursor = rawSemanticdbCursor(uri, line, character)
+          writeThroughRawPath()
+          cursor
+
+  /** Synchronously heals the index after a RawSemanticDBPath resolution: reuse
+    * the full-generation ingest to republish a segment reflecting the refreshed
+    * document. Runs inline on the calling thread (the ls-core single index
+    * executor in production), preserving the single-writer contract; a no-op
+    * when write-through is disabled or no workspace generation is known yet.
+    */
+  private def writeThroughRawPath(): Unit =
+    if syncWriteThrough then
+      currentWorkspace.foreach { ws =>
+        lastWriteThroughThread = Thread.currentThread().getName
+        pipeline.ingest(ws)
+      }
 
   /** Snapshot path: only when the doc is present and its on-disk source
     * still matches the ingested md5. Throws NoSymbolAtCursor when the doc is

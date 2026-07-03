@@ -336,11 +336,12 @@ object FixtureWorkspace:
 
   def newStack(
       overlay: DirtyBufferOverlay = NoopOverlay,
-      walCheckpointThresholdBytes: Long = MetaStore.DefaultWalThresholdBytes
+      walCheckpointThresholdBytes: Long = MetaStore.DefaultWalThresholdBytes,
+      syncWriteThrough: Boolean = true
   ): Stack =
     val dir = Files.createTempDirectory("ls-rename-store-")
     dir.toFile.deleteOnExit()
     val meta = MetaStore.open(dir.resolve("meta.sqlite"))
     val manager = SnapshotManager(dir.resolve("postings"))
     val pipeline = IngestPipeline(meta, manager, walCheckpointThresholdBytes = walCheckpointThresholdBytes)
-    Stack(dir, meta, manager, QueryOrchestrator(meta, manager, pipeline, overlay))
+    Stack(dir, meta, manager, QueryOrchestrator(meta, manager, pipeline, overlay, syncWriteThrough))
