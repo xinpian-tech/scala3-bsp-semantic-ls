@@ -20,7 +20,9 @@ final case class CurrentSnapshotFile(
 
 object CurrentSnapshotFile:
 
-  /** `<root>/snapshots/current.json`. */
+  /** `<root>/snapshots/current.json`, where `root` is the storage root (the
+    * sibling of `postings/`), not the postings segment root.
+    */
   def pathIn(root: Path): Path = root.resolve("snapshots").resolve("current.json")
 
   /** Hand-rolled JSON (ls-postings has no JSON dependency); stable key order. */

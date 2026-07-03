@@ -155,7 +155,9 @@ object Bootstrap:
     try
       Files.createDirectories(storage)
       meta = MetaStore.open(storage.resolve("meta.sqlite"))
-      snapshots = SnapshotManager(storage.resolve("postings"))
+      // Segments live under storage/postings; snapshots/current.json is a
+      // sibling of postings at the storage root (plan storage layout).
+      snapshots = SnapshotManager(storage.resolve("postings"), storage)
     catch
       case NonFatal(t) =>
         if meta != null then
@@ -175,7 +177,10 @@ object Bootstrap:
             val path = Path.of(seg.path)
             try
               val reader = SegmentReader.open(path)
-              theSnapshots.publish(reader)
+              // Recovery installs the recovered snapshot but must NOT rewrite
+              // current.json: a divergent file has to survive so the doctor can
+              // report it. The next normal ingest publish rewrites it.
+              theSnapshots.publish(reader, recordCurrentFile = false)
               notes += s"recovered postings segment ${seg.segmentId} (${seg.path})"
             catch
               case NonFatal(t) =>

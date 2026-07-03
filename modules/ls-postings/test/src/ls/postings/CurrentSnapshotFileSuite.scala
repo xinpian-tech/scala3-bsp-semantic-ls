@@ -78,3 +78,21 @@ class CurrentSnapshotFileSuite extends munit.FunSuite:
 
   test("read returns None when the file is absent"):
     assertEquals(CurrentSnapshotFile.read(tempRoot("current-json-absent")), None)
+
+  test("current.json is written under the currentFileRoot, not the postings segment root"):
+    val storage = tempRoot("current-json-loc")
+    val postingsRoot = storage.resolve("postings")
+    // segments under storage/postings; current.json a sibling at the storage root
+    val manager = SnapshotManager(postingsRoot, storage)
+    try
+      publish(manager, 1)
+      assert(
+        Files.isRegularFile(storage.resolve("snapshots").resolve("current.json")),
+        "current.json must be written at the storage root (sibling of postings/)"
+      )
+      assert(
+        !Files.exists(postingsRoot.resolve("snapshots").resolve("current.json")),
+        "current.json must NOT be written under the postings segment root"
+      )
+      assertEquals(manager.readCurrentFile().map(_.generation), Some(1L))
+    finally manager.close()

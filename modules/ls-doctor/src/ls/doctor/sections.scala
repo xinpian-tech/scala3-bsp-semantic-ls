@@ -261,10 +261,17 @@ final case class PostingsSegmentInfo(segmentId: Long, path: String, active: Bool
 enum SnapshotFileStatus:
   case Consistent, Divergent, Missing
 
+  /** Human label for the text report. */
   def label: String = this match
     case Consistent => "consistent"
     case Divergent => "divergent"
     case Missing => "missing (no current.json)"
+
+  /** Lowercase single-word value for the JSON wire form. */
+  def wire: String = this match
+    case Consistent => "consistent"
+    case Divergent => "divergent"
+    case Missing => "missing"
 
 /** Postings section (plan 19): manifest segments, the published snapshot and
   * how many superseded-but-undeleted segment directories await compaction.

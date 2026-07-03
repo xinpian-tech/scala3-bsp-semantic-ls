@@ -262,7 +262,7 @@ object Doctor:
       "snapshotOccurrenceCount" -> p.snapshotOccurrenceCount.map(num).getOrElse("null"),
       "compactionPending" -> num(p.compactionPending),
       "compactionPendingDirs" -> arr(p.compactionPendingDirs.map(str)),
-      "snapshotFile" -> str(p.snapshotFile.toString)
+      "snapshotFile" -> str(p.snapshotFile.wire)
     )
 
   private def pcJson(p: PcSection): String =

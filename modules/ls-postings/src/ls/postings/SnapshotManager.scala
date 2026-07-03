@@ -23,18 +23,25 @@ import scala.util.control.NonFatal
   * for [[deleteSuperseded]], the v1 compactor job, which physically removes
   * segment directories whose arena has fully closed.
   */
-final class SnapshotManager(val root: Path):
+final class SnapshotManager(val root: Path, val currentFileRoot: Path):
+  /** Single-root manager: segments and `current.json` both under `root` (used
+    * by tests and any layout without a separate storage root).
+    */
+  def this(root: Path) = this(root, root)
+
   private val currentRef = new AtomicReference[PostingsSnapshot | Null](null)
   private val retired = new ConcurrentLinkedQueue[PostingsSnapshot]()
   // Monotonic publish generation, seeded from any existing current.json so it
   // keeps increasing across restarts.
   private val generation =
-    new AtomicLong(CurrentSnapshotFile.read(root).map(_.generation).getOrElse(0L))
+    new AtomicLong(CurrentSnapshotFile.read(currentFileRoot).map(_.generation).getOrElse(0L))
 
   def segmentsDir: Path = root.resolve("segments")
 
-  /** The last-published `snapshots/current.json`, or None if absent/unreadable. */
-  def readCurrentFile(): Option[CurrentSnapshotFile] = CurrentSnapshotFile.read(root)
+  /** The last-published `snapshots/current.json` (under `currentFileRoot`), or
+    * None if absent/unreadable.
+    */
+  def readCurrentFile(): Option[CurrentSnapshotFile] = CurrentSnapshotFile.read(currentFileRoot)
 
   /** Next segment id: 1 + the highest id of any existing segment directory
     * (including crash debris considered published), starting from 1.
@@ -63,7 +70,14 @@ final class SnapshotManager(val root: Path):
     * callers who need to hold it must [[PostingsSnapshot.retain]] via
     * [[current]].
     */
-  def publish(reader: SegmentReader): PostingsSnapshot =
+  /** Publishes `reader` as the current snapshot. When `recordCurrentFile` (the
+    * default), also records it in `snapshots/current.json`. Startup recovery
+    * passes `false` so it installs the recovered snapshot in memory WITHOUT
+    * rewriting the on-disk file — a divergent `current.json` must survive
+    * recovery so the doctor can report it; the next normal ingest publish
+    * rewrites the file back to a consistent state.
+    */
+  def publish(reader: SegmentReader, recordCurrentFile: Boolean = true): PostingsSnapshot =
     val snapshot = new PostingsSnapshot(reader)
     val old = currentRef.getAndSet(snapshot)
     if old ne null then
@@ -74,17 +88,18 @@ final class SnapshotManager(val root: Path):
     // the segments + SQLite manifest are the source of truth, and the recovery
     // cross-check reports a stale/missing file rather than trusting it, so a
     // metadata-write hiccup must not fail an otherwise-successful publish.
-    try
-      CurrentSnapshotFile.writeAtomic(
-        root,
-        CurrentSnapshotFile(
-          segmentId = reader.segmentId,
-          path = reader.segmentDir.toString,
-          publishedAtMs = System.currentTimeMillis(),
-          generation = generation.incrementAndGet()
+    if recordCurrentFile then
+      try
+        CurrentSnapshotFile.writeAtomic(
+          currentFileRoot,
+          CurrentSnapshotFile(
+            segmentId = reader.segmentId,
+            path = reader.segmentDir.toString,
+            publishedAtMs = System.currentTimeMillis(),
+            generation = generation.incrementAndGet()
+          )
         )
-      )
-    catch case NonFatal(_) => ()
+      catch case NonFatal(_) => ()
     snapshot
 
   /** Returns the current snapshot already retained (caller MUST release), or

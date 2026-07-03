@@ -257,7 +257,7 @@ class RenderTest extends munit.FunSuite:
     assertEquals(root.getAsJsonObject("bsp").get("serverName").getAsString, "Fake BSP")
     assertEquals(root.getAsJsonObject("runtime").get("javaVersion").getAsString.take(2), "25")
     assertEquals(root.getAsJsonObject("postings").get("compactionPending").getAsInt, 1)
-    assertEquals(root.getAsJsonObject("postings").get("snapshotFile").getAsString, "Consistent")
+    assertEquals(root.getAsJsonObject("postings").get("snapshotFile").getAsString, "consistent")
     // generated/stale live under the semanticdb section, not sqlite
     assertEquals(root.getAsJsonObject("semanticdb").get("generatedSourceCount").getAsLong, 2L)
     val staleJson = root.getAsJsonObject("semanticdb").getAsJsonArray("staleTargets")
