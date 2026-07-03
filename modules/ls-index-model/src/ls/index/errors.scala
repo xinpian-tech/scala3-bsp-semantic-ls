@@ -24,5 +24,9 @@ enum LsError(val message: String):
       extends LsError(s"no symbol occurrence at $uri:$line:$character")
   case NotIndexed(uri: String)
       extends LsError(s"$uri is not part of any indexed build target")
+  case NoSemanticdb(uri: String)
+      extends LsError(
+        s"$uri has no SemanticDB output; every source must be compiled with -Xsemanticdb"
+      )
 
 final class LsException(val error: LsError) extends RuntimeException(error.message)

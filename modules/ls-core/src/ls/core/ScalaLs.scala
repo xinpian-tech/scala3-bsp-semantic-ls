@@ -377,6 +377,21 @@ final class ScalaLs(val config: ScalaLs.Config = ScalaLs.Config())
     val uri = Uris.normalize(rawUri)
     s.uris.toSdbUri(uri).getOrElse(throw LsException(LsError.NotIndexed(uri)))
 
+  /** SemanticDB is mandatory: every source is assumed to be compiled with
+    * `-Xsemanticdb`. A request on a source whose build target produces no
+    * SemanticDB is a hard error (no PC fallback, no empty result) — the same
+    * gate for PC and index requests alike. When the workspace is not Ready the
+    * per-handler fallback/error path is left unchanged.
+    */
+  private def requireSemanticdb(rawUri: String): Unit =
+    state match
+      case WorkspaceState.Ready(s) =>
+        val uri = Uris.normalize(rawUri)
+        val indexable =
+          s.uriToTarget.get(uri).exists(bspId => s.workspaceTargets.targets.exists(_.bspId == bspId))
+        if !indexable then throw LsException(LsError.NoSemanticdb(uri))
+      case _ => ()
+
   private def log(message: String): Unit = config.bootstrap.log(message)
 
   // ------------------------------------------------------------ text documents
@@ -436,6 +451,7 @@ final class ScalaLs(val config: ScalaLs.Config = ScalaLs.Config())
         params: CompletionParams
     ): CompletableFuture[JEither[java.util.List[CompletionItem], CompletionList]] =
       onPc {
+        requireSemanticdb(params.getTextDocument.getUri)
         val pos = params.getPosition
         withPcBuffer(params.getTextDocument.getUri)(
           JEither.forRight[java.util.List[CompletionItem], CompletionList](emptyCompletions())
@@ -461,6 +477,7 @@ final class ScalaLs(val config: ScalaLs.Config = ScalaLs.Config())
 
     override def hover(params: HoverParams): CompletableFuture[Hover] =
       onPc {
+        requireSemanticdb(params.getTextDocument.getUri)
         val pos = params.getPosition
         withPcBuffer(params.getTextDocument.getUri)(null: Hover) { (s, uri) =>
           s.pc.hover(uri, pos.getLine, pos.getCharacter).orNull
@@ -469,6 +486,7 @@ final class ScalaLs(val config: ScalaLs.Config = ScalaLs.Config())
 
     override def signatureHelp(params: SignatureHelpParams): CompletableFuture[SignatureHelp] =
       onPc {
+        requireSemanticdb(params.getTextDocument.getUri)
         val pos = params.getPosition
         withPcBuffer(params.getTextDocument.getUri)(null: SignatureHelp) { (s, uri) =>
           s.pc.signatureHelp(uri, pos.getLine, pos.getCharacter)
@@ -479,6 +497,7 @@ final class ScalaLs(val config: ScalaLs.Config = ScalaLs.Config())
         params: DefinitionParams
     ): CompletableFuture[JEither[java.util.List[? <: Location], java.util.List[? <: LocationLink]]] =
       onPc {
+        requireSemanticdb(params.getTextDocument.getUri)
         val pos = params.getPosition
         withPcBuffer(params.getTextDocument.getUri)(emptyLocations()) { (s, uri) =>
           JEither.forLeft(s.pc.definition(uri, pos.getLine, pos.getCharacter).lspLocations)
@@ -489,6 +508,7 @@ final class ScalaLs(val config: ScalaLs.Config = ScalaLs.Config())
         params: TypeDefinitionParams
     ): CompletableFuture[JEither[java.util.List[? <: Location], java.util.List[? <: LocationLink]]] =
       onPc {
+        requireSemanticdb(params.getTextDocument.getUri)
         val pos = params.getPosition
         withPcBuffer(params.getTextDocument.getUri)(emptyLocations()) { (s, uri) =>
           JEither.forLeft(s.pc.typeDefinition(uri, pos.getLine, pos.getCharacter).lspLocations)
@@ -501,6 +521,7 @@ final class ScalaLs(val config: ScalaLs.Config = ScalaLs.Config())
         params: ReferenceParams
     ): CompletableFuture[java.util.List[? <: Location]] =
       onIndex {
+        requireSemanticdb(params.getTextDocument.getUri)
         val s = requireReady()
         val sdbUri = sdbUriOf(s, params.getTextDocument.getUri)
         val pos = params.getPosition
@@ -521,6 +542,7 @@ final class ScalaLs(val config: ScalaLs.Config = ScalaLs.Config())
         params: DocumentHighlightParams
     ): CompletableFuture[java.util.List[? <: DocumentHighlight]] =
       onIndex {
+        requireSemanticdb(params.getTextDocument.getUri)
         state match
           case WorkspaceState.Ready(s) =>
             try
@@ -545,6 +567,7 @@ final class ScalaLs(val config: ScalaLs.Config = ScalaLs.Config())
         params: PrepareRenameParams
     ): CompletableFuture[Either3[Range, PrepareRenameResult, PrepareRenameDefaultBehavior]] =
       onIndex {
+        requireSemanticdb(params.getTextDocument.getUri)
         state match
           case WorkspaceState.Ready(s) =>
             try
@@ -558,6 +581,7 @@ final class ScalaLs(val config: ScalaLs.Config = ScalaLs.Config())
 
     override def rename(params: RenameParams): CompletableFuture[WorkspaceEdit] =
       onIndex {
+        requireSemanticdb(params.getTextDocument.getUri)
         val s = requireReady()
         val sdbUri = sdbUriOf(s, params.getTextDocument.getUri)
         val pos = params.getPosition

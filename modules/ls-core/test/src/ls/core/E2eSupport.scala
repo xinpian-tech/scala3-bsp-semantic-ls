@@ -32,8 +32,8 @@ import ls.index.Span
   *     `-semanticdb-target:` override and `-sourceroot <root>`;
   *   - target b: source FILE `b/src/B.scala`, plain `-Ysemanticdb`
   *     (targetroot = classDirectory), depends on a;
-  *   - target c: source FILE `c/src/C.scala`, NO SemanticDB at all
-  *     (IndexUnavailable).
+  *   - target c: source FILE `c/src/C.scala`, NO SemanticDB at all. SemanticDB
+  *     is mandatory, so every request on a `c` source is a hard error.
   */
 object E2eFixture:
 

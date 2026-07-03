@@ -26,3 +26,14 @@ object a extends SampleModule
 object b extends SampleModule {
   def moduleDeps = Seq(a)
 }
+
+/** Module `c` is deliberately built WITHOUT `-Xsemanticdb`, so it emits no
+  * SemanticDB and is IndexUnavailable — the real-BSP analogue of Mill's own
+  * `mill-build` meta-target. Global index features (workspace symbol,
+  * references, rename, documentHighlight) are disabled for `c`, but the
+  * presentation compiler still serves it (hover/completion/definition/
+  * signatureHelp) because a PC config is registered for every build target.
+  */
+object c extends ScalaModule {
+  def scalaVersion = "3.8.4"
+}

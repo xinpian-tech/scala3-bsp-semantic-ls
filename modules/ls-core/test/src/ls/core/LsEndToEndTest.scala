@@ -229,14 +229,41 @@ class LsEndToEndTest extends munit.FunSuite:
     assertEquals(clears.size, 1)
     assert(clears.head.getDiagnostics.isEmpty, "expected empty clearing publish")
 
-  test("doctor over executeCommand reports the BSP server and the IndexUnavailable target"):
+  test("doctor over executeCommand reports the BSP server and flags the SemanticDB-less target as an error"):
     val _ = env.initResult
     val report = executeCommand(ScalaLs.Commands.Doctor)
     assert(report.contains("state: ready"), report)
     assert(report.contains("fake-bsp-server"), report)
+    // SemanticDB is mandatory: target c (compiled without -Xsemanticdb) is an
+    // ERROR, not a tolerated "IndexUnavailable" steady state.
+    assert(report.contains("SemanticDB coverage: ERROR"), report)
     assert(report.contains("bsp://workspace/c"), report)
     assert(report.contains("SQLite:"), report)
     assert(report.contains("Postings:"), report)
+
+  test("SemanticDB is mandatory: completion on a source without SemanticDB is a hard error"):
+    val _ = env.initResult
+    val params = new CompletionParams(textDoc("c/src/C.scala"), new Position(0, 6))
+    val ex = intercept[ExecutionException](docsService.completion(params).get(60, TimeUnit.SECONDS))
+    val message = ex.getCause.asInstanceOf[ResponseErrorException].getResponseError.getMessage
+    assert(message.contains("has no SemanticDB output"), message)
+    assert(message.contains("-Xsemanticdb"), message)
+
+  test("SemanticDB is mandatory: references on a source without SemanticDB is a hard error"):
+    val _ = env.initResult
+    val params =
+      new ReferenceParams(textDoc("c/src/C.scala"), new Position(0, 6), new ReferenceContext(true))
+    val ex = intercept[ExecutionException](docsService.references(params).get(60, TimeUnit.SECONDS))
+    val message = ex.getCause.asInstanceOf[ResponseErrorException].getResponseError.getMessage
+    assert(message.contains("has no SemanticDB output"), message)
+
+  test("SemanticDB is mandatory: documentHighlight on a source without SemanticDB errors (not empty)"):
+    val _ = env.initResult
+    val params = new DocumentHighlightParams(textDoc("c/src/C.scala"), new Position(0, 6))
+    val ex =
+      intercept[ExecutionException](docsService.documentHighlight(params).get(60, TimeUnit.SECONDS))
+    val message = ex.getCause.asInstanceOf[ResponseErrorException].getResponseError.getMessage
+    assert(message.contains("has no SemanticDB output"), message)
 
   test("workspace/symbol finds the fixture class with a real file location"):
     val _ = env.initResult

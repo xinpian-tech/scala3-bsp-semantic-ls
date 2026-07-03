@@ -163,7 +163,7 @@ class RenderTest extends munit.FunSuite:
       "  server: Fake BSP 9.9.9",
       "  targets: 2",
       "  Scala 3 targets: 2 (bsp://ws/app, bsp://ws/nosdb)",
-      "  IndexUnavailable targets: 1 (bsp://ws/nosdb)",
+      "  SemanticDB coverage: ERROR - 1 target(s) without SemanticDB (recompile with -Xsemanticdb): bsp://ws/nosdb",
       "  semanticdb roots: 1",
       "  fresh docs: 1",
       "  stale docs (md5 mismatch): 1",

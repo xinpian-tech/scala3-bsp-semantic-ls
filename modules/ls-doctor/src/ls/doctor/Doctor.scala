@@ -60,11 +60,18 @@ object Doctor:
       case (Some(name), None) => name
       case (None, Some(version)) => s"unknown server $version"
       case (None, None) => "unknown (initialize result not provided)"
+    // SemanticDB is mandatory: every Scala target must emit it. A target without
+    // SemanticDB is an ERROR, not a tolerated "IndexUnavailable" steady state.
+    val coverage =
+      if b.indexUnavailableTargets.isEmpty then "SemanticDB coverage: all targets emit SemanticDB"
+      else
+        s"SemanticDB coverage: ERROR - ${b.indexUnavailableTargets.length} target(s) without " +
+          s"SemanticDB (recompile with -Xsemanticdb): ${b.indexUnavailableTargets.mkString(", ")}"
     Vector(
       s"server: $server",
       s"targets: ${b.targetCount}",
       s"Scala 3 targets: ${countAndList(b.scala3Targets)}",
-      s"IndexUnavailable targets: ${noneOrList(b.indexUnavailableTargets)}"
+      coverage
     )
 
   private def semanticdbLines(s: SemanticdbSection): Vector[String] =

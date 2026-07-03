@@ -416,7 +416,12 @@ object Bootstrap:
       pc.registerTarget(cfg)
       pcConfigs = pcConfigs.updated(t.bspId, cfg)
 
-    m.unavailableTargets.foreach(t => notes += LsError.IndexUnavailable(t.bspId).message)
+    // SemanticDB is mandatory (assume every source is compiled with -Xsemanticdb):
+    // a target without SemanticDB is an error surfaced in the doctor, not a
+    // tolerated steady state.
+    m.unavailableTargets.foreach(t =>
+      notes += s"ERROR: target ${t.bspId} has no SemanticDB output; every source must be compiled with -Xsemanticdb"
+    )
 
     // Supplementary project facts, best-effort and capability-gated (never crash).
     val indexableIds = workspaceTargets.targets.map(_.bspId)
