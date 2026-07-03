@@ -55,8 +55,9 @@ Per-system outputs (via `flake-utils.lib.eachDefaultSystem`):
 | `packages.<system>.default` | `pkgs.callPackage ./nix/package.nix { inherit mill jdk; inherit (pkgs) sqlite; }` |
 | `formatter.<system>` | `pkgs.nixpkgs-fmt` |
 
-The flake does **not** currently export `packages.<system>.mill` or
-`packages.<system>.mill-ivy-fetcher` (relevant for the lock workflow below).
+The flake exports `packages.<system>.mill` and
+`packages.<system>.mill-ivy-fetcher` (used by the lock workflow below), so
+`nix shell '.#mill' '.#mill-ivy-fetcher' -c mif run …` works.
 
 ### 2.1 Dev shell (`nix/dev-shell.nix`)
 
@@ -76,17 +77,17 @@ Exported environment variables — these are contract, code may rely on them:
 
 ### 2.2 Checks (`nix/checks.nix`)
 
-`nix flake check` runs three checks:
+`nix flake check` runs four checks:
 
 | Check attr | What it enforces |
 |---|---|
 | `checks.<system>.java25-toolchain` | `java -version` from the flake toolchain reports major version 25. |
 | `checks.<system>.ivy-lock-present` | `nix/ivy-lock.nix` exists in the flake source and parses as a Nix expression (`nix-instantiate --parse`). |
 | `checks.<system>.mill-ivy-fetcher-input` | `flake.nix` literally pins `mill-ivy-fetcher.url = "github:Avimitin/mill-ivy-fetcher"`. |
+| `checks.<system>.package` | the offline package build (`packages.<system>.default`) succeeds. |
 
-Note: `nix/ivy-lock.nix` is generated (section 3), not handwritten. Until it has been
-generated and committed, `ivy-lock-present` fails — that is intentional gating, not a
-bug.
+Note: `nix/ivy-lock.nix` is generated (section 3), not handwritten; it is committed
+in the tree and `ivy-lock-present` gates it.
 
 ## 3. Dependency locking with mill-ivy-fetcher
 
@@ -145,6 +146,7 @@ nix develop -c mill __.compile
 nix develop -c mill __.test
 nix develop -c mill bench.smoke
 nix develop -c ./scripts/check-ivy-lock.sh
+./scripts/check-docs.sh
 ```
 
 `bench.smoke` is a real Mill command on the `bench` module (see `build.mill`): it
@@ -165,7 +167,7 @@ the package wrapper uses Java 25
 
 `nix build .#default` (i.e. `packages.<system>.default`) builds
 `pname = "scala3-bsp-semantic-ls"` from a file set containing only `build.mill` and
-`modules/`, using `mill -i core.assembly` with the pre-fetched `ivyCache` (no network).
+`modules/`, using `mill --no-daemon core.assembly` with the pre-fetched `ivyCache` (no network).
 
 Output layout:
 
@@ -200,18 +202,17 @@ use the same `ALL-UNNAMED` spelling.
 |---|---|---|
 | FFM API | `ls-sqlite-ffm` binds the SQLite C API (`sqlite3_open_v2`, `sqlite3_prepare_v3`, `sqlite3_bind_*`, `sqlite3_step`, `sqlite3_column_*`, `sqlite3_reset`, `sqlite3_clear_bindings`, `sqlite3_finalize`, `sqlite3_close_v2`) against the library at `LS_SQLITE_LIB` | `--enable-native-access=ALL-UNNAMED` (wrapper and test forkArgs) |
 | MemorySegment mmap | `ls-postings` maps immutable postings segments read-only via `FileChannel.map -> MemorySegment` under a snapshot-owned `Arena` | none beyond JDK 25 |
-| AOT cache | faster cold start / first request | build with `scripts/aot-train.sh --workspace <dir> --out <path>` — the headless `Main --aot-train` workload exercises LSP/BSP initialize, the SQLite + snapshot store open, a SemanticDB-backed workspace/symbol and references query, and a PC completion, and the script runs the JDK-25 `-XX:AOTMode=record`→`create` two-step. Then set `LS_AOT_CACHE=<path>` at launch → wrapper adds `-XX:AOTCache=<path>` (default `.scala3-bsp-semantic-ls/aot-cache.bin`); the doctor's Runtime section reports `AOT cache: loaded/missing` |
+| AOT cache | faster cold start / first request | build with `scripts/aot-train.sh --workspace <dir> --out <path>`. When `<dir>/.bsp` exists the training runs the STRICT real-BSP workload (`--require-index`: LSP/BSP initialize, SQLite + snapshot store open, compile + reindex, a SemanticDB-backed workspace/symbol + references query, and a PC completion); with no `.bsp` it runs the lenient no-BSP workload. Training passes `--in-process-pc` (the production PC default is forked; the cache cannot cover the PC's child JVM). The script then runs the JDK-25 `-XX:AOTMode=record`→`create` two-step. Set `LS_AOT_CACHE=<path>` at launch → wrapper adds `-XX:AOTCache=<path>` (default `.scala3-bsp-semantic-ls/aot-cache.bin`); the doctor's Runtime section reports `AOT cache: loaded/missing` |
 | Compact Object Headers | lower heap pressure on the object-dense ingest/query workload | `-XX:+UseCompactObjectHeaders` (always on in the wrapper) |
 | JFR profiling | bench/JFR harness (`bench` module) | JDK 25 built-in |
 
-## 7. Current gaps (planned items)
+## 7. Foundation status
 
-These are required by the contract above but not yet present in the tree; they are
-part of the in-flight foundation work, not optional:
+Everything the contract above requires is present in the tree:
 
-- `nix/ivy-lock.nix` — must be generated with `mif` and committed; until then
-  `checks.ivy-lock-present`, `scripts/check-ivy-lock.sh`, and `nix build` all fail.
-- `modules/ls-pc/resources/default-plugin-schema.json` — installed by
-  `nix/package.nix` into `share/`; must exist before `nix build .#default` succeeds.
-- Flake outputs `.#mill` / `.#mill-ivy-fetcher` — planned, only needed for the
-  `nix shell` lock-workflow variant (section 3).
+- `nix/ivy-lock.nix` is generated (`scripts/regen-ivy-lock.sh`) and committed;
+  `checks.ivy-lock-present` and `scripts/check-ivy-lock.sh` gate it.
+- `modules/ls-pc/resources/default-plugin-schema.json` exists and is installed by
+  `nix/package.nix` into `share/`.
+- Flake outputs `.#mill` / `.#mill-ivy-fetcher` are exported (see section 3), so
+  `nix shell '.#mill' '.#mill-ivy-fetcher' -c mif run …` works.

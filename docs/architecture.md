@@ -62,8 +62,8 @@ scalac-generated SemanticDB and never injects the plugin. PC plugins belong to t
 project, run only inside the PC worker, affect only PC request results, and must
 never write SQLite, write mmap postings, or alter workspace-wide semantic truth.
 When semantic truth is unavailable, requests fail with a typed `ls.index.LsError`
-(e.g. `LsError.IndexUnavailable`, `LsError.StaleIndex`) rather than degrading to a
-pretend-accurate answer.
+(e.g. `LsError.NoSemanticdb` for a source whose target emits no SemanticDB,
+`LsError.StaleIndex`) rather than degrading to a pretend-accurate answer.
 
 ## 3. Components
 
@@ -152,7 +152,7 @@ JVM (e.g. AOT training, so the PC code paths are recorded into the cache).
   meta.sqlite            # metadata, manifest, FTS, dictionaries (WAL mode)
   meta.sqlite-wal
   meta.sqlite-shm
-  postings/segment-N/    # immutable mmap postings segments (docs/index-format.md)
+  postings/segments/segment-NNNNNN/  # immutable mmap postings segments, 6-digit id (docs/index-format.md)
   snapshots/current.json
   pc/plugins/            # PC plugin staging
   pc/generated-sources/  # synthetic sources from PC plugins
@@ -228,7 +228,8 @@ the read path.
 
 ```text
  1. BSP compile succeeds.
- 2. SemanticDB watcher finds changed files.
+ 2. reindex performs a FULL rescan of the target SemanticDB roots (v1: no
+    incremental file watcher; every reindex re-reads the SemanticDB tree).
  3. RawSemanticDBPath parses TextDocuments (ls.index.NormalizedDocument).
  4. Validate md5.
  5. SQLite transaction interns symbols and updates metadata.
@@ -504,7 +505,7 @@ PC-generated persistent global index
 
 | Risk | Mitigation |
 |---|---|
-| BSP server produces no SemanticDB | Mark target `IndexUnavailable` (`LsError.IndexUnavailable`); Doctor reports what is missing; never fall back to an approximate index. |
+| BSP server produces no SemanticDB | SemanticDB is mandatory: every request on a source in such a target is a hard `LsError.NoSemanticdb` error (no PC fallback, no empty result) and the doctor renders `SemanticDB coverage: ERROR` — for every target, including Mill's own `mill-build`; never fall back to an approximate index. |
 | SemanticDB is stale | md5 check; per-document epoch check; compile-before-rename; stale target status. |
 | PC plugin diverges from the real build | SemanticDB remains truth; PC plugins affect editing only; PC-only symbols can never be globally renamed (`LsError.PcOnlySymbol`). |
 | mmap segment / SQLite manifest inconsistency | atomic rename; fsync; checksum; manifest transaction; startup recovery. |

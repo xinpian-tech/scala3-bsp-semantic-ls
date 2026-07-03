@@ -30,6 +30,11 @@ jobs:
       - name: ivy lock freshness
         run: nix develop -c ./scripts/check-ivy-lock.sh
 
+      # Mechanical docs checker: traceability entries resolve and no stale claims
+      # remain. Needs no Nix/Mill, so it runs directly.
+      - name: docs check
+        run: ./scripts/check-docs.sh
+
   real-bsp-e2e:
     runs-on: ubuntu-latest
     steps:
