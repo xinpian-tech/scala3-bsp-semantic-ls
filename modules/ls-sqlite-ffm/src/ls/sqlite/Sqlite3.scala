@@ -17,6 +17,7 @@ object Sqlite3:
   inline val DONE = 101
 
   // sqlite3_open_v2 flags.
+  inline val OpenReadOnly = 0x00000001
   inline val OpenReadWrite = 0x00000002
   inline val OpenCreate = 0x00000004
   inline val OpenNoMutex = 0x00008000

@@ -167,6 +167,28 @@ object Db:
   /** In-memory database, mainly for tests. */
   def openInMemory(): Db = openWithFlags(":memory:", Sqlite3.fromEnv)
 
+  /** Opens an EXISTING database read-only (no create) — for reader-pool
+    * connections. Write attempts fail; it shares the writer's WAL so reads see
+    * the latest committed state. The database file and its WAL must already
+    * exist (the writer created them).
+    */
+  def openReadOnly(path: Path): Db = openReadOnly(path, Sqlite3.fromEnv)
+
+  def openReadOnly(path: Path, sqlite: Sqlite3): Db = openReadOnlyAt(path.toString, sqlite)
+
+  private[sqlite] def openReadOnlyAt(location: String, sqlite: Sqlite3): Db =
+    val handle = sqlite.openV2(location, Sqlite3.OpenReadOnly | Sqlite3.OpenNoMutex)
+    val db = new Db(sqlite, handle, location)
+    try
+      db.exec("PRAGMA busy_timeout=5000")
+      db.exec("PRAGMA query_only=ON")
+      db
+    catch
+      case t: Throwable =>
+        try db.close()
+        catch case c: Throwable => t.addSuppressed(c)
+        throw t
+
   private def openWithFlags(location: String, sqlite: Sqlite3): Db =
     val handle = sqlite.openV2(
       location,

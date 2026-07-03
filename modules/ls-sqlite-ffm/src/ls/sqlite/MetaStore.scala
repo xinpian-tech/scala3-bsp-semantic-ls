@@ -106,7 +106,14 @@ final case class SegmentRow(
   */
 final class MetaStore(val db: Db) extends AutoCloseable:
 
-  def close(): Unit = db.close()
+  /** Bounded pool of read-only connections serving concurrent read paths (the
+    * writer `db` stays single-threaded and is never borrowed from the pool).
+    */
+  val readers: ReaderPool = ReaderPool.open(db.path, db.sqlite, ReaderPool.DefaultSize)
+
+  def close(): Unit =
+    readers.close()
+    db.close()
 
   /** Size of the WAL sidecar file in bytes (0 when absent). */
   def walSizeBytes: Long = db.walFileSizeBytes
@@ -515,14 +522,20 @@ final class MetaStore(val db: Db) extends AutoCloseable:
     * suffixed `*`, tokens are AND-ed, results come back in bm25 order.
     * Names are joined from symbol_metadata (the FTS table is contentless).
     */
+  /** Runs the workspace-symbol FTS query on a borrowed read-only connection
+    * from the reader pool, keeping the single-threaded writer free.
+    */
   def workspaceSymbolSearch(query: String, limit: Int): Vector[WorkspaceSymbolHit] =
+    readers.withReader(conn => workspaceSymbolSearchOn(conn, query, limit))
+
+  private def workspaceSymbolSearchOn(conn: Db, query: String, limit: Int): Vector[WorkspaceSymbolHit] =
     val tokens = query.trim.split("\\s+").toVector.filter(_.nonEmpty)
     if tokens.isEmpty || limit <= 0 then Vector.empty
     else
       val matchExpr = tokens
         .map(t => "\"" + t.replace("\"", "\"\"") + "\"*")
         .mkString(" ")
-      db.prepare(
+      conn.prepare(
         """SELECT r.symbol_id, m.display_name, m.owner_name, m.package_name,
           |       r.kind, r.doc_id, r.target_id
           |FROM workspace_symbols_fts

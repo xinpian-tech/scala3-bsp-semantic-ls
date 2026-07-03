@@ -227,6 +227,44 @@ class MetaStoreSuite extends munit.FunSuite with TempDbFixture:
     (sym, wsRow(name, owner, pkg, kind, target, sym),
       SymbolMetadataRow(sym, target, name, owner, pkg, kind, 0, None, None))
 
+  tempDir.test("concurrent readers run FTS queries with correct results via the reader pool") { dir =>
+    val store = open(dir)
+    try
+      val target = newTarget(store)
+      val (doc, _) = store.upsertDocument(target, "file:///ws/A.scala", "/sdb/A", 1L, "m", false, false)
+      val (fooSym, fooWs, fooMeta) = indexSymbol(
+        store, target, doc, 1L, "com/example/FooBuilder#", "FooBuilder", Some("example"), Some("com.example"), SymKind.Class)
+      val (barSym, barWs, barMeta) = indexSymbol(
+        store, target, doc, 1L, "com/example/BarWriter#", "BarWriter", Some("example"), Some("com.example"), SymKind.Class)
+      store.replaceSymbolMetadata(doc, Seq(fooMeta, barMeta))
+      store.replaceWorkspaceSymbols(doc, Seq(fooWs, barWs))
+
+      // more threads than the pool has connections, so borrowers queue; each
+      // query still returns the correct FTS results on its borrowed reader
+      val threadCount = 8
+      val start = new java.util.concurrent.CountDownLatch(1)
+      val errors = new java.util.concurrent.ConcurrentLinkedQueue[String]()
+      val threads = (1 to threadCount).map { _ =>
+        val t = new Thread(() => {
+          start.await()
+          var i = 0
+          while i < 25 do
+            val foo = store.workspaceSymbolSearch("Foo", 10).map(_.symbolId).toSet
+            if foo != Set(fooSym) then errors.add(s"Foo -> $foo")
+            val bar = store.workspaceSymbolSearch("BarWriter", 10).map(_.symbolId)
+            if bar != Vector(barSym) then errors.add(s"BarWriter -> $bar")
+            i += 1
+        })
+        t.setDaemon(true)
+        t
+      }
+      threads.foreach(_.start())
+      start.countDown()
+      threads.foreach(_.join(30000))
+      assert(errors.isEmpty, s"concurrent FTS results diverged: ${errors.toArray.mkString("; ")}")
+    finally store.close()
+  }
+
   tempDir.test("workspaceSymbolSearch supports prefix and multi-token queries") { dir =>
     val store = open(dir)
     try
