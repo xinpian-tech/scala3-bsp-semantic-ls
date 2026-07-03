@@ -47,8 +47,12 @@ final class SdbCorpusTruth(
     val sourceroot: Path,
     val params: SdbCorpusParams,
     val docUris: Vector[String],
-    /** doc index -> multiset of (packedStart, packedEnd, flags) occurrences. */
-    val docOccKeys: Vector[Vector[(Int, Int, Int)]],
+    /** doc index -> multiset of (docOrd, packedStart, packedEnd, flags)
+      * occurrences. The doc ordinal is retained so the ingest consistency gate
+      * can key each occurrence to its owning document (resolved to the stable
+      * [[docUris]] identity) and catch an occurrence migrating between docs.
+      */
+    val docOccKeys: Vector[Vector[(Int, Int, Int, Int)]],
     val hot: RenameTruth,
     val rare: RenameTruth,
     /** semanticSymbol of a known group with its total occurrence count. */
@@ -138,7 +142,7 @@ object SemanticdbCorpus:
     // Per-doc accumulators of (SdbSymbolInfo defined here, occurrences here).
     val docSymbols = Array.fill(n)(Vector.newBuilder[SdbSymbolInfo])
     val docOccs = Array.fill(n)(Vector.newBuilder[SdbOccurrence])
-    val docOccKeys = Array.fill(n)(Vector.newBuilder[(Int, Int, Int)])
+    val docOccKeys = Array.fill(n)(Vector.newBuilder[(Int, Int, Int, Int)])
     // Per-doc, per-line display name: the source line for line l is `    <name>`
     // so the token at chars [4, 4+len) equals the symbol's display name (the
     // ingest only makes an occurrence renameable when the source token matches).
@@ -161,7 +165,7 @@ object SemanticdbCorpus:
       docOccs(doc) += SdbOccurrence(Some(SdbRange(line, 4, line, 4 + name.length)), sym, role)
       var flags = OccFlags.Editable
       if definition then flags |= OccFlags.Definition
-      docOccKeys(doc) += ((Span.pack(line, 4), Span.pack(line, 4 + name.length), flags))
+      docOccKeys(doc) += ((doc, Span.pack(line, 4), Span.pack(line, 4 + name.length), flags))
       // record rename ground truth for the hot (0) and first rare (1) symbols
       if target == 0 then
         hotEdits.getOrElseUpdate(docUris(doc), scala.collection.mutable.Set.empty) += span

@@ -46,8 +46,8 @@ final class CorpusTruth(
     ranked.slice(start, start + n)
 
 /** Synthetic corpus generator working DIRECTLY at the storage layer — no
-  * scalac involved (plan 18.3: benchmarks measure the index machinery, not
-  * the compiler).
+  * scalac involved, so the benchmarks measure the index machinery, not the
+  * compiler.
   *
   * Layout: `docs` documents spread round-robin over `targets` build targets;
   * `symbolsPerDoc` symbols defined per document; the reference budget is

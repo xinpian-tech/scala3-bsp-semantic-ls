@@ -75,6 +75,19 @@ class BenchSuite extends munit.FunSuite:
       )
     do assert(report.contains(expected), s"missing '$expected' in:\n$report")
 
+    // metric rows are well-formed: non-negative and monotonic (p50 <= p95 <= p99)
+    for name <- List(
+        "workspace/symbol fts (prefix)",
+        "references hot (all targets)",
+        "symbolAt (doc postings)",
+        "rename large (hot)",
+        "pc completion"
+      )
+    do
+      val (p50, p95, p99, _) = metricRow(report, name)
+      assert(p50 >= 0 && p95 >= 0 && p99 >= 0, s"$name: negative percentile in\n$report")
+      assert(p50 <= p95 + 1e-9 && p95 <= p99 + 1e-9, s"$name: percentiles not monotonic ($p50/$p95/$p99)")
+
   test("a ground-truth mismatch makes the bench exit non-zero"):
     val buffer = new ByteArrayOutputStream()
     val exit = BenchMain.run(
@@ -84,6 +97,57 @@ class BenchSuite extends munit.FunSuite:
     val report = buffer.toString(StandardCharsets.UTF_8)
     assertNotEquals(exit, 0, report)
     assert(report.contains("consistency:") && report.contains("FAILED"), report)
+
+  test("ingest tiers are sized by document count (1000 smoke, 10000/100000 full)"):
+    // the first SdbCorpusParams field is the DOCUMENT count, not a symbol count
+    assertEquals(BenchMain.configFor("smoke", Array.empty).ingestTiers.map(_._2.docs).toList, List(1000))
+    val full = BenchMain.configFor("full", Array("--full")).ingestTiers
+    assertEquals(full.map(_._1).toList, List("semanticdb-ingest-1k", "semanticdb-ingest-10k", "semanticdb-ingest-100k"))
+    assertEquals(full.map(_._2.docs).toList, List(1000, 10000, 100000))
+    // --tier-docs-cap shrinks documents so a full run can be exercised cheaply
+    assertEquals(
+      BenchMain.configFor("full", Array("--full", "--tier-docs-cap", "40")).ingestTiers.map(_._2.docs).toList,
+      List(40, 40, 40)
+    )
+
+  test("full mode renders all three ingest-tier rows (docs-capped, cheap)"):
+    val cfg = BenchMain
+      .configFor("full", Array("--full", "--tier-docs-cap", "40"))
+      .copy(
+        corpus = CorpusParams(docs = 30, symbolsPerDoc = 3, occurrences = 800, targets = 3),
+        queries = 20,
+        bspSizes = Vector(3),
+        renameSamples = 2,
+        pcSamples = 5
+      )
+    val buffer = new ByteArrayOutputStream()
+    val exit = BenchMain.runWith(cfg, new PrintStream(buffer, true, StandardCharsets.UTF_8))
+    val report = buffer.toString(StandardCharsets.UTF_8)
+    assertEquals(exit, 0, report)
+    for row <- List(
+        "bench (full)",
+        "semanticdb-ingest-1k",
+        "semanticdb-ingest-10k",
+        "semanticdb-ingest-100k"
+      )
+    do assert(report.contains(row), s"missing '$row' in:\n$report")
+
+  test("a real occurrence-set mismatch trips the ingest gate (not a bare check)"):
+    val cfg = BenchMain.configFor("tiny", Array("--tiny")).copy(corruptOccset = true)
+    val buffer = new ByteArrayOutputStream()
+    val exit = BenchMain.runWith(cfg, new PrintStream(buffer, true, StandardCharsets.UTF_8))
+    val report = buffer.toString(StandardCharsets.UTF_8)
+    assertNotEquals(exit, 0, report)
+    assert(report.contains("occurrence-set mismatch"), report)
+
+  /** Parses a metric row `name p50 p95 p99 records/s` into its four numbers. */
+  private def metricRow(report: String, name: String): (Double, Double, Double, Long) =
+    val line = report.linesIterator
+      .find(_.startsWith(name))
+      .getOrElse(fail(s"no metric row '$name' in:\n$report"))
+    val toks = line.substring(name.length).trim.split("\\s+")
+    assert(toks.length >= 4, s"malformed metric row '$name': $line")
+    (toks(0).toDouble, toks(1).toDouble, toks(2).toDouble, toks(3).toLong)
 
   test("--smoke exits 0 in-process"):
     val buffer = new ByteArrayOutputStream()

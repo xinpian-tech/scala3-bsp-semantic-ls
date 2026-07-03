@@ -27,7 +27,7 @@ import ls.rename.{CompileService, QueryOrchestrator, ReferencesEngine, RenameEng
 import ls.rename.ingest.{IngestPipeline, TargetSpec, WorkspaceTargets}
 import ls.sqlite.MetaStore
 
-/** Benchmark + JFR harness over the real storage layer (plan 18.3 / Phase 10).
+/** Benchmark + JFR harness over the real storage layer.
   *
   * Modes:
   * {{{
@@ -54,10 +54,7 @@ object BenchMain:
       if args.contains("--full") then "full"
       else if args.contains("--tiny") then "tiny"
       else "smoke"
-    val (params, queries) = mode match
-      case "full" => (CorpusParams(docs = 2000, symbolsPerDoc = 5, occurrences = 500000, targets = 8), 1000)
-      case "tiny" => (CorpusParams(docs = 40, symbolsPerDoc = 5, occurrences = 2000, targets = 4), 50)
-      case _ => (CorpusParams(docs = 200, symbolsPerDoc = 5, occurrences = 20000, targets = 4), 200)
+    val config = configFor(mode, args)
 
     val jfrPath = args.toVector.sliding(2).collectFirst {
       case Vector("--jfr", path) => Path.of(path)
@@ -69,15 +66,15 @@ object BenchMain:
       case Vector("--jfr-preset", name) => name
     }.getOrElse("default")
     val recording = jfrPath.map { _ =>
-      val config = jdk.jfr.Configuration.getConfiguration(jfrPreset)
-      val r = new jdk.jfr.Recording(config)
+      val jfrConfig = jdk.jfr.Configuration.getConfiguration(jfrPreset)
+      val r = new jdk.jfr.Recording(jfrConfig)
       r.start()
       r
     }
 
     val dir = Files.createTempDirectory("ls-bench-")
     try
-      val exit = runBench(mode, params, queries, dir, out, args.contains("--inject-failure"))
+      val exit = runBench(config, dir, out)
       recording.zip(jfrPath).foreach { (r, path) =>
         if path.getParent != null then Files.createDirectories(path.getParent)
         r.dump(path)
@@ -92,14 +89,72 @@ object BenchMain:
         1
     finally deleteRecursively(dir)
 
-  private def runBench(
+  /** Everything [[runBench]] needs. Kept as an explicit value (not derived from
+    * `mode` inside the run) so tests can drive the full-mode row wiring with a
+    * tiny corpus and inject a real ground-truth mismatch. The document counts
+    * for the SemanticDB ingest tiers live here: 1000 (smoke) / 10000 / 100000.
+    */
+  private[bench] final case class BenchConfig(
       mode: String,
-      params: CorpusParams,
+      corpus: CorpusParams,
       queries: Int,
-      dir: Path,
-      out: PrintStream,
-      injectFailure: Boolean
-  ): Int =
+      ingestTiers: Vector[(String, SdbCorpusParams)],
+      bspSizes: Vector[Int],
+      renameSamples: Int,
+      pcSamples: Int,
+      injectFailure: Boolean = false,
+      corruptOccset: Boolean = false
+  )
+
+  /** Builds the run configuration for a mode. `--tier-docs-cap <n>` caps every
+    * SemanticDB ingest tier's document count so a real `--full` run (all three
+    * `1k`/`10k`/`100k` tier labels) can be exercised cheaply from a test.
+    */
+  private[bench] def configFor(mode: String, args: Array[String]): BenchConfig =
+    val tierCap = args.toVector.sliding(2).collectFirst {
+      case Vector("--tier-docs-cap", n) => n.toInt
+    }
+    // first field is the DOCUMENT count; symbols track docs (one owned symbol
+    // per doc). One hot symbol (>=1000 refs), five rare (<=3), the rest single.
+    def sdbTier(docs: Int): SdbCorpusParams =
+      val d = tierCap.fold(docs)(c => math.min(docs, c))
+      SdbCorpusParams(docs = d, symbols = d, hotRefs = 1000, rareCount = 5, rareRefs = 3, fillerRefs = 1)
+    val (corpus, queries) = mode match
+      case "full" => (CorpusParams(docs = 2000, symbolsPerDoc = 5, occurrences = 500000, targets = 8), 1000)
+      case "tiny" => (CorpusParams(docs = 40, symbolsPerDoc = 5, occurrences = 2000, targets = 4), 50)
+      case _ => (CorpusParams(docs = 200, symbolsPerDoc = 5, occurrences = 20000, targets = 4), 200)
+    val ingestTiers = mode match
+      case "full" =>
+        Vector(
+          "semanticdb-ingest-1k" -> sdbTier(1000),
+          "semanticdb-ingest-10k" -> sdbTier(10000),
+          "semanticdb-ingest-100k" -> sdbTier(100000)
+        )
+      case "tiny" => Vector("semanticdb-ingest-1k" -> SdbCorpusParams(20, 20, 30, 3, 3, 1))
+      case _ => Vector("semanticdb-ingest-1k" -> sdbTier(1000))
+    BenchConfig(
+      mode = mode,
+      corpus = corpus,
+      queries = queries,
+      ingestTiers = ingestTiers,
+      bspSizes = if mode == "tiny" then Vector(2, 4) else Vector(5, 50, 200),
+      renameSamples = if mode == "full" then 10 else if mode == "tiny" then 2 else 4,
+      pcSamples = if mode == "full" then 200 else if mode == "tiny" then 20 else 100,
+      injectFailure = args.contains("--inject-failure"),
+      corruptOccset = args.contains("--corrupt-occset")
+    )
+
+  /** Runs a fully-specified config against a throwaway store (test entry). */
+  private[bench] def runWith(config: BenchConfig, out: PrintStream): Int =
+    val dir = Files.createTempDirectory("ls-bench-")
+    try runBench(config, dir, out)
+    finally deleteRecursively(dir)
+
+  private def runBench(cfg: BenchConfig, dir: Path, out: PrintStream): Int =
+    val mode = cfg.mode
+    val params = cfg.corpus
+    val queries = cfg.queries
+    val injectFailure = cfg.injectFailure
     val errors = Vector.newBuilder[String]
     def check(cond: Boolean, msg: => String): Unit = if !cond then errors += msg
 
@@ -150,8 +205,8 @@ object BenchMain:
         // misses (e.g. "Sym5" -> "s5"), forcing the sidecar subsequence search ---
         def fuzzyForm(name: String): String =
           name.take(1).toLowerCase + name.dropWhile(!_.isDigit)
-        // Plan: (fuzzy-form query, expected exact displayName). Expected symbols
-        // are constrained to the candidate-pull-visible range (the fuzzy pull is
+        // (fuzzy-form query, expected exact displayName): expected symbols are
+        // constrained to the candidate-pull-visible range (the fuzzy pull is
         // capped at 5000) so the ground-truth check holds even in --full.
         val fuzzyVisible = math.min(s, 4000)
         val fuzzyPlan = Vector.tabulate(queries) { q =>
@@ -274,18 +329,11 @@ object BenchMain:
         // rename, and the occurrence-set
         // gate re-run against the IngestPipeline-produced segment.
         val ingestLines = Vector.newBuilder[String]
-        val tiers: Vector[(String, SdbCorpusParams)] = mode match
-          case "full" =>
-            Vector(
-              ("semanticdb-ingest-1k", SdbCorpusParams(200, 1000, 1000, 5, 3, 2)),
-              ("semanticdb-ingest-10k", SdbCorpusParams(1000, 10000, 1000, 20, 3, 2)),
-              ("semanticdb-ingest-100k", SdbCorpusParams(4000, 100000, 1000, 50, 3, 2))
-            )
-          case "tiny" => Vector(("semanticdb-ingest-1k", SdbCorpusParams(20, 60, 30, 3, 3, 2)))
-          case _ => Vector(("semanticdb-ingest-1k", SdbCorpusParams(200, 1000, 1000, 5, 3, 2)))
+        val tiers: Vector[(String, SdbCorpusParams)] = cfg.ingestTiers
 
         // Generate + ingest each tier; keep the first (smoke) store open for the
-        // cold/warm/rename rows, close the rest.
+        // cold/warm/rename rows, close the rest. Every tier is consistency-checked
+        // immediately after its ingest, including the occurrence-set gate below.
         var keepMeta: MetaStore = null
         var keepMgr: SnapshotManager = null
         var keepOrch: QueryOrchestrator = null
@@ -317,25 +365,44 @@ object BenchMain:
           check(wsRows == cp.symbols.toLong, s"$label: workspace_symbol_rows $wsRows != ${cp.symbols}")
           val docsPerSec = if ingestMs <= 0 then 0L else (cp.docs / (ingestMs / 1000.0)).toLong
           ingestLines += f"$label%-32s ${ingestMs}%10.1f ms  $docsPerSec%10d docs/s"
+
+          // Per-tier occurrence-set preservation gate: this tier's published
+          // segment must reproduce the generated per-doc occurrence multiset
+          // exactly. Each occurrence is keyed by its owning document's stable uri
+          // (not just span+flags) so an occurrence migrating between docs is
+          // caught, and the gate runs for every tier — including 10k/100k.
+          val expectedOccs = scala.collection.mutable.HashMap.empty[(String, Int, Int, Int), Int]
+          for (occs, gd) <- corpus.docOccKeys.zipWithIndex; k <- occs do
+            val key = (corpus.docUris(gd), k._2, k._3, k._4)
+            expectedOccs.update(key, expectedOccs.getOrElse(key, 0) + 1)
+          val scannedOccs = scala.collection.mutable.HashMap.empty[(String, Int, Int, Int), Int]
+          val gateSnap = imgr.current().getOrElse(throw IllegalStateException(s"$label: no ingest snapshot"))
+          try
+            var d = 0
+            while d < gateSnap.docCount do
+              val doc = ls.index.DocOrd(d)
+              val uri = gateSnap.uriOf(doc)
+              val sink = new CollectingOccSink
+              gateSnap.scanDocOccurrences(doc, sink)
+              sink.keys.foreach { k =>
+                val key = (uri, k._2, k._3, k._4)
+                scannedOccs.update(key, scannedOccs.getOrElse(key, 0) + 1)
+              }
+              d += 1
+          finally gateSnap.release()
+          // negative-test hook: inject one bogus scanned occurrence so the real
+          // gate below reports a genuine occurrence-set mismatch (not a bare fail).
+          if cfg.corruptOccset && idx == 0 then
+            scannedOccs.update(("__corrupt__", -1, -1, -1), 1)
+          check(
+            scannedOccs == expectedOccs,
+            s"$label: ingest occurrence-set mismatch: scanned ${scannedOccs.valuesIterator.sum} " +
+              s"(${scannedOccs.size} distinct), expected ${expectedOccs.valuesIterator.sum} (${expectedOccs.size} distinct)"
+          )
+
           if idx == 0 then
             keepMeta = imeta; keepMgr = imgr; keepOrch = iorch; keepCorpus = corpus; keepIngestMs = ingestMs
           else { imgr.close(); imeta.close() }
-
-        // occurrence-set gate on the INGEST output (not just the direct segment)
-        val iSnap = keepMgr.current().getOrElse(throw IllegalStateException("no ingest snapshot"))
-        val expectedIngestOccs = scala.collection.mutable.HashMap.empty[(Int, Int, Int), Int]
-        for (occs <- keepCorpus.docOccKeys; k <- occs) do
-          expectedIngestOccs.update(k, expectedIngestOccs.getOrElse(k, 0) + 1)
-        val scannedIngestOccs = scala.collection.mutable.HashMap.empty[(Int, Int, Int), Int]
-        for d <- 0 until keepCorpus.params.docs do
-          val sink = new CollectingOccSink
-          iSnap.scanDocOccurrences(ls.index.DocOrd(d), sink)
-          sink.keys.foreach(k => scannedIngestOccs.update((k._2, k._3, k._4), scannedIngestOccs.getOrElse((k._2, k._3, k._4), 0) + 1))
-        check(
-          scannedIngestOccs == expectedIngestOccs,
-          s"ingest occurrence-set mismatch: scanned ${scannedIngestOccs.valuesIterator.sum}, expected ${expectedIngestOccs.valuesIterator.sum}"
-        )
-        iSnap.release()
 
         // cold/warm start. Cold = the fresh ingest plus the first successful
         // references query; warm = a process-restart simulation.
@@ -352,8 +419,7 @@ object BenchMain:
         // rename small (rare) / large (hot)
         val renameEngine = RenameEngine(keepOrch, NoopCompiler)
         def renameRow(t: RenameTruth): Metrics.Result =
-          val samples = if mode == "full" then 10 else if mode == "tiny" then 2 else 6
-          Metrics.measure(Vector.fill(samples)(0)) { _ =>
+          Metrics.measure(Vector.fill(cfg.renameSamples)(0)) { _ =>
             val plan = renameEngine.rename(t.cursorUri, t.cursorLine, t.cursorChar, "Renamed")
             check(
               plan.occurrenceCount == t.occurrenceCount,
@@ -370,8 +436,7 @@ object BenchMain:
 
         // BSP import: time ProjectModelLoader.load against a fake N-target server.
         val bspLines = Vector.newBuilder[String]
-        val bspSizes = if mode == "tiny" then Vector(2, 4) else Vector(5, 50, 200)
-        for size <- bspSizes do
+        for size <- cfg.bspSizes do
           val bdir = Files.createTempDirectory(dir, s"bsp-$size-")
           val (session, closeBsp) = BenchBspServer.connect(bdir, size)
           try
@@ -403,21 +468,36 @@ object BenchMain:
         def measurePc(withPlugin: Boolean): Metrics.Result =
           val gen = Files.createTempDirectory(dir, "pc-gen-")
           val pm = new PcPluginManager(PcPluginInitContext(None, gen))
-          if withPlugin then pm.register(new BenchPassthroughPlugin)
+          val plugin = Option.when(withPlugin) {
+            val p = new BenchPassthroughPlugin
+            pm.register(p)
+            p
+          }
           val facade = new PcFacade(pm, PcSettings(None, gen, 4, 90000L))
+          val what = if withPlugin then "pc completion (plugin)" else "pc completion"
           try
             facade.registerTarget(PcTargetConfig("bench-pc", libClasspath, Vector.empty))
             val uri = "file:///bench/PcBuffer.scala"
             facade.didOpen("bench-pc", uri, pcText)
             val warm = facade.completion(uri, 2, pcCol) // first completion compiles
-            check(
-              warm.getItems.asScala.exists(_.getLabel.startsWith("map")),
-              s"pc completion${if withPlugin then " (plugin)" else ""}: no 'map' item"
-            )
-            val samples = if mode == "full" then 200 else if mode == "tiny" then 20 else 100
-            Metrics.measure(Vector.fill(samples)(0)) { _ =>
-              facade.completion(uri, 2, pcCol).getItems.size.toLong
+            check(warm.getItems.asScala.exists(_.getLabel.startsWith("map")), s"$what: warmup has no 'map' item")
+            val result = Metrics.measure(Vector.fill(cfg.pcSamples)(0)) { _ =>
+              val items = facade.completion(uri, 2, pcCol).getItems
+              // every timed sample must still resolve the same completion (proves
+              // the plugin path preserves results, not just that it was invoked).
+              check(items.asScala.exists(_.getLabel.startsWith("map")), s"$what: timed sample has no 'map' item")
+              items.size.toLong
             }
+            // the pass-through plugin must have been dispatched once per completion
+            // (warmup + every timed sample), proving the plugin hook actually ran.
+            plugin.foreach { p =>
+              val expected = cfg.pcSamples + 1
+              check(
+                p.completions == expected,
+                s"pc plugin dispatch count ${p.completions} != $expected (warmup + ${cfg.pcSamples} samples)"
+              )
+            }
+            result
           finally facade.shutdown()
         val pcCompletion = measurePc(withPlugin = false)
         val pcWithPlugin = measurePc(withPlugin = true)
@@ -510,11 +590,16 @@ object BenchMain:
 
   /** Pass-through PC service plugin: its `afterCompletion` hook is invoked but
     * returns the completion list unchanged, so labels are preserved and the
-    * measured delta is the plugin-dispatch overhead.
+    * measured delta is the plugin-dispatch overhead. The invocation count is
+    * asserted against warmup+samples to prove the hook actually dispatched.
     */
   private final class BenchPassthroughPlugin extends PcServicePlugin:
+    private val calls = new java.util.concurrent.atomic.AtomicInteger(0)
+    def completions: Int = calls.get()
     def id: String = "bench-passthrough"
-    override def afterCompletion(req: PcRequest, result: CompletionList): CompletionList = result
+    override def afterCompletion(req: PcRequest, result: CompletionList): CompletionList =
+      calls.incrementAndGet()
+      result
 
   /** Warm-start (process-restart) simulation: open a fresh store over the same
     * on-disk directory, recover the manifest-active segment, publish it, and time
