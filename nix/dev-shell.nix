@@ -1,4 +1,4 @@
-{ pkgs, jdk, mill }:
+{ pkgs, jdk, mill, zaozi-src ? null }:
 
 pkgs.mkShell {
   packages = with pkgs; [
@@ -18,4 +18,8 @@ pkgs.mkShell {
   # System SQLite is never used; only the Nix-provided library is a valid
   # runtime dependency.
   LS_SQLITE_LIB = "${pkgs.sqlite.out}/lib/libsqlite3${pkgs.stdenv.hostPlatform.extensions.sharedLibrary}";
+
+  # Pinned + patched zaozi source (real-repo real-BSP workspace for
+  # scripts/it-zaozi.sh). Null when the flake is used without the zaozi input.
+  ZAOZI_SRC = if zaozi-src == null then "" else "${zaozi-src}";
 }

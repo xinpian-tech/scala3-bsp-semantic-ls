@@ -2,57 +2,43 @@
 # Real-repo validation against the FULL, UNMODIFIED zaozi
 # (https://github.com/xinpian-tech/zaozi) built with its OWN Nix toolchain.
 #
+# zaozi is a pinned flake input of THIS repo (see flake.nix `inputs.zaozi`); the
+# only local change — enabling SemanticDB emission, which our SemanticDB-first
+# server requires — is maintained as nix/patches/zaozi-semanticdb.patch and
+# applied by the flake. The dev shell exposes the patched, pinned source as
+# ZAOZI_SRC, so this script never does an ad-hoc `git clone` or in-place edit.
+#
 # Unlike scripts/it-real-bsp.sh (deterministic toy workspace), this drives the
-# language server against a genuine 260+-file Scala 3 hardware framework whose
-# core modules bind native CIRCT/MLIR through the Panama FFM API — provisioned
-# entirely by zaozi's flake (`nix develop`), which supplies CIRCT, MLIR and
-# jextract from the binary cache.
+# server against a genuine 260+-file Scala 3 hardware framework whose core
+# modules bind native CIRCT/MLIR through the Panama FFM API — provisioned by
+# zaozi's own flake (`nix develop`), which supplies CIRCT/MLIR/jextract from the
+# binary cache. It is a HEAVY manual validation, NOT part of the ordinary CI gate.
 #
-# It is a HEAVY, network-dependent, manual validation (clones zaozi, builds the
-# native toolchain, compiles 260+ files); it is NOT part of the ordinary CI gate.
-#
-# Usage:
-#   nix develop -c ./scripts/it-zaozi.sh                 # clone + build + validate
-#   ZAOZI_DIR=/path/to/zaozi nix develop -c ./scripts/it-zaozi.sh   # reuse a checkout
-#
-# The ONLY change made to zaozi is enabling SemanticDB emission (a scalac flag,
-# added ALONGSIDE the upstream options; no source file is touched) — our server
-# is SemanticDB-first, so the workspace must emit `.semanticdb`.
+# Usage:  nix develop -c ./scripts/it-zaozi.sh
 set -euo pipefail
 cd "$(dirname "$0")/.."
 REPO="$PWD"
 
-ZAOZI_URL="https://github.com/xinpian-tech/zaozi.git"
-WORK="${ZAOZI_DIR:-$(mktemp -d)/zaozi}"
+: "${ZAOZI_SRC:?ZAOZI_SRC unset — run inside 'nix develop' (flake exposes the pinned zaozi source)}"
+SQLITE="${LS_SQLITE_LIB:?LS_SQLITE_LIB unset — run inside 'nix develop'}"
 PROBE_SYMBOL="${ZAOZI_PROBE_SYMBOL:-ConversionCreateApi}"
 
-if [ ! -d "$WORK/.git" ]; then
-  echo "it-zaozi: cloning original zaozi -> $WORK"
-  git clone --depth 1 "$ZAOZI_URL" "$WORK"
-fi
-
-# Build OUR server assembly + capture the Nix-provided SQLite the FFM layer needs.
+# Build OUR server assembly.
 mill --no-daemon core.assembly
 JAR="$REPO/out/core/assembly.dest/out.jar"
 [ -f "$JAR" ] || { echo "it-zaozi: assembly jar not found: $JAR" >&2; exit 1; }
-SQLITE="${LS_SQLITE_LIB:?LS_SQLITE_LIB unset — run inside 'nix develop'}"
 
-# Enable SemanticDB on the ORIGINAL zaozi: add -Xsemanticdb -sourceroot alongside
-# the upstream scalacOptions (idempotent; no source file changed).
-if ! grep -q "Xsemanticdb" "$WORK/build.mill"; then
-  echo "it-zaozi: enabling SemanticDB emission in zaozi/build.mill"
-  python3 - "$WORK" <<'PY'
-import sys
-root=sys.argv[1]; p=root+"/build.mill"; s=open(p).read()
-needle='super.scalacOptions() ++ Seq("-java-output-version", "25")'
-repl='super.scalacOptions() ++ Seq("-java-output-version", "25", "-Xsemanticdb", "-sourceroot", mill.api.BuildCtx.workspaceRoot.toString)'
-assert needle in s, "upstream scalacOptions anchor not found — zaozi build.mill changed"
-open(p,"w").write(s.replace(needle,repl))
-PY
-fi
+# Copy the pinned + patched zaozi source out of the read-only Nix store into a
+# writable workspace (mill writes out/, .bsp/ there).
+WORK="$(mktemp -d)/zaozi"
+mkdir -p "$WORK"
+cp -r "$ZAOZI_SRC/." "$WORK/"
+chmod -R u+w "$WORK"
+grep -q "Xsemanticdb" "$WORK/build.mill" || { echo "it-zaozi: patched source lacks -Xsemanticdb" >&2; exit 1; }
+echo "it-zaozi: pinned+patched zaozi source at $WORK"
 
-# Build the full zaozi (native CIRCT/MLIR modules) inside ITS OWN nix dev shell,
-# producing SemanticDB, and install the real Mill BSP connection.
+# Build the full zaozi (native CIRCT/MLIR) inside ITS OWN nix dev shell, emitting
+# SemanticDB, and install the real Mill BSP connection.
 ( cd "$WORK"
   rm -rf .bsp .scala3-bsp-semantic-ls
   nix develop "$WORK" -c bash -c 'mill --no-daemon __.compile && mill --no-daemon mill.bsp.BSP/install'

@@ -95,7 +95,8 @@
       "inputs": {
         "flake-utils": "flake-utils",
         "mill-ivy-fetcher": "mill-ivy-fetcher",
-        "nixpkgs": "nixpkgs_2"
+        "nixpkgs": "nixpkgs_2",
+        "zaozi": "zaozi"
       }
     },
     "systems": {
@@ -131,6 +132,22 @@
       "original": {
         "owner": "numtide",
         "repo": "treefmt-nix",
+        "type": "github"
+      }
+    },
+    "zaozi": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1782478578,
+        "narHash": "sha256-pQYHzckyC1XYIdf3hYZhPM0jIkMB8ffuB4FbTqVOAHg=",
+        "owner": "xinpian-tech",
+        "repo": "zaozi",
+        "rev": "fefb58e9a7d70d112cef3e7a891a849e43f3b43c",
+        "type": "github"
+      },
+      "original": {
+        "owner": "xinpian-tech",
+        "repo": "zaozi",
         "type": "github"
       }
     }
