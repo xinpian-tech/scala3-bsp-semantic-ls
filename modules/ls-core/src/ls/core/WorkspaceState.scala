@@ -114,7 +114,11 @@ object Bootstrap:
   final case class Config(
       connectBsp: (Path, BspClientHandlers) => Option[BspSession] = defaultConnect,
       pcRequestTimeoutMillis: Long = 15000L,
-      log: String => Unit = msg => System.err.println(s"[scala3-bsp-semantic-ls] $msg")
+      log: String => Unit = msg => System.err.println(s"[scala3-bsp-semantic-ls] $msg"),
+      /** Sink for LSP diagnostics; the server wires it to its LanguageClient so
+        * build diagnostics reach the editor (plan 5.1). Defaults to a drop.
+        */
+      publishDiagnostics: org.eclipse.lsp4j.PublishDiagnosticsParams => Unit = _ => ()
   )
 
   def defaultConnect(root: Path, handlers: BspClientHandlers): Option[BspSession] =
@@ -196,7 +200,9 @@ object Bootstrap:
       livePc = pc
 
       // --- BSP connection + project model ---
+      val diagnosticRouter = DiagnosticRouter(config.publishDiagnostics)
       val handlers = BspClientHandlers(
+        onDiagnostics = diagnosticRouter.accept,
         onLogMessage = p => config.log(s"bsp: ${p.getMessage}"),
         onServerStderr = line => config.log(s"bsp-stderr: $line")
       )

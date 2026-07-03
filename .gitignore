@@ -12,5 +12,5 @@ result-*
 .scala3-bsp-semantic-ls/
 mill-java-opts
 
-# Humanize one-shot consultation logs (ephemeral)
-.humanize/skill/
+# Humanize local loop state (goal tracker, round summaries, consultation logs)
+.humanize/

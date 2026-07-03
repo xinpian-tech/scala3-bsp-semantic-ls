@@ -96,10 +96,14 @@ final class ScalaLs(val config: ScalaLs.Config = ScalaLs.Config())
 
   override def initialized(params: InitializedParams): Unit =
     val root = workspaceRoot.getOrElse(Path.of(".").toAbsolutePath.normalize)
+    // Route BSP build diagnostics to the connected LSP client (plan 5.1).
+    val bootstrapConfig = config.bootstrap.copy(
+      publishDiagnostics = p => client.foreach(_.publishDiagnostics(p))
+    )
     val t = new Thread(
       () =>
         val result =
-          try Bootstrap.run(root, config.bootstrap, docs, overlay)
+          try Bootstrap.run(root, bootstrapConfig, docs, overlay)
           catch case NonFatal(t) => WorkspaceState.Failed(t.toString)
         state = result
         result.ready.foreach(replayOpenBuffers)

@@ -2,7 +2,10 @@ package ls.core
 
 import ls.index.{LsError, LsException, Span, SymKind}
 import ls.rename.{HighlightKind, WorkspaceEditPlan}
+import ch.epfl.scala.bsp4j.{Diagnostic as BspDiagnostic, DiagnosticSeverity as BspSeverity}
 import org.eclipse.lsp4j.{
+  Diagnostic as LspDiagnostic,
+  DiagnosticSeverity as LspSeverity,
   DocumentHighlightKind,
   Location,
   Position,
@@ -67,3 +70,28 @@ object LspConvert:
   def highlightKind(kind: HighlightKind): DocumentHighlightKind = kind match
     case HighlightKind.Read => DocumentHighlightKind.Read
     case HighlightKind.Write => DocumentHighlightKind.Write
+
+  /** BSP [[BspDiagnostic]] -> LSP [[LspDiagnostic]]. Ranges share semantics
+    * (zero-based line/character). `code` is the same jsonrpc `Either` type on
+    * both sides and is passed through. A missing severity stays null (the
+    * client renders it with its default).
+    */
+  def diagnostic(d: BspDiagnostic): LspDiagnostic =
+    val r = d.getRange
+    val lspRange = new Range(
+      new Position(r.getStart.getLine, r.getStart.getCharacter),
+      new Position(r.getEnd.getLine, r.getEnd.getCharacter)
+    )
+    val out = new LspDiagnostic(lspRange, d.getMessage)
+    Option(d.getSeverity).foreach(s => out.setSeverity(diagnosticSeverity(s)))
+    Option(d.getSource).foreach(out.setSource)
+    Option(d.getCode).foreach(out.setCode)
+    out
+
+  private def diagnosticSeverity(s: BspSeverity): LspSeverity =
+    s.getValue match
+      case 1 => LspSeverity.Error
+      case 2 => LspSeverity.Warning
+      case 3 => LspSeverity.Information
+      case 4 => LspSeverity.Hint
+      case _ => LspSeverity.Information

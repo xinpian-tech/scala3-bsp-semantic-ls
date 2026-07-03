@@ -159,6 +159,22 @@ class LsEndToEndTest extends munit.FunSuite:
     assert(env.fake.initializeReceived.get, "build/initialize")
     assert(env.fake.initializedNotified.get, "build/initialized")
 
+  test("executeCommand compile forwards BSP diagnostics to the LSP client"):
+    val _ = env.initResult
+    env.client.diagnostics.clear()
+    val result = executeCommand(ScalaLs.Commands.Compile)
+    assert(result.startsWith("compile ok"), result)
+    val bFile = ws.bSourceFile
+    def publishForB: Option[PublishDiagnosticsParams] =
+      env.client.diagnostics.asScala.find(p =>
+        java.nio.file.Path.of(java.net.URI.create(p.getUri)) == bFile
+      )
+    eventually("diagnostic published for B.scala")(publishForB.isDefined)
+    val diags = publishForB.get.getDiagnostics.asScala.toVector
+    assert(diags.nonEmpty, "expected at least one diagnostic")
+    assertEquals(diags.head.getSeverity, DiagnosticSeverity.Warning)
+    assert(diags.head.getMessage.getLeft.contains("value unused"), diags.head.getMessage.getLeft)
+
   test("doctor over executeCommand reports the BSP server and the IndexUnavailable target"):
     val _ = env.initResult
     val report = executeCommand(ScalaLs.Commands.Doctor)
