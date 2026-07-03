@@ -191,6 +191,7 @@ class ReferencesAndQuerySuite extends munit.FunSuite:
     val overlay = new DirtyBufferOverlay:
       override def isDirty(uri: String): Boolean = false
       override def symbolAt(uri: String, line: Int, character: Int): Option[OverlayHit] = None
+      override def contributesOccurrences: Boolean = true
       override def occurrencesOf(semanticSymbol: String): Option[Vector[Loc]] =
         if semanticSymbol == "pkga/Item#" then Some(Vector(extra)) else None
     val stack2 = FixtureWorkspace.newStack(overlay)
@@ -202,6 +203,38 @@ class ReferencesAndQuerySuite extends munit.FunSuite:
       val overlayHits = r.hits.filter(_.fromOverlay)
       assertEquals(overlayHits.map(_.loc), Vector(extra))
       assert(r.hits.exists(!_.fromOverlay))
+    finally stack2.close()
+
+  test("overlay hits keyed to any alias-group member are merged, not just the cursor symbol"):
+    // The cursor is on the class `pkga/Item#`, but the overlay only knows an
+    // occurrence keyed to a companion-side member (`pkga/Item.` / `.apply`).
+    // A group-keyed fan-out must still surface it; a cursor-symbol-only query
+    // (the pre-fix behaviour) would miss it entirely.
+    val extra = Loc("virtual/Dirty.scala", Span(1, 2, 1, 6))
+    val queried = scala.collection.mutable.Set.empty[String]
+    val overlay = new DirtyBufferOverlay:
+      override def isDirty(uri: String): Boolean = false
+      override def symbolAt(uri: String, line: Int, character: Int): Option[OverlayHit] = None
+      override def contributesOccurrences: Boolean = true
+      override def occurrencesOf(semanticSymbol: String): Option[Vector[Loc]] =
+        queried += semanticSymbol
+        // companion object and its members start with "pkga/Item."; the class
+        // itself is "pkga/Item#" and must NOT match.
+        if semanticSymbol.startsWith("pkga/Item.") then Some(Vector(extra)) else None
+    val stack2 = FixtureWorkspace.newStack(overlay)
+    try
+      stack2.orchestrator.ingest(FixtureWorkspace.workspaceFor(fx))
+      val engine2 = ReferencesEngine(stack2.orchestrator)
+      val (line, ch) = fx.cursor("a/src/pkga/Item.scala", "Item", 0)
+      val r = engine2.references("a/src/pkga/Item.scala", line, ch, includeDeclaration = false)
+      val overlayHits = r.hits.filter(_.fromOverlay)
+      assertEquals(overlayHits.map(_.loc), Vector(extra), s"queried=$queried")
+      // The fan-out queried the cursor symbol AND at least one companion member.
+      assert(queried.contains("pkga/Item#"), s"queried=$queried")
+      assert(
+        queried.exists(s => s != "pkga/Item#" && s.startsWith("pkga/Item.")),
+        s"group fan-out must query companion members; queried=$queried"
+      )
     finally stack2.close()
 
   test("dirty buffer: overlay answers symbolAtCursor; unanswerable dirty query degrades"):

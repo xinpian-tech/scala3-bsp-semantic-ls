@@ -349,6 +349,16 @@ IndexSnapshot.using(currentSnapshot.get()) { snap =>
 }
 ```
 
+The dirty-buffer overlay fan-out is **group-keyed**: references query the overlay
+for *every* member symbol of the cursor's ref group (`IndexSnapshot.refGroupSymbols`),
+not just the symbol under the cursor, so an overlay occurrence keyed to a companion
+member, `apply` forwarder, or getter/setter alias is still surfaced. The fan-out is
+gated on `DirtyBufferOverlay.contributesOccurrences`; the production `PcOverlay`
+(`ls.core`) leaves it `false` and its `occurrencesOf` is a deliberate no-op — the PC
+worker contributes symbol-at-cursor for dirty files but no extra reference
+occurrences yet — so the group-keyed query costs nothing in production and is
+exercised only by test overlays that opt in.
+
 `references(includeDeclaration = false)` reads only reference postings;
 `includeDeclaration = true` additionally reads definition postings. Occurrence roles
 mirror SemanticDB (`ls.index.Role.Reference` / `Role.Definition`); per-occurrence

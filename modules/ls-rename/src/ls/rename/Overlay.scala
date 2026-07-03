@@ -39,6 +39,13 @@ trait DirtyBufferOverlay:
     */
   def occurrencesOf(semanticSymbol: String): Option[Vector[Loc]]
 
+  /** True when [[occurrencesOf]] can contribute occurrences at all. When false
+    * (the default, and the production PC overlay), references skip the per-group
+    * overlay fan-out entirely. An overlay that returns real occurrences must
+    * override this to `true` so the group-keyed query is exercised.
+    */
+  def contributesOccurrences: Boolean = false
+
 /** Overlay used until the PC worker is wired in: nothing is ever dirty. */
 object NoopOverlay extends DirtyBufferOverlay:
   override def isDirty(uri: String): Boolean = false

@@ -197,6 +197,15 @@ class HandBuiltCorpusTest extends munit.FunSuite:
     assertEquals(snapshot.definitionTargetOf(a).map(_.ord), Some(0))
     assertEquals(snapshot.definitionTargetOf(foo), None)
 
+  test("refGroupSymbols returns every member symbol of a group"):
+    // ref group 0 unifies "a/A#" and "a/A#foo()."; group 1 is the singleton "a/B."
+    assertEquals(snapshot.refGroupSymbols(RefGroupOrd(0)).toSet, Set("a/A#", "a/A#foo()."))
+    assertEquals(snapshot.refGroupSymbols(RefGroupOrd(1)), Vector("a/B."))
+    // every returned symbol round-trips back to the same ref group
+    for g <- Vector(0, 1) do
+      for s <- snapshot.refGroupSymbols(RefGroupOrd(g)) do
+        assertEquals(snapshot.refGroupOf(snapshot.symbolOrdOf(s).get).map(_.ord), Some(g))
+
   test("scanReferences: all targets allowed, epoch-stale record dropped"):
     val sink = CollectSink()
     snapshot.scanReferences(RefGroupOrd(0), TargetBitset.all(3), sink)

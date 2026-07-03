@@ -45,16 +45,41 @@ final class ReferencesEngine(orchestrator: QueryOrchestrator):
           else throw LsException(LsError.NotIndexed(uri))
         }
 
+    // Group-keyed dirty-buffer overlay (plan 12.3): fan the overlay query
+    // across every member of the cursor's alias group, not just the cursor
+    // symbol, so an overlay occurrence keyed to any alias (e.g. a companion
+    // member) is included. Skipped entirely for overlays that contribute no
+    // occurrences (the production PC overlay), so it costs nothing there.
     val overlayHits: Vector[ReferenceHit] =
-      orchestrator.overlay
-        .occurrencesOf(cursor.semanticSymbol)
-        .getOrElse(Vector.empty)
-        .map(loc => ReferenceHit(loc, Role.Reference, fromOverlay = true))
+      if !orchestrator.overlay.contributesOccurrences then Vector.empty
+      else
+        overlayGroupSymbols(cursor)
+          .flatMap(sym => orchestrator.overlay.occurrencesOf(sym).getOrElse(Vector.empty))
+          .distinct
+          .map(loc => ReferenceHit(loc, Role.Reference, fromOverlay = true))
 
     ReferencesResult(
       dedupeAndSort(indexHits ++ overlayHits),
       needsReindex = cursor.needsReindex
     )
+
+  /** The raw semantic symbols of the cursor's alias (ref) group, for the
+    * group-keyed overlay fan-out. Always includes the cursor's own symbol, and
+    * falls back to just that when the group is not in the current snapshot
+    * (e.g. a fresh RawSemanticDBPath symbol).
+    */
+  private def overlayGroupSymbols(cursor: CursorSymbol): Vector[String] =
+    val fromGroup: Vector[String] =
+      orchestrator.snapshots
+        .withCurrent { snap =>
+          snap
+            .symbolOrdOf(cursor.encodedSymbol)
+            .flatMap(snap.refGroupOf)
+            .map(g => snap.refGroupSymbols(g).map(s => SymbolEncoding.decode(s)._1))
+            .getOrElse(Vector.empty)
+        }
+        .getOrElse(Vector.empty)
+    (cursor.semanticSymbol +: fromGroup).distinct
 
   private def snapshotHits(
       snap: PostingsSnapshot,

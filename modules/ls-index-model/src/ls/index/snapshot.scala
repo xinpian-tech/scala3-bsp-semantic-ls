@@ -58,6 +58,8 @@ trait IndexSnapshot:
   def semanticSymbolOf(sym: SymbolOrd): String
   def symbolOrdOf(semanticSymbol: String): Option[SymbolOrd]
   def refGroupOf(sym: SymbolOrd): Option[RefGroupOrd]
+  /** The member symbol strings of a ref group (for a group-keyed overlay fan-out). */
+  def refGroupSymbols(group: RefGroupOrd): Vector[String]
   def renameGroupOf(sym: SymbolOrd): Option[RenameGroupOrd]
   /** Target that defines the symbol, when known in this snapshot. */
   def definitionTargetOf(sym: SymbolOrd): Option[TargetOrd]

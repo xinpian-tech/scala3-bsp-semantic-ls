@@ -123,6 +123,17 @@ final class SegmentReader private (
   def renameGroupOrdOf(symbolOrd: Int): Int = symIdx.get(LeInt, symEntryOff(symbolOrd) + 20)
   def defTargetOrdOf(symbolOrd: Int): Int = symIdx.get(LeInt, symEntryOff(symbolOrd) + 24)
 
+  /** The member symbol strings of ref group `groupOrd`, in ordinal order. Used
+    * to fan a group-keyed dirty-buffer overlay query across every alias.
+    */
+  def refGroupSymbols(groupOrd: Int): Vector[String] =
+    val out = Vector.newBuilder[String]
+    var s = 0
+    while s < symbolCount do
+      if refGroupOrdOf(s) == groupOrd then out += semanticSymbolOf(s)
+      s += 1
+    out.result()
+
   /** Binary search over the UTF-8-sorted on-disk symbol dictionary. Returns
     * the symbol ordinal or -1. No strings are materialized.
     */

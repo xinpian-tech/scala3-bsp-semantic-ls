@@ -145,6 +145,9 @@ final class PostingsSnapshot private[postings] (val reader: SegmentReader) exten
     val g = reader.refGroupOrdOf(sym.ord)
     if g < 0 then None else Some(RefGroupOrd(g))
 
+  override def refGroupSymbols(group: RefGroupOrd): Vector[String] =
+    reader.refGroupSymbols(group.ord)
+
   override def renameGroupOf(sym: SymbolOrd): Option[RenameGroupOrd] =
     val g = reader.renameGroupOrdOf(sym.ord)
     if g < 0 then None else Some(RenameGroupOrd(g))
