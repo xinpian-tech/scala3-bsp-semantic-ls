@@ -10,7 +10,7 @@ package ls.sqlite
   */
 object Schema:
 
-  val Version = 1
+  val Version = 2
 
   private[sqlite] val tables: List[String] = List(
     // 7.1 targets
@@ -109,6 +109,21 @@ object Schema:
       |)""".stripMargin
   )
 
+  /** Schema v2 (plan §11 fuzzy workspace-symbol): a sidecar holding, per
+    * `workspace_symbol_rows.rowid`, the normalized display name and its
+    * camel-hump initials for the bounded fuzzy candidate pull. `IF NOT EXISTS`
+    * so it is safe in both the fresh-create path and the v1→v2 migration.
+    */
+  private[sqlite] val fuzzyDdl: List[String] = List(
+    """CREATE TABLE IF NOT EXISTS workspace_symbol_fuzzy (
+      |  rowid            INTEGER PRIMARY KEY,
+      |  normalized_name  TEXT NOT NULL,
+      |  initials         TEXT NOT NULL
+      |)""".stripMargin,
+    "CREATE INDEX IF NOT EXISTS idx_workspace_symbol_fuzzy_normalized ON workspace_symbol_fuzzy(normalized_name)",
+    "CREATE INDEX IF NOT EXISTS idx_workspace_symbol_fuzzy_initials ON workspace_symbol_fuzzy(initials)"
+  )
+
   private[sqlite] val indexes: List[String] = List(
     "CREATE INDEX idx_documents_uri ON documents(uri)",
     // The table-level UNIQUE treats NULL local_doc_id values as distinct
@@ -124,8 +139,9 @@ object Schema:
   def userVersion(db: Db): Int =
     db.prepare("PRAGMA user_version").queryOne(_.columnInt(0)).getOrElse(0)
 
-  /** Creates schema v1 if the database is fresh; no-op when already at v1;
-    * refuses databases written by a newer (or unknown) schema. Idempotent.
+  /** Creates the current schema if the database is fresh, migrates a v1
+    * database to v2, no-ops when already current, and refuses databases written
+    * by a newer (or unknown) schema. Idempotent.
     */
   def ensureSchema(db: Db): Unit =
     userVersion(db) match
@@ -133,6 +149,12 @@ object Schema:
         db.withWriteTransaction {
           tables.foreach(db.exec)
           indexes.foreach(db.exec)
+          fuzzyDdl.foreach(db.exec)
+          db.exec(s"PRAGMA user_version=$Version")
+        }
+      case 1 =>
+        db.withWriteTransaction {
+          migrateV1ToV2(db)
           db.exec(s"PRAGMA user_version=$Version")
         }
       case Version => ()
@@ -140,3 +162,29 @@ object Schema:
         throw IllegalStateException(
           s"database ${db.path} has schema version $other; this build only supports version $Version"
         )
+
+  /** v1 -> v2: add the fuzzy sidecar and backfill it from the existing
+    * workspace-symbol rows (normalized name + camel-hump initials of each
+    * document's `display_name`). Runs inside the caller's write transaction, so
+    * an interrupted migration rolls back rather than leaving a partial sidecar.
+    */
+  private def migrateV1ToV2(db: Db): Unit =
+    fuzzyDdl.foreach(db.exec)
+    val rows = db
+      .prepare(
+        """SELECT r.rowid, m.display_name
+          |FROM workspace_symbol_rows r
+          |LEFT JOIN symbol_metadata m
+          |  ON m.symbol_id = r.symbol_id AND m.target_id = r.target_id AND m.doc_id = r.doc_id""".stripMargin
+      )
+      .queryAll(st => (st.columnLong(0), st.columnTextOpt(1).getOrElse("")))
+    val insert = db.prepare(
+      "INSERT INTO workspace_symbol_fuzzy (rowid, normalized_name, initials) VALUES (?, ?, ?)"
+    )
+    rows.foreach { (rowid, name) =>
+      insert
+        .bindLong(1, rowid)
+        .bindText(2, FuzzyRank.normalize(name))
+        .bindText(3, FuzzyRank.initials(name))
+        .run()
+    }

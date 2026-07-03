@@ -111,6 +111,14 @@ final class MetaStore(val db: Db) extends AutoCloseable:
     */
   val readers: ReaderPool = ReaderPool.open(db.path, db.sqlite, ReaderPool.DefaultSize)
 
+  private val lastFuzzyCandidateCountRef = new java.util.concurrent.atomic.AtomicInteger(0)
+
+  /** Observable test seam: how many candidates the most recent fuzzy fallback
+    * pulled (never exceeds [[MetaStore.FuzzyCandidateCap]]). Proves the bounded
+    * pull; unused in production.
+    */
+  private[sqlite] def lastFuzzyCandidateCount: Int = lastFuzzyCandidateCountRef.get
+
   def close(): Unit =
     readers.close()
     db.close()
@@ -491,7 +499,11 @@ final class MetaStore(val db: Db) extends AutoCloseable:
         .bindLong(1, docId.value)
         .queryAll(_.columnLong(0))
       val deleteFts = db.prepare("DELETE FROM workspace_symbols_fts WHERE rowid = ?")
-      oldRowids.foreach(rowid => deleteFts.bindLong(1, rowid).run())
+      val deleteFuzzy = db.prepare("DELETE FROM workspace_symbol_fuzzy WHERE rowid = ?")
+      oldRowids.foreach { rowid =>
+        deleteFts.bindLong(1, rowid).run()
+        deleteFuzzy.bindLong(1, rowid).run()
+      }
       db.prepare("DELETE FROM workspace_symbol_rows WHERE doc_id = ?")
         .bindLong(1, docId.value)
         .run()
@@ -500,6 +512,9 @@ final class MetaStore(val db: Db) extends AutoCloseable:
       )
       val insertFts = db.prepare(
         "INSERT INTO workspace_symbols_fts (rowid, display_name, owner_name, package_name) VALUES (?, ?, ?, ?)"
+      )
+      val insertFuzzy = db.prepare(
+        "INSERT INTO workspace_symbol_fuzzy (rowid, normalized_name, initials) VALUES (?, ?, ?)"
       )
       rows.foreach { r =>
         insertRow
@@ -515,6 +530,11 @@ final class MetaStore(val db: Db) extends AutoCloseable:
           .bindTextOpt(3, r.ownerName)
           .bindTextOpt(4, r.packageName)
           .run()
+        insertFuzzy
+          .bindLong(1, rowid)
+          .bindText(2, FuzzyRank.normalize(r.displayName))
+          .bindText(3, FuzzyRank.initials(r.displayName))
+          .run()
       }
     }
 
@@ -524,41 +544,94 @@ final class MetaStore(val db: Db) extends AutoCloseable:
   def workspaceSymbolSearch(query: String, limit: Int): Vector[WorkspaceSymbolHit] =
     readers.withReader(conn => workspaceSymbolSearchOn(conn, query, limit))
 
-  /** FTS5 prefix search: each whitespace-separated token is quoted and
-    * suffixed `*`, tokens are AND-ed, results come back in bm25 order.
-    * Names are joined from symbol_metadata (the FTS table is contentless).
+  /** FTS5 prefix search followed by a bounded camel-hump/subsequence fuzzy
+    * fallback (plan §11). The FTS prefix path is primary and always ordered
+    * first; only when it under-fills `limit` for a single-token query does the
+    * fuzzy fallback run — a bounded candidate pull (cap
+    * [[MetaStore.FuzzyCandidateCap]]) ranked in memory by [[FuzzyRank]], whose
+    * hits not already returned by FTS are appended until `limit`. FTS5 trigram
+    * is deliberately not used.
     */
   private def workspaceSymbolSearchOn(conn: Db, query: String, limit: Int): Vector[WorkspaceSymbolHit] =
     val tokens = query.trim.split("\\s+").toVector.filter(_.nonEmpty)
     if tokens.isEmpty || limit <= 0 then Vector.empty
     else
-      val matchExpr = tokens
-        .map(t => "\"" + t.replace("\"", "\"\"") + "\"*")
-        .mkString(" ")
-      conn.prepare(
-        """SELECT r.symbol_id, m.display_name, m.owner_name, m.package_name,
-          |       r.kind, r.doc_id, r.target_id
-          |FROM workspace_symbols_fts
-          |JOIN workspace_symbol_rows r ON r.rowid = workspace_symbols_fts.rowid
-          |LEFT JOIN symbol_metadata m
-          |  ON m.symbol_id = r.symbol_id AND m.target_id = r.target_id AND m.doc_id = r.doc_id
-          |WHERE workspace_symbols_fts MATCH ?
-          |ORDER BY bm25(workspace_symbols_fts)
-          |LIMIT ?""".stripMargin
-      )
-        .bindText(1, matchExpr)
-        .bindInt(2, limit)
-        .queryAll { st =>
-          WorkspaceSymbolHit(
-            symbolId = SymbolId(st.columnLong(0)),
-            displayName = st.columnTextOpt(1).getOrElse(""),
-            ownerName = st.columnTextOpt(2),
-            packageName = st.columnTextOpt(3),
-            kind = SymKind.fromCode(st.columnInt(4)),
-            docId = DocId(st.columnLong(5)),
-            targetId = TargetId(st.columnLong(6))
-          )
-        }
+      val ftsHits = ftsSearch(conn, tokens, limit)
+      // Fuzzy fallback only for a single identifier token that FTS under-filled;
+      // multi-token queries stay FTS-only so package/qualifier queries are exact.
+      if ftsHits.size >= limit || tokens.size != 1 then ftsHits.take(limit)
+      else
+        val term = tokens.head
+        val nq = FuzzyRank.normalize(term)
+        if nq.isEmpty then ftsHits
+        else
+          val seen = ftsHits.map(identityKey).toSet
+          val candidates = fuzzyCandidates(conn, nq)
+          lastFuzzyCandidateCountRef.set(candidates.size)
+          val extra = candidates
+            .flatMap((rowid, hit) => FuzzyRank.score(term, hit.displayName).map(s => (s, rowid, hit)))
+            .filterNot((_, _, hit) => seen.contains(identityKey(hit)))
+            .sortBy((s, rowid, _) => (-s, rowid))
+            .map((_, _, hit) => hit)
+          (ftsHits ++ extra).take(limit)
+
+  private def identityKey(h: WorkspaceSymbolHit): (Long, Long, Long) =
+    (h.symbolId.value, h.docId.value, h.targetId.value)
+
+  private def ftsSearch(conn: Db, tokens: Vector[String], limit: Int): Vector[WorkspaceSymbolHit] =
+    val matchExpr = tokens
+      .map(t => "\"" + t.replace("\"", "\"\"") + "\"*")
+      .mkString(" ")
+    conn.prepare(
+      """SELECT r.symbol_id, m.display_name, m.owner_name, m.package_name,
+        |       r.kind, r.doc_id, r.target_id
+        |FROM workspace_symbols_fts
+        |JOIN workspace_symbol_rows r ON r.rowid = workspace_symbols_fts.rowid
+        |LEFT JOIN symbol_metadata m
+        |  ON m.symbol_id = r.symbol_id AND m.target_id = r.target_id AND m.doc_id = r.doc_id
+        |WHERE workspace_symbols_fts MATCH ?
+        |ORDER BY bm25(workspace_symbols_fts)
+        |LIMIT ?""".stripMargin
+    )
+      .bindText(1, matchExpr)
+      .bindInt(2, limit)
+      .queryAll(readHit)
+
+  /** Bounded fuzzy candidate pull: sidecar rows whose normalized name or
+    * initials start with the query's first character, capped at
+    * [[MetaStore.FuzzyCandidateCap]] so a large corpus never triggers an
+    * unbounded scan. Returns each candidate's rowid (for a stable tie-break)
+    * plus its hit.
+    */
+  private def fuzzyCandidates(conn: Db, nq: String): Vector[(Long, WorkspaceSymbolHit)] =
+    val prefix = nq.charAt(0).toString + "%"
+    conn.prepare(
+      """SELECT f.rowid, r.symbol_id, m.display_name, m.owner_name, m.package_name,
+        |       r.kind, r.doc_id, r.target_id
+        |FROM workspace_symbol_fuzzy f
+        |JOIN workspace_symbol_rows r ON r.rowid = f.rowid
+        |LEFT JOIN symbol_metadata m
+        |  ON m.symbol_id = r.symbol_id AND m.target_id = r.target_id AND m.doc_id = r.doc_id
+        |WHERE f.normalized_name LIKE ? OR f.initials LIKE ?
+        |LIMIT ?""".stripMargin
+    )
+      .bindText(1, prefix)
+      .bindText(2, prefix)
+      .bindInt(3, MetaStore.FuzzyCandidateCap)
+      .queryAll(st => (st.columnLong(0), readHit(st, base = 1)))
+
+  private def readHit(st: Statement): WorkspaceSymbolHit = readHit(st, base = 0)
+
+  private def readHit(st: Statement, base: Int): WorkspaceSymbolHit =
+    WorkspaceSymbolHit(
+      symbolId = SymbolId(st.columnLong(base + 0)),
+      displayName = st.columnTextOpt(base + 1).getOrElse(""),
+      ownerName = st.columnTextOpt(base + 2),
+      packageName = st.columnTextOpt(base + 3),
+      kind = SymKind.fromCode(st.columnInt(base + 4)),
+      docId = DocId(st.columnLong(base + 5)),
+      targetId = TargetId(st.columnLong(base + 6))
+    )
 
   // --- segment manifest ---
 
@@ -626,6 +699,12 @@ final class MetaStore(val db: Db) extends AutoCloseable:
 object MetaStore:
   /** Default `-wal` size above which a fully-checkpointed WAL is truncated. */
   val DefaultWalThresholdBytes: Long = 16L * 1024 * 1024
+
+  /** Upper bound on the fuzzy candidate pull (plan §11): a large corpus never
+    * triggers an unbounded scan; the in-memory ranker only ever sees this many
+    * rows.
+    */
+  val FuzzyCandidateCap: Int = 5000
 
   /** Opens (creating and migrating if needed) the metadata store at `path`. */
   def open(path: Path): MetaStore =

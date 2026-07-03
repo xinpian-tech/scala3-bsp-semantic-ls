@@ -315,6 +315,76 @@ class MetaStoreSuite extends munit.FunSuite with TempDbFixture:
     finally store.close()
   }
 
+  tempDir.test("camel-hump fuzzy fallback ranks the hump-aligned match first (FTS underfill)") { dir =>
+    val store = open(dir)
+    try
+      val target = newTarget(store)
+      val (doc, _) = store.upsertDocument(target, "file:///ws/Fuzzy.scala", "/sdb/Fuzzy", 1L, "m", false, false)
+      val (wsSym, wsWs, wsMeta) =
+        indexSymbol(store, target, doc, 1L, "a/workspaceSymbol#", "workspaceSymbol", None, None, SymKind.Class)
+      val (whSym, whWs, whMeta) =
+        indexSymbol(store, target, doc, 1L, "a/whimsy#", "whimsy", None, None, SymKind.Class)
+      store.replaceSymbolMetadata(doc, Seq(wsMeta, whMeta))
+      store.replaceWorkspaceSymbols(doc, Seq(wsWs, whWs))
+
+      // FTS prefix cannot match the camel-hump query "wSy"; the fuzzy fallback
+      // finds both and ranks hump-aligned workspaceSymbol above plain whimsy.
+      assertEquals(store.workspaceSymbolSearch("wSy", 10).map(_.symbolId), Vector(wsSym, whSym))
+      // exact/prefix stays the primary FTS path
+      assertEquals(store.workspaceSymbolSearch("workspace", 10).map(_.symbolId), Vector(wsSym))
+    finally store.close()
+  }
+
+  tempDir.test("MetaStore.open migrates a pre-populated v1 database and fuzzy search then works") { dir =>
+    val path = dir.resolve("meta.sqlite")
+    // Hand-build a schema-v1 database with one workspace-symbol row (no sidecar).
+    val v1 = Db.open(path)
+    try
+      v1.withWriteTransaction {
+        Schema.tables.foreach(v1.exec)
+        Schema.indexes.foreach(v1.exec)
+        v1.exec("PRAGMA user_version=1")
+      }
+      v1.exec(
+        "INSERT INTO symbol_metadata (symbol_id, target_id, doc_id, display_name, kind, properties) VALUES (5, 1, 1, 'workspaceSymbol', 0, 0)"
+      )
+      v1.exec(
+        "INSERT INTO workspace_symbol_rows (rowid, symbol_id, target_id, doc_id, kind) VALUES (1, 5, 1, 1, 0)"
+      )
+    finally v1.close()
+
+    val store = MetaStore.open(path) // triggers the v1 -> v2 migration + backfill
+    try
+      assertEquals(Schema.userVersion(store.db), 2)
+      assertEquals(store.workspaceSymbolSearch("wSy", 10).map(_.symbolId), Vector(SymbolId(5)))
+    finally store.close()
+  }
+
+  tempDir.test("fuzzy fallback pulls a bounded candidate set (cap 5000) on a large corpus") { dir =>
+    val store = open(dir)
+    try
+      val n = MetaStore.FuzzyCandidateCap + 500 // more sidecar rows than the cap
+      store.db.withWriteTransaction {
+        val insRow = store.db.prepare(
+          "INSERT INTO workspace_symbol_rows (rowid, symbol_id, target_id, doc_id, kind) VALUES (?, ?, 1, 1, 0)"
+        )
+        val insFz = store.db.prepare(
+          "INSERT INTO workspace_symbol_fuzzy (rowid, normalized_name, initials) VALUES (?, ?, ?)"
+        )
+        var i = 1
+        while i <= n do
+          insRow.bindLong(1, i.toLong).bindLong(2, i.toLong).run()
+          insFz.bindLong(1, i.toLong).bindText(2, s"zeta$i").bindText(3, "z").run()
+          i += 1
+      }
+      // "zq" prefix-matches nothing in FTS, forcing the fuzzy fallback; every
+      // sidecar row shares the first character 'z', so the pull is capped.
+      val hits = store.workspaceSymbolSearch("zq", 10)
+      assert(hits.length <= 10, hits.length.toString)
+      assertEquals(store.lastFuzzyCandidateCount, MetaStore.FuzzyCandidateCap)
+    finally store.close()
+  }
+
   tempDir.test("replaceWorkspaceSymbols drops a document's old FTS entries") { dir =>
     val store = open(dir)
     try
