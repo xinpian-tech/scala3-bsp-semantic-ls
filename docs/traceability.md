@@ -83,6 +83,68 @@ fuzzy, PC completion + plugin overhead, FFM call overhead, occurrence-set
 preservation) is asserted by `BenchSuite` with a generator-vs-index ground-truth
 consistency check (mismatch → non-zero exit).
 
+## Case map (machine-checkable)
+
+`scripts/check-docs.sh` parses every `` `<TestClass>` :: "<case substring>" `` line
+below and FAILS if the substring is not present in that class's `.scala` test file
+(so a typo, or a renamed/removed test, breaks the gate). Each substring is an exact
+fragment of a real `test("…")` name.
+
+### Plan §13.1 rename-safety rules
+- `RenameSuite` :: "external library symbol is rejected as outside the workspace"
+- `RenameSuite` :: "occurrences in generated sources are rejected"
+- `RenameSuite` :: "occurrences in readonly sources are rejected"
+- `RenameSuite` :: "override family is rejected"
+- `RenameSuite` :: "synthetic-only symbol is rejected with the synthetic-only reason"
+- `RenameSuite` :: "PC-only symbols are rejected"
+- `RenameMutationSuite` :: "shared-source disagreement between targets is rejected"
+- `RenameSuite` :: "exported symbol is rejected with the exported-symbol reason"
+- `RenameSuite` :: "dependency sources are rejected"
+- `RenameSuite` :: "rename of an opaque type is rejected (conservative policy)"
+- `RenameSuite` :: "compile failure rejects the rename"
+- `RenameMutationSuite` :: "stale md5: source edited after compile is rejected before emitting edits"
+
+### Plan §18.1 correctness cases
+- `ReferencesAndQuerySuite` :: "inline def references are exactly the definition and both call sites"
+- `ReferencesAndQuerySuite` :: "export forwarder references are exactly the definition and the forwarder call"
+- `ReferencesAndQuerySuite` :: "case-class copy references resolve to the copy symbol call site only"
+- `ReferencesAndQuerySuite` :: "private member references are exactly the in-file definition and uses"
+- `ReferencesAndQuerySuite` :: "local val references stay inside the document"
+- `ReferencesAndQuerySuite` :: "cross-file val member references are exactly the definition and cross-file use"
+- `ReferencesAndQuerySuite` :: "var getter, setter, and definition references are exactly all value tokens"
+- `ReferencesAndQuerySuite` :: "given references are exactly the by-name uses including the using-clause site"
+- `ReferencesAndQuerySuite` :: "top-level def and val references are exactly their definitions and cross-file uses"
+- `ReferencesAndQuerySuite` :: "opaque type references are exactly the type, companion, and all in-file uses"
+- `ReferencesAndQuerySuite` :: "extension method references are exactly the definition and both call sites"
+- `ScalacIntegrationSuite` :: "derives clause: the case class is defined and the derived given is synthetic-only"
+- `RenameMutationSuite` :: "fresh-snapshot stale index: the cursor document itself is edited after compile"
+- `BootstrapRecoverySuite` :: "a manifest pointing at a deleted segment degrades gracefully and heals on the next ingest"
+
+### Plan §18.3 benchmark rows
+- `BenchSuite` :: "tiny run renders the report and passes all consistency checks"
+- `BenchSuite` :: "ingest tiers are sized by document count (1000 smoke, 10000/100000 full)"
+- `BenchSuite` :: "a ground-truth mismatch makes the bench exit non-zero"
+- `BenchSuite` :: "a real occurrence-set mismatch trips the ingest gate (not a bare check)"
+- `BenchSuite` :: "--jfr uses a named preset and records JVM events; default preset is 'default'"
+
+### AC-16 real-BSP E-rows
+- `RealBspCoreTest` :: "E1 doctor: module c (no -Xsemanticdb) is flagged as a SemanticDB error"
+- `RealBspCoreTest` :: "E1 SemanticDB is mandatory: completion on module c is a hard error (no PC fallback)"
+- `RealBspCoreTest` :: "E1 SemanticDB is mandatory: documentHighlight on module c is a hard error (not empty)"
+- `RealBspCoreTest` :: "E4a rename on a source without SemanticDB (module c) is a hard error"
+- `RealBspCoreTest` :: "E4b rename of an external/library symbol is rejected (outside the workspace)"
+- `RealBspCoreTest` :: "E4c rename at a position with no symbol occurrence is rejected"
+- `RealBspCoreTest` :: "E5 hover (PC) answers on an indexed module"
+- `RealBspCoreTest` :: "E5 signatureHelp (PC) answers at a constructor call site"
+- `RealBspCoreTest` :: "E5 definition (PC) resolves a same-file reference to its declaration"
+- `RealBspCoreTest` :: "E5 documentHighlight (index) returns the in-file occurrences of a symbol"
+- `RealBspLifecycleTest` :: "E2 a real compile error is forwarded as an Error diagnostic; the fix clears it"
+- `RealBspLifecycleTest` :: "E3 didSave -> compile -> reingest reflects new token positions with no explicit reindex"
+- `RealBspLifecycleTest` :: "E6 a source shared across two targets unifies references and passes rename consistency"
+- `RealBspLifecycleTest` :: "E8 repeated saves keep one segment dir; a warm restart serves references from recovery"
+- `RealBspIsolationTest` :: "E7 forked PC over real BSP survives a worker kill"
+- `RealBspIsolationTest` :: "E9 an AOT-trained boot loads the cache and stays queryable"
+
 ## Accepted plan evolutions (recorded here; `rlcr.md` unmodified)
 
 - **SemanticDB is mandatory (supersedes the graceful `IndexUnavailable` state).**

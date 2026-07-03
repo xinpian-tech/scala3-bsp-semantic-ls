@@ -37,6 +37,24 @@ while IFS= read -r p; do
   [ -e "$p" ] || err "traceability names path '${p}' but it does not exist"
 done < <(grep -oE '(modules|scripts|docs|nix|it|\.github)/[A-Za-z0-9_./-]+\.[A-Za-z0-9]+' "$trace" | sort -u)
 
+# (2b) Case map: every `Class` :: "case substring" entry must resolve to a test
+#      whose file actually contains that substring — so a renamed/removed/typo'd
+#      test case breaks the gate (not just a wrong class name).
+mapped=0
+while IFS= read -r line; do
+  cls=$(printf '%s\n' "$line" | sed -nE 's/.*`([A-Za-z0-9]+)` :: ".*/\1/p')
+  cse=$(printf '%s\n' "$line" | sed -nE 's/.*:: "(.+)".*/\1/p')
+  [ -n "$cls" ] && [ -n "$cse" ] || continue
+  mapped=$((mapped + 1))
+  f=$(grep -rlE "(class|object) ${cls}\b" modules/*/test/src --include='*.scala' | head -1)
+  if [ -z "$f" ]; then
+    err "case map: test class '${cls}' not found"
+  elif ! grep -Fq -- "$cse" "$f"; then
+    err "case map: case \"${cse}\" not found in ${cls} (${f})"
+  fi
+done < <(grep -E '`[A-Za-z0-9]+` :: "' "$trace")
+[ "$mapped" -ge 30 ] || err "case map has only ${mapped} entries; expected the rename-rule / correctness-case / benchmark / real-BSP E-row map"
+
 # (3) Stale/false claims that F1 must purge. Grep everything under docs/ EXCEPT
 #     traceability.md itself (which documents the evolution old->new by design).
 stale() { # <extended-regex> <why>
