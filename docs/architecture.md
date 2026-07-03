@@ -554,18 +554,18 @@ that scalac emits them only in the skipped synthetics payload (plan 4.3).
 
 | plan §18.1 case | test(s) |
 |-----------------|---------|
-| export forwarder | `ScalacIntegrationSuite` export-shape/ref-group/rename-group cases; `ReferencesAndQuerySuite` "references through an export forwarder are found"; `RenameSuite` "rename of an exported symbol is rejected with the exported-symbol reason" |
+| export forwarder | `ScalacIntegrationSuite` export-shape/ref-group/rename-group cases; `ReferencesAndQuerySuite` "export forwarder references are exactly the definition and the forwarder call"; `RenameSuite` "rename of an exported symbol is rejected with the exported-symbol reason" |
 | inline def | `ReferencesAndQuerySuite` "inline def references are exactly the definition and both call sites"; `RenameSuite` "rename an inline def edits its definition and every call site across targets" |
-| macro-generated (case-class copy) | `ScalacIntegrationSuite` "synthetic-only case-class copy…"; `RenameSuite` "synthetic-only symbol is rejected with the synthetic-only reason" |
+| macro-generated (case-class copy) | `ScalacIntegrationSuite` "synthetic-only case-class copy…"; `ReferencesAndQuerySuite` "case-class copy references resolve to the copy symbol call site only"; `RenameSuite` "synthetic-only symbol is rejected with the synthetic-only reason" |
 | macro-generated (`derives`) | `ScalacIntegrationSuite` "derives clause: the case class is defined and the derived given is synthetic-only" (characterization: the derived given is emitted only in the skipped synthetics payload, plan 4.3) |
 | private member | `ReferencesAndQuerySuite` "private member references are exactly the in-file definition and uses"; `RenameSuite` "rename a private method/val edits its definition and in-file uses only" |
 | local val / local def | `ReferencesAndQuerySuite` "local val…" / "nested local def references stay inside the document"; `RenameSuite` "rename local val touches only its document" / "rename a nested local def touches only its document" |
 | val member getter | `ReferencesAndQuerySuite` "cross-file val member references are exactly the definition and cross-file use"; `RenameSuite` "rename a val member edits its definition and cross-file uses" |
-| var getter/setter | `ReferencesAndQuerySuite` "var getter and setter are unified"; `RenameSuite` "rename var renames getter, setter site and definition together" |
-| given / using | `ReferencesAndQuerySuite` "given references are exactly the by-name uses including the using-clause site" |
+| var getter/setter | `ReferencesAndQuerySuite` "var getter, setter, and definition references are exactly all value tokens"; `RenameSuite` "rename var renames getter, setter site and definition together" |
+| given / using | `ReferencesAndQuerySuite` "given references are exactly the by-name uses including the using-clause site"; `RenameSuite` "rename a given edits its definition and every by-name use across files and targets" |
 | top-level def/val | `ReferencesAndQuerySuite` "top-level def and val references are exactly their definitions and cross-file uses"; `RenameSuite` "rename a top-level def/val edits its definition and cross-file uses" |
 | opaque type | `ReferencesAndQuerySuite` "opaque type references are exactly the type, companion, and all in-file uses"; `ScalacIntegrationSuite` "opaque type carries the Opaque property and its rename group is flagged unsafe"; `RenameSuite` "rename of an opaque type is rejected (conservative policy)" |
-| extension method | `ReferencesAndQuerySuite` "extension method references cross targets"; `RenameSuite` "rename an extension method edits its definition and call sites across targets" |
+| extension method | `ReferencesAndQuerySuite` "extension method references are exactly the definition and both call sites"; `RenameSuite` "rename an extension method edits its definition and call sites across targets" |
 | external symbol reject | `RenameSuite` "rename of an external library symbol is rejected as outside the workspace" |
 | fresh-snapshot stale index | `RenameMutationSuite` "fresh-snapshot stale index: the cursor document itself is edited after compile" |
 | manifest → missing segment recovery | `BootstrapRecoverySuite` "a manifest pointing at a deleted segment degrades gracefully and heals on the next ingest" |

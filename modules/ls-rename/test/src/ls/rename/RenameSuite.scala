@@ -197,6 +197,19 @@ class RenameSuite extends munit.FunSuite:
       Set("a/src/pkga/Core.scala", "a/src/pkga/Impl.scala", "b/src/pkgb/UseB.scala")
     )
 
+  test("rename a given edits its definition and every by-name use across files and targets"):
+    val plan = rename("a/src/pkga/Core.scala", "defaultCore", 0, "appDefault")
+    val files = Vector(
+      "a/src/pkga/Core.scala",
+      "a/src/pkga/Impl.scala",
+      "a/src/pkga/Using.scala",
+      "b/src/pkgb/UseB.scala"
+    )
+    for uri <- files do
+      assertEquals(spanSet(plan, uri), fx.tokenSpans(uri, "defaultCore").toSet, s"$uri: $plan")
+    assertEquals(plan.edits.keySet, files.toSet)
+    assert(plan.edits.values.flatten.forall(_.newText == "appDefault"), plan.toString)
+
   test("keyword new name is backtick-quoted"):
     val plan = rename("a/src/pkga/Vars.scala", "tmp", 0, "type")
     assert(plan.edits("a/src/pkga/Vars.scala").forall(_.newText == "`type`"), plan.toString)

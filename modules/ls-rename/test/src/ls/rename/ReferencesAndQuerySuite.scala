@@ -105,22 +105,43 @@ class ReferencesAndQuerySuite extends munit.FunSuite:
     assert(!locs.contains(Loc("a/src/pkga/Over.scala", fmtSpans(1))), "other overload def")
     assert(!locs.contains(Loc("a/src/pkga/Over.scala", fmtSpans(3))), "fmt(\"x\") call")
 
-  test("references through an export forwarder are found"):
-    // cursor on the OriginalOwner.exported definition; references must include
-    // the ForwarderOwner.exported(3) forwarder call site (nth=2 whole-word
-    // "exported": 0=def, 1=export clause, 2=call)
-    val r = refs("a/src/pkga/Exported.scala", "exported", nth = 0)
-    assert(
-      containsToken(r, "a/src/pkga/Exported.scala", "exported", 2),
+  test("export forwarder references are exactly the definition and the forwarder call"):
+    // cursor on the OriginalOwner.exported definition; the group unifies the
+    // forwarder. The `exported` text tokens are 0=def, 1=export clause, 2=call,
+    // but the export clause emits an occurrence for the exported-from OBJECT
+    // (OriginalOwner), NOT for the method name, so the method's exact reference
+    // set is only the definition (0) and the ForwarderOwner.exported(3) call (2).
+    val r = refs("a/src/pkga/Exported.scala", "exported", nth = 0, includeDeclaration = true)
+    assertEquals(r.locations.map(_.uri).distinct, Vector("a/src/pkga/Exported.scala"))
+    assertEquals(
+      locsIn(r, "a/src/pkga/Exported.scala").map(_.span).toSet,
+      Set(
+        fx.tokenSpan("a/src/pkga/Exported.scala", "exported", 0), // definition
+        fx.tokenSpan("a/src/pkga/Exported.scala", "exported", 2) // forwarder call
+      ),
       r.locations.toString
     )
 
-  test("var getter and setter are unified"):
-    val r = refs("a/src/pkga/Vars.scala", "value", nth = 1) // read: c.value + 1
-    val spans = fx.tokenSpans("a/src/pkga/Vars.scala", "value")
-    val locs = locsIn(r, "a/src/pkga/Vars.scala")
-    assert(locs.exists(_.span == spans(1)), r.locations.toString) // read
-    assert(locs.exists(_.span.startLine == spans(2).startLine), r.locations.toString) // write via setter
+  test("case-class copy references resolve to the copy symbol call site only"):
+    // cursor on the `.copy` call: the synthesized copy has no definition
+    // occurrence (it lives in the skipped synthetics payload), so references are
+    // exactly the call-site token in this file.
+    val r = refs("a/src/pkga/Copyable.scala", "copy", nth = 0, includeDeclaration = true)
+    assertEquals(r.locations.map(_.uri).distinct, Vector("a/src/pkga/Copyable.scala"))
+    assertEquals(
+      locsIn(r, "a/src/pkga/Copyable.scala").map(_.span).toSet,
+      fx.tokenSpans("a/src/pkga/Copyable.scala", "copy").toSet,
+      r.locations.toString
+    )
+
+  test("var getter, setter, and definition references are exactly all value tokens"):
+    val r = refs("a/src/pkga/Vars.scala", "value", nth = 0, includeDeclaration = true)
+    assertEquals(r.locations.map(_.uri).distinct, Vector("a/src/pkga/Vars.scala"))
+    assertEquals(
+      locsIn(r, "a/src/pkga/Vars.scala").map(_.span).toSet,
+      fx.tokenSpans("a/src/pkga/Vars.scala", "value").toSet,
+      r.locations.toString
+    )
 
   test("local val references stay inside the document"):
     val r = refs("a/src/pkga/Vars.scala", "tmp", nth = 0, includeDeclaration = true)
@@ -132,10 +153,23 @@ class ReferencesAndQuerySuite extends munit.FunSuite:
     )
     assertEquals(r.locations.map(_.uri).distinct, Vector("a/src/pkga/Vars.scala"))
 
-  test("extension method references cross targets"):
-    val r = refs("a/src/pkga/Core.scala", "shout", nth = 0)
-    assert(containsToken(r, "a/src/pkga/Impl.scala", "shout", 0), r.locations.toString)
-    assert(containsToken(r, "b/src/pkgb/UseB.scala", "shout", 0), r.locations.toString)
+  test("extension method references are exactly the definition and both call sites"):
+    val r = refs("a/src/pkga/Core.scala", "shout", nth = 0, includeDeclaration = true)
+    for (uri, tok) <- Vector(
+        "a/src/pkga/Core.scala" -> "shout",
+        "a/src/pkga/Impl.scala" -> "shout",
+        "b/src/pkgb/UseB.scala" -> "shout"
+      )
+    do
+      assertEquals(
+        locsIn(r, uri).map(_.span).toSet,
+        fx.tokenSpans(uri, tok).toSet,
+        s"$uri: ${r.locations}"
+      )
+    assertEquals(
+      r.locations.map(_.uri).toSet,
+      Set("a/src/pkga/Core.scala", "a/src/pkga/Impl.scala", "b/src/pkgb/UseB.scala")
+    )
 
   test("given references by name"):
     val r = refs("a/src/pkga/Core.scala", "defaultCore", nth = 0)
