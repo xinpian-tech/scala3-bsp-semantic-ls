@@ -387,9 +387,14 @@ final class ScalaLs(val config: ScalaLs.Config = ScalaLs.Config())
     state match
       case WorkspaceState.Ready(s) =>
         val uri = Uris.normalize(rawUri)
-        val indexable =
+        val indexableInModel =
           s.uriToTarget.get(uri).exists(bspId => s.workspaceTargets.targets.exists(_.bspId == bspId))
-        if !indexable then throw LsException(LsError.NoSemanticdb(uri))
+        // A source already present in the persisted index has SemanticDB even
+        // when the live BSP model has not (re)loaded its target — e.g. a warm
+        // restart with no BSP connection recovering the on-disk index.
+        def indexedOnDisk =
+          s.uris.toSdbUri(uri).exists(sdb => s.meta.documentsByUri(sdb).nonEmpty)
+        if !indexableInModel && !indexedOnDisk then throw LsException(LsError.NoSemanticdb(uri))
       case _ => ()
 
   private def log(message: String): Unit = config.bootstrap.log(message)

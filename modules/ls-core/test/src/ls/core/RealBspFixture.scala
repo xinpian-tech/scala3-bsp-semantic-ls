@@ -69,11 +69,23 @@ object RealBspFixture:
   /** A fresh temp copy of the sample workspace with the real mill build run in
     * it: `.bsp/mill-bsp.json` installed and `__.compile` green. Each call yields
     * an independent workspace so a mutating suite never disturbs another.
+    *
+    * `extraSources` (uri -> text) and `buildMill` (a full replacement for
+    * `build.mill`, or None to keep the sample's) let a suite extend the sample
+    * before the real build runs — e.g. adding a source shared by two targets.
     */
-  def freshWorkspace(): E2eFixture.Ws =
+  def freshWorkspace(
+      extraSources: Map[String, String] = Map.empty,
+      buildMill: Option[String] = None
+  ): E2eFixture.Ws =
     val sample = repoRoot.resolve("it").resolve("sample-workspace")
     val root = Files.createTempDirectory("ls-real-bsp-it-").toRealPath()
     copyTree(sample, root)
+    buildMill.foreach(text => Files.writeString(root.resolve("build.mill"), text))
+    for (uri, text) <- extraSources do
+      val p = root.resolve(uri)
+      Files.createDirectories(p.getParent)
+      Files.writeString(p, text)
     runMill(root, "mill.bsp.BSP/install")
     runMill(root, "__.compile")
     assert(
@@ -166,23 +178,32 @@ object RealBspFixture:
   * reindex that a real editor session goes through. Also exposes the recording
   * client's published diagnostics so lifecycle suites can await them.
   */
-final class RealBspServer(val ws: E2eFixture.Ws):
+final class RealBspServer(
+    val ws: E2eFixture.Ws,
+    expectedDocs: Int = 4,
+    withBsp: Boolean = true
+):
 
   val server: ScalaLs = new ScalaLs(
     ScalaLs.Config(
       bootstrap = Bootstrap.Config(
         // The production path: discover .bsp/mill-bsp.json and launch its argv
         // as a child process, only with test-friendly timeouts (a real mill BSP
-        // compile evaluates the whole build in .bsp/out).
-        connectBsp = (root, handlers) =>
-          BspDiscovery.pick(root).map(file =>
-            BspSession.launch(
-              root,
-              file.details,
-              handlers,
-              BspSessionConfig(requestTimeout = 300.seconds)
-            )
-          ),
+        // compile evaluates the whole build in .bsp/out). `withBsp = false` boots
+        // WITHOUT a BSP connection — a warm restart that must serve from the
+        // recovered persisted index alone.
+        connectBsp =
+          if withBsp then
+            (root, handlers) =>
+              BspDiscovery.pick(root).map(file =>
+                BspSession.launch(
+                  root,
+                  file.details,
+                  handlers,
+                  BspSessionConfig(requestTimeout = 300.seconds)
+                )
+              )
+          else (_, _) => None,
         pcRequestTimeoutMillis = 120000L,
         log = msg => System.err.println(s"[real-bsp-it] $msg")
       ),
@@ -234,10 +255,27 @@ final class RealBspServer(val ws: E2eFixture.Ws):
     val compileResult = executeCommand(ScalaLs.Commands.Compile)
     assert(compileResult.startsWith("compile ok"), s"real BSP compile failed: $compileResult")
     val reindexResult = executeCommand(ScalaLs.Commands.Reindex)
-    assert(reindexResult.contains("4 docs"), s"expected all 4 sample docs ingested: $reindexResult")
+    if expectedDocs >= 0 then
+      assert(
+        reindexResult.contains(s"$expectedDocs docs"),
+        s"expected $expectedDocs sample docs ingested: $reindexResult"
+      )
     reindexResult
 
   // --------------------------------------------------------------- helpers
+
+  /** The on-disk postings segments directory of the ready index. */
+  def segmentsDir: java.nio.file.Path =
+    server.currentState.ready.get.snapshots.segmentsDir
+
+  /** LSP shutdown + exit, releasing the SQLite storage under `ws` so a warm
+    * restart can open the same index. `exitProcessOnExit = false` keeps the JVM.
+    */
+  def shutdown(): Unit =
+    try
+      proxy.shutdown().get(60, TimeUnit.SECONDS)
+      proxy.exit()
+    catch case _: Exception => ()
 
   def docsService: org.eclipse.lsp4j.services.TextDocumentService = proxy.getTextDocumentService
   def wsService: org.eclipse.lsp4j.services.WorkspaceService = proxy.getWorkspaceService
