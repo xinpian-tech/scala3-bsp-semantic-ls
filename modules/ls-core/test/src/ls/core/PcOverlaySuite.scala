@@ -23,7 +23,9 @@ class PcOverlaySuite extends munit.FunSuite:
   private def rangeOf(span: Span): Range =
     new Range(new Position(span.startLine, span.startChar), new Position(span.endLine, span.endChar))
 
-  private def fixture(): (PcOverlay, DocumentStore, StubPc, String, String) =
+  private def fixture(
+      isIndexedName: String => Boolean = _ => true
+  ): (PcOverlay, DocumentStore, StubPc, String, String) =
     val dir = Files.createTempDirectory("ls-core-overlay")
     val file = dir.resolve("A.scala")
     Files.writeString(file, "class A\n")
@@ -32,7 +34,7 @@ class PcOverlaySuite extends munit.FunSuite:
     val docs = new DocumentStore
     val overlay = new PcOverlay(docs)
     val pc = new StubPc
-    overlay.install(pc, u => if u == sdbUri then Some(fileUri) else None)
+    overlay.install(pc, u => if u == sdbUri then Some(fileUri) else None, isIndexedName)
     (overlay, docs, pc, fileUri, sdbUri)
 
   test("nothing is dirty before install"):
@@ -172,3 +174,37 @@ class PcOverlaySuite extends munit.FunSuite:
   test("occurrencesOf contributes nothing in v1"):
     val (overlay, _, _, _, _) = fixture()
     assertEquals(overlay.occurrencesOf("pkg/A#"), None)
+
+  // --- PC-only workspace-symbol dirty-buffer overlay ---
+
+  test("a top-level symbol only in a dirty buffer surfaces PC-only"):
+    // NewThing is in the open buffer but not in the persisted index.
+    val (overlay, docs, pc, fileUri, sdbUri) = fixture(isIndexedName = _ => false)
+    pc.open = Set(fileUri)
+    docs.open(fileUri, "class A\nobject NewThing\n") // dirty: disk is "class A\n"
+    // workspace/symbol merge candidate: matched, name not indexed
+    val surfaced = overlay.pcOnlySymbols("NewThing")
+    assertEquals(surfaced.map(_.name), Vector("NewThing"))
+    assertEquals(surfaced.head.fileUri, fileUri)
+    assertEquals(surfaced.head.keyword, "object")
+    // references/rename cursor on the NewThing token -> PC-only hit (the engines
+    // refuse it with LsError.PcOnlySymbol).
+    val hit = overlay.symbolAt(sdbUri, 1, "object N".length)
+    assert(hit.exists(_.pcOnly), s"expected a PC-only hit, got $hit")
+
+  test("once the name is indexed (saved+ingested) it is no longer PC-only"):
+    // Same buffer, but the index now knows NewThing (post save + ingest).
+    val (overlay, docs, pc, fileUri, sdbUri) = fixture(isIndexedName = _ == "NewThing")
+    pc.open = Set(fileUri)
+    docs.open(fileUri, "class A\nobject NewThing\n")
+    assertEquals(overlay.pcOnlySymbols("NewThing"), Vector.empty)
+    val hit = overlay.symbolAt(sdbUri, 1, "object N".length)
+    assert(!hit.exists(_.pcOnly), s"indexed symbol must not be PC-only, got $hit")
+
+  test("a clean (saved) buffer contributes no PC-only symbols"):
+    // A symbol present in the persisted index (buffer equals disk) is never
+    // PC-only: pcOnlySymbols only scans dirty buffers.
+    val (overlay, docs, pc, fileUri, _) = fixture(isIndexedName = _ => false)
+    pc.open = Set(fileUri)
+    docs.open(fileUri, "class A\n") // equals disk -> not dirty
+    assertEquals(overlay.pcOnlySymbols("A"), Vector.empty)

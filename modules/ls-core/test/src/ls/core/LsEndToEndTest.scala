@@ -418,6 +418,39 @@ class LsEndToEndTest extends munit.FunSuite:
     val symbols = wsService.symbol(new WorkspaceSymbolParams("Core")).get(60, TimeUnit.SECONDS)
     assert(symbols.isRight && symbols.getRight.asScala.exists(_.getName == "Core"))
 
+  test("an unsaved top-level symbol surfaces PC-only and refuses references/rename"):
+    val _ = env.initResult
+    val uri = ws.fileUri(E2eFixture.useUri)
+    // add a brand-new top-level object the persisted index has never seen
+    val dirty = ws.sourceText(E2eFixture.useUri) + "\nobject NewThing:\n  val z = 1\n"
+    docsService.didOpen(new DidOpenTextDocumentParams(new TextDocumentItem(uri, "scala", 1, dirty)))
+
+    // workspace/symbol surfaces it, flagged PC-only, located in the dirty buffer
+    val symbols =
+      wsService.symbol(new WorkspaceSymbolParams("NewThing")).get(60, TimeUnit.SECONDS).getRight.asScala.toVector
+    val newThing = symbols.filter(_.getName == "NewThing")
+    assert(newThing.nonEmpty, symbols.map(_.getName).toString)
+    assertEquals(newThing.head.getContainerName, ScalaLs.PcOnlyContainer)
+    assertEquals(newThing.head.getLocation.getLeft.getUri, uri)
+
+    // references + rename on it are refused with LsError.PcOnlySymbol over the wire
+    val lines = dirty.linesIterator.toVector
+    val ntLine = lines.indexWhere(_.contains("object NewThing"))
+    val ntChar = lines(ntLine).indexOf("NewThing") + 1
+    val cursor = new Position(ntLine, ntChar)
+    val refErr = intercept[ExecutionException](
+      docsService
+        .references(new ReferenceParams(textDoc(E2eFixture.useUri), cursor, new ReferenceContext(true)))
+        .get(60, TimeUnit.SECONDS)
+    )
+    assert(refErr.getCause.getMessage.contains("PC-only"), refErr.getCause.getMessage)
+    val renErr = intercept[ExecutionException](
+      docsService
+        .rename(new RenameParams(textDoc(E2eFixture.useUri), cursor, "Renamed"))
+        .get(60, TimeUnit.SECONDS)
+    )
+    assert(renErr.getCause.getMessage.contains("PC-only"), renErr.getCause.getMessage)
+
   test("shutdown tears down the BSP session"):
     val _ = env.initResult
     env.proxy.shutdown().get(60, TimeUnit.SECONDS)

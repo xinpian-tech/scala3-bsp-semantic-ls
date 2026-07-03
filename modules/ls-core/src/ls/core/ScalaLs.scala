@@ -125,10 +125,17 @@ final class ScalaLs(val config: ScalaLs.Config = ScalaLs.Config())
   def awaitBootstrap(timeoutMillis: Long): Boolean =
     readyLatch.await(timeoutMillis, TimeUnit.MILLISECONDS)
 
+  /** Whether a display name is present in the persisted workspace-symbol index
+    * (exact match over the FTS-backed search). Drives the PC-only overlay: a
+    * top-level dirty-buffer symbol is PC-only exactly when this is false.
+    */
+  private def indexedName(cs: CoreServices)(name: String): Boolean =
+    name.nonEmpty && cs.orchestrator.workspaceSymbol(name).exists(_.displayName == name)
+
   /** Test hook: inject a pre-built state instead of running bootstrap. */
   private[core] def injectStateForTests(s: WorkspaceState): Unit =
     state = s
-    s.ready.foreach(cs => overlay.install(FacadePcQueries(cs.pc), cs.uris.toFileUri))
+    s.ready.foreach(cs => overlay.install(FacadePcQueries(cs.pc), cs.uris.toFileUri, indexedName(cs)))
     readyLatch.countDown()
 
   private[core] def currentState: WorkspaceState = state
@@ -309,7 +316,7 @@ final class ScalaLs(val config: ScalaLs.Config = ScalaLs.Config())
               notes = s.notes
             )
             state = WorkspaceState.Ready(updated)
-            overlay.install(FacadePcQueries(updated.pc), updated.uris.toFileUri)
+            overlay.install(FacadePcQueries(updated.pc), updated.uris.toFileUri, indexedName(updated))
             replayOpenBuffers(updated)
             if updated.workspaceTargets.targets.nonEmpty then
               scheduleBuildJob(Vector.empty, compileFirst = false)
@@ -588,9 +595,13 @@ final class ScalaLs(val config: ScalaLs.Config = ScalaLs.Config())
       onIndex {
         state match
           case WorkspaceState.Ready(s) =>
-            val hits = s.orchestrator.workspaceSymbol(Option(params.getQuery).getOrElse(""))
+            val query = Option(params.getQuery).getOrElse("")
+            val hits = s.orchestrator.workspaceSymbol(query)
             val out = new java.util.ArrayList[WorkspaceSymbol](hits.length)
             hits.foreach(h => workspaceSymbolOf(s, h).foreach(out.add))
+            // Merge top-level symbols from open unsaved buffers that the
+            // persisted index has never seen, flagged PC-only.
+            overlay.pcOnlySymbols(query).foreach(p => out.add(pcOnlyWorkspaceSymbol(p)))
             JEither.forRight(out)
           case _ =>
             // BestEffort consistency (plan 10): an unbootstrapped workspace
@@ -650,6 +661,27 @@ final class ScalaLs(val config: ScalaLs.Config = ScalaLs.Config())
           container
         )
 
+    /** Builds a `WorkspaceSymbol` for a PC-only unsaved-buffer symbol: its
+      * location points into the dirty buffer and its container marks it PC-only
+      * so a client can tell it apart from a persisted-index result.
+      */
+    private def pcOnlyWorkspaceSymbol(p: PcOnlySymbol): WorkspaceSymbol =
+      val kind = p.keyword match
+        case "object" => SymbolKind.Object
+        case "class" => SymbolKind.Class
+        case "trait" => SymbolKind.Interface
+        case "enum" => SymbolKind.Enum
+        case "def" => SymbolKind.Method
+        case "val" | "var" => SymbolKind.Variable
+        case "type" => SymbolKind.TypeParameter
+        case _ => SymbolKind.Object
+      new WorkspaceSymbol(
+        p.name,
+        kind,
+        JEither.forLeft(LspConvert.location(p.fileUri, p.span)),
+        ScalaLs.PcOnlyContainer
+      )
+
     /** documents readback by doc id (MetaStore has no such accessor; the row
       * is needed to turn an FTS hit into a Location).
       */
@@ -662,6 +694,11 @@ final class ScalaLs(val config: ScalaLs.Config = ScalaLs.Config())
 object ScalaLs:
   val ServerName = "scala3-bsp-semantic-ls"
   val ServerVersion = "0.1.0"
+
+  /** `containerName` marker on a `workspace/symbol` result that exists only in
+    * an open unsaved buffer (PC-only, excluded from global references/rename).
+    */
+  val PcOnlyContainer = "unsaved buffer (PC-only)"
 
   object Commands:
     val Doctor = "scala3SemanticLs.doctor"

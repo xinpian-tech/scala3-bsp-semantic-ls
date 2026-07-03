@@ -306,7 +306,13 @@ object Bootstrap:
           theMeta.allTargets().map(t => Path.of(t.sourceroot))
       val uris = WorkspaceUris(sourceroots, orchestrator)
 
-      overlay.install(FacadePcQueries(pc), uris.toFileUri)
+      // A dirty-buffer top-level symbol is PC-only exactly when its display name
+      // is absent from the persisted index.
+      overlay.install(
+        FacadePcQueries(pc),
+        uris.toFileUri,
+        name => name.nonEmpty && orchestrator.workspaceSymbol(name).exists(_.displayName == name)
+      )
 
       val services = CoreServices(
         workspaceRoot = workspaceRoot,

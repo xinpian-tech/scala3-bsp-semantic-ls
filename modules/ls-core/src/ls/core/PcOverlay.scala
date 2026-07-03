@@ -47,12 +47,21 @@ final class FacadePcQueries(pc: PcBackend) extends PcSymbolQueries:
   */
 final class PcOverlay(docs: DocumentStore) extends DirtyBufferOverlay:
 
-  private final case class Env(pc: PcSymbolQueries, toFileUri: String => Option[String])
+  private final case class Env(
+      pc: PcSymbolQueries,
+      toFileUri: String => Option[String],
+      /** True when a display name is present in the persisted index. */
+      isIndexedName: String => Boolean
+  )
 
   @volatile private var env: Option[Env] = None
 
-  def install(pc: PcSymbolQueries, toFileUri: String => Option[String]): Unit =
-    env = Some(Env(pc, toFileUri))
+  def install(
+      pc: PcSymbolQueries,
+      toFileUri: String => Option[String],
+      isIndexedName: String => Boolean
+  ): Unit =
+    env = Some(Env(pc, toFileUri, isIndexedName))
 
   def installed: Boolean = env.isDefined
 
@@ -64,7 +73,10 @@ final class PcOverlay(docs: DocumentStore) extends DirtyBufferOverlay:
       e <- env
       fileUri <- fileUriOf(e, sdbUri)
       if e.pc.isOpen(fileUri)
-      hit <- pcHit(e, fileUri, line, character)
+      // A top-level declaration in the dirty buffer whose name the persisted
+      // index has never seen is PC-only: global references and
+      // rename refuse it. Otherwise fall back to the PC symbol resolution.
+      hit <- pcOnlyTopLevelHit(e, fileUri, line, character).orElse(pcHit(e, fileUri, line, character))
     yield hit
 
   override def occurrencesOf(semanticSymbol: String): Option[Vector[Loc]] = None
@@ -103,6 +115,60 @@ final class PcOverlay(docs: DocumentStore) extends DirtyBufferOverlay:
       }
     catch case NonFatal(_) => None
 
+  private def isIndexed(e: Env, name: String): Boolean =
+    // Fail safe: if the index membership check throws, treat the symbol as
+    // indexed so a query error never spuriously refuses references/rename.
+    try e.isIndexedName(name)
+    catch case NonFatal(_) => true
+
+  /** A PC-only overlay hit when the cursor sits on the name of a top-level
+    * declaration in the dirty buffer that the persisted index has never seen.
+    * The synthetic symbol string is never used: `pcOnly` short-circuits the
+    * engines before they read it.
+    */
+  private def pcOnlyTopLevelHit(
+      e: Env,
+      fileUri: String,
+      line: Int,
+      character: Int
+  ): Option[OverlayHit] =
+    docs.text(fileUri).flatMap { text =>
+      PcOverlay
+        .topLevelDecls(text)
+        .find(d => d.span.startLine == line && character >= d.span.startChar && character <= d.span.endChar)
+        .filter(d => !isIndexed(e, d.name))
+        .map(d =>
+          OverlayHit(
+            semanticSymbol = s"local/${d.name}#",
+            span = d.span,
+            role = Role.Definition,
+            pcOnly = true
+          )
+        )
+    }
+
+  /** Top-level symbols declared in open, unsaved buffers whose names the
+    * persisted index has never seen, matched (case-insensitive substring)
+    * against the workspace/symbol query. These are surfaced by
+    * `workspace/symbol` flagged PC-only.
+    */
+  def pcOnlySymbols(query: String): Vector[PcOnlySymbol] =
+    env match
+      case None => Vector.empty
+      case Some(e) =>
+        val q = query.toLowerCase
+        docs.openUris.flatMap { fileUri =>
+          if !docs.isDirty(fileUri) then Vector.empty[PcOnlySymbol]
+          else
+            docs.text(fileUri).toVector.flatMap { text =>
+              PcOverlay
+                .topLevelDecls(text)
+                .filter(d => q.isEmpty || d.name.toLowerCase.contains(q))
+                .filter(d => !isIndexed(e, d.name))
+                .map(d => PcOnlySymbol(d.name, d.keyword, fileUri, d.span))
+            }
+        }
+
   /** The identifier token covering the cursor in the OPEN BUFFER text (the
     * overlay only ever runs on dirty buffers, so the buffer is the only
     * honest text source). None when the cursor is not on an identifier.
@@ -121,3 +187,32 @@ final class PcOverlay(docs: DocumentStore) extends DirtyBufferOverlay:
         if end > start then Some(Span(line, start, line, end)) else None
       }
     yield span
+
+object PcOverlay:
+
+  /** A top-level declaration `keyword Name` at column 0 (optionally preceded by
+    * modifiers): the span covers the name token only.
+    */
+  private final case class TopLevelDecl(name: String, keyword: String, span: Span)
+
+  private val Modifiers = "private|protected|final|sealed|abstract|case|open|implicit|lazy|override|inline|transparent"
+  private val Keyword = "object|class|trait|enum|def|val|var|type"
+  private val TopLevelDeclRe =
+    s"^(?:(?:$Modifiers)\\s+)*($Keyword)\\s+([A-Za-z_][A-Za-z0-9_$$]*)".r
+
+  /** Top-level declarations in a buffer: the declaration keyword sits at column
+    * 0 (top-level members in Scala 3; nested members are indented). A light
+    * scan — no PC round-trip — is enough to surface unsaved symbols.
+    */
+  private def topLevelDecls(text: String): Vector[TopLevelDecl] =
+    text.linesIterator.zipWithIndex.flatMap { (lineText, ln) =>
+      TopLevelDeclRe.findFirstMatchIn(lineText).map { m =>
+        TopLevelDecl(name = m.group(2), keyword = m.group(1), span = Span(ln, m.start(2), ln, m.end(2)))
+      }
+    }.toVector
+
+/** A top-level symbol that exists only in an open, unsaved buffer (not in the
+  * persisted index): surfaced by `workspace/symbol` flagged PC-only, and
+  * excluded from global references/rename.
+  */
+final case class PcOnlySymbol(name: String, keyword: String, fileUri: String, span: Span)
