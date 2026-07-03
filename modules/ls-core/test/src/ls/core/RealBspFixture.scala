@@ -18,13 +18,15 @@ import org.eclipse.lsp4j.services.LanguageServer
 import ls.bsp.{BspDiscovery, BspSession, BspSessionConfig}
 import ls.index.Span
 
-/** Shared boot of the language server against a REAL BSP server (Mill itself),
-  * used by every gated real-BSP suite (`RealBspIntegrationTest`,
-  * `RealBspCoreTest`, ...). The heavy work — copying `it/sample-workspace`,
+/** Boot of the language server against a REAL BSP server (Mill itself), used by
+  * every gated real-BSP suite. The heavy work — copying `it/sample-workspace`,
   * `mill.bsp.BSP/install` + `mill __.compile`, launching `mill --bsp`, and
-  * booting [[ScalaLs]] over LSP pipes — happens once per test JVM through the
-  * lazy vals here, so the suites that share the JVM boot a single mill-bsp
-  * server between them instead of one each.
+  * booting [[ScalaLs]] over LSP pipes — is encapsulated in [[RealBspServer]], so
+  * a suite can either share the read-only [[RealBspFixture.shared]] instance
+  * (RealBspCoreTest, RealBspIntegrationTest, whose assertions treat the workspace
+  * as immutable) or spin up its OWN instance when it mutates sources
+  * (RealBspLifecycleTest). This matches the plan's "one workspace fixture per
+  * suite" while still booting mill-bsp lazily.
   *
   * Gated by `LS_REAL_BSP_IT=1` (run `scripts/it-real-bsp.sh` inside
   * `nix develop`); the suites `assume(enabled)` so the ordinary run skips them.
@@ -64,10 +66,11 @@ object RealBspFixture:
       p.nn
     }
 
-  /** Temp copy of the sample workspace with the real mill build run in it:
-    * `.bsp/mill-bsp.json` installed and `__.compile` green.
+  /** A fresh temp copy of the sample workspace with the real mill build run in
+    * it: `.bsp/mill-bsp.json` installed and `__.compile` green. Each call yields
+    * an independent workspace so a mutating suite never disturbs another.
     */
-  lazy val ws: E2eFixture.Ws =
+  def freshWorkspace(): E2eFixture.Ws =
     val sample = repoRoot.resolve("it").resolve("sample-workspace")
     val root = Files.createTempDirectory("ls-real-bsp-it-").toRealPath()
     copyTree(sample, root)
@@ -79,7 +82,93 @@ object RealBspFixture:
     )
     E2eFixture.Ws(root)
 
-  lazy val server: ScalaLs = new ScalaLs(
+  /** The shared read-only server: boots mill-bsp once for the suites whose
+    * assertions treat the sample workspace as immutable.
+    */
+  lazy val shared: RealBspServer = new RealBspServer(freshWorkspace())
+
+  // Forwarders onto the shared instance so read-only suites keep referring to
+  // `RealBspFixture.{ws, proxy, executeCommand, ...}` unchanged.
+  def ws: E2eFixture.Ws = shared.ws
+  def proxy: LanguageServer = shared.proxy
+  def docsService: org.eclipse.lsp4j.services.TextDocumentService = shared.docsService
+  def wsService: org.eclipse.lsp4j.services.WorkspaceService = shared.wsService
+  def executeCommand(command: String): String = shared.executeCommand(command)
+  def textDoc(uri: String): TextDocumentIdentifier = shared.textDoc(uri)
+  def position(uri: String, token: String, nth: Int = 0): Position = shared.position(uri, token, nth)
+  def locationOf(uri: String, span: Span): Location = shared.locationOf(uri, span)
+  def withOpen[A](uri: String, text: String)(body: => A): A = shared.withOpen(uri, text)(body)
+  def initResult: InitializeResult = shared.initResult
+  def readyIndex: String = shared.readyIndex
+
+  // ------------------------------------------------------------- plumbing
+
+  /** Recursive copy skipping build droppings, in case the sample workspace in
+    * the repository was ever built in place.
+    */
+  def copyTree(from: Path, to: Path): Unit =
+    val skipped = Set("out", ".bsp", ".scala3-bsp-semantic-ls")
+    Files.walkFileTree(
+      from,
+      new SimpleFileVisitor[Path]:
+        override def preVisitDirectory(dir: Path, attrs: BasicFileAttributes): FileVisitResult =
+          if dir != from && skipped.contains(dir.getFileName.toString) then
+            FileVisitResult.SKIP_SUBTREE
+          else
+            Files.createDirectories(to.resolve(from.relativize(dir).toString))
+            FileVisitResult.CONTINUE
+        override def visitFile(file: Path, attrs: BasicFileAttributes): FileVisitResult =
+          Files.copy(
+            file,
+            to.resolve(from.relativize(file).toString),
+            StandardCopyOption.REPLACE_EXISTING
+          )
+          FileVisitResult.CONTINUE
+    )
+    ()
+
+  /** Runs `mill --no-daemon <args>` from PATH in `cwd`, streaming output to
+    * stderr on failure. `--no-daemon` because the mill daemon is flaky in
+    * throwaway temp directories; the BSP server later launched from
+    * `.bsp/mill-bsp.json` runs `mill --bsp`, which is daemon-less by design.
+    */
+  def runMill(cwd: Path, args: String*): Unit =
+    val cmd = Vector("mill", "--no-daemon") ++ args
+    val pb = new ProcessBuilder(cmd.asJava)
+    pb.directory(cwd.toFile)
+    pb.redirectErrorStream(true)
+    val process = pb.start()
+    val output = new StringBuilder
+    val reader = new BufferedReader(
+      new InputStreamReader(process.getInputStream, StandardCharsets.UTF_8)
+    )
+    val pump = new Thread(
+      () =>
+        var line = reader.readLine()
+        while line != null do
+          output.append(line).append('\n')
+          line = reader.readLine()
+      ,
+      "real-bsp-it-mill-output"
+    )
+    pump.setDaemon(true)
+    pump.start()
+    val finished = process.waitFor(10, TimeUnit.MINUTES)
+    if !finished then process.destroyForcibly()
+    pump.join(5000)
+    assert(
+      finished && process.exitValue() == 0,
+      s"'${cmd.mkString(" ")}' in $cwd ${if finished then s"exited ${process.exitValue()}" else "timed out"}:\n$output"
+    )
+
+/** One booted language server over the real `mill --bsp` for a given workspace
+  * copy: LSP pipes, initialize, and (via [[readyIndex]]) the first compile +
+  * reindex that a real editor session goes through. Also exposes the recording
+  * client's published diagnostics so lifecycle suites can await them.
+  */
+final class RealBspServer(val ws: E2eFixture.Ws):
+
+  val server: ScalaLs = new ScalaLs(
     ScalaLs.Config(
       bootstrap = Bootstrap.Config(
         // The production path: discover .bsp/mill-bsp.json and launch its argv
@@ -102,8 +191,13 @@ object RealBspFixture:
     )
   )
 
+  /** The LSP client end; its `diagnostics` queue records every
+    * `textDocument/publishDiagnostics` the server pushes.
+    */
+  val client = new RecordingLanguageClient
+
   /** LSP pipes: real LSPLauncher on both ends, exactly like LsEndToEndTest. */
-  lazy val proxy: LanguageServer =
+  val proxy: LanguageServer =
     val lspToServer = new PipedInputStream(1 << 20)
     val lspClientOut = new PipedOutputStream(lspToServer)
     val lspToClient = new PipedInputStream(1 << 20)
@@ -113,11 +207,9 @@ object RealBspFixture:
     server.connect(serverLauncher.getRemoteProxy)
     serverLauncher.startListening()
 
-    val client = new RecordingLanguageClient
     val clientLauncher = LSPLauncher.createClientLauncher(client, lspToClient, lspClientOut)
     clientLauncher.startListening()
     val remote = clientLauncher.getRemoteProxy
-    // One shared shutdown for all suites sharing this JVM-wide server.
     Runtime.getRuntime.addShutdownHook(new Thread(new Runnable:
       override def run(): Unit =
         try remote.shutdown().get(60, TimeUnit.SECONDS)
@@ -135,8 +227,7 @@ object RealBspFixture:
 
   /** Mill BSP evaluates in `.bsp/out`, so the SemanticDB the model points at
     * does not exist until a compile is requested OVER the BSP session. Drives
-    * the real editor-session flow once: compile + reindex. Shared across suites
-    * so the real compile happens once.
+    * the real editor-session flow once: compile + reindex.
     */
   lazy val readyIndex: String =
     val _ = initResult
@@ -166,9 +257,8 @@ object RealBspFixture:
       .get(600, TimeUnit.SECONDS)
       .asInstanceOf[String]
 
-  /** Opens `uri` in the PC facade with its current on-disk text (a PC request
-    * precondition), runs `body`, then closes it so the shared index state stays
-    * clean for later index queries.
+  /** Opens `uri` in the PC facade with `text` (a PC request precondition), runs
+    * `body`, then closes it so shared index state stays clean.
     */
   def withOpen[A](uri: String, text: String)(body: => A): A =
     docsService.didOpen(
@@ -176,63 +266,3 @@ object RealBspFixture:
     )
     try body
     finally docsService.didClose(new DidCloseTextDocumentParams(textDoc(uri)))
-
-  // ------------------------------------------------------------- plumbing
-
-  /** Recursive copy skipping build droppings, in case the sample workspace in
-    * the repository was ever built in place.
-    */
-  private def copyTree(from: Path, to: Path): Unit =
-    val skipped = Set("out", ".bsp", ".scala3-bsp-semantic-ls")
-    Files.walkFileTree(
-      from,
-      new SimpleFileVisitor[Path]:
-        override def preVisitDirectory(dir: Path, attrs: BasicFileAttributes): FileVisitResult =
-          if dir != from && skipped.contains(dir.getFileName.toString) then
-            FileVisitResult.SKIP_SUBTREE
-          else
-            Files.createDirectories(to.resolve(from.relativize(dir).toString))
-            FileVisitResult.CONTINUE
-        override def visitFile(file: Path, attrs: BasicFileAttributes): FileVisitResult =
-          Files.copy(
-            file,
-            to.resolve(from.relativize(file).toString),
-            StandardCopyOption.REPLACE_EXISTING
-          )
-          FileVisitResult.CONTINUE
-    )
-    ()
-
-  /** Runs `mill --no-daemon <args>` from PATH in `cwd`, streaming output to
-    * stderr on failure. `--no-daemon` because the mill daemon is flaky in
-    * throwaway temp directories; the BSP server later launched from
-    * `.bsp/mill-bsp.json` runs `mill --bsp`, which is daemon-less by design.
-    */
-  private def runMill(cwd: Path, args: String*): Unit =
-    val cmd = Vector("mill", "--no-daemon") ++ args
-    val pb = new ProcessBuilder(cmd.asJava)
-    pb.directory(cwd.toFile)
-    pb.redirectErrorStream(true)
-    val process = pb.start()
-    val output = new StringBuilder
-    val reader = new BufferedReader(
-      new InputStreamReader(process.getInputStream, StandardCharsets.UTF_8)
-    )
-    val pump = new Thread(
-      () =>
-        var line = reader.readLine()
-        while line != null do
-          output.append(line).append('\n')
-          line = reader.readLine()
-      ,
-      "real-bsp-it-mill-output"
-    )
-    pump.setDaemon(true)
-    pump.start()
-    val finished = process.waitFor(10, TimeUnit.MINUTES)
-    if !finished then process.destroyForcibly()
-    pump.join(5000)
-    assert(
-      finished && process.exitValue() == 0,
-      s"'${cmd.mkString(" ")}' in $cwd ${if finished then s"exited ${process.exitValue()}" else "timed out"}:\n$output"
-    )

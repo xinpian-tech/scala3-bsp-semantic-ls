@@ -2,12 +2,10 @@ diff --git a/build.mill b/build.mill
 index c1b7278..a4b3902 100644
 --- a/build.mill
 +++ b/build.mill
-@@ -29,7 +29,7 @@ object v {
- 
+@@ -30,5 +30,5 @@ object v {
  trait ZaoziScalaModule extends ScalaModule {
    override def scalacOptions: T[Seq[String]] = Task(
 -    super.scalacOptions() ++ Seq("-java-output-version", "25")
 +    super.scalacOptions() ++ Seq("-java-output-version", "25", "-Xsemanticdb", "-sourceroot", mill.api.BuildCtx.workspaceRoot.toString)
    )
  }
- 

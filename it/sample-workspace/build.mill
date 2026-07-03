@@ -28,11 +28,12 @@ object b extends SampleModule {
 }
 
 /** Module `c` is deliberately built WITHOUT `-Xsemanticdb`, so it emits no
-  * SemanticDB and is IndexUnavailable — the real-BSP analogue of Mill's own
-  * `mill-build` meta-target. Global index features (workspace symbol,
-  * references, rename, documentHighlight) are disabled for `c`, but the
-  * presentation compiler still serves it (hover/completion/definition/
-  * signatureHelp) because a PC config is registered for every build target.
+  * SemanticDB. SemanticDB is mandatory: like Mill's own `mill-build` target, `c`
+  * is a hard SemanticDB-coverage error — the doctor flags it, and EVERY request
+  * on a `c` source is rejected with `LsError.NoSemanticdb`, both the presentation
+  * compiler paths (hover/completion/definition/signatureHelp) and the index paths
+  * (references/rename/documentHighlight). It is the real-BSP fixture that proves
+  * the mandatory-SemanticDB policy.
   */
 object c extends ScalaModule {
   def scalaVersion = "3.8.4"
