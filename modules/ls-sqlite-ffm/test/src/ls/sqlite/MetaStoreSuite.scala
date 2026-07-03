@@ -265,6 +265,40 @@ class MetaStoreSuite extends munit.FunSuite with TempDbFixture:
     finally store.close()
   }
 
+  tempDir.test("workspaceSymbolNameExists is exact membership, robust beyond the search window") { dir =>
+    val store = open(dir)
+    try
+      val target = newTarget(store)
+      val (doc, _) = store.upsertDocument(target, "file:///ws/Big.scala", "/sdb/Big", 1L, "m", false, false)
+      // Seed more neighbors sharing the "NewThing" prefix than the search window,
+      // plus one exact "NewThing", so a ranked/limited search may not return the
+      // exact row while exact membership always does.
+      val n = 250
+      val neighbors = (0 until n).map { i =>
+        indexSymbol(store, target, doc, 1L, s"pkg/NewThingNbr$i#", f"NewThingNbr$i%03d", None, None, SymKind.Class)
+      }
+      val (_, exactWs, exactMeta) =
+        indexSymbol(store, target, doc, 1L, "pkg/NewThing#", "NewThing", None, None, SymKind.Object)
+      store.replaceSymbolMetadata(doc, (neighbors.map(_._3) :+ exactMeta))
+      store.replaceWorkspaceSymbols(doc, (neighbors.map(_._2) :+ exactWs))
+
+      // exact membership finds the indexed name and rejects a non-indexed one
+      assert(store.workspaceSymbolNameExists("NewThing"), "exact indexed name must be found")
+      assert(!store.workspaceSymbolNameExists("NewThingAbsent"), "a non-indexed name must not be found")
+      assert(!store.workspaceSymbolNameExists("NewThingNbr"), "a prefix that is not a full display name must not be found")
+      // The ranked search window is exceeded here (251 prefix matches, limit
+      // 200) and the exact row is ranked out of it — so the old ranked-search
+      // classification would wrongly report "NewThing" as absent from the index,
+      // while exact membership (asserted above) reports it present.
+      val ranked = store.workspaceSymbolSearch("NewThing", 200)
+      assertEquals(ranked.length, 200, "the ranked search window is smaller than the match set")
+      assert(
+        !ranked.exists(_.displayName == "NewThing"),
+        "expected the exact row to be ranked out of the search window (the point of the exact predicate)"
+      )
+    finally store.close()
+  }
+
   tempDir.test("workspaceSymbolSearch supports prefix and multi-token queries") { dir =>
     val store = open(dir)
     try

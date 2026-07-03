@@ -126,11 +126,12 @@ final class ScalaLs(val config: ScalaLs.Config = ScalaLs.Config())
     readyLatch.await(timeoutMillis, TimeUnit.MILLISECONDS)
 
   /** Whether a display name is present in the persisted workspace-symbol index
-    * (exact match over the FTS-backed search). Drives the PC-only overlay: a
-    * top-level dirty-buffer symbol is PC-only exactly when this is false.
+    * (an EXACT membership query, not the ranked/limited search). Drives the
+    * PC-only overlay: a top-level dirty-buffer symbol is PC-only exactly when
+    * this is false.
     */
   private def indexedName(cs: CoreServices)(name: String): Boolean =
-    name.nonEmpty && cs.orchestrator.workspaceSymbol(name).exists(_.displayName == name)
+    name.nonEmpty && cs.orchestrator.workspaceSymbolNameExists(name)
 
   /** Test hook: inject a pre-built state instead of running bootstrap. */
   private[core] def injectStateForTests(s: WorkspaceState): Unit =

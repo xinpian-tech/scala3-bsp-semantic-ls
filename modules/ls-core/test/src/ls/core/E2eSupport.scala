@@ -120,6 +120,27 @@ object E2eFixture:
     val reporter = dotty.tools.dotc.Main.process((args ++ files.map(_.toString)).toArray)
     assert(!reporter.hasErrors, s"scalac failed:\n${reporter.allErrors.mkString("\n")}")
 
+  /** Recompiles target a's sources in place (reading whatever is now on disk),
+    * regenerating its SemanticDB under `semanticdbOverride`. Used to prove the
+    * save+ingest transition of a newly-added symbol: mutate the source on disk,
+    * recompile, then didSave so the server re-ingests real SemanticDB.
+    */
+  def recompileTargetA(ws: Ws): Unit =
+    compileTree(
+      ws.root,
+      Vector(ws.root.resolve(coreUri), ws.root.resolve(useUri)),
+      Vector(
+        "-Xsemanticdb",
+        s"-semanticdb-target:${ws.semanticdbOverride}",
+        "-sourceroot",
+        ws.root.toString,
+        "-d",
+        ws.classDirOf("a").toString,
+        "-classpath",
+        libraryJars.mkString(File.pathSeparator)
+      )
+    )
+
   /** The compiled master fixture, built once per test JVM. */
   lazy val master: Ws =
     val root = Files.createTempDirectory("ls-core-e2e-")

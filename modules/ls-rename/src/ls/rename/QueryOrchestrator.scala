@@ -86,6 +86,13 @@ final class QueryOrchestrator(
   def workspaceSymbol(query: String, limit: Int = 200): Vector[WorkspaceSymbolHit] =
     meta.workspaceSymbolSearch(query, limit)
 
+  /** Exact persisted-index membership for a display name (not the ranked,
+    * limited search): true iff the index holds a workspace symbol named exactly
+    * `name`. Backs the PC-only overlay classification.
+    */
+  def workspaceSymbolNameExists(name: String): Boolean =
+    meta.workspaceSymbolNameExists(name)
+
   // --- symbol at cursor ---
 
   def symbolAtCursor(uri: String, line: Int, character: Int): CursorSymbol =

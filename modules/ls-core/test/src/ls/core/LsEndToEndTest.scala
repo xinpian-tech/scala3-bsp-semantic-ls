@@ -418,14 +418,14 @@ class LsEndToEndTest extends munit.FunSuite:
     val symbols = wsService.symbol(new WorkspaceSymbolParams("Core")).get(60, TimeUnit.SECONDS)
     assert(symbols.isRight && symbols.getRight.asScala.exists(_.getName == "Core"))
 
-  test("an unsaved top-level symbol surfaces PC-only and refuses references/rename"):
+  test("an unsaved top-level symbol is PC-only, then normal after save+ingest"):
     val _ = env.initResult
     val uri = ws.fileUri(E2eFixture.useUri)
     // add a brand-new top-level object the persisted index has never seen
     val dirty = ws.sourceText(E2eFixture.useUri) + "\nobject NewThing:\n  val z = 1\n"
     docsService.didOpen(new DidOpenTextDocumentParams(new TextDocumentItem(uri, "scala", 1, dirty)))
 
-    // workspace/symbol surfaces it, flagged PC-only, located in the dirty buffer
+    // (1) while unsaved: workspace/symbol surfaces it flagged PC-only in the buffer
     val symbols =
       wsService.symbol(new WorkspaceSymbolParams("NewThing")).get(60, TimeUnit.SECONDS).getRight.asScala.toVector
     val newThing = symbols.filter(_.getName == "NewThing")
@@ -450,6 +450,40 @@ class LsEndToEndTest extends munit.FunSuite:
         .get(60, TimeUnit.SECONDS)
     )
     assert(renErr.getCause.getMessage.contains("PC-only"), renErr.getCause.getMessage)
+
+    // (2) save + ingest: write the buffer to disk, regenerate target-a SemanticDB,
+    // then didSave so the server re-ingests real SemanticDB carrying NewThing.
+    java.nio.file.Files.writeString(ws.root.resolve(E2eFixture.useUri), dirty)
+    E2eFixture.recompileTargetA(ws)
+    val ingestsBefore = env.server.completedIngests
+    docsService.didSave(new DidSaveTextDocumentParams(textDoc(E2eFixture.useUri)))
+    eventually("re-ingest after save advanced")(env.server.completedIngests > ingestsBefore)
+
+    // (3) now NewThing is a normal indexed result, not the PC-only overlay entry
+    val after =
+      wsService.symbol(new WorkspaceSymbolParams("NewThing")).get(60, TimeUnit.SECONDS).getRight.asScala.toVector
+    val indexed = after.filter(_.getName == "NewThing")
+    assert(indexed.nonEmpty, after.map(_.getName).toString)
+    assert(
+      indexed.forall(_.getContainerName != ScalaLs.PcOnlyContainer),
+      s"still PC-only after ingest: ${indexed.map(_.getContainerName)}"
+    )
+
+    // (4) references now resolve from the index (no PcOnlySymbol refusal)
+    val refsAfter = docsService
+      .references(new ReferenceParams(textDoc(E2eFixture.useUri), cursor, new ReferenceContext(true)))
+      .get(60, TimeUnit.SECONDS)
+      .asScala
+      .toVector
+    assert(refsAfter.nonEmpty, "references on the now-indexed symbol returned nothing")
+    // rename must no longer be refused as PC-only (it may fail for unrelated reasons)
+    val renameOutcome =
+      try Right(docsService.rename(new RenameParams(textDoc(E2eFixture.useUri), cursor, "Renamed2")).get(60, TimeUnit.SECONDS))
+      catch case e: ExecutionException => Left(Option(e.getCause).map(_.getMessage).getOrElse(""))
+    assert(
+      renameOutcome.isRight || !renameOutcome.left.getOrElse("").contains("PC-only"),
+      s"rename still refused as PC-only after ingest: $renameOutcome"
+    )
 
   test("shutdown tears down the BSP session"):
     val _ = env.initResult

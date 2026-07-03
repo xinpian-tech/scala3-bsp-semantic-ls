@@ -307,11 +307,12 @@ object Bootstrap:
       val uris = WorkspaceUris(sourceroots, orchestrator)
 
       // A dirty-buffer top-level symbol is PC-only exactly when its display name
-      // is absent from the persisted index.
+      // is absent from the persisted index (an exact membership check, not the
+      // ranked/limited search).
       overlay.install(
         FacadePcQueries(pc),
         uris.toFileUri,
-        name => name.nonEmpty && orchestrator.workspaceSymbol(name).exists(_.displayName == name)
+        name => name.nonEmpty && orchestrator.workspaceSymbolNameExists(name)
       )
 
       val services = CoreServices(
