@@ -39,8 +39,7 @@ jobs:
         with:
           nix_path: nixpkgs=channel:nixos-unstable
 
-      # Drives the LSP server against a REAL Mill BSP server, over both the
-      # deterministic it/sample-workspace and the vendored real third-party
-      # it/zaozi workspace (see it/zaozi/NOTICE.md). Gated by LS_REAL_BSP_IT=1.
+      # Drives the LSP server against a REAL Mill BSP server built from
+      # it/sample-workspace. Gated by LS_REAL_BSP_IT=1 inside the script.
       - name: real-bsp e2e
         run: nix develop -c ./scripts/it-real-bsp.sh

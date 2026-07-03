@@ -60,8 +60,16 @@ object Main:
         case Some(dir) =>
           // --require-index forces the strict real-BSP workload (compile +
           // reindex + non-empty index queries); without it the run degrades
-          // gracefully for a workspace that has no BSP connection.
-          sys.exit(AotTrain.run(Path.of(dir), requireIndex = args.contains("--require-index")))
+          // gracefully for a workspace that has no BSP connection. --skip-pc
+          // skips the version-locked PC completion check (SemanticDB index
+          // features stay asserted) — for a real repo on a mismatched compiler.
+          sys.exit(
+            AotTrain.run(
+              Path.of(dir),
+              requireIndex = args.contains("--require-index"),
+              skipPc = args.contains("--skip-pc")
+            )
+          )
         case None =>
           System.err.println("--aot-train requires a workspace directory argument")
           sys.exit(2)

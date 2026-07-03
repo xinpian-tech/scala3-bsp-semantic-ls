@@ -3,9 +3,11 @@ package ls.core
 import java.nio.file.{Files, Path}
 import java.util.concurrent.{CompletableFuture, TimeUnit}
 
+import scala.concurrent.duration.DurationInt
 import scala.jdk.CollectionConverters.*
 import scala.util.control.NonFatal
 
+import ls.bsp.{BspDiscovery, BspSession, BspSessionConfig}
 import org.eclipse.lsp4j.*
 import org.eclipse.lsp4j.services.{LanguageClient, TextDocumentService, WorkspaceService}
 
@@ -37,12 +39,25 @@ object AotTrain:
   def run(
       workspaceRoot: Path,
       requireIndex: Boolean,
+      skipPc: Boolean = false,
       log: String => Unit = msg => System.err.println(s"[aot-train] $msg")
   ): Int =
     val root = workspaceRoot.toAbsolutePath.normalize
-    log(s"training workload over $root (requireIndex=$requireIndex)")
+    log(s"training workload over $root (requireIndex=$requireIndex, skipPc=$skipPc)")
 
-    val server = new ScalaLs(ScalaLs.Config(exitProcessOnExit = false))
+    // A generous BSP request timeout so a large real project (whose first
+    // build/compile can take minutes) does not time out mid-compile.
+    val server = new ScalaLs(
+      ScalaLs.Config(
+        bootstrap = Bootstrap.Config(
+          connectBsp = (r, handlers) =>
+            BspDiscovery
+              .pick(r)
+              .map(f => BspSession.launch(r, f.details, handlers, BspSessionConfig(requestTimeout = 600.seconds)))
+        ),
+        exitProcessOnExit = false
+      )
+    )
     server.connect(new SilentLanguageClient)
     try
       val initParams = new InitializeParams()
@@ -58,7 +73,7 @@ object AotTrain:
           if !bspBacked then
             log("FAIL: --require-index set but no BSP-backed index is available")
             1
-          else strict(server, root, log)
+          else strict(server, root, log, skipPc)
         else
           lenient(server, root, log)
           0
@@ -78,7 +93,7 @@ object AotTrain:
 
   // -- strict real-BSP workload: compile + reindex, then assert non-empty ------
 
-  private def strict(server: ScalaLs, root: Path, log: String => Unit): Int =
+  private def strict(server: ScalaLs, root: Path, log: String => Unit, skipPc: Boolean): Int =
     val errors = scala.collection.mutable.ArrayBuffer.empty[String]
     def require(cond: Boolean, msg: => String): Unit = if !cond then errors += msg
 
@@ -109,8 +124,12 @@ object AotTrain:
         require(refs != null && !refs.isEmpty, s"references on '${probe.name}' returned no locations")
         log(s"workspace/symbol('${probe.name}')=${hits.size} references=${Option(refs).map(_.size).getOrElse(0)}")
 
-    // PC completion at a real member-select
-    findSelectProbe(sources) match
+    // PC completion at a real member-select. Skipped for cross-version real
+    // repos (e.g. a Scala 3.7.x project under this 3.8.x presentation compiler):
+    // the SemanticDB-backed index features above are version-independent, but PC
+    // completion needs a matching compiler.
+    if skipPc then log("PC completion check skipped (--skip-pc)")
+    else findSelectProbe(sources) match
       case None => require(false, "no member-select found to probe completion")
       case Some(probe) =>
         openDoc(docs, probe.uri, probe.text)
