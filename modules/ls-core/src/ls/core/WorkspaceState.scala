@@ -156,7 +156,7 @@ object Bootstrap:
       Files.createDirectories(storage)
       meta = MetaStore.open(storage.resolve("meta.sqlite"))
       // Segments live under storage/postings; snapshots/current.json is a
-      // sibling of postings at the storage root (plan storage layout).
+      // sibling of postings directly at the storage root.
       snapshots = SnapshotManager(storage.resolve("postings"), storage)
     catch
       case NonFatal(t) =>

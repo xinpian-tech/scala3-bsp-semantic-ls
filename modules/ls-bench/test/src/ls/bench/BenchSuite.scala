@@ -65,3 +65,33 @@ class BenchSuite extends munit.FunSuite:
     val buffer = new ByteArrayOutputStream()
     val exit = BenchMain.run(Array("--smoke"), new PrintStream(buffer, true, StandardCharsets.UTF_8))
     assertEquals(exit, 0, buffer.toString(StandardCharsets.UTF_8))
+
+  private def eventCount(jfr: java.nio.file.Path): (Int, Boolean) =
+    import scala.jdk.CollectionConverters.*
+    val events = jdk.jfr.consumer.RecordingFile.readAllEvents(jfr).asScala.toVector
+    (events.length, events.exists(_.getEventType.getName.startsWith("jdk.")))
+
+  test("--jfr uses a named preset and records JVM events; default preset is 'default'"):
+    val dir = Files.createTempDirectory("ls-bench-jfr")
+    // explicit preset: --jfr-preset profile
+    val jfr = dir.resolve("out.jfr")
+    val buf = new ByteArrayOutputStream()
+    val exit = BenchMain.run(
+      Array("--tiny", "--jfr", jfr.toString, "--jfr-preset", "profile"),
+      new PrintStream(buf, true, StandardCharsets.UTF_8)
+    )
+    assertEquals(exit, 0, buf.toString(StandardCharsets.UTF_8))
+    assert(Files.isRegularFile(jfr), "jfr recording file should exist")
+    val (count, hasJvm) = eventCount(jfr)
+    assert(count > 0, s"jfr recording contained no events (an unconfigured recording is empty)")
+    assert(hasJvm, "jfr recording contained no jdk.* JVM events")
+
+    // default preset (no --jfr-preset) also produces a configured, non-empty recording
+    val jfr2 = dir.resolve("out2.jfr")
+    val buf2 = new ByteArrayOutputStream()
+    val exit2 = BenchMain.run(
+      Array("--tiny", "--jfr", jfr2.toString),
+      new PrintStream(buf2, true, StandardCharsets.UTF_8)
+    )
+    assertEquals(exit2, 0, buf2.toString(StandardCharsets.UTF_8))
+    assert(eventCount(jfr2)._1 > 0, "default-preset jfr recording was empty")

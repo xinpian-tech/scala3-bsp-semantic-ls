@@ -18,6 +18,7 @@ import ls.sqlite.MetaStore
   *   --full         bigger corpus for real measurements
   *   --tiny         minimal corpus (test harness self-check)
   *   --jfr <path>   record the run with JFR, dumped to <path> on exit
+  *   --jfr-preset <name>  named JFR configuration for --jfr (default: default)
   * }}}
   *
   * The corpus is generated directly at the storage layer ([[Corpus]]), the
@@ -44,8 +45,15 @@ object BenchMain:
     val jfrPath = args.toVector.sliding(2).collectFirst {
       case Vector("--jfr", path) => Path.of(path)
     }
+    // Named JFR configuration (default: "default"); "profile" adds method
+    // sampling. Without a configuration a Recording captures no events, so the
+    // preset is what makes --jfr produce a useful recording.
+    val jfrPreset = args.toVector.sliding(2).collectFirst {
+      case Vector("--jfr-preset", name) => name
+    }.getOrElse("default")
     val recording = jfrPath.map { _ =>
-      val r = new jdk.jfr.Recording()
+      val config = jdk.jfr.Configuration.getConfiguration(jfrPreset)
+      val r = new jdk.jfr.Recording(config)
       r.start()
       r
     }
