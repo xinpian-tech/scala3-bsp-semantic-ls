@@ -23,19 +23,21 @@ import ls.doctor.{Doctor, DoctorInput}
   *   --aot-train <dir>     run the headless AOT training workload and exit
   *   --require-index       with --aot-train: require a real BSP-backed index
   *                         (compile + reindex, fail if the index stays empty)
-  *   --in-process-pc       run the presentation compiler in this JVM (default)
+  *   --in-process-pc       run the presentation compiler in this JVM
   *   --forked-pc           run the presentation compiler in an isolated child JVM
-  *                         (process isolation; opt-in for now)
+  *                         (process isolation; the default)
   * }}}
   */
 object Main:
 
-  /** Resolve the PC backend mode from CLI flags. `--forked-pc` wins if both are
-    * given; the default (and `--in-process-pc`) is in-process.
+  /** Resolve the PC backend mode from CLI flags. Process isolation (forked) is the
+    * production default; `--in-process-pc` opts back into the same JVM, and
+    * `--forked-pc` wins if both are given.
     */
   private[core] def pcBackendMode(args: Array[String]): PcBackendMode =
     if args.contains("--forked-pc") then PcBackendMode.Forked
-    else PcBackendMode.InProcess
+    else if args.contains("--in-process-pc") then PcBackendMode.InProcess
+    else PcBackendMode.Forked
 
   private val knownFlags = Set("--in-process-pc", "--forked-pc")
 

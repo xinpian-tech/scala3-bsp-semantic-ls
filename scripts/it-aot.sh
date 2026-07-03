@@ -18,4 +18,9 @@ export LS_AOT_IT=1
 export LS_REPO_ROOT="$PWD"
 export LS_AOT_ASSEMBLY_JAR="$PWD/out/core/assembly.dest/out.jar"
 
-exec mill --no-daemon core.test.testOnly ls.core.AotTrainIntegrationTest
+# AotTrainIntegrationTest is the gated AOT-training test; RealBspIsolationTest
+# carries the E9 row (an AOT-trained boot loads the cache and stays queryable),
+# gated on the same LS_AOT_IT. Its E7 row (LS_REAL_BSP_IT) stays skipped here.
+exec mill --no-daemon core.test.testOnly \
+  ls.core.AotTrainIntegrationTest \
+  ls.core.RealBspIsolationTest

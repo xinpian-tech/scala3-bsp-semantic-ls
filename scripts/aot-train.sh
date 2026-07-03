@@ -46,7 +46,10 @@ conf="$tmp/aot.conf"
 runflags=(--enable-native-access=ALL-UNNAMED -XX:+UseCompactObjectHeaders)
 
 # A workspace with a BSP connection trains the strict real-BSP workload.
-appargs=(--aot-train "$workspace")
+# `--in-process-pc` keeps the presentation compiler in THIS JVM so its code paths
+# are recorded into the AOT cache (the production default is now forked, which
+# would run the PC in a child JVM the cache cannot cover).
+appargs=(--aot-train "$workspace" --in-process-pc)
 if [ -d "$workspace/.bsp" ]; then
   appargs+=(--require-index)
   echo "aot-train: .bsp present -> strict real-BSP training"

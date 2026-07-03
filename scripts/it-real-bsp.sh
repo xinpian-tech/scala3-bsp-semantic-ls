@@ -3,7 +3,8 @@
 # built from the deterministic `it/sample-workspace`. Runs every real-BSP suite in
 # ONE JVM invocation so they share the single lazily-booted mill-bsp fixture
 # (RealBspFixture): RealBspIntegrationTest (happy path), RealBspCoreTest
-# (E1/E4/E5), and RealBspLifecycleTest (E2/E3/E6/E8).
+# (E1/E4/E5), RealBspLifecycleTest (E2/E3/E6/E8), and RealBspIsolationTest (E7;
+# its E9 AOT row is gated on LS_AOT_IT and runs via scripts/it-aot.sh instead).
 #
 # For a full real-repo validation against the unmodified zaozi built with its own
 # Nix toolchain, see scripts/it-zaozi.sh (heavy, manual).
@@ -20,4 +21,5 @@ export LS_REPO_ROOT="$PWD"
 exec mill --no-daemon core.test.testOnly \
   ls.core.RealBspIntegrationTest \
   ls.core.RealBspCoreTest \
-  ls.core.RealBspLifecycleTest
+  ls.core.RealBspLifecycleTest \
+  ls.core.RealBspIsolationTest

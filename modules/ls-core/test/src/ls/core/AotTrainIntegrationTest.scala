@@ -112,7 +112,8 @@ class AotTrainIntegrationTest extends munit.FunSuite:
     val bare = Files.createTempDirectory("ls-aot-it-nobsp-")
     Files.writeString(bare.resolve("Empty.scala"), "package p\nobject Empty\n")
     val (rc, log) = runProcess(
-      Vector(env.javaBin) ++ runFlags ++ Vector("-jar", jar.toString, "--aot-train", bare.toString),
+      Vector(env.javaBin) ++ runFlags ++
+        Vector("-jar", jar.toString, "--aot-train", bare.toString, "--in-process-pc"),
       env.repoRoot,
       5
     )

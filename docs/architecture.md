@@ -131,17 +131,19 @@ LSP core route through the `ls.core.PcBackend` seam, which has two
 implementations selected at boot:
 
 - `InProcessPcBackend` — the presentation compiler runs in the LS JVM over
-  `ls.pc.PcFacade`. The default (`--in-process-pc`).
+  `ls.pc.PcFacade`. Opt-in via `--in-process-pc`.
 - `ForkedPcBackend` — the PC runs in an isolated child JVM (`ls.pc.PcWorkerMain`)
   proxied by `ls.pc.ForkedPcWorker` over a small JSON-RPC protocol
-  (`ls.pc.PcWorkerApi`). Selected by `--forked-pc`. A wedged or crashed child is
-  killed and respawned with its targets/open buffers replayed, so a plugin crash
-  is a latency blip, not index corruption. The doctor `PC` section reports
-  "forked worker alive"; `ForkedPcBackend.workerPid` is a fault-injection hook.
+  (`ls.pc.PcWorkerApi`). The production default (also selectable with
+  `--forked-pc`). A wedged or crashed child is killed and respawned with its
+  targets/open buffers replayed, so a plugin crash is a latency blip, not index
+  corruption. The doctor `PC` section reports "forked worker alive";
+  `ForkedPcBackend.workerPid` is a fault-injection hook.
 
-Process isolation (plan §5.2) is the eventual production default; the flip from
-in-process to forked is sequenced behind the real-BSP forked end-to-end
-acceptance test and is opt-in via `--forked-pc` until then.
+Process isolation is the production default: the flip from in-process to forked
+landed once the real-BSP forked end-to-end acceptance test (a worker-kill respawn
+over a live Mill BSP session) was green. `--in-process-pc` opts back into the same
+JVM (e.g. AOT training, so the PC code paths are recorded into the cache).
 
 ### 3.3 Storage layout
 

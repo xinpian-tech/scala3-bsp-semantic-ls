@@ -142,7 +142,9 @@ class PcBackendSuite extends munit.FunSuite:
   test("Main resolves the PC backend mode from flags"):
     assertEquals(Main.pcBackendMode(Array("--forked-pc")), PcBackendMode.Forked)
     assertEquals(Main.pcBackendMode(Array("--in-process-pc")), PcBackendMode.InProcess)
-    assertEquals(Main.pcBackendMode(Array.empty[String]), PcBackendMode.InProcess)
+    // process isolation is now the production default (flipped once the forked
+    // worker-kill end-to-end over real Mill BSP was green)
+    assertEquals(Main.pcBackendMode(Array.empty[String]), PcBackendMode.Forked)
     assertEquals(Main.pcBackendMode(Array("--forked-pc", "--in-process-pc")), PcBackendMode.Forked)
 
   test("Bootstrap with Forked mode wires a forked backend (no BSP, no child spawn)"):

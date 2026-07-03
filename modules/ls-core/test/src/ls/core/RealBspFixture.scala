@@ -181,12 +181,14 @@ object RealBspFixture:
 final class RealBspServer(
     val ws: E2eFixture.Ws,
     expectedDocs: Int = 4,
-    withBsp: Boolean = true
+    withBsp: Boolean = true,
+    pcBackendMode: PcBackendMode = PcBackendMode.InProcess
 ):
 
   val server: ScalaLs = new ScalaLs(
     ScalaLs.Config(
       bootstrap = Bootstrap.Config(
+        pcBackendMode = pcBackendMode,
         // The production path: discover .bsp/mill-bsp.json and launch its argv
         // as a child process, only with test-friendly timeouts (a real mill BSP
         // compile evaluates the whole build in .bsp/out). `withBsp = false` boots
