@@ -31,8 +31,12 @@ SQLite writes
 mmap postings writes
 ```
 
-The PC worker is a separate JVM, isolated from the main LS process. A crashing user
-plugin must never corrupt the main index or take down the main LS.
+A crashing user plugin must never corrupt the main index or take down the main LS.
+With `--forked-pc` the PC worker is an isolated child JVM: a plugin that crashes
+the worker is killed and respawned (targets/buffers replayed), so the main LS
+survives untouched. The default `--in-process-pc` mode still contains a plugin
+crash at the hook boundary (the plugin is disabled and listed in the doctor), but
+a JVM-fatal fault is only fully isolated in forked mode.
 
 Plugin boundary (plan 1.4): this project does **not** manage the SemanticDB compiler
 plugin — that belongs to the build tool / BSP server / scalac configuration and the

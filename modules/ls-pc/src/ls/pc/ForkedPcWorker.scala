@@ -7,7 +7,7 @@ import scala.jdk.CollectionConverters.*
 import scala.util.control.NonFatal
 
 import org.eclipse.lsp4j.jsonrpc.Launcher
-import org.eclipse.lsp4j.{CompletionList, Hover, Range, SignatureHelp}
+import org.eclipse.lsp4j.{CompletionItem, CompletionList, Hover, Range, SignatureHelp}
 
 /** [[PcWorkerApi]] proxy over a forked PC worker JVM (plan 5.2: PC worker is
   * a separate JVM; user plugin crashes cannot break the main LS index).
@@ -47,6 +47,11 @@ final class ForkedPcWorker(
 
   def isAlive: Boolean = lock.synchronized(session.exists(_.process.isAlive))
 
+  /** OS process id of the live child, if any (test hook for fault injection:
+    * kill this pid and the next request respawns + replays).
+    */
+  def pid: Option[Long] = lock.synchronized(session.map(_.process.pid()))
+
   /** Kill the child (if any). The next request spawns a fresh one and replays
     * targets/buffers.
     */
@@ -80,6 +85,9 @@ final class ForkedPcWorker(
 
   override def completion(params: PcWorkerPositionParams): CompletableFuture[CompletionList] =
     guarded("pc/completion")(_.completion(params))
+
+  override def completionItemResolve(params: PcWorkerResolveParams): CompletableFuture[CompletionItem] =
+    guarded("pc/completionResolve")(_.completionItemResolve(params))
 
   override def hover(params: PcWorkerPositionParams): CompletableFuture[Hover] =
     guarded("pc/hover")(_.hover(params))

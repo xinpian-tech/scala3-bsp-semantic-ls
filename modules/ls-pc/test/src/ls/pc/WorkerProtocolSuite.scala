@@ -117,6 +117,24 @@ class WorkerProtocolSuite extends munit.FunSuite:
 
   test("in-process worker reports plugin status"):
     val status = get(worker.pluginStatus())
-    val plugins = status.servicePlugins.asScala.mkString("\n")
-    assert(plugins.contains("marker-completion"), plugins)
-    assert(status.disabled.asScala.exists(_.startsWith("throwing-plugin")), status.disabled.asScala.toString)
+    val ids = status.servicePlugins.asScala.map(_.id)
+    assert(ids.contains("marker-completion"), ids.toString)
+    assert(status.disabled.asScala.exists(_.id == "throwing-plugin"), status.disabled.asScala.map(_.id).toString)
+
+  test("PcWorkerPluginStatus round-trips a report losslessly"):
+    val report = PcPluginStatusReport(
+      compilerPlugins = Vector(CompilerPluginStatus(Vector("/p.jar"), Vector("-opt"), loaded = true, "ok")),
+      servicePlugins = Vector(ServicePluginStatus("svc", "config", enabled = false, selfTestOk = false, "self-test boom")),
+      disabled = Vector(DisabledPlugin("svc", "hook 'afterCompletion' threw RuntimeException: boom"))
+    )
+    assertEquals(PcWorkerPluginStatus.toReport(PcWorkerPluginStatus.of(report)), report)
+
+  test("in-process worker resolves a completion item"):
+    val item = new org.eclipse.lsp4j.CompletionItem("List")
+    val params = new PcWorkerResolveParams
+    params.targetId = SharedPc.targetId
+    params.symbol = "scala/collection/immutable/List."
+    params.item = item
+    // resolve must at least return the same (or an enriched) item, not fail
+    val resolved = get(worker.completionItemResolve(params))
+    assertEquals(resolved.getLabel, "List")

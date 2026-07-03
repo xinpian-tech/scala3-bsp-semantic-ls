@@ -67,7 +67,7 @@ final class CoreServices(
     val serverInfo: Option[InitializeBuildResult],
     val model: Option[BspProjectModel],
     val workspaceTargets: WorkspaceTargets,
-    val pc: PcFacade,
+    val pc: PcBackend,
     val pcConfigs: Map[String, PcTargetConfig],
     /** Normalized `file://` URI -> owning bspId, from the project model. */
     val uriToTarget: Map[String, String],
@@ -113,6 +113,11 @@ object Bootstrap:
     */
   final case class Config(
       connectBsp: (Path, BspClientHandlers) => Option[BspSession] = defaultConnect,
+      /** PC execution backend (plan 5.2). Defaults to in-process; `--forked-pc`
+        * selects an isolated child JVM. The default flips to forked only after
+        * the real-BSP forked end-to-end test stabilizes.
+        */
+      pcBackendMode: PcBackendMode = PcBackendMode.InProcess,
       pcRequestTimeoutMillis: Long = 15000L,
       log: String => Unit = msg => System.err.println(s"[scala3-bsp-semantic-ls] $msg"),
       /** Sink for LSP diagnostics; the server wires it to its LanguageClient so
@@ -167,7 +172,7 @@ object Bootstrap:
 
     val theMeta = meta.nn
     val theSnapshots = snapshots.nn
-    var livePc: PcFacade | Null = null
+    var livePc: PcBackend | Null = null
     var liveSession: BspSession | Null = null
     try
       // --- startup recovery: publish the active segment without re-ingesting ---
@@ -208,14 +213,39 @@ object Bootstrap:
         PcPluginInitContext(Some(workspaceRoot), settings.generatedSourcesRoot, m => config.log(s"pc-plugin: $m"))
       )
       val pluginConfigFile = PcPluginConfigLoader.defaultPath(workspaceRoot)
-      if Files.isRegularFile(pluginConfigFile) then
+      val havePluginConfig = Files.isRegularFile(pluginConfigFile)
+      if havePluginConfig then
         try
           pluginManager.applyConfig(PcPluginConfigLoader.load(pluginConfigFile))
           notes += s"applied PC plugin config $pluginConfigFile"
         catch
           case NonFatal(t) =>
             notes += s"PC plugin config $pluginConfigFile could not be loaded: ${describe(t)}"
-      val pc = new PcFacade(pluginManager, settings)
+
+      // PC backend selection (plan 5.2): in-process runs the PC in this JVM
+      // over the facade; forked spawns an isolated child (ls.pc.PcWorkerMain)
+      // that loads its own plugins from --plugin-config, so a plugin crash
+      // can never reach the main LS index.
+      val pc: PcBackend = config.pcBackendMode match
+        case PcBackendMode.InProcess =>
+          new InProcessPcBackend(new PcFacade(pluginManager, settings))
+        case PcBackendMode.Forked =>
+          val workerArgs =
+            Vector(
+              "--workspace",
+              workspaceRoot.toString,
+              "--generated-sources",
+              settings.generatedSourcesRoot.toString,
+              "--timeout-ms",
+              config.pcRequestTimeoutMillis.toString
+            ) ++ (if havePluginConfig then Vector("--plugin-config", pluginConfigFile.toString)
+                  else Vector.empty)
+          val worker = new ls.pc.ForkedPcWorker(
+            workerArgs = workerArgs,
+            requestTimeoutMillis = math.max(config.pcRequestTimeoutMillis * 2, 30000L)
+          )
+          notes += "PC backend: forked worker JVM"
+          new ForkedPcBackend(worker)
       livePc = pc
 
       // --- BSP connection + project model ---
@@ -331,7 +361,7 @@ object Bootstrap:
     */
   private[core] def loadModel(
       session: BspSession,
-      pc: PcFacade,
+      pc: PcBackend,
       initialize: Boolean,
       log: String => Unit
   ): ModelLoad =

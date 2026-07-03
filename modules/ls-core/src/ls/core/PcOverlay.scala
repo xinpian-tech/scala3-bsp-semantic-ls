@@ -3,24 +3,24 @@ package ls.core
 import scala.util.control.NonFatal
 
 import ls.index.{Loc, Role, Span}
-import ls.pc.{DefinitionOrigin, DefinitionResult, PcFacade}
+import ls.pc.{DefinitionOrigin, DefinitionResult}
 import ls.rename.{DirtyBufferOverlay, OverlayHit}
 import org.eclipse.lsp4j.Range
 
-/** The narrow slice of the PC surface the overlay needs; [[PcFacade]] is
-  * final, so tests stub this trait instead.
+/** The narrow slice of the PC surface the overlay needs; tests stub this trait
+  * instead of a concrete backend.
   */
 trait PcSymbolQueries:
   def isOpen(fileUri: String): Boolean
   def prepareRename(fileUri: String, line: Int, character: Int): Option[Range]
   def definition(fileUri: String, line: Int, character: Int): DefinitionResult
 
-final class FacadePcQueries(facade: PcFacade) extends PcSymbolQueries:
-  def isOpen(fileUri: String): Boolean = facade.bufferText(fileUri).isDefined
+final class FacadePcQueries(pc: PcBackend) extends PcSymbolQueries:
+  def isOpen(fileUri: String): Boolean = pc.bufferText(fileUri).isDefined
   def prepareRename(fileUri: String, line: Int, character: Int): Option[Range] =
-    facade.prepareRename(fileUri, line, character)
+    pc.prepareRename(fileUri, line, character)
   def definition(fileUri: String, line: Int, character: Int): DefinitionResult =
-    facade.definition(fileUri, line, character)
+    pc.definition(fileUri, line, character)
 
 /** PC-backed [[DirtyBufferOverlay]] (PCPath of plan 10 / plan 12.1).
   *

@@ -67,7 +67,7 @@ class ExecuteCommandSuite extends munit.FunSuite:
           )
         )
       ),
-      pc = pc,
+      pc = InProcessPcBackend(pc),
       pcConfigs = Map.empty,
       uriToTarget = Map.empty,
       uris = WorkspaceUris(Vector(dir), orchestrator),

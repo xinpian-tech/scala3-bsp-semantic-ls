@@ -126,8 +126,22 @@ completion / hover / signature / definition
 prepareRename
 ```
 
-The PC worker is a separate JVM, isolated from the main process. A crashing user
-plugin must never corrupt the main index.
+A crashing user plugin must never corrupt the main index. All PC calls from the
+LSP core route through the `ls.core.PcBackend` seam, which has two
+implementations selected at boot:
+
+- `InProcessPcBackend` — the presentation compiler runs in the LS JVM over
+  `ls.pc.PcFacade`. The default (`--in-process-pc`).
+- `ForkedPcBackend` — the PC runs in an isolated child JVM (`ls.pc.PcWorkerMain`)
+  proxied by `ls.pc.ForkedPcWorker` over a small JSON-RPC protocol
+  (`ls.pc.PcWorkerApi`). Selected by `--forked-pc`. A wedged or crashed child is
+  killed and respawned with its targets/open buffers replayed, so a plugin crash
+  is a latency blip, not index corruption. The doctor `PC` section reports
+  "forked worker alive"; `ForkedPcBackend.workerPid` is a fault-injection hook.
+
+Process isolation (plan §5.2) is the eventual production default; the flip from
+in-process to forked is sequenced behind the real-BSP forked end-to-end
+acceptance test and is opt-in via `--forked-pc` until then.
 
 ### 3.3 Storage layout
 

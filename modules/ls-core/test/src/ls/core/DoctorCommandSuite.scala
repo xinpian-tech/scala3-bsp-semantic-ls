@@ -122,7 +122,7 @@ class DoctorCommandSuite extends munit.FunSuite:
       workspaceTargets = WorkspaceTargets(
         Vector(TargetSpec(bspId = LibId, semanticdbRoot = sdbRoot, sourceroot = srcRoot))
       ),
-      pc = pc,
+      pc = InProcessPcBackend(pc),
       pcConfigs = Map.empty,
       uriToTarget = Map.empty,
       uris = WorkspaceUris(Vector(root), orchestrator),

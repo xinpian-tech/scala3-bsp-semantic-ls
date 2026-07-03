@@ -49,7 +49,7 @@ object DoctorCommand:
       sqlite = SqliteSection.gather(s.meta),
       postings = PostingsSection.gather(s.meta, s.snapshots),
       pc = SectionState.attempt("PC") {
-        PcSection.gather(s.pc.activeTargets, s.pc.registeredTargets, workerAlive = None)
+        PcSection.gather(s.pc.activeTargets, s.pc.registeredTargets, workerAlive = s.pc.workerAlive)
       },
       pcPlugins = SectionState.attempt("PC Plugins") {
         PcPluginsSection.gather(s.pc.pluginStatus)

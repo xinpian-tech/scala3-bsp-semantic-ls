@@ -6,7 +6,7 @@ import java.util.concurrent.{CompletableFuture, Executors}
 import scala.jdk.CollectionConverters.*
 
 import org.eclipse.lsp4j.jsonrpc.services.JsonRequest
-import org.eclipse.lsp4j.{CompletionList, Hover, Range, SignatureHelp}
+import org.eclipse.lsp4j.{CompletionItem, CompletionList, Hover, Range, SignatureHelp}
 
 /** JSON-friendly parameter/result carriers for the PC worker protocol
   * (plan 5.2). Plain mutable fields so lsp4j's gson-based json handler can
@@ -56,6 +56,14 @@ final class PcWorkerPositionParams:
   var line: Int = 0
   var character: Int = 0
 
+/** Resolve a completion item: `item` is the item to enrich, `symbol` its PC
+  * symbol (from the item's data), `targetId` the owning build target.
+  */
+final class PcWorkerResolveParams:
+  var targetId: String = ""
+  var symbol: String = ""
+  var item: CompletionItem = new CompletionItem()
+
 /** JSON-friendly definition result: `origins.get(i)` is the
   * [[DefinitionOrigin]] name for `locations.get(i)`.
   */
@@ -81,23 +89,74 @@ object PcWorkerDefinitionResult:
     }
     DefinitionResult(r.symbol, marked)
 
-/** JSON-friendly plugin status mirror of [[PcPluginStatusReport]]. */
+/** JSON-friendly mirror of [[CompilerPluginStatus]]. */
+final class PcWorkerCompilerPlugin:
+  var jars: java.util.List[String] = new java.util.ArrayList()
+  var options: java.util.List[String] = new java.util.ArrayList()
+  var loaded: Boolean = false
+  var detail: String = ""
+
+/** JSON-friendly mirror of [[ServicePluginStatus]]. */
+final class PcWorkerServicePlugin:
+  var id: String = ""
+  var source: String = ""
+  var enabled: Boolean = true
+  var selfTestOk: Boolean = true
+  var selfTestDetail: String = ""
+
+/** JSON-friendly mirror of [[DisabledPlugin]]. */
+final class PcWorkerDisabledPlugin:
+  var id: String = ""
+  var reason: String = ""
+
+/** JSON-friendly, LOSSLESS mirror of [[PcPluginStatusReport]] for the forked
+  * worker: nested plain-field carriers so the doctor and PC-only rejection see
+  * the same structured status a forked child reports as an in-process facade
+  * would. [[toReport]] is the exact inverse of [[of]].
+  */
 final class PcWorkerPluginStatus:
-  var compilerPlugins: java.util.List[String] = new java.util.ArrayList()
-  var servicePlugins: java.util.List[String] = new java.util.ArrayList()
-  var selfTests: java.util.List[String] = new java.util.ArrayList()
-  var disabled: java.util.List[String] = new java.util.ArrayList()
+  var compilerPlugins: java.util.List[PcWorkerCompilerPlugin] = new java.util.ArrayList()
+  var servicePlugins: java.util.List[PcWorkerServicePlugin] = new java.util.ArrayList()
+  var disabled: java.util.List[PcWorkerDisabledPlugin] = new java.util.ArrayList()
 
 object PcWorkerPluginStatus:
   def of(report: PcPluginStatusReport): PcWorkerPluginStatus =
     val s = new PcWorkerPluginStatus
     s.compilerPlugins = report.compilerPlugins.map { c =>
-      s"${c.jars.mkString(",")}: ${if c.loaded then "loaded" else c.detail}"
+      val w = new PcWorkerCompilerPlugin
+      w.jars = c.jars.asJava
+      w.options = c.options.asJava
+      w.loaded = c.loaded
+      w.detail = c.detail
+      w
     }.asJava
-    s.servicePlugins = report.servicePlugins.map(p => s"${p.id} (${p.source})").asJava
-    s.selfTests = report.servicePlugins.map(p => s"${p.id}: ${p.selfTestDetail}").asJava
-    s.disabled = report.disabled.map(d => s"${d.id}: ${d.reason}").asJava
+    s.servicePlugins = report.servicePlugins.map { p =>
+      val w = new PcWorkerServicePlugin
+      w.id = p.id
+      w.source = p.source
+      w.enabled = p.enabled
+      w.selfTestOk = p.selfTestOk
+      w.selfTestDetail = p.selfTestDetail
+      w
+    }.asJava
+    s.disabled = report.disabled.map { d =>
+      val w = new PcWorkerDisabledPlugin
+      w.id = d.id
+      w.reason = d.reason
+      w
+    }.asJava
     s
+
+  def toReport(s: PcWorkerPluginStatus): PcPluginStatusReport =
+    PcPluginStatusReport(
+      compilerPlugins = s.compilerPlugins.asScala.toVector.map(c =>
+        CompilerPluginStatus(c.jars.asScala.toVector, c.options.asScala.toVector, c.loaded, c.detail)
+      ),
+      servicePlugins = s.servicePlugins.asScala.toVector.map(p =>
+        ServicePluginStatus(p.id, p.source, p.enabled, p.selfTestOk, p.selfTestDetail)
+      ),
+      disabled = s.disabled.asScala.toVector.map(d => DisabledPlugin(d.id, d.reason))
+    )
 
 /** The PC worker JVM boundary (plan 5.2): a small JSON-RPC surface over the
   * facade operations — target init, dirty-buffer lifecycle, the six queries,
@@ -120,6 +179,9 @@ trait PcWorkerApi:
 
   @JsonRequest("pc/completion")
   def completion(params: PcWorkerPositionParams): CompletableFuture[CompletionList]
+
+  @JsonRequest("pc/completionResolve")
+  def completionItemResolve(params: PcWorkerResolveParams): CompletableFuture[CompletionItem]
 
   /** Null when the PC has no hover at the position. */
   @JsonRequest("pc/hover")
@@ -194,6 +256,9 @@ final class InProcessPcWorker(
 
   override def completion(params: PcWorkerPositionParams): CompletableFuture[CompletionList] =
     async(facade.completion(params.uri, params.line, params.character))
+
+  override def completionItemResolve(params: PcWorkerResolveParams): CompletableFuture[CompletionItem] =
+    async(facade.completionItemResolve(params.targetId, params.item, params.symbol))
 
   override def hover(params: PcWorkerPositionParams): CompletableFuture[Hover] =
     async(facade.hover(params.uri, params.line, params.character).orNull)
