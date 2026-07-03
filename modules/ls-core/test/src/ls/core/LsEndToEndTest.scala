@@ -159,21 +159,75 @@ class LsEndToEndTest extends munit.FunSuite:
     assert(env.fake.initializeReceived.get, "build/initialize")
     assert(env.fake.initializedNotified.get, "build/initialized")
 
-  test("executeCommand compile forwards BSP diagnostics to the LSP client"):
+  private def sameFile(uri: String, path: java.nio.file.Path): Boolean =
+    java.nio.file.Path.of(java.net.URI.create(uri)) == path
+
+  private def bspErrorPublish(file: java.nio.file.Path, targetName: String, msg: String)
+      : ch.epfl.scala.bsp4j.PublishDiagnosticsParams =
+    val d = new ch.epfl.scala.bsp4j.Diagnostic(
+      new ch.epfl.scala.bsp4j.Range(
+        new ch.epfl.scala.bsp4j.Position(1, 2),
+        new ch.epfl.scala.bsp4j.Position(1, 7)
+      ),
+      msg
+    )
+    d.setSeverity(ch.epfl.scala.bsp4j.DiagnosticSeverity.ERROR)
+    new ch.epfl.scala.bsp4j.PublishDiagnosticsParams(
+      new ch.epfl.scala.bsp4j.TextDocumentIdentifier(file.toUri.toString),
+      new ch.epfl.scala.bsp4j.BuildTargetIdentifier(s"bsp://workspace/$targetName"),
+      java.util.List.of(d),
+      true
+    )
+
+  private def bspClearPublish(file: java.nio.file.Path, targetName: String)
+      : ch.epfl.scala.bsp4j.PublishDiagnosticsParams =
+    new ch.epfl.scala.bsp4j.PublishDiagnosticsParams(
+      new ch.epfl.scala.bsp4j.TextDocumentIdentifier(file.toUri.toString),
+      new ch.epfl.scala.bsp4j.BuildTargetIdentifier(s"bsp://workspace/$targetName"),
+      java.util.List.of(),
+      true
+    )
+
+  private def publishesFor(file: java.nio.file.Path): Vector[PublishDiagnosticsParams] =
+    env.client.diagnostics.asScala.filter(p => sameFile(p.getUri, file)).toVector
+
+  test("executeCommand compile forwards an error diagnostic with the exact shape and status"):
     val _ = env.initResult
-    env.client.diagnostics.clear()
-    val result = executeCommand(ScalaLs.Commands.Compile)
-    assert(result.startsWith("compile ok"), result)
     val bFile = ws.bSourceFile
-    def publishForB: Option[PublishDiagnosticsParams] =
-      env.client.diagnostics.asScala.find(p =>
-        java.nio.file.Path.of(java.net.URI.create(p.getUri)) == bFile
-      )
-    eventually("diagnostic published for B.scala")(publishForB.isDefined)
-    val diags = publishForB.get.getDiagnostics.asScala.toVector
-    assert(diags.nonEmpty, "expected at least one diagnostic")
-    assertEquals(diags.head.getSeverity, DiagnosticSeverity.Warning)
-    assert(diags.head.getMessage.getLeft.contains("value unused"), diags.head.getMessage.getLeft)
+    env.client.diagnostics.clear()
+    env.bspServer.stageCompile(
+      CompileScenario(Vector(bspErrorPublish(bFile, "b", "boom in B")), ch.epfl.scala.bsp4j.StatusCode.ERROR)
+    )
+    val result = executeCommand(ScalaLs.Commands.Compile)
+    assert(result.startsWith("compile failed"), result)
+    eventually("exactly one diagnostic publish for B.scala")(publishesFor(bFile).size == 1)
+    val publish = publishesFor(bFile).head
+    val diags = publish.getDiagnostics.asScala.toVector
+    assertEquals(diags.size, 1)
+    assertEquals(diags.head.getSeverity, DiagnosticSeverity.Error)
+    assertEquals(LspConvert.span(diags.head.getRange), Span(1, 2, 1, 7))
+    assertEquals(diags.head.getMessage.getLeft, "boom in B")
+
+  test("a reset-empty diagnostic clears the uri with exactly one empty publish"):
+    val _ = env.initResult
+    val bFile = ws.bSourceFile
+    env.client.diagnostics.clear()
+    env.bspServer.stageCompile(
+      CompileScenario(Vector(bspErrorPublish(bFile, "b", "to be cleared")), ch.epfl.scala.bsp4j.StatusCode.OK)
+    )
+    executeCommand(ScalaLs.Commands.Compile)
+    eventually("initial non-empty diagnostic present")(
+      publishesFor(bFile).exists(!_.getDiagnostics.isEmpty)
+    )
+    env.client.diagnostics.clear()
+    env.bspServer.stageCompile(
+      CompileScenario(Vector(bspClearPublish(bFile, "b")), ch.epfl.scala.bsp4j.StatusCode.OK)
+    )
+    executeCommand(ScalaLs.Commands.Compile)
+    eventually("clearing publish arrives")(publishesFor(bFile).nonEmpty)
+    val clears = publishesFor(bFile)
+    assertEquals(clears.size, 1)
+    assert(clears.head.getDiagnostics.isEmpty, "expected empty clearing publish")
 
   test("doctor over executeCommand reports the BSP server and the IndexUnavailable target"):
     val _ = env.initResult

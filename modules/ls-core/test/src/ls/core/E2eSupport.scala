@@ -176,6 +176,14 @@ object E2eFixture:
   * the presentation compiler gets a real classpath, exactly as a real BSP
   * server would provide.
   */
+/** One-shot compile outcome staged onto [[ClasspathAugmentingServer]]: the next
+  * `buildTarget/compile` emits these diagnostics and returns this status.
+  */
+final case class CompileScenario(
+    publishes: Vector[ch.epfl.scala.bsp4j.PublishDiagnosticsParams],
+    status: ch.epfl.scala.bsp4j.StatusCode
+)
+
 final class ClasspathAugmentingServer(
     val underlying: FakeBuildServer,
     extraClasspath: String => Vector[Path]
@@ -186,9 +194,25 @@ final class ClasspathAugmentingServer(
 
   val compileRequests = new AtomicInteger(0)
 
+  private val stagedCompile =
+    new java.util.concurrent.atomic.AtomicReference[Option[CompileScenario]](None)
+
+  /** Stage a one-shot outcome for the next compile, then revert to the default
+    * successful, diagnostic-free compile. Lets a test drive an exact diagnostic
+    * shape without perturbing the compiles other tests depend on.
+    */
+  def stageCompile(scenario: CompileScenario): Unit = stagedCompile.set(Some(scenario))
+
   override def buildTargetCompile(params: CompileParams): CompletableFuture[CompileResult] =
     compileRequests.incrementAndGet()
-    underlying.buildTargetCompile(params)
+    val status = stagedCompile.getAndSet(None) match
+      case Some(scenario) =>
+        scenario.publishes.foreach(underlying.client.onBuildPublishDiagnostics)
+        scenario.status
+      case None => ch.epfl.scala.bsp4j.StatusCode.OK
+    val result = new CompileResult(status)
+    result.setOriginId(params.getOriginId)
+    CompletableFuture.completedFuture(result)
 
   override def buildTargetScalacOptions(
       params: ScalacOptionsParams

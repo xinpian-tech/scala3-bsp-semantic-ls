@@ -116,7 +116,7 @@ object Bootstrap:
       pcRequestTimeoutMillis: Long = 15000L,
       log: String => Unit = msg => System.err.println(s"[scala3-bsp-semantic-ls] $msg"),
       /** Sink for LSP diagnostics; the server wires it to its LanguageClient so
-        * build diagnostics reach the editor (plan 5.1). Defaults to a drop.
+        * build diagnostics reach the editor. Defaults to dropping notifications.
         */
       publishDiagnostics: org.eclipse.lsp4j.PublishDiagnosticsParams => Unit = _ => ()
   )

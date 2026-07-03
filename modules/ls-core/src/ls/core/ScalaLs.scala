@@ -96,7 +96,7 @@ final class ScalaLs(val config: ScalaLs.Config = ScalaLs.Config())
 
   override def initialized(params: InitializedParams): Unit =
     val root = workspaceRoot.getOrElse(Path.of(".").toAbsolutePath.normalize)
-    // Route BSP build diagnostics to the connected LSP client (plan 5.1).
+    // Route BSP build diagnostics to the connected LSP client.
     val bootstrapConfig = config.bootstrap.copy(
       publishDiagnostics = p => client.foreach(_.publishDiagnostics(p))
     )
