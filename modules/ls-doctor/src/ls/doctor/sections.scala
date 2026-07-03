@@ -159,7 +159,9 @@ final case class SqliteSection(
     /** Active rows in `documents`. */
     documentCount: Long,
     /** Rows in `symbol_intern`. */
-    symbolCount: Long
+    symbolCount: Long,
+    /** Size of the `-wal` sidecar file in bytes. */
+    walSizeBytes: Long
 )
 
 object SqliteSection:
@@ -188,7 +190,8 @@ object SqliteSection:
         activeSegmentId = active.map(_.segmentId),
         activeSegmentPath = active.map(_.path),
         documentCount = documentCount,
-        symbolCount = meta.symbolCount()
+        symbolCount = meta.symbolCount(),
+        walSizeBytes = meta.walSizeBytes
       )
 
 /** One segment_manifest row as shown by the doctor. */

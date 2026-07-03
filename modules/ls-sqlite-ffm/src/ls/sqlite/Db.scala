@@ -19,6 +19,28 @@ import scala.collection.mutable
   * not be executed reentrantly (e.g. starting the same query inside a
   * foreachRow callback over that query).
   */
+/** WAL checkpoint mode (SQLite `PRAGMA wal_checkpoint`). */
+enum CheckpointMode(val keyword: String):
+  case Passive extends CheckpointMode("PASSIVE")
+  case Full extends CheckpointMode("FULL")
+  case Restart extends CheckpointMode("RESTART")
+  case Truncate extends CheckpointMode("TRUNCATE")
+
+/** Result row of `PRAGMA wal_checkpoint`: `busy` (the checkpoint could not run
+  * to completion), `log` (frames in the WAL, -1 if unknown), `checkpointed`
+  * (frames moved into the db file, -1 if unknown).
+  */
+final case class CheckpointResult(busy: Boolean, log: Int, checkpointed: Int):
+  /** All WAL frames are checkpointed into the db file. */
+  def fullyCheckpointed: Boolean = !busy && log >= 0 && log == checkpointed
+
+/** Outcome of a scheduled checkpoint: the PASSIVE pass plus the optional
+  * TRUNCATE pass (present only when TRUNCATE was attempted).
+  */
+final case class CheckpointOutcome(passive: CheckpointResult, truncate: Option[CheckpointResult]):
+  /** The WAL file was reset to zero length. */
+  def truncated: Boolean = truncate.exists(r => !r.busy)
+
 final class Db private (
     private[sqlite] val sqlite: Sqlite3,
     private[sqlite] val handle: MemorySegment,
@@ -88,6 +110,39 @@ final class Db private (
           catch case r: Throwable => t.addSuppressed(r)
           throw t
       finally txDepth = 0
+
+  /** Runs `PRAGMA wal_checkpoint(mode)` and returns its result row. PASSIVE
+    * never blocks on readers or writers; the other modes may return busy rather
+    * than blocking (bounded by the current busy_timeout). Never throws for a
+    * BUSY checkpoint.
+    */
+  def checkpoint(mode: CheckpointMode): CheckpointResult =
+    requireOpen()
+    prepare(s"PRAGMA wal_checkpoint(${mode.keyword})")
+      .queryOne(st => CheckpointResult(st.columnInt(0) != 0, st.columnInt(1), st.columnInt(2)))
+      .getOrElse(CheckpointResult(busy = true, log = -1, checkpointed = -1))
+
+  /** Size of the `-wal` sidecar file in bytes (0 when it does not exist). */
+  def walFileSizeBytes: Long =
+    val wal = Path.of(path + "-wal")
+    if Files.isRegularFile(wal) then Files.size(wal) else 0L
+
+  /** Scheduled checkpoint that never blocks the writer: a PASSIVE pass (always
+    * non-blocking), then a TRUNCATE pass only when PASSIVE fully checkpointed
+    * the WAL and the `-wal` file exceeds `walThresholdBytes`. The TRUNCATE runs
+    * with busy_timeout=0 so a concurrent reader makes it return busy at once
+    * rather than waiting; the timeout is restored afterwards.
+    */
+  def smartCheckpoint(walThresholdBytes: Long): CheckpointOutcome =
+    requireOpen()
+    val passive = checkpoint(CheckpointMode.Passive)
+    val truncate =
+      if !(passive.fullyCheckpointed && walFileSizeBytes > walThresholdBytes) then None
+      else
+        exec("PRAGMA busy_timeout=0")
+        try Some(checkpoint(CheckpointMode.Truncate))
+        finally exec("PRAGMA busy_timeout=5000")
+    CheckpointOutcome(passive, truncate)
 
   /** Finalizes all cached statements and closes the connection. Idempotent. */
   def close(): Unit =

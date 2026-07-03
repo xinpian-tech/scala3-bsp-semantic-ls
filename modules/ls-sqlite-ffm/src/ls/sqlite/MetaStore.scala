@@ -95,6 +95,16 @@ final class MetaStore(val db: Db) extends AutoCloseable:
 
   def close(): Unit = db.close()
 
+  /** Size of the WAL sidecar file in bytes (0 when absent). */
+  def walSizeBytes: Long = db.walFileSizeBytes
+
+  /** Scheduled WAL checkpoint, run on the single writer thread after an ingest
+    * publish. Non-blocking: PASSIVE always, then TRUNCATE only when the WAL is
+    * fully checkpointed and larger than `walThresholdBytes`.
+    */
+  def checkpoint(walThresholdBytes: Long = MetaStore.DefaultWalThresholdBytes): CheckpointOutcome =
+    db.smartCheckpoint(walThresholdBytes)
+
   // --- targets ---
 
   def upsertTarget(
@@ -562,6 +572,9 @@ final class MetaStore(val db: Db) extends AutoCloseable:
     )
 
 object MetaStore:
+  /** Default `-wal` size above which a fully-checkpointed WAL is truncated. */
+  val DefaultWalThresholdBytes: Long = 16L * 1024 * 1024
+
   /** Opens (creating and migrating if needed) the metadata store at `path`. */
   def open(path: Path): MetaStore =
     val db = Db.open(path)

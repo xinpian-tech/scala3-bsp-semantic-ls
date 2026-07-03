@@ -164,3 +164,72 @@ class DbSuite extends munit.FunSuite with TempDbFixture:
       assertEquals(seen.sorted, List(1, 2))
     finally db.close()
   }
+
+  private def growWal(db: Db, rows: Int): Unit =
+    db.exec("CREATE TABLE t (x INTEGER)")
+    db.withWriteTransaction {
+      val st = db.prepare("INSERT INTO t VALUES (?)")
+      for i <- 1 to rows do st.bindInt(1, i).run()
+    }
+
+  tempDir.test("checkpoint(TRUNCATE) empties the WAL when idle") { dir =>
+    val db = Db.open(dir.resolve("meta.sqlite"))
+    try
+      growWal(db, 5000)
+      assert(db.walFileSizeBytes > 0L, "the WAL should have grown")
+      val r = db.checkpoint(CheckpointMode.Truncate)
+      assert(!r.busy, s"idle TRUNCATE must not be busy: $r")
+      assert(r.fullyCheckpointed, s"expected all frames checkpointed: $r")
+      assertEquals(db.walFileSizeBytes, 0L, "TRUNCATE resets the WAL file to zero")
+    finally db.close()
+  }
+
+  tempDir.test("smartCheckpoint truncates a large fully-checkpointed WAL when idle") { dir =>
+    val db = Db.open(dir.resolve("meta.sqlite"))
+    try
+      growWal(db, 5000)
+      val outcome = db.smartCheckpoint(walThresholdBytes = 0L)
+      assert(outcome.passive.fullyCheckpointed, s"passive should complete when idle: ${outcome.passive}")
+      assert(outcome.truncated, "TRUNCATE should run when idle and over threshold")
+      assertEquals(db.walFileSizeBytes, 0L)
+    finally db.close()
+  }
+
+  tempDir.test("smartCheckpoint above threshold vs below threshold") { dir =>
+    val db = Db.open(dir.resolve("meta.sqlite"))
+    try
+      growWal(db, 3000)
+      // A huge threshold means the WAL is under it -> no TRUNCATE.
+      val under = db.smartCheckpoint(walThresholdBytes = Long.MaxValue)
+      assert(!under.truncated, "TRUNCATE must be skipped when the WAL is under threshold")
+      assert(db.walFileSizeBytes > 0L, "WAL is still present when not truncated")
+    finally db.close()
+  }
+
+  tempDir.test("smartCheckpoint never blocks the writer and skips TRUNCATE under a held reader") { dir =>
+    val path = dir.resolve("meta.sqlite")
+    val writer = Db.open(path)
+    val reader = Db.open(path)
+    try
+      growWal(writer, 3000)
+      // Hold a read transaction open on the reader connection.
+      reader.exec("BEGIN")
+      reader.prepare("SELECT count(*) FROM t").queryOne(_.columnLong(0))
+
+      val t0 = System.nanoTime()
+      val outcome = writer.smartCheckpoint(walThresholdBytes = 0L)
+      val elapsedMs = (System.nanoTime() - t0) / 1_000_000L
+      assert(elapsedMs < 2000L, s"checkpoint blocked for ${elapsedMs}ms under a held reader")
+      assert(!outcome.truncated, s"TRUNCATE must be skipped/busy while a reader is held: $outcome")
+
+      // Writes still proceed while the reader is held.
+      writer.withWriteTransaction { writer.prepare("INSERT INTO t VALUES (?)").bindInt(1, 99).run() }
+
+      // Once the reader releases, a checkpoint can truncate.
+      reader.exec("COMMIT")
+      val after = writer.smartCheckpoint(walThresholdBytes = 0L)
+      assert(after.truncated, s"TRUNCATE should run after the reader released: $after")
+    finally
+      reader.close()
+      writer.close()
+  }

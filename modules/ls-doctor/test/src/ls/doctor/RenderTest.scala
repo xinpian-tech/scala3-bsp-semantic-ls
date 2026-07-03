@@ -99,7 +99,8 @@ class RenderTest extends munit.FunSuite:
           activeSegmentId = Some(1L),
           activeSegmentPath = Some(tmp.resolve("postings/segments/segment-000001").toString),
           documentCount = 1L,
-          symbolCount = 2L
+          symbolCount = 2L,
+          walSizeBytes = 4096L
         )
       ),
       postings = SectionState.Ready(
@@ -171,6 +172,7 @@ class RenderTest extends munit.FunSuite:
       "  manifest generation: segment 1",
       "  documents: 1",
       "  symbols: 2",
+      "  wal size: 4096 bytes",
       "  active segments: 1 of 1",
       "  snapshot id: 1",
       "  snapshot docs: 1",

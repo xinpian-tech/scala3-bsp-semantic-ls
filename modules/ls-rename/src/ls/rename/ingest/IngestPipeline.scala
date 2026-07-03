@@ -340,6 +340,9 @@ final class IngestPipeline(
     // does not leak one directory per re-ingest; snapshots still held by
     // readers are left for a later pass.
     manager.deleteSuperseded()
+    // Keep the SQLite WAL bounded without ever blocking the writer.
+    try meta.checkpoint()
+    catch case scala.util.control.NonFatal(t) => ()
 
     IngestReport(
       segmentId = segmentId,

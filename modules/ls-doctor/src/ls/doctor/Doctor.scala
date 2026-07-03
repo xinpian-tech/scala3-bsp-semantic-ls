@@ -97,7 +97,8 @@ object Doctor:
       s"FTS: ${enabledDisabled(s.ftsEnabled)} (workspace_symbols_fts ${if s.ftsEnabled then "present" else "absent"})",
       s"manifest generation: $manifest",
       s"documents: ${s.documentCount}",
-      s"symbols: ${s.symbolCount}"
+      s"symbols: ${s.symbolCount}",
+      s"wal size: ${s.walSizeBytes} bytes"
     )
 
   private def postingsLines(p: PostingsSection): Vector[String] =
@@ -236,7 +237,8 @@ object Doctor:
       "activeSegmentId" -> s.activeSegmentId.map(num).getOrElse("null"),
       "activeSegmentPath" -> optStr(s.activeSegmentPath),
       "documentCount" -> num(s.documentCount),
-      "symbolCount" -> num(s.symbolCount)
+      "symbolCount" -> num(s.symbolCount),
+      "walSizeBytes" -> num(s.walSizeBytes)
     )
 
   private def postingsJson(p: PostingsSection): String =
