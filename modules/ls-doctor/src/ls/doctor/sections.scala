@@ -253,6 +253,19 @@ object SqliteSection:
 /** One segment_manifest row as shown by the doctor. */
 final case class PostingsSegmentInfo(segmentId: Long, path: String, active: Boolean)
 
+/** Cross-check of `snapshots/current.json` against the SQLite manifest's active
+  * segment (by segment directory path): `Consistent` when they agree,
+  * `Divergent` when the file names a different segment, `Missing` when no file
+  * is present. A divergent file is reported, never silently trusted.
+  */
+enum SnapshotFileStatus:
+  case Consistent, Divergent, Missing
+
+  def label: String = this match
+    case Consistent => "consistent"
+    case Divergent => "divergent"
+    case Missing => "missing (no current.json)"
+
 /** Postings section (plan 19): manifest segments, the published snapshot and
   * how many superseded-but-undeleted segment directories await compaction.
   */
@@ -263,7 +276,9 @@ final case class PostingsSection(
     snapshotOccurrenceCount: Option[Long],
     /** Segment dirs on disk that are not the manifest's active segment. */
     compactionPending: Int,
-    compactionPendingDirs: Vector[String]
+    compactionPendingDirs: Vector[String],
+    /** `snapshots/current.json` vs the manifest active segment (by path). */
+    snapshotFile: SnapshotFileStatus
 ):
   def activeSegments: Vector[PostingsSegmentInfo] = segments.filter(_.active)
 
@@ -291,8 +306,25 @@ object PostingsSection:
         snapshotDocCount = snapshotFacts.map(_._2),
         snapshotOccurrenceCount = snapshotFacts.map(_._3),
         compactionPending = pendingDirs.length,
-        compactionPendingDirs = pendingDirs
+        compactionPendingDirs = pendingDirs,
+        snapshotFile = snapshotFileStatus(manager, segments)
       )
+
+  /** Cross-checks `snapshots/current.json` against the manifest's active segment
+    * by normalized directory path: absent → Missing; same active path →
+    * Consistent; otherwise Divergent (reported, never silently trusted).
+    */
+  private def snapshotFileStatus(
+      manager: SnapshotManager,
+      segments: Vector[PostingsSegmentInfo]
+  ): SnapshotFileStatus =
+    manager.readCurrentFile() match
+      case None => SnapshotFileStatus.Missing
+      case Some(f) =>
+        val activePath = segments.find(_.active).flatMap(s => normalize(s.path))
+        val filePath = normalize(f.path)
+        if activePath.isDefined && activePath == filePath then SnapshotFileStatus.Consistent
+        else SnapshotFileStatus.Divergent
 
   private def normalize(path: String): Option[String] =
     try Some(Path.of(path).toAbsolutePath.normalize.toString)

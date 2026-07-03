@@ -2,6 +2,7 @@ package ls.doctor
 
 import java.nio.file.Files
 
+import ls.postings.CurrentSnapshotFile
 import ls.semanticdb.Md5
 
 import DoctorTestSupport.*
@@ -99,6 +100,31 @@ class StoreSectionsTest extends munit.FunSuite:
         assertEquals(section.snapshotOccurrenceCount, Some(5L))
         assertEquals(section.compactionPending, 0)
         assertEquals(section.compactionPendingDirs, Vector.empty[String])
+        // publish wrote snapshots/current.json naming the active segment
+        assertEquals(section.snapshotFile, SnapshotFileStatus.Consistent)
+
+  store.test("PostingsSection: a current.json that diverges from the manifest is reported, not trusted"): s =>
+    // tamper current.json to name a different segment path than the manifest active one
+    CurrentSnapshotFile.writeAtomic(
+      s.manager.root,
+      CurrentSnapshotFile(
+        segmentId = 999L,
+        path = s.manager.segmentsDir.resolve("segment-999999").toString,
+        publishedAtMs = 1L,
+        generation = 99L
+      )
+    )
+    PostingsSection.gather(s.meta, s.manager) match
+      case SectionState.Unavailable(reason) => fail(s"unexpectedly unavailable: $reason")
+      case SectionState.Ready(section) =>
+        assertEquals(section.snapshotFile, SnapshotFileStatus.Divergent)
+
+  store.test("PostingsSection: a missing current.json is reported as missing"): s =>
+    Files.deleteIfExists(CurrentSnapshotFile.pathIn(s.manager.root))
+    PostingsSection.gather(s.meta, s.manager) match
+      case SectionState.Unavailable(reason) => fail(s"unexpectedly unavailable: $reason")
+      case SectionState.Ready(section) =>
+        assertEquals(section.snapshotFile, SnapshotFileStatus.Missing)
 
   store.test("PostingsSection: superseded-but-undeleted dir counts as compaction pending"): s =>
     val leftover = s.manager.segmentsDir.resolve("segment-000099")

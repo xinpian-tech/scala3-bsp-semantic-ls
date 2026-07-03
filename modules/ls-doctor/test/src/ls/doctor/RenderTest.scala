@@ -114,7 +114,8 @@ class RenderTest extends munit.FunSuite:
           snapshotDocCount = Some(1),
           snapshotOccurrenceCount = Some(5L),
           compactionPending = 1,
-          compactionPendingDirs = Vector(tmp.resolve("postings/segments/segment-000000").toString)
+          compactionPendingDirs = Vector(tmp.resolve("postings/segments/segment-000000").toString),
+          snapshotFile = SnapshotFileStatus.Consistent
         )
       ),
       pc = SectionState.Ready(
@@ -182,6 +183,7 @@ class RenderTest extends munit.FunSuite:
       "  snapshot docs: 1",
       "  snapshot occurrences: 5",
       "  compaction pending: 1",
+      "  snapshot file: consistent",
       "  worker status: in-process (no forked worker)",
       "  active targets: none",
       "  registered targets: 1 (bsp://ws/app)",
@@ -255,6 +257,7 @@ class RenderTest extends munit.FunSuite:
     assertEquals(root.getAsJsonObject("bsp").get("serverName").getAsString, "Fake BSP")
     assertEquals(root.getAsJsonObject("runtime").get("javaVersion").getAsString.take(2), "25")
     assertEquals(root.getAsJsonObject("postings").get("compactionPending").getAsInt, 1)
+    assertEquals(root.getAsJsonObject("postings").get("snapshotFile").getAsString, "Consistent")
     // generated/stale live under the semanticdb section, not sqlite
     assertEquals(root.getAsJsonObject("semanticdb").get("generatedSourceCount").getAsLong, 2L)
     val staleJson = root.getAsJsonObject("semanticdb").getAsJsonArray("staleTargets")

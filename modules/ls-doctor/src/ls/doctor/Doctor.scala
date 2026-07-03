@@ -118,7 +118,8 @@ object Doctor:
         s"snapshot id: ${p.snapshotId.map(_.toString).getOrElse("none published")}",
         s"snapshot docs: ${p.snapshotDocCount.map(_.toString).getOrElse("n/a")}",
         s"snapshot occurrences: ${p.snapshotOccurrenceCount.map(_.toString).getOrElse("n/a")}",
-        s"compaction pending: ${p.compactionPending}"
+        s"compaction pending: ${p.compactionPending}",
+        s"snapshot file: ${p.snapshotFile.label}"
       ) ++ pendingDirs
 
   private def pcLines(p: PcSection): Vector[String] =
@@ -260,7 +261,8 @@ object Doctor:
       "snapshotDocCount" -> p.snapshotDocCount.map(c => num(c.toLong)).getOrElse("null"),
       "snapshotOccurrenceCount" -> p.snapshotOccurrenceCount.map(num).getOrElse("null"),
       "compactionPending" -> num(p.compactionPending),
-      "compactionPendingDirs" -> arr(p.compactionPendingDirs.map(str))
+      "compactionPendingDirs" -> arr(p.compactionPendingDirs.map(str)),
+      "snapshotFile" -> str(p.snapshotFile.toString)
     )
 
   private def pcJson(p: PcSection): String =

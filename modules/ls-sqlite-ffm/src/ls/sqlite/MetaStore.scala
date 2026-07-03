@@ -518,16 +518,16 @@ final class MetaStore(val db: Db) extends AutoCloseable:
       }
     }
 
-  /** FTS5 prefix search: each whitespace-separated token is quoted and
-    * suffixed `*`, tokens are AND-ed, results come back in bm25 order.
-    * Names are joined from symbol_metadata (the FTS table is contentless).
-    */
   /** Runs the workspace-symbol FTS query on a borrowed read-only connection
     * from the reader pool, keeping the single-threaded writer free.
     */
   def workspaceSymbolSearch(query: String, limit: Int): Vector[WorkspaceSymbolHit] =
     readers.withReader(conn => workspaceSymbolSearchOn(conn, query, limit))
 
+  /** FTS5 prefix search: each whitespace-separated token is quoted and
+    * suffixed `*`, tokens are AND-ed, results come back in bm25 order.
+    * Names are joined from symbol_metadata (the FTS table is contentless).
+    */
   private def workspaceSymbolSearchOn(conn: Db, query: String, limit: Int): Vector[WorkspaceSymbolHit] =
     val tokens = query.trim.split("\\s+").toVector.filter(_.nonEmpty)
     if tokens.isEmpty || limit <= 0 then Vector.empty
