@@ -69,19 +69,13 @@ when any bit is set. Each rule and its test:
 | `DependencySource` | occurrence in a dependency source | `RenameSuite` |
 | `OpaqueType` | opaque type (conservative reject, DEC-3) | `RenameSuite`, `ScalacIntegrationSuite` |
 
-## Plan §18.1 correctness cases → tests
+## Plan §18.1 cases and §18.3 benchmarks → tests
 
-The full §18.1 case→test mapping is maintained in `docs/architecture.md` (the
-"§18.1 → test" section); the cases are implemented in `RenameSuite`,
-`ReferencesAndQuerySuite`, `ScalacIntegrationSuite`, and `RenameMutationSuite`.
-
-## Plan §18.3 benchmark rows → `BenchSuite`
-
-Every §18.3 benchmark row (SemanticDB ingest 1k/10k/100k docs, cold/warm start,
-BSP import 5/50/200, rename small/large, references, workspace-symbol prefix +
-fuzzy, PC completion + plugin overhead, FFM call overhead, occurrence-set
-preservation) is asserted by `BenchSuite` with a generator-vs-index ground-truth
-consistency check (mismatch → non-zero exit).
+Both are enumerated **row-by-row** in the machine-checkable Case map below: every
+plan §18.1 correctness case and every §18.3 benchmark row maps to a test class + an
+exact case/report-row substring that `scripts/check-docs.sh` verifies is present.
+The §18.1 cases live in `ReferencesAndQuerySuite` / `RenameSuite` /
+`ScalacIntegrationSuite` / `RenameMutationSuite`; the §18.3 rows in `BenchSuite`.
 
 ## Case map (machine-checkable)
 
@@ -104,28 +98,58 @@ fragment of a real `test("…")` name.
 - `RenameSuite` :: "compile failure rejects the rename"
 - `RenameMutationSuite` :: "stale md5: source edited after compile is rejected before emitting edits"
 
-### Plan §18.1 correctness cases
-- `ReferencesAndQuerySuite` :: "inline def references are exactly the definition and both call sites"
-- `ReferencesAndQuerySuite` :: "export forwarder references are exactly the definition and the forwarder call"
-- `ReferencesAndQuerySuite` :: "case-class copy references resolve to the copy symbol call site only"
-- `ReferencesAndQuerySuite` :: "private member references are exactly the in-file definition and uses"
-- `ReferencesAndQuerySuite` :: "local val references stay inside the document"
-- `ReferencesAndQuerySuite` :: "cross-file val member references are exactly the definition and cross-file use"
-- `ReferencesAndQuerySuite` :: "var getter, setter, and definition references are exactly all value tokens"
-- `ReferencesAndQuerySuite` :: "given references are exactly the by-name uses including the using-clause site"
-- `ReferencesAndQuerySuite` :: "top-level def and val references are exactly their definitions and cross-file uses"
-- `ReferencesAndQuerySuite` :: "opaque type references are exactly the type, companion, and all in-file uses"
-- `ReferencesAndQuerySuite` :: "extension method references are exactly the definition and both call sites"
-- `ScalacIntegrationSuite` :: "derives clause: the case class is defined and the derived given is synthetic-only"
-- `RenameMutationSuite` :: "fresh-snapshot stale index: the cursor document itself is edited after compile"
-- `BootstrapRecoverySuite` :: "a manifest pointing at a deleted segment degrades gracefully and heals on the next ingest"
+### Plan §18.1 correctness cases (one entry per plan.md §18.1 row)
+- class references — `ReferencesAndQuerySuite` :: "class references unify companion object and constructor across files and targets"
+- object references — `ReferencesAndQuerySuite` :: "object references (SharedThing) from the shared source"
+- trait references — `ReferencesAndQuerySuite` :: "trait references (Greeter) reach the extends clause and cross-target signatures"
+- enum references — `ReferencesAndQuerySuite` :: "enum references (Color) include the cross-target type and case use"
+- constructor references — `ReferencesAndQuerySuite` :: "apply-sugar unification: case class references include Item(1), Item.apply(2), new Item(3)"
+- companion class/object — `ReferencesAndQuerySuite` :: "class references unify companion object and constructor across files and targets"
+- method overload — `ReferencesAndQuerySuite` :: "method overloads stay separate"
+- val getter — `ReferencesAndQuerySuite` :: "cross-file val member references are exactly the definition and cross-file use"
+- var getter/setter — `ReferencesAndQuerySuite` :: "var getter, setter, and definition references are exactly all value tokens"
+- local val — `ReferencesAndQuerySuite` :: "local val references stay inside the document"
+- local def — `ReferencesAndQuerySuite` :: "nested local def references stay inside the document"
+- private member — `ReferencesAndQuerySuite` :: "private member references are exactly the in-file definition and uses"
+- top-level definitions — `ReferencesAndQuerySuite` :: "top-level def and val references are exactly their definitions and cross-file uses"
+- extension methods — `ReferencesAndQuerySuite` :: "extension method references are exactly the definition and both call sites"
+- given / using — `ReferencesAndQuerySuite` :: "given references are exactly the by-name uses including the using-clause site"
+- export — `ReferencesAndQuerySuite` :: "export forwarder references are exactly the definition and the forwarder call"
+- inline — `ReferencesAndQuerySuite` :: "inline def references are exactly the definition and both call sites"
+- macro-generated API — `ReferencesAndQuerySuite` :: "case-class copy references resolve to the copy symbol call site only"
+- shared sources across targets — `RealBspLifecycleTest` :: "E6 a source shared across two targets unifies references and passes rename consistency"
+- generated sources — `RenameSuite` :: "occurrences in generated sources are rejected"
+- readonly source rejection — `RenameSuite` :: "occurrences in readonly sources are rejected"
+- dependency source rejection — `RenameSuite` :: "dependency sources are rejected"
+- stale md5 rejection — `RenameMutationSuite` :: "stale md5: source edited after compile is rejected before emitting edits"
+- compile-failure rename rejection — `RenameSuite` :: "compile failure rejects the rename"
+- PC-only symbol rename rejection — `RenameSuite` :: "PC-only symbols are rejected"
+- (also) opaque type references — `ReferencesAndQuerySuite` :: "opaque type references are exactly the type, companion, and all in-file uses"
+- (also) derives synthetic-only — `ScalacIntegrationSuite` :: "derives clause: the case class is defined and the derived given is synthetic-only"
+- (also) fresh-snapshot stale index — `RenameMutationSuite` :: "fresh-snapshot stale index: the cursor document itself is edited after compile"
 
-### Plan §18.3 benchmark rows
-- `BenchSuite` :: "tiny run renders the report and passes all consistency checks"
-- `BenchSuite` :: "ingest tiers are sized by document count (1000 smoke, 10000/100000 full)"
-- `BenchSuite` :: "a ground-truth mismatch makes the bench exit non-zero"
-- `BenchSuite` :: "a real occurrence-set mismatch trips the ingest gate (not a bare check)"
-- `BenchSuite` :: "--jfr uses a named preset and records JVM events; default preset is 'default'"
+### Plan §18.3 benchmark rows (one entry per plan.md §18.3 row; the substring is the report-row string `BenchSuite` emits and asserts)
+- cold start — `BenchSuite` :: "cold-start"
+- warm start — `BenchSuite` :: "warm-start"
+- BSP import — `BenchSuite` :: "bsp-import-"
+- SemanticDB ingest 1k — `BenchSuite` :: "semanticdb-ingest-1k"
+- SemanticDB ingest 10k — `BenchSuite` :: "semanticdb-ingest-10k"
+- SemanticDB ingest 100k — `BenchSuite` :: "semanticdb-ingest-100k"
+- workspace symbol prefix — `BenchSuite` :: "workspace/symbol fts (prefix)"
+- workspace symbol fuzzy — `BenchSuite` :: "workspace/symbol fuzzy"
+- references rare — `BenchSuite` :: "references rare (all targets)"
+- references medium — `BenchSuite` :: "references medium (all targets)"
+- references hot — `BenchSuite` :: "references hot (all targets)"
+- rename small — `BenchSuite` :: "rename small (rare)"
+- rename large — `BenchSuite` :: "rename large (hot)"
+- PC completion P50/P95/P99 — `BenchSuite` :: "pc completion"
+- PC plugin overhead — `BenchSuite` :: "pc plugin overhead"
+- SQLite FFM overhead — `BenchSuite` :: "sqlite-ffm-call-overhead"
+- mmap scan records/sec — `BenchSuite` :: "doc scan (full)"
+- (consistency gate) — `BenchSuite` :: "tiny run renders the report and passes all consistency checks"
+- (ingest tiers by docs) — `BenchSuite` :: "ingest tiers are sized by document count (1000 smoke, 10000/100000 full)"
+- (occurrence-set gate) — `BenchSuite` :: "a real occurrence-set mismatch trips the ingest gate (not a bare check)"
+- (JFR preset) — `BenchSuite` :: "--jfr uses a named preset and records JVM events; default preset is 'default'"
 
 ### AC-16 real-BSP E-rows
 - `RealBspCoreTest` :: "E1 doctor: module c (no -Xsemanticdb) is flagged as a SemanticDB error"
