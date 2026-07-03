@@ -38,10 +38,13 @@ grep -q "Xsemanticdb" "$WORK/build.mill" || { echo "it-zaozi: patched source lac
 echo "it-zaozi: pinned+patched zaozi source at $WORK"
 
 # Build the full zaozi (native CIRCT/MLIR) inside ITS OWN nix dev shell, emitting
-# SemanticDB, and install the real Mill BSP connection.
+# SemanticDB, and install the real Mill BSP connection. The workspace is a plain
+# copy of the Nix-store source (not a git checkout), so the flake is addressed
+# with the explicit `path:` scheme — a bare path would make Nix search upward for
+# an enclosing git repo and mis-root the flake at /tmp.
 ( cd "$WORK"
   rm -rf .bsp .scala3-bsp-semantic-ls
-  nix develop "$WORK" -c bash -c 'mill --no-daemon __.compile && mill --no-daemon mill.bsp.BSP/install'
+  nix develop "path:$WORK" -c bash -c 'mill --no-daemon __.compile && mill --no-daemon mill.bsp.BSP/install'
 )
 sdb=$(find "$WORK/out" -name '*.semanticdb' 2>/dev/null | wc -l)
 echo "it-zaozi: zaozi built with $sdb SemanticDB files"
@@ -53,8 +56,10 @@ echo "it-zaozi: zaozi built with $sdb SemanticDB files"
 python3 - "$WORK" <<'PY'
 import json,sys
 z=sys.argv[1]; p=z+"/.bsp/mill-bsp.json"; d=json.load(open(p))
+# `path:` scheme (see the compile step): the workspace is a plain store copy, not
+# a git checkout, so a bare path would make Nix mis-root the flake at /tmp.
 if d["argv"][:2] != ["nix","develop"]:
-    d["argv"]=["nix","develop",z,"-c"]+d["argv"]
+    d["argv"]=["nix","develop","path:"+z,"-c"]+d["argv"]
     json.dump(d,open(p,"w"),indent=2)
 PY
 
