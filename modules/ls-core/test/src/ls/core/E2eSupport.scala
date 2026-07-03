@@ -171,6 +171,27 @@ object E2eFixture:
     )
     ws
 
+  /** A private deep copy of the compiled master fixture, so a second booted
+    * server gets its own workspace + storage and never collides with the
+    * shared `master`-rooted server. SemanticDB uris are sourceroot-relative, so
+    * the copied index resolves against the new root unchanged.
+    */
+  def freshCopy(): Ws =
+    val src = master.root
+    val dst = Files.createTempDirectory("ls-core-e2e-copy-")
+    dst.toFile.deleteOnExit()
+    val stream = Files.walk(src)
+    try
+      stream.iterator().asScala.foreach { p =>
+        val target = dst.resolve(src.relativize(p).toString)
+        if Files.isDirectory(p) then Files.createDirectories(target)
+        else
+          Files.createDirectories(target.getParent)
+          Files.copy(p, target)
+      }
+    finally stream.close()
+    Ws(dst)
+
 /** [[FakeBuildServer]] is final; this delegate rewrites only the
   * buildTarget/scalacOptions classpath (the fake returns an empty one) so
   * the presentation compiler gets a real classpath, exactly as a real BSP

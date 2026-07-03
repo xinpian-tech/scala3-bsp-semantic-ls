@@ -136,7 +136,7 @@ final class BspSession private[bsp] (
 
   /** buildTarget/dependencySources when the server advertises the capability.
     * Best-effort: not advertised or a failed request yields None and never
-    * crashes the caller (the data is supplementary, plan section 4.1).
+    * crashes the caller (the data is supplementary, not required to index).
     */
   def dependencySources(bspIds: Vector[String]): Option[Vector[DependencySourcesItem]] =
     capabilityGated(bspIds, _.getDependencySourcesProvider, "buildTarget/dependencySources") {

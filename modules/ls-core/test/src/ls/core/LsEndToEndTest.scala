@@ -407,9 +407,13 @@ class LsEndToEndTest extends munit.FunSuite:
     val _ = env.initResult
     val loadsBefore = env.fake.workspaceBuildTargetsCalls.get
     val ingestsBefore = env.server.completedIngests
+    val snapshotBefore = snapshotId(executeCommand(ScalaLs.Commands.Doctor))
     env.bspServer.sendDidChange("a")
     eventually("workspaceBuildTargets refetched")(env.fake.workspaceBuildTargetsCalls.get > loadsBefore)
     eventually("re-ingest ran after reload")(env.server.completedIngests > ingestsBefore)
+    eventually("doctor snapshot generation advanced")(
+      snapshotId(executeCommand(ScalaLs.Commands.Doctor)).exists(id => snapshotBefore.forall(_ < id))
+    )
     // The server stays queryable after the reload.
     val symbols = wsService.symbol(new WorkspaceSymbolParams("Core")).get(60, TimeUnit.SECONDS)
     assert(symbols.isRight && symbols.getRight.asScala.exists(_.getName == "Core"))
