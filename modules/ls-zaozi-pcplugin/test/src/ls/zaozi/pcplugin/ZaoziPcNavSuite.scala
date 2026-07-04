@@ -192,3 +192,205 @@ class ZaoziPcNavSuite extends munit.FunSuite:
       val result = facade.definition(uri, line, ch)
       assert(result != null, "definition on a missing dynamic field must still return a result")
     finally facade.shutdown()
+
+  test("go-to on io.a lands on the `val a` name range, not just its line"):
+    val (facade, tid) = newFacade(Vector(s"-Xplugin:$pluginJar"))
+    val (locs) =
+      try
+        val uri = "file:///ls-zaozi-pcplugin-test/RangeBuffer.scala"
+        facade.didOpen(tid, uri, fixture)
+        val (line, ch) = cursor(fixture, "io.a", 3)
+        facade.definition(uri, line, ch).locations.map { d =>
+          val s = d.location.getRange.getStart; (s.getLine, s.getCharacter)
+        }
+      finally facade.shutdown()
+    val (nameLine, nameChar) = cursor(fixture, "val a: Int = 0", 4) // the `a` in `val a`
+    assert(
+      locs.contains((nameLine, nameChar)),
+      s"expected a definition at the `val a` name ($nameLine,$nameChar); got $locs"
+    )
+
+  test("with the plugin, go-to works through a real selectDynamic macro expansion (getRefViaFieldValName)"):
+    val classes = macroFixtureClasses
+    val buffer =
+      """|package sample
+         |import me.jiuyang.zaozi.reftpe.*
+         |import me.jiuyang.zaozi.magic.DynamicSubfield
+         |class MyBundle extends DynamicSubfield:
+         |  val a: Int = 0
+         |object Top:
+         |  val io: Referable[MyBundle] = null.asInstanceOf[Referable[MyBundle]]
+         |  val probe = io.a
+         |""".stripMargin
+    def defLinesFor(scalacOptions: Vector[String]): Vector[Int] =
+      val genRoot = Files.createTempDirectory("ls-zaozi-macro-gen")
+      val pm = new PcPluginManager(PcPluginInitContext(None, genRoot))
+      val facade = new PcFacade(pm, PcSettings(None, genRoot, 4, 90000L))
+      val tid = "zaoziMacroTarget"
+      facade.registerTarget(PcTargetConfig(tid, libraryClasspath :+ classes, scalacOptions))
+      try
+        val uri = "file:///ls-zaozi-pcplugin-test/MacroBuffer.scala"
+        facade.didOpen(tid, uri, buffer)
+        val (line, ch) = cursor(buffer, "io.a", 3)
+        facade.definition(uri, line, ch).locations.map(_.location.getRange.getStart.getLine)
+      finally facade.shutdown()
+    val valALine = lineOf(buffer, "val a: Int = 0")
+    assert(defLinesFor(Vector(s"-Xplugin:$pluginJar")).contains(valALine), "macro-expanded io.a should reach val a")
+    assert(!defLinesFor(Vector.empty).contains(valALine), "baseline macro-expanded io.a must not reach val a")
+
+  test("go-to resolves the field on a non-Interface Referable receiver (Writable)"):
+    val wrapperFixture =
+      """|package me.jiuyang.zaozi.magic { trait DynamicSubfield }
+         |package me.jiuyang.zaozi.reftpe {
+         |  import scala.language.dynamics
+         |  trait Referable[T] extends scala.Dynamic:
+         |    transparent inline def selectDynamic(name: String): Any = referHelper(this, name)
+         |  trait Writable[T] extends Referable[T]
+         |  def referHelper(r: Any, name: String): Any = null
+         |}
+         |package sample {
+         |  import me.jiuyang.zaozi.reftpe.*
+         |  import me.jiuyang.zaozi.magic.DynamicSubfield
+         |  class MyBundle extends DynamicSubfield:
+         |    val a: Int = 0
+         |  object Top:
+         |    val io: Writable[MyBundle] = null.asInstanceOf[Writable[MyBundle]]
+         |    val probe = io.a
+         |}
+         |""".stripMargin
+    val (facade, tid) = newFacade(Vector(s"-Xplugin:$pluginJar"))
+    val lines =
+      try
+        val uri = "file:///ls-zaozi-pcplugin-test/WritableBuffer.scala"
+        facade.didOpen(tid, uri, wrapperFixture)
+        val (line, ch) = cursor(wrapperFixture, "io.a", 3)
+        facade.definition(uri, line, ch).locations.map(_.location.getRange.getStart.getLine)
+      finally facade.shutdown()
+    assert(lines.contains(lineOf(wrapperFixture, "val a: Int = 0")), s"Writable receiver should resolve; got $lines")
+
+  test("applyDynamic index/slice access is left as identity"):
+    val applyFixture =
+      """|package me.jiuyang.zaozi.magic { trait DynamicSubfield }
+         |package me.jiuyang.zaozi.reftpe {
+         |  import scala.language.dynamics
+         |  trait Referable[T] extends scala.Dynamic:
+         |    transparent inline def selectDynamic(name: String): Any = referHelper(this, name)
+         |    transparent inline def applyDynamic(name: String)(inline args: Any*): Any = applyHelper(this, name, args)
+         |  def referHelper(r: Any, name: String): Any = null
+         |  def applyHelper(r: Any, name: String, args: Seq[Any]): Any = null
+         |}
+         |package sample {
+         |  import me.jiuyang.zaozi.reftpe.*
+         |  import me.jiuyang.zaozi.magic.DynamicSubfield
+         |  class MyBundle extends DynamicSubfield:
+         |    val vec: Int = 0
+         |  object Top:
+         |    val io: Referable[MyBundle] = null.asInstanceOf[Referable[MyBundle]]
+         |    val probe = io.vec(0)
+         |}
+         |""".stripMargin
+    def defLinesFor(scalacOptions: Vector[String]): Vector[Int] =
+      val (facade, tid) = newFacade(scalacOptions)
+      try
+        val uri = "file:///ls-zaozi-pcplugin-test/ApplyBuffer.scala"
+        facade.didOpen(tid, uri, applyFixture)
+        // cursor on the `(0)` index-call, not the field name
+        val (line, ch) = cursor(applyFixture, "io.vec(0)", 7)
+        facade.definition(uri, line, ch).locations.map(_.location.getRange.getStart.getLine)
+      finally facade.shutdown()
+    assertEquals(
+      defLinesFor(Vector(s"-Xplugin:$pluginJar")),
+      defLinesFor(Vector.empty),
+      "applyDynamic index/slice must be identity (unchanged by the plugin)"
+    )
+
+  test("hover is unchanged on a non-zaozi dynamic access and does not crash on a missing field"):
+    val alien =
+      """|package other {
+         |  import scala.language.dynamics
+         |  trait Widget[T] extends scala.Dynamic:
+         |    transparent inline def selectDynamic(name: String): Any = widgetHelper(this, name)
+         |  def widgetHelper(r: Any, name: String): Any = null
+         |  class Panel:
+         |    val a: Int = 0
+         |  object Top:
+         |    val io: Widget[Panel] = null.asInstanceOf[Widget[Panel]]
+         |    val probe = io.a
+         |}
+         |""".stripMargin
+    def hoverText(text: String, scalacOptions: Vector[String]): String =
+      val (facade, tid) = newFacade(scalacOptions)
+      try
+        val uri = "file:///ls-zaozi-pcplugin-test/AlienHover.scala"
+        facade.didOpen(tid, uri, text)
+        val (line, ch) = cursor(text, "io.a", 3)
+        facade.hover(uri, line, ch).fold("")(_.toString)
+      finally facade.shutdown()
+    // non-zaozi: plugin must not change hover
+    assertEquals(
+      hoverText(alien, Vector(s"-Xplugin:$pluginJar")),
+      hoverText(alien, Vector.empty),
+      "hover on a non-zaozi dynamic access must be unchanged by the plugin"
+    )
+    // unresolved field: hover must not crash (returns some result, possibly empty)
+    val missing =
+      """|package me.jiuyang.zaozi.magic { trait DynamicSubfield }
+         |package me.jiuyang.zaozi.reftpe {
+         |  import scala.language.dynamics
+         |  trait Referable[T] extends scala.Dynamic:
+         |    transparent inline def selectDynamic(name: String): Any = referHelper(this, name)
+         |  def referHelper(r: Any, name: String): Any = null
+         |}
+         |package sample {
+         |  import me.jiuyang.zaozi.reftpe.*
+         |  import me.jiuyang.zaozi.magic.DynamicSubfield
+         |  class MyBundle extends DynamicSubfield:
+         |    val a: Int = 0
+         |  object Top:
+         |    val io: Referable[MyBundle] = null.asInstanceOf[Referable[MyBundle]]
+         |    val probe = io.nope
+         |}
+         |""".stripMargin
+    val (facade, tid) = newFacade(Vector(s"-Xplugin:$pluginJar"))
+    try
+      val uri = "file:///ls-zaozi-pcplugin-test/MissingHover.scala"
+      facade.didOpen(tid, uri, missing)
+      val (line, ch) = cursor(missing, "io.nope", 3)
+      assert(facade.hover(uri, line, ch) != null, "hover on a missing field must not crash")
+    finally facade.shutdown()
+
+  /** Compile a mini zaozi API with a real `selectDynamic` macro (whose expansion is
+    * `getRefViaFieldValName`) into a classes dir the PC target can reference. Macros
+    * require a prior compilation unit, which this provides. */
+  private lazy val macroFixtureClasses: Path =
+    // Scala 3 rejects two top-level `package` clauses in one file, so split the
+    // mini API into one file per package.
+    val magicSrc =
+      """|package me.jiuyang.zaozi.magic
+         |trait DynamicSubfield:
+         |  def getRefViaFieldValName(refer: Any, name: String): Any = null
+         |""".stripMargin
+    val reftpeSrc =
+      """|package me.jiuyang.zaozi.reftpe
+         |import scala.language.dynamics
+         |import scala.quoted.*
+         |trait Referable[T] extends scala.Dynamic:
+         |  def _tpe: T
+         |  def refer: Any = null
+         |  transparent inline def selectDynamic(name: String): Any = ${ ZaoziFixtureMacros.sel[T]('this, 'name) }
+         |object ZaoziFixtureMacros:
+         |  def sel[T](self: Expr[Referable[T]], name: Expr[String])(using Type[T], Quotes): Expr[Any] =
+         |    '{ $self._tpe.asInstanceOf[me.jiuyang.zaozi.magic.DynamicSubfield].getRefViaFieldValName($self.refer, $name) }
+         |""".stripMargin
+    val srcDir = Files.createTempDirectory("ls-zaozi-macro-src")
+    val magicFile = srcDir.resolve("Magic.scala")
+    val reftpeFile = srcDir.resolve("Referable.scala")
+    Files.writeString(magicFile, magicSrc)
+    Files.writeString(reftpeFile, reftpeSrc)
+    val outDir = Files.createTempDirectory("ls-zaozi-macro-classes")
+    val cp = libraryClasspath.map(_.toString).mkString(File.pathSeparator)
+    val reporter = dotty.tools.dotc.Main.process(
+      Array("-d", outDir.toString, "-classpath", cp, magicFile.toString, reftpeFile.toString)
+    )
+    assert(!reporter.hasErrors, "mini-zaozi macro fixture failed to compile")
+    outDir
