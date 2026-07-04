@@ -14,3 +14,6 @@ mill-java-opts
 
 # Humanize local loop state (goal tracker, round summaries, consultation logs)
 .humanize/
+
+# Agent runtime state (ephemeral sub-agent worktrees)
+.claude/
