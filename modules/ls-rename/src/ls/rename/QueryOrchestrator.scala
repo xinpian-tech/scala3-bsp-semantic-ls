@@ -3,6 +3,8 @@ package ls.rename
 import java.nio.charset.StandardCharsets
 import java.nio.file.{Files, Path}
 
+import scala.util.control.NonFatal
+
 import ls.index.*
 import ls.postings.{PostingsSnapshot, SnapshotManager}
 import ls.rename.ingest.{IngestPipeline, IngestReport, WorkspaceTargets}
@@ -119,25 +121,39 @@ final class QueryOrchestrator(
       fromSnapshot match
         case Some(hit) => hit
         case None =>
-          // RawSemanticDBPath: serve from the parsed .semanticdb, then
-          // synchronously persist the refreshed document so the next query for
-          // this uri resolves from the snapshot.
+          // RawSemanticDBPath: serve from the parsed .semanticdb, then attempt a
+          // synchronous write-through so the next query for this uri resolves
+          // from the snapshot. On a successful publish the index now reflects
+          // this doc, so clear `needsReindex` to avoid a redundant caller-
+          // scheduled reingest; if write-through is disabled or its ingest
+          // fails, keep the flag so a later reindex still heals the index.
           val cursor = rawSemanticdbCursor(uri, line, character)
-          writeThroughRawPath()
-          cursor
+          if writeThroughRawPath() then cursor.copy(needsReindex = false)
+          else cursor
 
   /** Synchronously heals the index after a RawSemanticDBPath resolution: reuse
     * the full-generation ingest to republish a segment reflecting the refreshed
     * document. Runs inline on the calling thread (the ls-core single index
-    * executor in production), preserving the single-writer contract; a no-op
-    * when write-through is disabled or no workspace generation is known yet.
+    * executor in production), preserving the single-writer contract.
+    *
+    * Best-effort: returns true ONLY after a successful synchronous publish (so
+    * the caller can clear `needsReindex`); returns false when write-through is
+    * disabled, no workspace generation is known yet, OR the ingest throws. An
+    * ingest failure must never propagate — the raw path already answered the
+    * query — and keeping `needsReindex` set then leaves the doc to be healed by
+    * a later reindex.
     */
-  private def writeThroughRawPath(): Unit =
+  private def writeThroughRawPath(): Boolean =
     if syncWriteThrough then
-      currentWorkspace.foreach { ws =>
-        lastWriteThroughThread = Thread.currentThread().getName
-        pipeline.ingest(ws)
-      }
+      currentWorkspace match
+        case Some(ws) =>
+          lastWriteThroughThread = Thread.currentThread().getName
+          try
+            pipeline.ingest(ws)
+            true
+          catch case NonFatal(_) => false
+        case None => false
+    else false
 
   /** Snapshot path: only when the doc is present and its on-disk source
     * still matches the ingested md5. Throws NoSymbolAtCursor when the doc is

@@ -77,11 +77,12 @@ class RawPathSuite extends munit.FunSuite:
       val (line0, ch0) = fx.cursor(uri, "shout", 0)
       editAndRegenerate(fx, uri)
 
-      // a raw-path REFERENCE query serves from raw and flags needsReindex, and
-      // synchronously writes the refreshed document through to the index
+      // a raw-path REFERENCE query serves from raw and synchronously writes the
+      // refreshed document through to the index; a SUCCESSFUL write-through then
+      // clears needsReindex so no redundant reingest is scheduled
       val engine = ReferencesEngine(stack.orchestrator)
       val refs = engine.references(uri, line0 + 1, ch0, includeDeclaration = false)
-      assert(refs.needsReindex, "the raw-path query itself still flags needsReindex")
+      assert(!refs.needsReindex, "a successful write-through clears needsReindex (no redundant reingest)")
       assert(refs.locations.exists(_.uri == "b/src/pkgb/UseB.scala"), refs.locations.toString)
 
       // no manual re-ingest ran; the write-through already healed the index
