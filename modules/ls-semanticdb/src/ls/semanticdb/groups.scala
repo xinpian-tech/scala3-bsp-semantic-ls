@@ -137,13 +137,23 @@ object AliasGroupBuilder:
       if infoByKey.get(key).exists(_.kind == SymKind.Method) && !definedKeys.contains(key) then
         descriptorOf(key.semanticSymbol) match
           case Some((owner, desc)) =>
-            definedMethodByDescriptor.getOrElse(desc, Vector.empty).find { orig =>
-              descriptorOf(orig.semanticSymbol).exists(_._1 != owner)
-            } match
-              case Some(orig) =>
+            // Union the forwarder into its exported target ONLY when the
+            // descriptor maps to a UNIQUE definition-having method under a
+            // different owner. Descriptor-only matching (first hit) mis-unions
+            // when an unrelated method shares the descriptor — e.g. `export B.m`
+            // alongside a separate `C.m` with the same name/signature would pick
+            // whichever came first, polluting the wrong group's references and
+            // leaving the real target unflagged. On an ambiguous (>1) or absent
+            // different-owner match we skip rather than guess.
+            val candidates = definedMethodByDescriptor
+              .getOrElse(desc, Vector.empty)
+              .filter(orig => descriptorOf(orig.semanticSymbol).exists(_._1 != owner))
+              .distinct
+            candidates match
+              case Vector(orig) =>
                 forwarderKeys += key
                 uf.union(i, indexOf(orig))
-              case None => ()
+              case _ => ()
           case None => ()
 
     // 3. Assemble groups; iteration over sorted keys keeps output ordered by

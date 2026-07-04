@@ -42,20 +42,28 @@ object AotTrain:
       skipPc: Boolean = false,
       navProbe: Boolean = false,
       navExpectPlugin: Boolean = true,
+      pcBackendMode: PcBackendMode = PcBackendMode.InProcess,
       log: String => Unit = msg => System.err.println(s"[aot-train] $msg")
   ): Int =
     val root = workspaceRoot.toAbsolutePath.normalize
-    log(s"training workload over $root (requireIndex=$requireIndex, skipPc=$skipPc, navProbe=$navProbe, navExpectPlugin=$navExpectPlugin)")
+    log(
+      s"training workload over $root (requireIndex=$requireIndex, skipPc=$skipPc, navProbe=$navProbe, " +
+        s"navExpectPlugin=$navExpectPlugin, pcBackendMode=$pcBackendMode)"
+    )
 
     // A generous BSP request timeout so a large real project (whose first
-    // build/compile can take minutes) does not time out mid-compile.
+    // build/compile can take minutes) does not time out mid-compile. The PC
+    // backend honors the caller's selection (--forked-pc / --in-process-pc), so
+    // an AOT/probe run can exercise the production forked worker, not just
+    // in-process.
     val server = new ScalaLs(
       ScalaLs.Config(
         bootstrap = Bootstrap.Config(
           connectBsp = (r, handlers) =>
             BspDiscovery
               .pick(r)
-              .map(f => BspSession.launch(r, f.details, handlers, BspSessionConfig(requestTimeout = 600.seconds)))
+              .map(f => BspSession.launch(r, f.details, handlers, BspSessionConfig(requestTimeout = 600.seconds))),
+          pcBackendMode = pcBackendMode
         ),
         exitProcessOnExit = false
       )

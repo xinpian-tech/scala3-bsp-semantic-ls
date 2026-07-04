@@ -80,7 +80,10 @@ object Main:
               // loaded from the workspace pc-plugins.json). --zaozi-nav-baseline
               // flips the expectation to the no-plugin baseline (selectDynamic).
               navProbe = args.contains("--zaozi-nav-probe"),
-              navExpectPlugin = !args.contains("--zaozi-nav-baseline")
+              navExpectPlugin = !args.contains("--zaozi-nav-baseline"),
+              // Honor --forked-pc / --in-process-pc so an AOT/zaozi probe can
+              // exercise the production forked worker, not just in-process.
+              pcBackendMode = pcBackendMode(args)
             )
           )
         case None =>

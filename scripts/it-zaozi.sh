@@ -100,14 +100,19 @@ echo "it-zaozi: wrote PC plugin config $PLUGIN_CFG -> $PLUGIN_JAR"
 # zaozi/tests/src/BundleSpec.scala. No `--skip-pc`: the generic completion probe
 # now tries member-selects in deterministic order until one completes, so a
 # macro-retained empty select no longer forces skipping the whole PC path.
+#
+# The probes pin `--in-process-pc`: this real-repo nav validation is exercised on
+# the in-process PC (the forked worker path is covered by the ZaoziPcForkedSuite /
+# ForkedWorkerSuite unit + smoke tests). Without the flag the server would default
+# to the forked worker (production default).
 echo "it-zaozi: [plugin] indexing zaozi over real Mill BSP + PC nav probe (probe: $PROBE_SYMBOL)"
 LS_SQLITE_LIB="$SQLITE" java --enable-native-access=ALL-UNNAMED -jar "$JAR" \
-  --aot-train "$WORK" --require-index --zaozi-nav-probe
+  --aot-train "$WORK" --require-index --in-process-pc --zaozi-nav-probe
 
 # The no-plugin BASELINE, in its OWN workspace: go-to on `io.a` must resolve to
 # the framework `selectDynamic` (NOT `val a`), proving the plugin is the cause.
 echo "it-zaozi: [baseline] indexing zaozi over real Mill BSP + PC nav baseline (no plugin)"
 LS_SQLITE_LIB="$SQLITE" java --enable-native-access=ALL-UNNAMED -jar "$JAR" \
-  --aot-train "$BASE_WORK" --require-index --zaozi-nav-probe --zaozi-nav-baseline
+  --aot-train "$BASE_WORK" --require-index --in-process-pc --zaozi-nav-probe --zaozi-nav-baseline
 
 echo "it-zaozi: OK — plugin run resolved io.a -> val a / io.f.g / io.k; baseline resolved io.a -> selectDynamic"
