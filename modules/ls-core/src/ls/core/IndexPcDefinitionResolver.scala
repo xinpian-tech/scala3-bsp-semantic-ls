@@ -45,8 +45,14 @@ final class IndexPcDefinitionResolver(meta: MetaStore, snapshots: SnapshotManage
                 snap.refGroupOf(sym) match
                   case None => Vector.empty[Location]
                   case Some(group) =>
-                    // (docOrd, targetId, span) of every definition occurrence
-                    val occs = Vector.newBuilder[(Int, Long, Span)]
+                    // scanDefinitions returns the definitions of the WHOLE ref
+                    // group, which unions aliases (a class with its companion
+                    // object/apply, a getter/setter pair, …). `SymbolSearch`
+                    // asked for ONE symbol, so keep only occurrences that define
+                    // exactly `sym` — otherwise cross-file go-to would also jump
+                    // to unrelated alias declarations. Collect raw first, then
+                    // filter by the symbol at each occurrence's name start.
+                    val raw = Vector.newBuilder[(Int, Int, Int, Int)]
                     snap.scanDefinitions(
                       group,
                       new OccurrenceSink:
@@ -58,18 +64,22 @@ final class IndexPcDefinitionResolver(meta: MetaStore, snapshots: SnapshotManage
                             packedEnd: Int,
                             flags: Int
                         ): Unit =
-                          occs += ((
-                            docOrd,
-                            snap.targetIdOf(TargetOrd(targetOrd)).value,
-                            Span(
-                              Span.unpackLine(packedStart),
-                              Span.unpackChar(packedStart),
-                              Span.unpackLine(packedEnd),
-                              Span.unpackChar(packedEnd)
-                            )
-                          ))
+                          raw += ((docOrd, targetOrd, packedStart, packedEnd))
                     )
-                    val collected = occs.result()
+                    val collected: Vector[(Int, Long, Span)] =
+                      raw.result().flatMap { (docOrd, targetOrd, packedStart, packedEnd) =>
+                        val sl = Span.unpackLine(packedStart)
+                        val sc = Span.unpackChar(packedStart)
+                        if snap.symbolAt(DocOrd(docOrd), sl, sc).exists(_.symbolOrd == sym) then
+                          Some(
+                            (
+                              docOrd,
+                              snap.targetIdOf(TargetOrd(targetOrd)).value,
+                              Span(sl, sc, Span.unpackLine(packedEnd), Span.unpackChar(packedEnd))
+                            )
+                          )
+                        else None
+                      }
                     val sourcerootOf: Map[Long, Option[Path]] =
                       collected.map(_._2).distinct.map(id => id -> sourcerootOnReader(id)).toMap
                     collected
