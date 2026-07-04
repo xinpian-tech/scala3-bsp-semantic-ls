@@ -285,6 +285,31 @@ class LsEndToEndTest extends munit.FunSuite:
     val message = ex.getCause.asInstanceOf[ResponseErrorException].getResponseError.getMessage
     assert(message.contains("has no SemanticDB output"), s"stale row must not bypass NoSemanticdb: $message")
 
+  test("SemanticDB is mandatory: a live BSP session rejects an UNOWNED uri even with a stale active persisted row"):
+    val _ = env.initResult
+    val s = env.server.currentState.ready.get
+    // A live BSP session is authoritative about coverage.
+    assert(s.session.isDefined, "fixture must have a live BSP session")
+    // A source the live build model does NOT own (e.g. a source/target removed
+    // via buildTarget/didChange), but which still has a STALE but ACTIVE
+    // persisted document row from an earlier ingest. The disk fallback must NOT
+    // let that stale row answer while a live session says the uri is uncovered —
+    // it applies only in truly BSP-less recovered-index mode.
+    val goneRel = "phantom/src/Gone.scala"
+    assert(!s.uriToTarget.contains(ws.fileUri(goneRel)), "the phantom uri must be unowned by the live model")
+    val tid = s.meta.upsertTarget(
+      "bsp://workspace/phantom", "3.8.4", "cp", "opt", "/no-sdb-root", ws.root.toString, active = true
+    )
+    s.meta.upsertDocument(tid, goneRel, "/nonexistent.semanticdb", 0L, "stale-md5", false, false)
+    assert(s.meta.documentsByUri(goneRel).exists(_.active), "seeded an active doc for the phantom uri")
+    val params = new ReferenceParams(textDoc(goneRel), new Position(0, 6), new ReferenceContext(true))
+    val ex = intercept[ExecutionException](docsService.references(params).get(60, TimeUnit.SECONDS))
+    val message = ex.getCause.asInstanceOf[ResponseErrorException].getResponseError.getMessage
+    assert(
+      message.contains("has no SemanticDB output"),
+      s"a live session must reject an unowned uri, not serve the stale row: $message"
+    )
+
   test("workspace/symbol finds the fixture class with a real file location"):
     val _ = env.initResult
     val result = wsService.symbol(new WorkspaceSymbolParams("Core")).get(60, TimeUnit.SECONDS)

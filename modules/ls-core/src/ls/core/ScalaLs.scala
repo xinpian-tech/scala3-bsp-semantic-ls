@@ -391,13 +391,17 @@ final class ScalaLs(val config: ScalaLs.Config = ScalaLs.Config())
         val indexableInModel =
           ownedByLiveTarget.exists(bspId => s.workspaceTargets.targets.exists(_.bspId == bspId))
         // The persisted-index fallback lets a warm restart with NO BSP connection
-        // serve already-indexed sources. It must NOT override a LIVE model that
-        // owns this uri via a non-indexable target (e.g. `-Xsemanticdb` removed):
-        // that stays a hard error, never answered from stale persisted rows. So it
-        // applies only when no live target owns the uri, and counts ACTIVE
-        // documents only.
+        // serve already-indexed sources. It applies ONLY in that truly BSP-less
+        // recovered-index mode (`session.isEmpty`): while a live BSP session
+        // exists, the live build model is authoritative about coverage, so a uri
+        // it no longer owns — e.g. a source/target removed via
+        // `buildTarget/didChange`, leaving only a stale persisted row — is a hard
+        // error, never answered from that stale row. It also must NOT override a
+        // live model that owns this uri via a non-indexable target
+        // (`-Xsemanticdb` removed). So: BSP-less AND no live owner, ACTIVE rows only.
         def indexedOnDisk =
-          ownedByLiveTarget.isEmpty &&
+          s.session.isEmpty &&
+            ownedByLiveTarget.isEmpty &&
             s.uris.toSdbUri(uri).exists(sdb => s.meta.documentsByUri(sdb).exists(_.active))
         if !indexableInModel && !indexedOnDisk then throw LsException(LsError.NoSemanticdb(uri))
       case _ => ()
