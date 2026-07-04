@@ -70,6 +70,17 @@ class CurrentSnapshotFileSuite extends munit.FunSuite:
       assertEquals(m2.readCurrentFile().map(_.generation), Some(3L))
     finally m2.close()
 
+  test("writeAtomic replaces an existing current.json (rewrite, not FileAlreadyExists)"):
+    // Rewriting over an existing current.json must REPLACE it, not fail. On this
+    // Linux FS ATOMIC_MOVE already replaces via rename(2), so this documents the
+    // rewrite contract that ATOMIC_MOVE + REPLACE_EXISTING guarantees on every
+    // provider (the integration path is covered by the publish-twice test above).
+    val root = tempRoot("current-json-replace")
+    CurrentSnapshotFile.writeAtomic(root, CurrentSnapshotFile(1L, "/seg/1", 100L, 1L))
+    CurrentSnapshotFile.writeAtomic(root, CurrentSnapshotFile(2L, "/seg/2", 200L, 2L))
+    assertEquals(CurrentSnapshotFile.read(root), Some(CurrentSnapshotFile(2L, "/seg/2", 200L, 2L)))
+    assert(!Files.exists(root.resolve("snapshots").resolve("current.json.tmp")))
+
   test("render/parse round-trips, including a path with spaces"):
     val f = CurrentSnapshotFile(7L, "/tmp/some dir/segment-000007", 123L, 4L)
     val root = tempRoot("current-json-roundtrip")

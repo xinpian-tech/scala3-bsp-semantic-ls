@@ -37,7 +37,11 @@ object CurrentSnapshotFile:
 
   /** Atomically (re)writes `<root>/snapshots/current.json`: a complete temp
     * file is written and moved into place, so a reader never sees a partial
-    * file and a crash leaves at most a `.tmp`.
+    * file and a crash leaves at most a `.tmp`. `REPLACE_EXISTING` is required
+    * alongside `ATOMIC_MOVE`: on FS providers where an atomic move does NOT
+    * implicitly replace an existing target, omitting it makes every rewrite
+    * after the first throw `FileAlreadyExistsException`, leaving `current.json`
+    * permanently stale.
     */
   def writeAtomic(root: Path, f: CurrentSnapshotFile): Unit =
     val dir = root.resolve("snapshots")
@@ -45,7 +49,7 @@ object CurrentSnapshotFile:
     val dest = dir.resolve("current.json")
     val tmp = dir.resolve("current.json.tmp")
     Files.write(tmp, render(f).getBytes(StandardCharsets.UTF_8))
-    Files.move(tmp, dest, StandardCopyOption.ATOMIC_MOVE)
+    Files.move(tmp, dest, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
 
   /** Reads and parses the file, or None if it is absent or unparseable. */
   def read(root: Path): Option[CurrentSnapshotFile] =
