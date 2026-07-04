@@ -1,11 +1,13 @@
 package ls.zaozi.pcplugin
 
+import scala.annotation.tailrec
 import scala.util.control.NonFatal
 
 import dotty.tools.dotc.ast.tpd.*
 import dotty.tools.dotc.core.Constants.Constant
 import dotty.tools.dotc.core.Contexts.Context
 import dotty.tools.dotc.core.Decorators.*
+import dotty.tools.dotc.core.Flags
 import dotty.tools.dotc.core.Names.termName
 import dotty.tools.dotc.core.Symbols.*
 import dotty.tools.dotc.core.Types.*
@@ -48,40 +50,90 @@ class ZaoziPcNavPhase extends PluginPhase:
   override val runsBefore: Set[String] = Set("SetRootTree")
 
   override def transformInlined(tree: Inlined)(using Context): Tree =
-    try rewriteDynamicNav(tree)
+    try
+      bundleFieldAccess(tree.call) match
+        case Some((bundleType, fieldName)) =>
+          resolveField(bundleType, fieldName) match
+            case Some(fieldSym) =>
+              cpy.Inlined(tree)(ref(fieldSym).withSpan(tree.call.span), tree.bindings, tree.expansion)
+            case None => tree
+        case None => tree
     catch case NonFatal(_) => tree
 
-  private def rewriteDynamicNav(tree: Inlined)(using Context): Tree =
-    dynamicFieldAccess(tree.call) match
-      case Some((qual, fieldName)) =>
-        resolveFieldSymbol(qual, fieldName) match
-          case Some(fieldSym) =>
-            cpy.Inlined(tree)(ref(fieldSym).withSpan(tree.call.span), tree.bindings, tree.expansion)
-          case None => tree
-      case None => tree
-
-  /** `(receiver, fieldName)` of a retained `qual.selectDynamic("field")` call. */
-  private def dynamicFieldAccess(call: Tree)(using Context): Option[(Tree, String)] =
+  /** `(bundleType, fieldName)` of a zaozi dynamic field access, from the retained
+    * pre-inlining call. Two shapes are recognized:
+    *   - `qual.selectDynamic("field")` — the retained call for `io.field`; the
+    *     bundle is the `T` of the `Referable[T]` receiver (the primary path).
+    *   - `bundle.getRefViaFieldValName[..](..)("field")` (and the optional
+    *     variant) — the macro-expanded accessor, if it is ever the retained call;
+    *     the bundle is the accessor's `DynamicSubfield` receiver (defensive).
+    * `applyDynamic`/`applyDynamicNamed` (index/slice) are intentionally NOT
+    * matched, so `io.vec(i)`/`io.bits(hi, lo)` stay as identity.
+    */
+  private def bundleFieldAccess(call: Tree)(using Context): Option[(Type, String)] =
     call match
       case Apply(Select(qual, sel), List(Literal(Constant(field: String))))
           if sel.toString == "selectDynamic" =>
-        Some((qual, field))
+        bundleOfReferable(qual.tpe.widen).map(t => (t, field))
+      case app @ Apply(fun, _) if accessorName(fun).isDefined =>
+        for
+          field <- literalArg(app)
+          recv <- accessorReceiver(fun)
+          bundle <- bundleOfReceiver(recv)
+        yield (bundle, field)
       case _ => None
 
-  /** Resolve `field` to its declaration in the bundle type of a
-    * `Referable[T <: DynamicSubfield]` receiver, or `None` if the receiver is
-    * not a zaozi referable or the field is not a real member.
-    */
-  private def resolveFieldSymbol(qual: Tree, fieldName: String)(using Context): Option[Symbol] =
-    val receiverType = qual.tpe.widen
-    receiverType.baseClasses.find(_.fullName.toString == ReferableName).flatMap { referable =>
-      receiverType.baseType(referable).argInfos.headOption.flatMap { bundleType =>
-        if bundleType.baseClasses.exists(_.fullName.toString == DynamicSubfieldName) then
-          val sym = bundleType.member(termName(fieldName)).symbol
-          if sym.exists && sym.isTerm then Some(sym) else None
-        else None
-      }
+  /** `T` of a `Referable[T]` receiver, when `T <: DynamicSubfield`. */
+  private def bundleOfReferable(tpe: Type)(using Context): Option[Type] =
+    tpe.baseClasses.find(_.fullName.toString == ReferableName).flatMap { referable =>
+      tpe.baseType(referable).argInfos.headOption.filter(isDynamicSubfield)
     }
+
+  /** Bundle type of a `getRefViaFieldValName` receiver: peel a leading
+    * `asInstanceOf[DynamicSubfield]` to recover the concrete pre-cast type.
+    */
+  private def bundleOfReceiver(recv: Tree)(using Context): Option[Type] =
+    val tpe = recv match
+      case TypeApply(Select(inner, cast), _) if cast.toString == "asInstanceOf" => inner.tpe.widen
+      case _                                                                    => recv.tpe.widen
+    Option(tpe).filter(isDynamicSubfield)
+
+  private def isDynamicSubfield(tpe: Type)(using Context): Boolean =
+    tpe.baseClasses.exists(_.fullName.toString == DynamicSubfieldName)
+
+  /** The bundle-field-accessor method name if `fun` selects one, else None. */
+  @tailrec
+  private def accessorName(fun: Tree)(using Context): Option[String] =
+    fun match
+      case Select(_, name) if isAccessor(name.toString) => Some(name.toString)
+      case Apply(inner, _)                              => accessorName(inner)
+      case TypeApply(inner, _)                          => accessorName(inner)
+      case _                                            => None
+
+  @tailrec
+  private def accessorReceiver(fun: Tree)(using Context): Option[Tree] =
+    fun match
+      case Select(recv, name) if isAccessor(name.toString) => Some(recv)
+      case Apply(inner, _)                                 => accessorReceiver(inner)
+      case TypeApply(inner, _)                             => accessorReceiver(inner)
+      case _                                               => None
+
+  private def isAccessor(name: String): Boolean =
+    name == "getRefViaFieldValName" || name == "getOptionRefViaFieldValName"
+
+  /** The first string-literal argument anywhere in a (possibly curried) apply. */
+  private def literalArg(tree: Tree)(using Context): Option[String] =
+    def scan(t: Tree): Option[String] = t match
+      case Apply(fun, args) =>
+        args.collectFirst { case Literal(Constant(s: String)) => s }.orElse(scan(fun))
+      case TypeApply(fun, _) => scan(fun)
+      case _                 => None
+    scan(tree)
+
+  /** Resolve `field` to a real, non-synthetic term member of the bundle type. */
+  private def resolveField(bundleType: Type, fieldName: String)(using Context): Option[Symbol] =
+    val sym = bundleType.member(termName(fieldName)).symbol
+    Option.when(sym.exists && sym.isTerm && !sym.is(Flags.Synthetic))(sym)
 
 object ZaoziPcNavPhase:
   val name: String = "zaozi-pc-dynamic-nav"
