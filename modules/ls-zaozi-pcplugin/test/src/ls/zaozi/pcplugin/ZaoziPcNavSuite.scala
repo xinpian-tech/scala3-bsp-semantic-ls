@@ -238,6 +238,59 @@ class ZaoziPcNavSuite extends munit.FunSuite:
     assert(defLinesFor(Vector(s"-Xplugin:$pluginJar")).contains(valALine), "macro-expanded io.a should reach val a")
     assert(!defLinesFor(Vector.empty).contains(valALine), "baseline macro-expanded io.a must not reach val a")
 
+  test("nested io.f.g resolves BOTH segments and optional io.k resolves, each to its own field decl"):
+    // A two-level bundle: RootBundle.f is itself a DynamicSubfield (SimpleBundle),
+    // so `io.f` types as Referable[SimpleBundle] (via the macro) and `io.f.g` is a
+    // second dynamic select. `k` is a second RootBundle field (the optional-field
+    // position). The bundle classes live in the buffer so go-to lands on their
+    // declarations; the macro API is the pre-compiled `macroFixtureClasses`.
+    val classes = macroFixtureClasses
+    val buffer =
+      """|package sample
+         |import me.jiuyang.zaozi.reftpe.*
+         |import me.jiuyang.zaozi.magic.DynamicSubfield
+         |class SimpleBundle extends DynamicSubfield:
+         |  val g: Int = 0
+         |class RootBundle extends DynamicSubfield:
+         |  val f: SimpleBundle = null.asInstanceOf[SimpleBundle]
+         |  val k: Int = 0
+         |object Top:
+         |  val io: Referable[RootBundle] = null.asInstanceOf[Referable[RootBundle]]
+         |  val p1 = io.f
+         |  val p2 = io.f.g
+         |  val p3 = io.k
+         |""".stripMargin
+    def defLinesAt(scalacOptions: Vector[String], marker: String, offset: Int): Vector[Int] =
+      val genRoot = Files.createTempDirectory("ls-zaozi-nested-gen")
+      val pm = new PcPluginManager(PcPluginInitContext(None, genRoot))
+      val facade = new PcFacade(pm, PcSettings(None, genRoot, 4, 90000L))
+      val tid = "zaoziNestedTarget"
+      facade.registerTarget(PcTargetConfig(tid, libraryClasspath :+ classes, scalacOptions))
+      try
+        val uri = "file:///ls-zaozi-pcplugin-test/NestedBuffer.scala"
+        facade.didOpen(tid, uri, buffer)
+        val (line, ch) = cursor(buffer, marker, offset)
+        facade.definition(uri, line, ch).locations.map(_.location.getRange.getStart.getLine)
+      finally facade.shutdown()
+
+    val fLine = lineOf(buffer, "val f: SimpleBundle")
+    val gLine = lineOf(buffer, "val g: Int")
+    val kLine = lineOf(buffer, "val k: Int")
+    val plugin = Vector(s"-Xplugin:$pluginJar")
+
+    // cursor on the `f` of `io.f` (p1 line) -> RootBundle.f
+    assert(defLinesAt(plugin, "io.f", 3).contains(fLine), s"io.f should reach RootBundle.f (line $fLine)")
+    // cursor on the `g` of `io.f.g` (p2 line) -> SimpleBundle.g
+    assert(defLinesAt(plugin, "io.f.g", 5).contains(gLine), s"nested io.f.g should reach SimpleBundle.g (line $gLine)")
+    // cursor on the `k` of `io.k` (p3 line) -> RootBundle.k
+    assert(defLinesAt(plugin, "io.k", 3).contains(kLine), s"optional io.k should reach RootBundle.k (line $kLine)")
+
+    // baseline: without the plugin, the nested segment does NOT reach the field
+    assert(
+      !defLinesAt(Vector.empty, "io.f.g", 5).contains(gLine),
+      "without the plugin, nested io.f.g must not reach SimpleBundle.g"
+    )
+
   test("go-to resolves the field on a non-Interface Referable receiver (Writable)"):
     val wrapperFixture =
       """|package me.jiuyang.zaozi.magic { trait DynamicSubfield }
@@ -361,7 +414,13 @@ class ZaoziPcNavSuite extends munit.FunSuite:
 
   /** Compile a mini zaozi API with a real `selectDynamic` macro (whose expansion is
     * `getRefViaFieldValName`) into a classes dir the PC target can reference. Macros
-    * require a prior compilation unit, which this provides. */
+    * require a prior compilation unit, which this provides.
+    *
+    * The macro types `selectDynamic("f")` as `Referable[<type of field f>]` (like
+    * zaozi's real macro), so a NESTED access `io.f.g` typechecks: `io.f` is a
+    * `Referable[SimpleBundle]` on which `.g` is another dynamic select. Without
+    * that precise result type the intermediate `io.f` would be `Any` and `.g`
+    * would not compile, so nested resolution could not be unit-tested at all. */
   private lazy val macroFixtureClasses: Path =
     // Scala 3 rejects two top-level `package` clauses in one file, so split the
     // mini API into one file per package.
@@ -379,8 +438,16 @@ class ZaoziPcNavSuite extends munit.FunSuite:
          |  def refer: Any = null
          |  transparent inline def selectDynamic(name: String): Any = ${ ZaoziFixtureMacros.sel[T]('this, 'name) }
          |object ZaoziFixtureMacros:
-         |  def sel[T](self: Expr[Referable[T]], name: Expr[String])(using Type[T], Quotes): Expr[Any] =
-         |    '{ $self._tpe.asInstanceOf[me.jiuyang.zaozi.magic.DynamicSubfield].getRefViaFieldValName($self.refer, $name) }
+         |  def sel[T: Type](self: Expr[Referable[T]], name: Expr[String])(using Quotes): Expr[Any] =
+         |    import quotes.reflect.*
+         |    val fieldName = name.valueOrAbort
+         |    val tRepr = TypeRepr.of[T]
+         |    val fieldSym = tRepr.typeSymbol.fieldMember(fieldName)
+         |    val fieldTpe = if fieldSym.exists then tRepr.memberType(fieldSym) else TypeRepr.of[Any]
+         |    fieldTpe.asType match
+         |      case '[ft] =>
+         |        '{ $self._tpe.asInstanceOf[me.jiuyang.zaozi.magic.DynamicSubfield]
+         |             .getRefViaFieldValName($self.refer, $name).asInstanceOf[Referable[ft]] }
          |""".stripMargin
     val srcDir = Files.createTempDirectory("ls-zaozi-macro-src")
     val magicFile = srcDir.resolve("Magic.scala")

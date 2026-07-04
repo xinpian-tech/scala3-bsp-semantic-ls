@@ -138,19 +138,35 @@ object AotTrain:
     // the SemanticDB-backed index features above are version-independent, but PC
     // completion needs a matching compiler.
     if skipPc then log("PC completion check skipped (--skip-pc)")
-    else findSelectProbe(sources) match
-      case None => require(false, "no member-select found to probe completion")
-      case Some(probe) =>
+    else
+      val probes = findSelectProbes(sources)
+      require(probes.nonEmpty, "no member-select found to probe completion")
+      // The FIRST arbitrary member-select can land inside a macro-retained tree
+      // copy (utest `Tests { … }` / `@generator`) where PC completion is empty —
+      // a known dotty-PC-on-macro limitation unrelated to the SemanticDB index.
+      // Try candidates in deterministic source order and require that at least
+      // one real select completes (not merely that the first one does).
+      var itemCount = -1
+      var chosen = ""
+      val it = probes.iterator
+      while itemCount < 0 && it.hasNext do
+        val probe = it.next()
         openDoc(docs, probe.uri, probe.text)
-        val result = docs
-          .completion(new CompletionParams(new TextDocumentIdentifier(probe.uri), probe.pos))
-          .get(RequestTimeoutMillis, TimeUnit.MILLISECONDS)
+        val result =
+          try
+            docs
+              .completion(new CompletionParams(new TextDocumentIdentifier(probe.uri), probe.pos))
+              .get(RequestTimeoutMillis, TimeUnit.MILLISECONDS)
+          catch case NonFatal(_) => null
         val items =
           if result == null then Vector.empty
           else if result.isRight then result.getRight.getItems.asScala.toVector
           else result.getLeft.asScala.toVector
-        require(items.nonEmpty, "PC completion returned no items")
-        log(s"completion items=${items.size}")
+        if items.nonEmpty then
+          itemCount = items.size
+          chosen = s"${probe.uri.split('/').lastOption.getOrElse(probe.uri)}:${probe.pos.getLine}"
+      require(itemCount > 0, s"PC completion returned no items for any of ${probes.size} member-selects")
+      log(s"completion items=$itemCount at $chosen (of ${probes.size} candidates)")
 
     // zaozi-specific: go-to + hover on a Dynamic bundle-field access through the
     // presentation compiler (the plugin loaded from pc-plugins.json steers it).
@@ -224,6 +240,32 @@ object AotTrain:
                   l.getRange.getStart.getLine <= declLine0 && declLine0 <= l.getRange.getEnd.getLine
               )
               (hit, locs.map(l => s"${l.getUri.split('/').lastOption.getOrElse(l.getUri)}:${l.getRange.getStart.getLine}").mkString(","))
+
+          // Text of the source line each definition location for `access` points
+          // at (reads the resolved target file). Used to prove the no-plugin
+          // baseline lands ON the framework `selectDynamic`, not merely "not the
+          // field" (a miss/empty result would otherwise pass a `!hit` check).
+          def targetLinesOf(access: String, charOffset: Int): Vector[String] =
+            val useLine = lines.indexWhere(_.contains(access))
+            if useLine < 0 then Vector.empty
+            else
+              val col = lines(useLine).indexOf(access) + charOffset
+              val params = new DefinitionParams(new TextDocumentIdentifier(uri), new Position(useLine, col))
+              val res =
+                try docs.definition(params).get(RequestTimeoutMillis, TimeUnit.MILLISECONDS)
+                catch case NonFatal(_) => null
+              val locs: Vector[Location] =
+                if res == null then Vector.empty
+                else if res.isLeft then res.getLeft.asScala.toVector
+                else Vector.empty
+              locs.flatMap { l =>
+                val tp = try java.nio.file.Paths.get(java.net.URI.create(l.getUri)) catch case NonFatal(_) => null
+                if tp == null then None
+                else
+                  val tlines = try Files.readAllLines(tp).asScala.toVector catch case NonFatal(_) => Vector.empty
+                  val ln = l.getRange.getStart.getLine
+                  if ln >= 0 && ln < tlines.size then Some(tlines(ln)) else None
+              }
 
           // Field-declaration line (0-based) of `val <field>` at/after `afterClass`.
           def declLineOf(afterClassRegex: String, field: String): Int =
@@ -314,6 +356,15 @@ object AotTrain:
             )
           else
             require(!hitA, s"zaozi-nav baseline: without the plugin, go-to on io.a must NOT reach `val a`; got [$locA]")
+            // ...and it must POSITIVELY resolve to the framework `selectDynamic`
+            // (a real source location whose line declares it), so the baseline
+            // proves the plugin is the cause rather than merely "missed the field".
+            val baseTargets = targetLinesOf("io.a", 3)
+            log(s"zaozi-nav baseline: io.a target lines=[${baseTargets.mkString(" | ").replace('\n', ' ').take(200)}]")
+            require(
+              baseTargets.exists(_.contains("selectDynamic")),
+              s"zaozi-nav baseline: without the plugin, go-to on io.a must resolve to `selectDynamic`; got target lines [${baseTargets.mkString(" | ").take(200)}]"
+            )
 
   private def hoverText(h: Hover): String =
     if h == null || h.getContents == null then ""
@@ -417,18 +468,21 @@ object AotTrain:
       }.nextOption()
     }.nextOption()
 
-  /** First member-select `x.y` that is not part of a package/import line, with a
-    * cursor right after the dot (where a completion request lists members).
+  /** Member-selects `x.y` (not on package/import lines), in deterministic source
+    * order, each with a cursor right after the dot (where a completion request
+    * lists members). Returns several candidates (capped) so the caller can skip
+    * selects that land in macro-retained trees — where PC completion is empty —
+    * and use the first that actually completes.
     */
-  private def findSelectProbe(sources: Vector[Path]): Option[SelectProbe] =
+  private def findSelectProbes(sources: Vector[Path]): Vector[SelectProbe] =
     sources.iterator.flatMap { p =>
       val text = try Files.readString(p) catch case NonFatal(_) => ""
       text.linesIterator.zipWithIndex.flatMap { (line, ln) =>
         val trimmed = line.trim
         if trimmed.startsWith("package") || trimmed.startsWith("import") then None
         else MemberSelect.findFirstMatchIn(line).map(m => SelectProbe(Uris.toUri(p), text, new Position(ln, m.start(2))))
-      }.nextOption()
-    }.nextOption()
+      }
+    }.take(40).toVector
 
 /** No-op LSP client for the headless training run: swallows every server
   * notification/request. ls-core compiles with `-Xmixin-force-forwarders:false`,

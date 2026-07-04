@@ -14,6 +14,12 @@
 # zaozi's own flake (`nix develop`), which supplies CIRCT/MLIR/jextract from the
 # binary cache. It is a HEAVY manual validation, NOT part of the ordinary CI gate.
 #
+# It provisions TWO independent zaozi workspaces so the plugin and no-plugin
+# baseline probes never share a Mill-BSP connection: a second sequential BSP
+# connection to the SAME workspace flakily fails to resolve zaozi's native env
+# inputs (mlirlib.mlirInstallPath / libcIncludePath). Isolated workspaces sidestep
+# that entirely, so the no-plugin baseline is a real run, not an inferred one.
+#
 # Usage:  nix develop -c ./scripts/it-zaozi.sh
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -33,33 +39,51 @@ PLUGIN_JAR="$REPO/out/zaoziPcplugin/jar.dest/out.jar"
 [ -f "$JAR" ] || { echo "it-zaozi: assembly jar not found: $JAR" >&2; exit 1; }
 [ -f "$PLUGIN_JAR" ] || { echo "it-zaozi: zaozi-pcplugin jar not found: $PLUGIN_JAR" >&2; exit 1; }
 
-# Copy the pinned + patched zaozi source out of the read-only Nix store into a
-# writable workspace (mill writes out/, .bsp/ there).
-WORK="$(mktemp -d)/zaozi"
-mkdir -p "$WORK"
-cp -r "$ZAOZI_SRC/." "$WORK/"
-chmod -R u+w "$WORK"
-grep -q "Xsemanticdb" "$WORK/build.mill" || { echo "it-zaozi: patched source lacks -Xsemanticdb" >&2; exit 1; }
-echo "it-zaozi: pinned+patched zaozi source at $WORK"
+# Provision one writable zaozi workspace: copy the pinned+patched Nix-store source
+# into `$1`, build the full zaozi (native CIRCT/MLIR) inside ITS OWN nix dev shell
+# emitting SemanticDB, install the Mill BSP connection, and wrap that connection so
+# `mill --bsp` runs inside zaozi's nix env. The `path:` flake scheme is required
+# because the workspace is a plain store copy (not a git checkout), so a bare path
+# would make Nix search upward and mis-root the flake at /tmp.
+provision_zaozi() {
+  local dst="$1"
+  mkdir -p "$dst"
+  cp -r "$ZAOZI_SRC/." "$dst/"
+  chmod -R u+w "$dst"
+  grep -q "Xsemanticdb" "$dst/build.mill" || { echo "it-zaozi: patched source lacks -Xsemanticdb" >&2; exit 1; }
+  ( cd "$dst"
+    rm -rf .bsp .scala3-bsp-semantic-ls
+    nix develop "path:$dst" -c bash -c 'mill --no-daemon __.compile && mill --no-daemon mill.bsp.BSP/install'
+  )
+  local sdb; sdb=$(find "$dst/out" -name '*.semanticdb' 2>/dev/null | wc -l)
+  [ "$sdb" -gt 0 ] || { echo "it-zaozi: $dst produced no SemanticDB" >&2; exit 1; }
+  python3 - "$dst" <<'PY'
+import json,sys
+z=sys.argv[1]; p=z+"/.bsp/mill-bsp.json"; d=json.load(open(p))
+# `path:` scheme (see the compile step): the workspace is a plain store copy, not
+# a git checkout, so a bare path would make Nix mis-root the flake at /tmp.
+if d["argv"][:2] != ["nix","develop"]:
+    d["argv"]=["nix","develop","path:"+z,"-c"]+d["argv"]
+    json.dump(d,open(p,"w"),indent=2)
+PY
+  echo "it-zaozi: provisioned zaozi workspace at $dst ($sdb SemanticDB files)"
+}
 
-# Build the full zaozi (native CIRCT/MLIR) inside ITS OWN nix dev shell, emitting
-# SemanticDB, and install the real Mill BSP connection. The workspace is a plain
-# copy of the Nix-store source (not a git checkout), so the flake is addressed
-# with the explicit `path:` scheme — a bare path would make Nix search upward for
-# an enclosing git repo and mis-root the flake at /tmp.
-( cd "$WORK"
-  rm -rf .bsp .scala3-bsp-semantic-ls
-  nix develop "path:$WORK" -c bash -c 'mill --no-daemon __.compile && mill --no-daemon mill.bsp.BSP/install'
-)
-sdb=$(find "$WORK/out" -name '*.semanticdb' 2>/dev/null | wc -l)
-echo "it-zaozi: zaozi built with $sdb SemanticDB files"
-[ "$sdb" -gt 0 ] || { echo "it-zaozi: zaozi produced no SemanticDB" >&2; exit 1; }
+# Two isolated workspaces: one loads the plugin (positive probe), one does not
+# (negative/baseline probe). They never share a BSP connection.
+ROOT="$(mktemp -d)"
+WORK="$ROOT/zaozi-plugin"
+BASE_WORK="$ROOT/zaozi-baseline"
+provision_zaozi "$WORK"
+provision_zaozi "$BASE_WORK"
 
-# Configure OUR presentation compiler to load the zaozi PC plugin, exactly as a
-# user would: a workspace pc-plugins.json naming the plugin jar as a compiler
-# plugin. Written AFTER the build (whose `rm -rf .scala3-bsp-semantic-ls` above
-# would otherwise delete it). In-process PC loads this in the main JVM; a forked
-# PC child would load it via --plugin-config — both from this same file.
+# Configure OUR presentation compiler to load the zaozi PC plugin in the PLUGIN
+# workspace only, exactly as a user would: a workspace pc-plugins.json naming the
+# plugin jar as a compiler plugin. Written AFTER the build (whose `rm -rf
+# .scala3-bsp-semantic-ls` above would otherwise delete it). In-process PC loads
+# this in the main JVM; a forked PC child loads it via --plugin-config — both from
+# this same file. The BASE_WORK workspace gets NO pc-plugins.json, so its PC runs
+# without the plugin.
 PLUGIN_CFG="$WORK/.scala3-bsp-semantic-ls/pc-plugins.json"
 mkdir -p "$(dirname "$PLUGIN_CFG")"
 python3 - "$PLUGIN_CFG" "$PLUGIN_JAR" <<'PY'
@@ -69,41 +93,21 @@ json.dump({"compilerPlugins":[{"jars":[jar]}]}, open(cfg,"w"), indent=2)
 PY
 echo "it-zaozi: wrote PC plugin config $PLUGIN_CFG -> $PLUGIN_JAR"
 
-# Wrap the BSP launch so `mill --bsp` runs inside zaozi's nix env (CIRCT/MLIR),
-# while OUR server runs in ITS OWN nix env (our SQLite). Mixing the two native
-# closures in one process crashes; wrapping keeps each in its own dev shell.
-python3 - "$WORK" <<'PY'
-import json,sys
-z=sys.argv[1]; p=z+"/.bsp/mill-bsp.json"; d=json.load(open(p))
-# `path:` scheme (see the compile step): the workspace is a plain store copy, not
-# a git checkout, so a bare path would make Nix mis-root the flake at /tmp.
-if d["argv"][:2] != ["nix","develop"]:
-    d["argv"]=["nix","develop","path:"+z,"-c"]+d["argv"]
-    json.dump(d,open(p,"w"),indent=2)
-PY
-
 # Drive the server against the full real zaozi: real BSP compile + reindex, then
-# assert the SemanticDB-backed index is populated and queryable AND that the PC
-# answers the zaozi-pcplugin go-to+hover on the `io.a` / `io.f.g` / `io.k` Dynamic
-# bundle-field accesses in zaozi/tests/src/BundleSpec.scala.
-#
-# `--skip-pc` skips only the GENERIC PC-completion probe (an arbitrary member-select
-# via findSelectProbe): general PC completion on zaozi's utest/@generator macro-heavy
-# code lands inside a macro's retained tree copy and returns nothing — a pre-existing
-# dotty-PC-on-macro limitation the plugin does not (and is not meant to) address. The
-# dedicated `--zaozi-nav-probe` still runs and is the real go-to assertion: it drives
-# textDocument/definition + hover on the Dynamic accesses (the plugin steers those
-# through the same macro-retained copies via its retained-call rewrite).
+# assert the SemanticDB-backed index is populated and queryable, generic PC
+# completion returns items, AND the PC answers the zaozi-pcplugin go-to+hover on
+# the `io.a` / `io.f.g` / `io.k` Dynamic bundle-field accesses in
+# zaozi/tests/src/BundleSpec.scala. No `--skip-pc`: the generic completion probe
+# now tries member-selects in deterministic order until one completes, so a
+# macro-retained empty select no longer forces skipping the whole PC path.
 echo "it-zaozi: [plugin] indexing zaozi over real Mill BSP + PC nav probe (probe: $PROBE_SYMBOL)"
 LS_SQLITE_LIB="$SQLITE" java --enable-native-access=ALL-UNNAMED -jar "$JAR" \
-  --aot-train "$WORK" --require-index --skip-pc --zaozi-nav-probe
+  --aot-train "$WORK" --require-index --zaozi-nav-probe
 
-# The no-plugin BASELINE (io.a does NOT resolve to the field without the plugin) is
-# covered by the unit + forked suites (ZaoziPcNavSuite "without it, it does not";
-# ZaoziPcForkedSuite baseline resolves to selectDynamic) — both exercise the real PC.
-# A second real-zaozi aot-train run here (plugin disabled) is intentionally NOT done:
-# a SECOND sequential Mill-BSP connection to the same workspace flakily fails to
-# resolve zaozi's native env inputs (mlirlib.mlirInstallPath / libcIncludePath) in the
-# re-launched BSP server — a Mill-BSP-in-nix flake unrelated to the plugin.
+# The no-plugin BASELINE, in its OWN workspace: go-to on `io.a` must resolve to
+# the framework `selectDynamic` (NOT `val a`), proving the plugin is the cause.
+echo "it-zaozi: [baseline] indexing zaozi over real Mill BSP + PC nav baseline (no plugin)"
+LS_SQLITE_LIB="$SQLITE" java --enable-native-access=ALL-UNNAMED -jar "$JAR" \
+  --aot-train "$BASE_WORK" --require-index --zaozi-nav-probe --zaozi-nav-baseline
 
-echo "it-zaozi: OK — the server indexed the full original zaozi and PC nav resolved io.a -> val a / io.f.g / io.k"
+echo "it-zaozi: OK — plugin run resolved io.a -> val a / io.f.g / io.k; baseline resolved io.a -> selectDynamic"
