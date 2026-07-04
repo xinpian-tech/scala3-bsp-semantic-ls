@@ -126,8 +126,7 @@ final class IndexPcDefinitionResolver(
       path <- toPathOpt(fromFileUri)
       spec <- ws.targets
         .filter(t => path.startsWith(t.sourceroot.toAbsolutePath.normalize))
-        .sortBy(-_.sourceroot.getNameCount)
-        .headOption
+        .maxByOption(_.sourceroot.getNameCount)
     yield ws.forwardDependencyClosure(spec.bspId)
 
   private def toPathOpt(fileUri: String): Option[Path] =

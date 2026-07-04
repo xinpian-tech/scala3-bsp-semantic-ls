@@ -1,7 +1,7 @@
 package ls.pc
 
 import java.io.PrintStream
-import java.nio.file.{Files, Path, Paths}
+import java.nio.file.{Files, Paths}
 import java.util.concurrent.{Executors, TimeUnit}
 import java.util.concurrent.atomic.AtomicReference
 
