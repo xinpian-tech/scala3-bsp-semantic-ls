@@ -291,6 +291,53 @@ class ZaoziPcNavSuite extends munit.FunSuite:
       "without the plugin, nested io.f.g must not reach SimpleBundle.g"
     )
 
+  test("optional-field access via getOptionRefViaFieldValName resolves to the field decl (accessor branch)"):
+    // zaozi OPTIONAL fields expand to `getOptionRefViaFieldValName(refer, "name")`,
+    // not `getRefViaFieldValName`. A plain `io.k` desugars to `io.selectDynamic("k")`
+    // whose retained call is the `selectDynamic` apply, so the plugin's case-1
+    // matcher always resolves it regardless of the expansion — that path can never
+    // reversion-test the `isAccessor` branch. This test instead makes the
+    // `getOptionRefViaFieldValName` accessor itself the navigable retained call
+    // (the fixture declares it `transparent inline`), which is exactly the shape
+    // the plugin's case-2 (`isAccessor`) matcher handles for optional fields. It
+    // therefore FAILS if `getOptionRefViaFieldValName` is dropped from `isAccessor`.
+    val classes = macroFixtureClasses
+    val buffer =
+      """|package sample
+         |import me.jiuyang.zaozi.reftpe.*
+         |import me.jiuyang.zaozi.magic.DynamicSubfield
+         |class RootBundle extends DynamicSubfield:
+         |  val k: Int = 0
+         |object Top:
+         |  val io: Referable[RootBundle] = null.asInstanceOf[Referable[RootBundle]]
+         |  val optK = io._tpe.asInstanceOf[DynamicSubfield].getOptionRefViaFieldValName(io.refer, "k")
+         |""".stripMargin
+    def defLinesFor(scalacOptions: Vector[String]): Vector[Int] =
+      val genRoot = Files.createTempDirectory("ls-zaozi-opt-gen")
+      val pm = new PcPluginManager(PcPluginInitContext(None, genRoot))
+      val facade = new PcFacade(pm, PcSettings(None, genRoot, 4, 90000L))
+      val tid = "zaoziOptTarget"
+      facade.registerTarget(PcTargetConfig(tid, libraryClasspath :+ classes, scalacOptions))
+      try
+        val uri = "file:///ls-zaozi-pcplugin-test/OptBuffer.scala"
+        facade.didOpen(tid, uri, buffer)
+        // Cursor on the `"k"` field-name argument of the accessor call: the plugin
+        // rewrites the whole `getOptionRefViaFieldValName(...)` retained call to a
+        // `ref(RootBundle.k)` spanning the argument region, so go-to here resolves
+        // to the field.
+        val (line, ch) = cursor(buffer, "\"k\"", 1)
+        facade.definition(uri, line, ch).locations.map(_.location.getRange.getStart.getLine)
+      finally facade.shutdown()
+    val kLine = lineOf(buffer, "val k: Int")
+    assert(
+      defLinesFor(Vector(s"-Xplugin:$pluginJar")).contains(kLine),
+      s"the getOptionRefViaFieldValName accessor should resolve to RootBundle.k (line $kLine)"
+    )
+    assert(
+      !defLinesFor(Vector.empty).contains(kLine),
+      "without the plugin, the getOptionRefViaFieldValName accessor must not reach RootBundle.k"
+    )
+
   test("go-to resolves the field on a non-Interface Referable receiver (Writable)"):
     val wrapperFixture =
       """|package me.jiuyang.zaozi.magic { trait DynamicSubfield }
@@ -428,6 +475,14 @@ class ZaoziPcNavSuite extends munit.FunSuite:
       """|package me.jiuyang.zaozi.magic
          |trait DynamicSubfield:
          |  def getRefViaFieldValName(refer: Any, name: String): Any = null
+         |  // OPTIONAL-field accessor. `transparent inline` so a direct call is
+         |  // retained as an `Inlined.call` — the exact tree shape the plugin's
+         |  // accessor matcher (isAccessor) handles when the macro-expanded
+         |  // `getOptionRefViaFieldValName` (not `selectDynamic`) is the navigable
+         |  // node. A regular method's call would never appear in an `Inlined.call`.
+         |  transparent inline def getOptionRefViaFieldValName(inline refer: Any, inline name: String): Any =
+         |    optFieldHelper(refer, name)
+         |  def optFieldHelper(refer: Any, name: String): Any = null
          |""".stripMargin
     val reftpeSrc =
       """|package me.jiuyang.zaozi.reftpe
