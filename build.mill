@@ -146,6 +146,37 @@ object core extends LsModule {
   }
 }
 
+/** zaozi presentation-compiler navigation plugin.
+  *
+  * A standalone Scala 3 compiler plugin (not an ls-* server layer, so it does
+  * NOT extend [[LsModule]]) that is loaded into the presentation compiler via
+  * `pc-plugins.json` compilerPlugins. It depends only on the compiler and ships
+  * as a plain jar (never an assembly) so nothing but its own classes plus
+  * `resources/plugin.properties` reach the `-Xplugin` classpath.
+  */
+object zaoziPcplugin extends ScalaModule {
+  override def moduleDir = super.moduleDir / os.up / "modules" / "ls-zaozi-pcplugin"
+  def scalaVersion = Deps.scalaVer
+
+  override def javaHome = Task {
+    Task.env.get("JAVA_HOME").map(p => PathRef(os.Path(p), quick = true))
+  }
+
+  def mvnDeps = Seq(Deps.scala3Compiler)
+  def scalacOptions = Seq("-deprecation", "-feature", "-unchecked")
+
+  object test extends ScalaTests with TestModule.Munit {
+    def mvnDeps = Seq(Deps.munit, Deps.scala3Compiler)
+    override def moduleDeps = super.moduleDeps ++ Seq(pc)
+    def forkArgs = Seq("--enable-native-access=ALL-UNNAMED")
+    // Drive the presentation compiler with the freshly built plugin jar loaded
+    // via -Xplugin, exactly as pc-plugins.json compilerPlugins would.
+    override def forkEnv = Task {
+      super.forkEnv() + ("ZAOZI_PCPLUGIN_JAR" -> build.zaoziPcplugin.jar().path.toString)
+    }
+  }
+}
+
 /** Benchmark + JFR harness. */
 object bench extends LsModule {
   def dirName = "ls-bench"
