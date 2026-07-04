@@ -40,7 +40,12 @@ stdenvNoCC.mkDerivation {
     runHook preBuild
     # --no-daemon: the daemon path would resolve mill-runner-daemon from the
     # network, which the sandbox forbids and the ivy lock does not carry.
+    # zaoziPcplugin.jar is a plain jar (the presentation-compiler navigation
+    # plugin) shipped under share/ for pc-plugins.json compilerPlugins.
+    # Separate invocations: mill silently skips a trailing second selector
+    # unless it is joined with `+`, so build each target on its own.
     mill --no-daemon core.assembly
+    mill --no-daemon zaoziPcplugin.jar
     runHook postBuild
   '';
 
@@ -51,6 +56,8 @@ stdenvNoCC.mkDerivation {
     cp out/core/assembly.dest/out.jar $out/lib/scala3-bsp-semantic-ls/scala3-bsp-semantic-ls.jar
     cp modules/ls-pc/resources/default-plugin-schema.json \
       $out/share/scala3-bsp-semantic-ls/default-plugin-schema.json
+    cp out/zaoziPcplugin/jar.dest/out.jar \
+      $out/share/scala3-bsp-semantic-ls/zaozi-pcplugin.jar
 
     # Java 25 only runtime. The assembly runs on the class path, so native
     # access for the ls-sqlite-ffm FFM binding is granted via ALL-UNNAMED

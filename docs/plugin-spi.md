@@ -74,6 +74,40 @@ Operational requirements (plan Phase 9):
   disabled plugins`). Plugin failure degrades PC features; it never degrades index
   correctness.
 
+### 2.1 Configuration file and the shipped `zaozi-pcplugin`
+
+Compiler plugins are configured per workspace in
+`<workspaceRoot>/.scala3-bsp-semantic-ls/pc-plugins.json` under `compilerPlugins`:
+
+```json
+{
+  "compilerPlugins": [
+    { "jars": ["/abs/path/to/plugin.jar"], "options": ["myPlugin:key:value"] }
+  ]
+}
+```
+
+Each `jars` entry becomes a `-Xplugin:<jar>` option and each `options` entry a
+`-P:<option>` on the PC worker's compiler instances (the config path is forwarded to
+the forked worker via `--plugin-config`).
+
+The packaged server ships one such plugin at
+`share/scala3-bsp-semantic-ls/zaozi-pcplugin.jar` (built by the `zaoziPcplugin` Mill
+module). It is a Scala 3 `StandardPlugin` that runs after `typer` in the presentation
+compiler and rewrites the `Inlined.call` of a zaozi `Referable` `scala.Dynamic`
+bundle-field access (`io.a`) to a typed reference to the resolved field symbol, so
+go-to-definition and hover resolve to the real `val a = Aligned(...)` declaration
+instead of the framework `selectDynamic` method. It keys strictly on the zaozi API
+(`me.jiuyang.zaozi.reftpe.Referable` / `me.jiuyang.zaozi.magic.DynamicSubfield`) and is
+inert on every other codebase. Point a workspace's `pc-plugins.json` `compilerPlugins`
+at that jar to enable zaozi bundle-field navigation.
+
+> **Doctor-status caveat.** The manager validates a configured compiler plugin by jar
+> existence only, so the Doctor line `compiler plugins loaded: N of M` reports how many
+> configured jars exist — **not** that the presentation compiler actually loaded the
+> plugin class or ran its phase. To confirm a compiler plugin is working, exercise the
+> PC feature it affects (e.g. go-to on `io.a`), not the doctor status.
+
 ## 3. PC service plugin SPI (plan 14.3)
 
 The project defines a stable service SPI. The trait, exactly as specified:

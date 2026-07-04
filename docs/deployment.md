@@ -59,7 +59,8 @@ against the pre-fetched ivy cache) and installs a self-contained launcher:
 ```text
 result/bin/scala3-bsp-semantic-ls                              # makeWrapper launcher (the entry point)
 result/lib/scala3-bsp-semantic-ls/scala3-bsp-semantic-ls.jar   # core.assembly fat jar (main: ls.core.Main)
-result/share/scala3-bsp-semantic-ls/default-plugin-schema.json # PC plugin schema
+result/share/scala3-bsp-semantic-ls/default-plugin-schema.json # PC plugin config schema
+result/share/scala3-bsp-semantic-ls/zaozi-pcplugin.jar         # PC compiler plugin: zaozi Dynamic bundle-field go-to/hover
 ```
 
 The wrapper is `makeWrapper ${jdk25}/bin/java` with these baked-in settings — you
@@ -74,8 +75,12 @@ get all of them for free when you launch the wrapped binary:
 | `--add-flags ${LS_AOT_CACHE:+-XX:AOTCache=$LS_AOT_CACHE}` | opt-in AOT cache — emitted only when `LS_AOT_CACHE` is set  |
 | `--add-flags -jar .../scala3-bsp-semantic-ls.jar`      | runs the assembly                                             |
 
-`default-plugin-schema.json` in `share/` is the JSON schema for PC service plugins
-(see [plugin-spi.md](plugin-spi.md)); it is data, not required to run.
+`default-plugin-schema.json` in `share/` is the JSON schema for the PC plugin config
+file (`pc-plugins.json` — both `compilerPlugins` and `servicePluginJars`; see
+[plugin-spi.md](plugin-spi.md)); it is data, not required to run. `zaozi-pcplugin.jar`
+in `share/` is a shipped PC **compiler** plugin: point a workspace's `pc-plugins.json`
+`compilerPlugins` at it to make go-to-definition and hover resolve zaozi's dynamic
+`io.field` bundle accesses to the real field declaration (see [plugin-spi.md §2.1](plugin-spi.md)).
 
 Package facts: `pname = scala3-bsp-semantic-ls`, `version = 0.1.0`,
 `mainProgram = scala3-bsp-semantic-ls`, platforms Linux + Darwin.
