@@ -21,12 +21,16 @@ import org.eclipse.lsp4j.{CompletionItem, CompletionList, Diagnostic, Hover, Ran
   */
 final class PcFacade(
     val pluginManager: PcPluginManager,
-    val settings: PcSettings
+    val settings: PcSettings,
+    /** Cross-file definition lookup handed down to the worker manager's PC
+      * instances; defaults to a no-op (cross-file go-to stays empty).
+      */
+    resolver: PcDefinitionResolver = PcDefinitionResolver.Empty
 ):
 
   def this(pluginManager: PcPluginManager) = this(pluginManager, PcSettings.ephemeral())
 
-  private val manager = new PcWorkerManager(pluginManager, settings)
+  private val manager = new PcWorkerManager(pluginManager, settings, resolver)
 
   /** Exposed for tests and the doctor; not part of the LSP-facing surface. */
   private[pc] def workerManager: PcWorkerManager = manager

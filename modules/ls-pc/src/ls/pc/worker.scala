@@ -4,6 +4,7 @@ import java.nio.file.Paths
 import java.util.concurrent.{CompletableFuture, Executors}
 
 import scala.jdk.CollectionConverters.*
+import scala.util.control.NonFatal
 
 import org.eclipse.lsp4j.jsonrpc.services.JsonRequest
 import org.eclipse.lsp4j.{CompletionItem, CompletionList, Hover, Range, SignatureHelp}
@@ -88,6 +89,18 @@ object PcWorkerDefinitionResult:
       DefinitionLocation(loc, origin)
     }
     DefinitionResult(r.symbol, marked)
+
+/** Child->parent cross-file definition callback params: the SemanticDB symbol
+  * the child's presentation compiler resolved plus the `file://` uri of the
+  * buffer the request originated from.
+  */
+final class PcWorkerSymbolParams:
+  var symbol: String = ""
+  var uri: String = ""
+
+/** Locations-only JSON carrier for the cross-file definition callback. */
+final class PcWorkerLocationsResult:
+  var locations: java.util.List[org.eclipse.lsp4j.Location] = new java.util.ArrayList()
 
 /** JSON-friendly mirror of [[CompilerPluginStatus]]. */
 final class PcWorkerCompilerPlugin:
@@ -206,11 +219,35 @@ trait PcWorkerApi:
   @JsonRequest("pc/shutdown")
   def shutdown(): CompletableFuture[String]
 
-/** Client-side interface of the worker protocol. The worker never calls back
-  * into its parent, so this is intentionally empty; it only satisfies the
-  * jsonrpc launcher's remote-interface requirement on the server side.
+/** Client-side (parent) interface of the worker protocol. Its single request
+  * is the child->parent callback for CROSS-FILE go-to-definition: the child's
+  * presentation compiler resolves a symbol whose definition is not in the
+  * open buffer, the child blocks its PC executor thread (never its jsonrpc
+  * reader thread) on this request, and the parent answers from its
+  * index-backed [[PcDefinitionResolver]]. The callback is a separate jsonrpc
+  * request id on the same channel, so it interleaves with the in-flight
+  * `pc/definition` request without deadlocking either side.
   */
-trait PcWorkerClient
+trait PcWorkerClient:
+  @JsonRequest("pc/symbolDefinition")
+  def symbolDefinition(params: PcWorkerSymbolParams): CompletableFuture[PcWorkerLocationsResult]
+
+/** Parent-side [[PcWorkerClient]]: answers the child's cross-file definition
+  * callback from `resolver`. Computed synchronously on the launcher's message
+  * thread — the resolver only reads the immutable postings snapshot and the
+  * SQLite reader pool and never waits on the child, so it cannot deadlock
+  * the protocol.
+  */
+final class ResolverPcWorkerClient(resolver: PcDefinitionResolver) extends PcWorkerClient:
+  override def symbolDefinition(params: PcWorkerSymbolParams): CompletableFuture[PcWorkerLocationsResult] =
+    val locs =
+      try resolver.definition(params.symbol, params.uri)
+      catch case NonFatal(_) => Vector.empty
+    val result = new PcWorkerLocationsResult
+    val list = new java.util.ArrayList[org.eclipse.lsp4j.Location](locs.length)
+    locs.foreach(list.add)
+    result.locations = list
+    CompletableFuture.completedFuture(result)
 
 /** Default in-process worker: [[PcWorkerApi]] over a [[PcFacade]]. Requests
   * are serialized on a dedicated daemon thread so a slow PC request cannot

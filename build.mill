@@ -167,7 +167,10 @@ object zaoziPcplugin extends ScalaModule {
 
   object test extends ScalaTests with TestModule.Munit {
     def mvnDeps = Seq(Deps.munit, Deps.scala3Compiler)
-    override def moduleDeps = super.moduleDeps ++ Seq(pc)
+    // `core` (with its transitive index stack) backs the cross-file navigation
+    // test: it ingests a compiled library into a real index and wires the
+    // index-backed PC definition resolver, exactly as the server does.
+    override def moduleDeps = super.moduleDeps ++ Seq(pc, core)
     def forkArgs = Seq("--enable-native-access=ALL-UNNAMED")
     // Drive the presentation compiler with the freshly built plugin jar loaded
     // via -Xplugin, exactly as pc-plugins.json compilerPlugins would.

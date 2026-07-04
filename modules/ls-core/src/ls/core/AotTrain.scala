@@ -245,6 +245,49 @@ object AotTrain:
           log(s"zaozi-nav: io.f.g->SimpleBundle.g@${declG + 1} hit=$hitG locs=[$locG]")
           log(s"zaozi-nav: io.k->val k@${declK + 1} hit=$hitK locs=[$locK]")
 
+          // CROSS-FILE (plugin-independent): go-to on the framework type
+          // `Bundle` in `class SimpleBundle extends Bundle:` must leave this
+          // file and land on `trait Bundle` in the zaozi sources — served by
+          // the index-backed PC SymbolSearch, with or without the nav plugin.
+          sortedScalaSources(root).find { p =>
+            p != path && {
+              val t = try Files.readString(p) catch case NonFatal(_) => ""
+              t.linesIterator.exists(_.startsWith("trait Bundle "))
+            }
+          } match
+            case None => require(false, "zaozi-nav: no framework source defining `trait Bundle` found")
+            case Some(defPath) =>
+              val defText = try Files.readString(defPath) catch case NonFatal(_) => ""
+              val defLine0 = defText.linesIterator.indexWhere(_.startsWith("trait Bundle "))
+              val useLine = lines.indexWhere(_.contains("extends Bundle:"))
+              require(useLine >= 0, "zaozi-nav: no `extends Bundle:` use in BundleSpec.scala")
+              if useLine >= 0 then
+                val col = lines(useLine).indexOf("extends Bundle:") + "extends B".length
+                val params = new DefinitionParams(new TextDocumentIdentifier(uri), new Position(useLine, col))
+                val res =
+                  try docs.definition(params).get(RequestTimeoutMillis, TimeUnit.MILLISECONDS)
+                  catch
+                    case NonFatal(t) =>
+                      log(s"zaozi-nav: cross-file definition(Bundle) threw: $t")
+                      null
+                val locs: Vector[Location] =
+                  if res == null then Vector.empty
+                  else if res.isLeft then res.getLeft.asScala.toVector
+                  else Vector.empty
+                val defUri = Uris.toUri(defPath)
+                val hit = locs.exists(l =>
+                  Uris.normalize(l.getUri) == Uris.normalize(defUri) &&
+                    l.getRange.getStart.getLine <= defLine0 && defLine0 <= l.getRange.getEnd.getLine
+                )
+                log(
+                  s"zaozi-nav: CROSS-FILE Bundle->${defPath.getFileName}@${defLine0 + 1} hit=$hit " +
+                    s"locs=[${locs.map(l => s"${l.getUri.split('/').lastOption.getOrElse(l.getUri)}:${l.getRange.getStart.getLine}").mkString(",")}]"
+                )
+                require(
+                  hit,
+                  s"zaozi-nav: cross-file go-to on `Bundle` should reach `trait Bundle` (${defPath.getFileName} line ${defLine0 + 1})"
+                )
+
           // hover on io.a
           val hovText =
             val useLine = lines.indexWhere(_.contains("io.a"))

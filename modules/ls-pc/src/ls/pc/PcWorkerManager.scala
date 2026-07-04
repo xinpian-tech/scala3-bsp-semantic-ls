@@ -68,7 +68,11 @@ object PcSettings:
   */
 final class PcWorkerManager(
     val pluginManager: PcPluginManager,
-    val settings: PcSettings
+    val settings: PcSettings,
+    /** Cross-file definition lookup plugged into the PC's `SymbolSearch`
+      * seam; defaults to a no-op so embedders without an index are unchanged.
+      */
+    resolver: PcDefinitionResolver = PcDefinitionResolver.Empty
 ):
 
   private final case class Entry(
@@ -192,6 +196,9 @@ final class PcWorkerManager(
     var base: scala.meta.pc.PresentationCompiler = new dotty.tools.pc.ScalaPresentationCompiler()
       .withExecutorService(executor)
       .withScheduledExecutorService(scheduler)
+      // Cross-file go-to: the PC delegates a definition whose symbol is not in
+      // the open buffer to SymbolSearch.definition; route it to the resolver.
+      .withSearch(new IndexBackedSymbolSearch(resolver))
     settings.workspaceRoot.foreach(root => base = base.withWorkspace(root))
     val underlying =
       base.newInstance(config.bspId, config.classpath.asJava, options.asJava, sourcePathSupplier)

@@ -65,3 +65,49 @@ class ForkedWorkerSuite extends munit.FunSuite:
       assert(get(worker.shutdown()).startsWith("ok"))
       assert(!worker.isAlive)
     finally worker.close()
+
+  test("forked worker: CROSS-FILE definition RPCs back to the parent resolver over pc/symbolDefinition"):
+    assumeForkAllowed()
+    val recorded = new java.util.concurrent.atomic.AtomicReference[(String, String)]()
+    val canned = new org.eclipse.lsp4j.Location(
+      "file:///parent-index/Lib.scala",
+      new org.eclipse.lsp4j.Range(
+        new org.eclipse.lsp4j.Position(7, 4),
+        new org.eclipse.lsp4j.Position(7, 9)
+      )
+    )
+    val resolver = new PcDefinitionResolver:
+      def definition(semanticdbSymbol: String, fromFileUri: String): Vector[org.eclipse.lsp4j.Location] =
+        recorded.set((semanticdbSymbol, fromFileUri))
+        Vector(canned)
+    val genDir = Files.createTempDirectory("ls-pc-forked-search-gen")
+    val worker = new ForkedPcWorker(
+      workerArgs = Vector("--generated-sources", genDir.toString, "--timeout-ms", "90000"),
+      requestTimeoutMillis = 120000,
+      resolver = resolver
+    )
+    try
+      assertEquals(get(worker.initializeTarget(PcWorkerTargetParams.of(SharedPc.targetConfig))), "ok")
+      val open = new PcWorkerDidOpenParams
+      open.targetId = SharedPc.targetId
+      open.uri = "file:///ls-pc-test/ForkedSearch.scala"
+      open.text = "object ForkedSearch:\n  val xs = List(1)\n"
+      assertEquals(get(worker.didOpen(open)), "ok")
+
+      // definition on `List`: defined in the scala library, NOT in the buffer,
+      // so the child's PC must call back to the parent for the location
+      val pos = new PcWorkerPositionParams
+      pos.uri = open.uri
+      pos.line = 1
+      pos.character = "  val xs = Li".length
+      val result = get(worker.definition(pos))
+      val locs = result.locations.asScala.toVector
+      assert(locs.contains(canned), s"parent-resolver location missing after the RPC round-trip: $locs")
+
+      val rec = recorded.get()
+      assert(rec != null, "the parent resolver was never called over pc/symbolDefinition")
+      assert(rec._1.startsWith("scala/") && rec._1.contains("List"), s"unexpected symbol: '${rec._1}'")
+      assertEquals(rec._2, open.uri)
+
+      assert(get(worker.shutdown()).startsWith("ok"))
+    finally worker.close()

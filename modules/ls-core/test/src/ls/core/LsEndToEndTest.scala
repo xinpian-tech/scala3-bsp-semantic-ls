@@ -380,6 +380,32 @@ class LsEndToEndTest extends munit.FunSuite:
         s"expected an edit at $expected in $uri, got $edits"
       )
 
+  test("textDocument/definition resolves CROSS-FILE symbols through the index-backed PC search"):
+    val _ = env.initResult
+    // Open Use.scala clean; `Core` and `ping` are DEFINED in Core.scala, so the
+    // PC cannot answer from the open buffer — it must consult the index-backed
+    // SymbolSearch (in-process resolver over the postings snapshot).
+    docsService.didOpen(
+      new DidOpenTextDocumentParams(
+        new TextDocumentItem(ws.fileUri(E2eFixture.useUri), "scala", 1, ws.sourceText(E2eFixture.useUri))
+      )
+    )
+    def definitions(token: String, nth: Int): Vector[Location] =
+      val params = new DefinitionParams(textDoc(E2eFixture.useUri), position(E2eFixture.useUri, token, nth))
+      val res = docsService.definition(params).get(120, TimeUnit.SECONDS)
+      assert(res != null && res.isLeft, s"expected a Location list for '$token'")
+      res.getLeft.asScala.toVector
+
+    // type reference `val core: Core` -> `class Core` name token in Core.scala
+    val classDef = locationOf(E2eFixture.coreUri, ws.tokenSpan(E2eFixture.coreUri, "Core", 0))
+    val coreLocs = definitions("Core", 0)
+    assert(coreLocs.contains(classDef), s"cross-file class definition missing: got $coreLocs, want $classDef")
+
+    // member call `core.ping` -> `def ping` name token in Core.scala
+    val pingDef = locationOf(E2eFixture.coreUri, ws.tokenSpan(E2eFixture.coreUri, "ping", 0))
+    val pingLocs = definitions("ping", 0)
+    assert(pingLocs.contains(pingDef), s"cross-file member definition missing: got $pingLocs, want $pingDef")
+
   test("didOpen + completion goes through the real presentation compiler"):
     val _ = env.initResult
     val dirtyText = ws.sourceText(E2eFixture.useUri) + "  val q = core.pi\n"

@@ -25,7 +25,12 @@ final class ForkedPcWorker(
     classpath: String = System.getProperty("java.class.path", ""),
     jvmArgs: Vector[String] = Vector.empty,
     workerArgs: Vector[String] = Vector.empty,
-    requestTimeoutMillis: Long = 60000
+    requestTimeoutMillis: Long = 60000,
+    /** Parent-side cross-file definition lookup: the child's PC calls back
+      * over `pc/symbolDefinition` and this resolver (index-backed in
+      * production) answers. Defaults to a no-op.
+      */
+    resolver: PcDefinitionResolver = PcDefinitionResolver.Empty
 ) extends PcWorkerApi
     with AutoCloseable:
 
@@ -179,7 +184,7 @@ final class ForkedPcWorker(
     builder.redirectError(ProcessBuilder.Redirect.INHERIT)
     val process = builder.start()
     val launcher = new Launcher.Builder[PcWorkerApi]()
-      .setLocalService(new PcWorkerClient {})
+      .setLocalService(new ResolverPcWorkerClient(resolver))
       .setRemoteInterface(classOf[PcWorkerApi])
       .setInput(process.getInputStream)
       .setOutput(process.getOutputStream)

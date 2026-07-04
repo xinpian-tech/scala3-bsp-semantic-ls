@@ -2,8 +2,10 @@ package ls.pc
 
 import java.io.PrintStream
 import java.nio.file.{Files, Path, Paths}
-import java.util.concurrent.Executors
+import java.util.concurrent.{Executors, TimeUnit}
+import java.util.concurrent.atomic.AtomicReference
 
+import scala.jdk.CollectionConverters.*
 import scala.util.control.NonFatal
 
 import org.eclipse.lsp4j.jsonrpc.Launcher
@@ -57,7 +59,32 @@ object PcWorkerMain:
           System.err.println(s"[pc-worker] failed to load plugin config $cfgPath: $t")
     }
 
-    val facade = new PcFacade(pluginManager, settings)
+    // Cross-file go-to: the PC's SymbolSearch.definition RPCs back to the
+    // parent (which owns the index) over the same jsonrpc channel, as a
+    // synchronous nested request (`pc/symbolDefinition`). The remote proxy
+    // only exists once the launcher below is built, so it is late-bound; PC
+    // instances are created lazily per request, long after startListening, so
+    // the proxy is always set before the first lookup. The call blocks a PC
+    // executor thread, never the jsonrpc reader thread, so the parent's
+    // response can always be read — no deadlock.
+    val clientProxy = new AtomicReference[PcWorkerClient]()
+    val resolver: PcDefinitionResolver = new PcDefinitionResolver:
+      def definition(semanticdbSymbol: String, fromFileUri: String): Vector[org.eclipse.lsp4j.Location] =
+        val proxy = clientProxy.get()
+        if proxy == null then Vector.empty
+        else
+          try
+            val params = new PcWorkerSymbolParams
+            params.symbol = semanticdbSymbol
+            params.uri = fromFileUri
+            val result = proxy
+              .symbolDefinition(params)
+              .get(settings.requestTimeoutMillis, TimeUnit.MILLISECONDS)
+            if result == null || result.locations == null then Vector.empty
+            else result.locations.asScala.toVector
+          catch case NonFatal(_) => Vector.empty
+
+    val facade = new PcFacade(pluginManager, settings, resolver)
     val exitRunnable: Runnable = () =>
       try Thread.sleep(200)
       catch case _: InterruptedException => ()
@@ -83,6 +110,7 @@ object PcWorkerMain:
       .setOutput(protocolOut)
       .setExecutorService(executor)
       .create()
+    clientProxy.set(launcher.getRemoteProxy)
 
     // Blocks until the parent closes our stdin (or shutdown exits the JVM).
     try launcher.startListening().get()

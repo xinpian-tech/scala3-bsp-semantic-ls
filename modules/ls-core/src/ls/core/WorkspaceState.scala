@@ -204,6 +204,13 @@ object Bootstrap:
       val pipeline = IngestPipeline(theMeta, theSnapshots)
       val orchestrator = QueryOrchestrator(theMeta, theSnapshots, pipeline, overlay)
 
+      // Cross-file go-to-definition: the PC's SymbolSearch.definition answers
+      // from the persisted index (immutable snapshot + SQLite reader pool, both
+      // safe off the index executor). In-process the resolver is handed to the
+      // facade directly; forked it stays parent-side and answers the child's
+      // pc/symbolDefinition jsonrpc callback.
+      val pcResolver = new IndexPcDefinitionResolver(theMeta, theSnapshots)
+
       // --- PC facade (plugins first, then the facade over them) ---
       val settings = PcSettings
         .forWorkspace(workspaceRoot)
@@ -229,7 +236,7 @@ object Bootstrap:
             catch
               case NonFatal(t) =>
                 notes += s"PC plugin config $pluginConfigFile could not be loaded: ${describe(t)}"
-          new InProcessPcBackend(new PcFacade(pluginManager, settings))
+          new InProcessPcBackend(new PcFacade(pluginManager, settings, pcResolver))
         case PcBackendMode.Forked =>
           val workerArgs =
             Vector(
@@ -243,7 +250,8 @@ object Bootstrap:
                   else Vector.empty)
           val worker = new ls.pc.ForkedPcWorker(
             workerArgs = workerArgs,
-            requestTimeoutMillis = math.max(config.pcRequestTimeoutMillis * 2, 30000L)
+            requestTimeoutMillis = math.max(config.pcRequestTimeoutMillis * 2, 30000L),
+            resolver = pcResolver
           )
           notes += "PC backend: forked worker JVM"
           new ForkedPcBackend(worker)
