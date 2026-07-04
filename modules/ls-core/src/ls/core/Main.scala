@@ -23,6 +23,11 @@ import ls.doctor.{Doctor, DoctorInput}
   *   --aot-train <dir>     run the headless AOT training workload and exit
   *   --require-index       with --aot-train: require a real BSP-backed index
   *                         (compile + reindex, fail if the index stays empty)
+  *   --skip-pc             with --aot-train: skip the version-locked PC completion
+  *                         check (index features stay asserted)
+  *   --zaozi-nav-probe     with --aot-train: assert PC go-to+hover on a zaozi
+  *                         Dynamic bundle-field access resolves to the field
+  *   --zaozi-nav-baseline  with --zaozi-nav-probe: flip to the no-plugin baseline
   *   --in-process-pc       run the presentation compiler in this JVM
   *   --forked-pc           run the presentation compiler in an isolated child JVM
   *                         (process isolation; the default)
@@ -69,7 +74,13 @@ object Main:
             AotTrain.run(
               Path.of(dir),
               requireIndex = args.contains("--require-index"),
-              skipPc = args.contains("--skip-pc")
+              skipPc = args.contains("--skip-pc"),
+              // --zaozi-nav-probe: assert PC go-to+hover on a zaozi Dynamic
+              // bundle-field access resolves to the field (the zaozi-pcplugin is
+              // loaded from the workspace pc-plugins.json). --zaozi-nav-baseline
+              // flips the expectation to the no-plugin baseline (selectDynamic).
+              navProbe = args.contains("--zaozi-nav-probe"),
+              navExpectPlugin = !args.contains("--zaozi-nav-baseline")
             )
           )
         case None =>

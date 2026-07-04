@@ -23,10 +23,15 @@ REPO="$PWD"
 SQLITE="${LS_SQLITE_LIB:?LS_SQLITE_LIB unset — run inside 'nix develop'}"
 PROBE_SYMBOL="${ZAOZI_PROBE_SYMBOL:-ConversionCreateApi}"
 
-# Build OUR server assembly.
+# Build OUR server assembly and the zaozi PC plugin jar (a plain compiler-plugin
+# jar loaded into our presentation compiler via pc-plugins.json). Separate `mill`
+# invocations: a single call with two targets silently skips the trailing one.
 mill --no-daemon core.assembly
+mill --no-daemon zaoziPcplugin.jar
 JAR="$REPO/out/core/assembly.dest/out.jar"
+PLUGIN_JAR="$REPO/out/zaoziPcplugin/jar.dest/out.jar"
 [ -f "$JAR" ] || { echo "it-zaozi: assembly jar not found: $JAR" >&2; exit 1; }
+[ -f "$PLUGIN_JAR" ] || { echo "it-zaozi: zaozi-pcplugin jar not found: $PLUGIN_JAR" >&2; exit 1; }
 
 # Copy the pinned + patched zaozi source out of the read-only Nix store into a
 # writable workspace (mill writes out/, .bsp/ there).
@@ -50,6 +55,20 @@ sdb=$(find "$WORK/out" -name '*.semanticdb' 2>/dev/null | wc -l)
 echo "it-zaozi: zaozi built with $sdb SemanticDB files"
 [ "$sdb" -gt 0 ] || { echo "it-zaozi: zaozi produced no SemanticDB" >&2; exit 1; }
 
+# Configure OUR presentation compiler to load the zaozi PC plugin, exactly as a
+# user would: a workspace pc-plugins.json naming the plugin jar as a compiler
+# plugin. Written AFTER the build (whose `rm -rf .scala3-bsp-semantic-ls` above
+# would otherwise delete it). In-process PC loads this in the main JVM; a forked
+# PC child would load it via --plugin-config — both from this same file.
+PLUGIN_CFG="$WORK/.scala3-bsp-semantic-ls/pc-plugins.json"
+mkdir -p "$(dirname "$PLUGIN_CFG")"
+python3 - "$PLUGIN_CFG" "$PLUGIN_JAR" <<'PY'
+import json,sys
+cfg,jar=sys.argv[1],sys.argv[2]
+json.dump({"compilerPlugins":[{"jars":[jar]}]}, open(cfg,"w"), indent=2)
+PY
+echo "it-zaozi: wrote PC plugin config $PLUGIN_CFG -> $PLUGIN_JAR"
+
 # Wrap the BSP launch so `mill --bsp` runs inside zaozi's nix env (CIRCT/MLIR),
 # while OUR server runs in ITS OWN nix env (our SQLite). Mixing the two native
 # closures in one process crashes; wrapping keeps each in its own dev shell.
@@ -65,10 +84,22 @@ PY
 
 # Drive the server against the full real zaozi: real BSP compile + reindex, then
 # assert the SemanticDB-backed index is populated and queryable (workspace/symbol
-# + references). PC completion is version-skewed (zaozi is Scala 3.7.x, our PC is
-# 3.8.x) so it is skipped; the index features are version-independent.
-echo "it-zaozi: indexing the full zaozi over real Mill BSP (probe: $PROBE_SYMBOL)"
+# + references) AND that the presentation compiler answers on real zaozi. zaozi is
+# now pinned to Scala 3.8.4 (see nix/patches/zaozi-semanticdb.patch) — the SAME
+# version as our PC — so PC features run (no --skip-pc): the zaozi-pcplugin steers
+# go-to+hover on the `io.a` / `io.f.g` / `io.k` Dynamic bundle-field accesses in
+# zaozi/tests/src/BundleSpec.scala to the real field declarations.
+echo "it-zaozi: [plugin] indexing zaozi over real Mill BSP + PC nav probe (probe: $PROBE_SYMBOL)"
 LS_SQLITE_LIB="$SQLITE" java --enable-native-access=ALL-UNNAMED -jar "$JAR" \
-  --aot-train "$WORK" --require-index --skip-pc
+  --aot-train "$WORK" --require-index --zaozi-nav-probe
 
-echo "it-zaozi: OK — the server indexed the full original zaozi"
+# Baseline: the SAME probe with NO plugin configured must resolve io.a to the
+# framework selectDynamic (not the field) — proving the plugin is the cause. Move
+# the config aside so the PC boots without it, then restore.
+echo "it-zaozi: [baseline] re-running the PC nav probe with the plugin disabled"
+mv "$PLUGIN_CFG" "$PLUGIN_CFG.disabled"
+LS_SQLITE_LIB="$SQLITE" java --enable-native-access=ALL-UNNAMED -jar "$JAR" \
+  --aot-train "$WORK" --require-index --zaozi-nav-probe --zaozi-nav-baseline
+mv "$PLUGIN_CFG.disabled" "$PLUGIN_CFG"
+
+echo "it-zaozi: OK — the server indexed the full original zaozi and PC nav resolved io.a -> val a"
