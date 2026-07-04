@@ -20,6 +20,8 @@ See [plan.md](plan.md) for the full rationale and
 [docs/index-format.md](docs/index-format.md),
 [docs/plugin-spi.md](docs/plugin-spi.md),
 [docs/nix-build.md](docs/nix-build.md) for the normative contracts.
+[docs/deployment.md](docs/deployment.md) is the operator guide: packaging, AOT,
+BSP/editor integration, and manual verification.
 
 ## Toolchain contract
 
