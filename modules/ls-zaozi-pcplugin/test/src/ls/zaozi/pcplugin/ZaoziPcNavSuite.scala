@@ -105,3 +105,90 @@ class ZaoziPcNavSuite extends munit.FunSuite:
       !baseLines.contains(valALine),
       s"without the plugin, go-to on io.a must NOT reach `val a`; baseline def lines $baseLines"
     )
+
+  test("with the plugin, hover on a dynamic io.a describes the field type; without it, it does not"):
+    def hoverText(scalacOptions: Vector[String]): String =
+      val (facade, tid) = newFacade(scalacOptions)
+      try
+        val uri = "file:///ls-zaozi-pcplugin-test/HoverBuffer.scala"
+        facade.didOpen(tid, uri, fixture)
+        val (line, ch) = cursor(fixture, "io.a", 3)
+        facade.hover(uri, line, ch).fold("")(_.toString)
+      finally facade.shutdown()
+
+    val withHover = hoverText(Vector(s"-Xplugin:$pluginJar"))
+    val baseHover = hoverText(Vector.empty)
+    assert(
+      withHover.contains("Int"),
+      s"with the plugin, hover on io.a should describe the `val a: Int` field; got: $withHover"
+    )
+    assert(
+      !baseHover.contains("Int"),
+      s"without the plugin, hover on io.a should not describe the field type; got: $baseHover"
+    )
+
+  test("the plugin does not rewrite a non-zaozi scala.Dynamic access"):
+    // Same shape, but the receiver is NOT a me.jiuyang.zaozi.reftpe.Referable.
+    val alien =
+      """|package other {
+         |  import scala.language.dynamics
+         |  trait Widget[T] extends scala.Dynamic:
+         |    transparent inline def selectDynamic(name: String): Any = widgetHelper(this, name)
+         |  def widgetHelper(r: Any, name: String): Any = null
+         |  class Panel:
+         |    val a: Int = 0
+         |  object Top:
+         |    val io: Widget[Panel] = null.asInstanceOf[Widget[Panel]]
+         |    val probe = io.a
+         |}
+         |""".stripMargin
+    def defLinesFor(scalacOptions: Vector[String]): Vector[Int] =
+      val (facade, tid) = newFacade(scalacOptions)
+      try
+        val uri = "file:///ls-zaozi-pcplugin-test/AlienBuffer.scala"
+        facade.didOpen(tid, uri, alien)
+        val (line, ch) = cursor(alien, "io.a", 3)
+        facade.definition(uri, line, ch).locations.map(_.location.getRange.getStart.getLine)
+      finally facade.shutdown()
+
+    val valALine = lineOf(alien, "val a: Int = 0")
+    val withPlugin = defLinesFor(Vector(s"-Xplugin:$pluginJar"))
+    val baseline = defLinesFor(Vector.empty)
+    assertEquals(
+      withPlugin,
+      baseline,
+      s"a non-zaozi Dynamic access must be unchanged by the plugin (with=$withPlugin base=$baseline)"
+    )
+    assert(
+      !withPlugin.contains(valALine),
+      s"the plugin must not resolve a non-zaozi Panel#a; got def lines $withPlugin"
+    )
+
+  test("the plugin degrades to identity (no crash) on a dynamic access to a missing field"):
+    val missing =
+      """|package me.jiuyang.zaozi.magic { trait DynamicSubfield }
+         |package me.jiuyang.zaozi.reftpe {
+         |  import scala.language.dynamics
+         |  trait Referable[T] extends scala.Dynamic:
+         |    transparent inline def selectDynamic(name: String): Any = referHelper(this, name)
+         |  def referHelper(r: Any, name: String): Any = null
+         |}
+         |package sample {
+         |  import me.jiuyang.zaozi.reftpe.*
+         |  import me.jiuyang.zaozi.magic.DynamicSubfield
+         |  class MyBundle extends DynamicSubfield:
+         |    val a: Int = 0
+         |  object Top:
+         |    val io: Referable[MyBundle] = null.asInstanceOf[Referable[MyBundle]]
+         |    val probe = io.notAField
+         |}
+         |""".stripMargin
+    val (facade, tid) = newFacade(Vector(s"-Xplugin:$pluginJar"))
+    try
+      val uri = "file:///ls-zaozi-pcplugin-test/MissingBuffer.scala"
+      facade.didOpen(tid, uri, missing)
+      val (line, ch) = cursor(missing, "io.notAField", 3)
+      // The request must return (no exception from the guarded phase).
+      val result = facade.definition(uri, line, ch)
+      assert(result != null, "definition on a missing dynamic field must still return a result")
+    finally facade.shutdown()
