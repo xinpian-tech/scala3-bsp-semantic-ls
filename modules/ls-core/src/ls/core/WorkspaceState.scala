@@ -208,8 +208,10 @@ object Bootstrap:
       // from the persisted index (immutable snapshot + SQLite reader pool, both
       // safe off the index executor). In-process the resolver is handed to the
       // facade directly; forked it stays parent-side and answers the child's
-      // pc/symbolDefinition jsonrpc callback.
-      val pcResolver = new IndexPcDefinitionResolver(theMeta, theSnapshots)
+      // pc/symbolDefinition jsonrpc callback. `orchestrator.workspace` supplies
+      // the live dependency graph so results are scoped to the requesting
+      // buffer's target context (a @volatile immutable read, safe on PC threads).
+      val pcResolver = new IndexPcDefinitionResolver(theMeta, theSnapshots, () => orchestrator.workspace)
 
       // --- PC facade (plugins first, then the facade over them) ---
       val settings = PcSettings

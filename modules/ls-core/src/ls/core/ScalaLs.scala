@@ -402,7 +402,9 @@ final class ScalaLs(val config: ScalaLs.Config = ScalaLs.Config())
         def indexedOnDisk =
           s.session.isEmpty &&
             ownedByLiveTarget.isEmpty &&
-            s.uris.toSdbUri(uri).exists(sdb => s.meta.documentsByUri(sdb).exists(_.active))
+            // Reader pool, not `documentsByUri` (single-writer NOMUTEX `db`): this
+            // gate runs on PC threads, which must never touch the writer connection.
+            s.uris.toSdbUri(uri).exists(sdb => s.meta.hasActiveDocument(sdb))
         if !indexableInModel && !indexedOnDisk then throw LsException(LsError.NoSemanticdb(uri))
       case _ => ()
 

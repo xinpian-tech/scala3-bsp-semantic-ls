@@ -69,6 +69,24 @@ final case class WorkspaceTargets(targets: Vector[TargetSpec]):
           queue.enqueue(dependent)
       seen.toSet
 
+  /** `bspId` plus every target it transitively depends on (via `directDeps`):
+    * the exact set of targets a source in `bspId` can SEE, i.e. where its
+    * cross-file go-to definitions may legitimately live. Restricting PC
+    * definition results to this set stops a disconnected target that happens to
+    * reuse the same symbol name from leaking an unrelated declaration. Empty for
+    * unknown ids.
+    */
+  def forwardDependencyClosure(bspId: String): Set[String] =
+    if !byId.contains(bspId) then Set.empty
+    else
+      val seen = mutable.Set(bspId)
+      val queue = mutable.Queue(bspId)
+      while queue.nonEmpty do
+        val current = queue.dequeue()
+        for dep <- byId.get(current).map(_.directDeps).getOrElse(Vector.empty) if byId.contains(dep) && seen.add(dep) do
+          queue.enqueue(dep)
+      seen.toSet
+
   /** DocFacts for `uri` in target `bspId`; workspace-source default when the
     * target is unknown.
     */

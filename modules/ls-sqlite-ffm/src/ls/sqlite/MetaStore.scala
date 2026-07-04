@@ -276,6 +276,21 @@ final class MetaStore(val db: Db) extends AutoCloseable:
       .bindText(1, uri)
       .queryAll(readDocument)
 
+  /** True iff an ACTIVE document row exists for `uri`, read on the READER pool.
+    * The SemanticDB gate (`ScalaLs.requireSemanticdb`) runs on PC threads in
+    * BSP-less recovered-index mode, where the single-writer NOMUTEX `db`
+    * connection and its non-thread-safe statement cache must NOT be touched;
+    * `documentsByUri` goes through that writer and is unsafe there.
+    */
+  def hasActiveDocument(uri: String): Boolean =
+    readers.withReader { conn =>
+      conn
+        .prepare("SELECT 1 FROM documents WHERE uri = ? AND active = 1 LIMIT 1")
+        .bindText(1, uri)
+        .queryOne(_.columnLong(0))
+        .isDefined
+    }
+
   /** Active documents joined to their target's bspId + sourceroot, ordered by
     * bspId then uri. Read-only; callers that need staleness resolve each
     * source path themselves (this store never re-hashes sources).

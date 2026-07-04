@@ -88,6 +88,19 @@ class MetaStoreSuite extends munit.FunSuite with TempDbFixture:
 
   // --- symbol interning ---
 
+  tempDir.test("hasActiveDocument reflects active document rows, read on the reader pool") { dir =>
+    val store = open(dir)
+    try
+      val target = newTarget(store)
+      val uri = "file:///ws/src/Main.scala"
+      assert(!store.hasActiveDocument(uri), "no row yet -> false")
+      store.upsertDocument(target, uri, "/sdb/Main.scala.semanticdb", 1000L, "md5-a", false, false)
+      assert(store.documentsByUri(uri).exists(_.active), "sanity: seeded an active doc")
+      assert(store.hasActiveDocument(uri), "active doc must be visible via the reader pool")
+      assert(!store.hasActiveDocument("file:///ws/src/Absent.scala"), "unknown uri -> false")
+    finally store.close()
+  }
+
   tempDir.test("internSymbols is idempotent and never duplicates rows") { dir =>
     val store = open(dir)
     try
