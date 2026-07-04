@@ -51,14 +51,47 @@ class ZaoziPcNavPhase extends PluginPhase:
 
   override def transformInlined(tree: Inlined)(using Context): Tree =
     try
-      bundleFieldAccess(tree.call) match
-        case Some((bundleType, fieldName)) =>
-          resolveField(bundleType, fieldName) match
-            case Some(fieldSym) =>
-              cpy.Inlined(tree)(ref(fieldSym).withSpan(tree.call.span), tree.bindings, tree.expansion)
-            case None => tree
-        case None => tree
+      fieldRefOf(tree.call) match
+        case Some(fieldRef) =>
+          // The primary path: this Inlined IS the dynamic access `io.a`. Point its
+          // retained call at the field so the symbol-at-cursor lookup returns it.
+          cpy.Inlined(tree)(fieldRef, tree.bindings, tree.expansion)
+        case None =>
+          // Not itself a dynamic access, but its retained `call` (e.g. the whole
+          // `Tests { ... }` argument of an enclosing utest/macro `Inlined`) may
+          // hold typed COPIES of dynamic accesses. The megaphase never descends
+          // into `Inlined.call`, but interactive navigation (`NavigateAST.pathTo`
+          // via `productIterator`) does — and prefers the call over the expansion
+          // on span ties — so an un-rewritten copy there makes go-to land on the
+          // stale `selectDynamic`. Rewrite those copies too.
+          val call1 = rewriteRetainedCall(tree.call)
+          if call1 eq tree.call then tree
+          else cpy.Inlined(tree)(call1, tree.bindings, tree.expansion)
     catch case NonFatal(_) => tree
+
+  /** A typed `ref` to the resolved bundle field if `call` is a zaozi dynamic
+    * field access, positioned at the access (so the cursor lands on the field
+    * name); else None.
+    */
+  private def fieldRefOf(call: Tree)(using Context): Option[Tree] =
+    bundleFieldAccess(call).flatMap { (bundleType, fieldName) =>
+      resolveField(bundleType, fieldName).map(sym => ref(sym).withSpan(call.span))
+    }
+
+  /** Rewrite dynamic-access `Inlined` copies nested anywhere inside a retained
+    * inline/macro call, including the calls of further-nested `Inlined` nodes
+    * (which a plain `TreeMap` does not descend into).
+    */
+  private def rewriteRetainedCall(call: Tree)(using Context): Tree =
+    if call.isEmpty then call
+    else
+      val mapper = new TreeMap:
+        override def transform(t: Tree)(using Context): Tree = t match
+          case inl: Inlined =>
+            val innerCall = fieldRefOf(inl.call).getOrElse(transform(inl.call))
+            cpy.Inlined(inl)(innerCall, transformSub(inl.bindings), transform(inl.expansion))
+          case _ => super.transform(t)
+      mapper.transform(call)
 
   /** `(bundleType, fieldName)` of a zaozi dynamic field access, from the retained
     * pre-inlining call. Two shapes are recognized:

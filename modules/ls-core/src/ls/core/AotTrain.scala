@@ -190,23 +190,9 @@ object AotTrain:
           openDoc(docs, uri, text)
           val lines = text.split("\n", -1)
 
-          // Diagnostics: is this uri mapped to a live PC target, is the buffer open
-          // in the PC, and what does the PC report about the configured plugin?
-          server.currentState.ready.foreach { s =>
-            val nuri = Uris.normalize(uri)
-            log(s"zaozi-nav: registeredTargets=${s.pc.registeredTargets.size} activeTargets=${s.pc.activeTargets}")
-            log(s"zaozi-nav: uriMapped=${s.uriToTarget.contains(nuri)} target=${s.uriToTarget.get(nuri)} bufferInPc=${s.pc.bufferText(nuri).isDefined}")
-            log(s"zaozi-nav: compilerPlugins=${s.pc.pluginStatus.compilerPlugins.map(cp => (cp.jars.map(_.split('/').lastOption.getOrElse("")), cp.loaded, cp.detail))}")
-            s.pc match
-              case ip: InProcessPcBackend =>
-                val diags = try ip.facade.diagnostics(nuri) catch case NonFatal(t) => Vector.empty
-                log(s"zaozi-nav: PC diagnostics count=${diags.size}")
-                diags.take(10).foreach(d => log(s"zaozi-nav:   diag ${d.getRange.getStart.getLine}:${d.getRange.getStart.getCharacter} ${String.valueOf(d.getMessage).replace('\n', ' ').take(180)}"))
-              case _ => log("zaozi-nav: (forked backend; skipping direct diagnostics)")
-          }
           // We configure exactly one compiler plugin (the zaozi jar), so "any
-          // compiler plugin loaded" is the plugin. (The jar dir is `zaoziPcplugin`,
-          // not `zaozi-pcplugin` — do not substring-match the hyphenated name.)
+          // compiler plugin loaded" means the plugin is active. (The jar dir is
+          // `zaoziPcplugin`, not `zaozi-pcplugin` — do not substring-match a name.)
           val pluginLoaded = server.currentState.ready.exists(_.pc.pluginStatus.compilerPlugins.exists(_.loaded))
           log(s"zaozi-nav: expectPlugin=$expectPlugin pluginLoaded=$pluginLoaded")
           // A mis-pathed jar would leave the plugin unloaded and make the baseline
