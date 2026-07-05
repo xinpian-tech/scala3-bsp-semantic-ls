@@ -236,6 +236,90 @@ fn checksums_negative_name_len_rejected_without_panic() {
     }
 }
 
+/// A single-doc, single-group segment with THREE records in the ref group and
+/// THREE doc-postings records (all on line 1, ascending starts), so postings
+/// order and span validity can be corrupted without collapsing the layout.
+fn multi_record_data() -> SegmentData {
+    let spans = [
+        Span::new(1, 0, 1, 5),
+        Span::new(1, 10, 1, 15),
+        Span::new(1, 20, 1, 25),
+    ];
+    SegmentData {
+        docs: vec![SegmentDoc {
+            uri: "file:///M.scala".into(),
+            doc_id: 1,
+            epoch: 5,
+            target_ord: 0,
+            generated: false,
+            readonly: false,
+        }],
+        targets: vec![1000],
+        symbols: vec![SegmentSymbol {
+            semantic_symbol: "m/Foo#".into(),
+            symbol_id: 200,
+            ref_group_ord: 0,
+            rename_group_ord: -1,
+            def_target_ord: 0,
+        }],
+        ref_occurrences: vec![spans.iter().map(|&s| gocc(0, 0, s, 0)).collect()],
+        def_occurrences: vec![vec![]],
+        rename_occurrences: vec![],
+        rename_profiles: vec![],
+        doc_occurrences: vec![spans
+            .iter()
+            .map(|&s| DocOcc {
+                symbol_ord: 0,
+                span: s,
+                flags: 0,
+            })
+            .collect()],
+        target_meta: vec![TargetMeta::default()],
+        symbol_meta: vec![],
+        search_rows: vec![],
+    }
+}
+
+fn write_multi() -> (tempfile::TempDir, PathBuf) {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = SegmentWriter::write(tmp.path(), 1, &multi_record_data(), 0).expect("write multi");
+    SegmentReader::open(&dir).expect("multi opens");
+    (tmp, dir)
+}
+
+#[test]
+fn unsorted_doc_postings_rejected() {
+    let (_t, dir) = write_multi();
+    // doc-postings.bin: record2 packed_start (col1 base 8+4*3=20, @ +8 = 28) ->
+    // pack(1,7), below record1's start. symbol_at's inner early break would
+    // otherwise stop at record1 and skip this later (still covering) record.
+    // first_line/last_line are unchanged, so only the sort proof rejects it.
+    assert_structural(recorrupt(&dir, "doc-postings.bin", |b| {
+        b[28..32].copy_from_slice(&Span::pack(1, 7).to_le_bytes())
+    }));
+}
+
+#[test]
+fn inverted_group_postings_span_rejected() {
+    let (_t, dir) = write_multi();
+    // ref-postings.bin: record2 packed_end (col4 base 8+16*3=56, @ +8 = 64) ->
+    // pack(1,2), below its own packed_start (group order stays intact).
+    assert_structural(recorrupt(&dir, "ref-postings.bin", |b| {
+        b[64..68].copy_from_slice(&Span::pack(1, 2).to_le_bytes())
+    }));
+}
+
+#[test]
+fn unsorted_group_postings_rejected() {
+    let (_t, dir) = write_multi();
+    // ref-postings.bin: record2 packed_start (col3 base 8+12*3=44, @ +8 = 52) ->
+    // pack(1,7), below record1's start but still <= its own end (not inverted),
+    // so the per-group (doc_ord, packed_start, packed_end) order proof rejects it.
+    assert_structural(recorrupt(&dir, "ref-postings.bin", |b| {
+        b[52..56].copy_from_slice(&Span::pack(1, 7).to_le_bytes())
+    }));
+}
+
 // ---- writer input validation ----
 
 fn expect_invalid(data: &SegmentData) {

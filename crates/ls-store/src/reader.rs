@@ -932,12 +932,15 @@ impl SegmentReader {
         Ok(())
     }
 
-    /// Every group-postings record's `doc_ord`/`target_ord` in range.
+    /// Every group-postings record's `doc_ord`/`target_ord` in range and packed
+    /// span non-inverted (unsigned `packed_start <= packed_end`).
     fn validate_group_records(&self, idx: usize, recs: usize) -> Result<()> {
         let file = self.file(idx);
         let name = format::CHECKSUMMED_FILES[idx];
         let doc_col = 8;
         let target_col = 8 + 2 * 4 * recs;
+        let start_col = 8 + 3 * 4 * recs;
+        let end_col = 8 + 4 * 4 * recs;
         for r in 0..recs {
             check_ord(
                 req_i32(file, doc_col + 4 * r, name)?,
@@ -949,6 +952,9 @@ impl SegmentReader {
                 self.target_count,
                 "group target_ord",
             )?;
+            let ps = req_u32(file, start_col + 4 * r, name)?;
+            let pe = req_u32(file, end_col + 4 * r, name)?;
+            expect(ps <= pe, "group postings inverted span")?;
         }
         Ok(())
     }
@@ -1002,6 +1008,25 @@ impl SegmentReader {
             if count == 0 {
                 expect(block_off == -1, "empty group block_index_offset")?;
             } else {
+                // Records within a group are sorted by (doc_ord, packed_start,
+                // packed_end); prove it so group scans that assume this order
+                // (and dedup) are sound. Packed values compare unsigned.
+                let pf = self.file(postings_idx);
+                let pname = format::CHECKSUMMED_FILES[postings_idx];
+                let start_col = 8 + 3 * 4 * postings_recs;
+                let end_col = 8 + 4 * 4 * postings_recs;
+                let mut prev: Option<(i32, u32, u32)> = None;
+                for r in acc..acc + count {
+                    let key = (
+                        req_i32(pf, 8 + 4 * r, pname)?,
+                        req_u32(pf, start_col + 4 * r, pname)?,
+                        req_u32(pf, end_col + 4 * r, pname)?,
+                    );
+                    if let Some(p) = prev {
+                        expect(key >= p, "group postings not sorted")?;
+                    }
+                    prev = Some(key);
+                }
                 expect(
                     block_off >= 0 && block_off as usize == *block_cursor,
                     "group block_index_offset",
@@ -1164,6 +1189,20 @@ impl SegmentReader {
                     interval_first >= 0 && interval_first as usize == iv_cursor,
                     "doc interval_first",
                 )?;
+                // Records within a doc are sorted by (packed_start, packed_end);
+                // symbol_at's inner early break (stop once packed_start > query)
+                // is only sound if this holds. Packed values compare unsigned.
+                let mut prev: Option<(u32, u32)> = None;
+                for r in post_acc..post_acc + post_count {
+                    let key = (
+                        req_u32(dp, dp_start_col + 4 * r, dp_name)?,
+                        req_u32(dp, dp_end_col + 4 * r, dp_name)?,
+                    );
+                    if let Some(p) = prev {
+                        expect(key >= p, "doc postings not sorted")?;
+                    }
+                    prev = Some(key);
+                }
                 let want_iv = post_count.div_ceil(256);
                 expect(
                     iv_count >= 0 && iv_count as usize == want_iv,
