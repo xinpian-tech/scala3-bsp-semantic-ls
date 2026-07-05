@@ -63,13 +63,18 @@
         # offline and is a valid -javaagent (its manifest declares the premain).
         pcHostAgentJar = pkgs.callPackage ./nix/pc-host-agent.nix { inherit mill jdk; };
 
-        # The Scala 3 standard library the live-boundary check hands a registered
-        # target as its classpath, so the embedded compiler can resolve `List`
-        # (etc.) for a real completion. Pinned by hash; the version matches the
+        # The Scala standard-library jars the live-boundary check hands a
+        # registered target as its classpath, so the embedded compiler can
+        # resolve `List`/`String` (etc.) for real queries. Both are what the
+        # retained PC test harness uses; pinned by hash, versions matched to the
         # compiler bundled in the PC-host assembly (build.mill `Deps.scalaVer`).
         scalaLibraryJar = pkgs.fetchurl {
           url = "https://repo1.maven.org/maven2/org/scala-lang/scala-library/3.8.4/scala-library-3.8.4.jar";
           hash = "sha256-G4Mw3ld0wVh0Fz8Wi2dCVcqgDF7zZIqwtst2O7f9Lec=";
+        };
+        scala3LibraryJar = pkgs.fetchurl {
+          url = "https://repo1.maven.org/maven2/org/scala-lang/scala3-library_3/3.8.4/scala3-library_3-3.8.4.jar";
+          hash = "sha256-j4LhyJdKho877rR1+pwyI50uCC6fgD6/w+65EhG4h9E=";
         };
 
         # End-to-end check that boots the PRODUCTION island (crane-built
@@ -84,7 +89,7 @@
           nativeBuildInputs = [ jdk ];
           LS_LIBJVM = "${jdk.home}/lib/server/libjvm.so";
           PC_HOST_AGENT_JAR = "${pcHostAgentJar}/pc-host-agent.jar";
-          LS_PC_TARGET_CLASSPATH = "${scalaLibraryJar}";
+          LS_PC_TARGET_CLASSPATH = "${scalaLibraryJar}:${scala3LibraryJar}";
         });
         pc-host-agent-check = pkgs.runCommand "check-pc-host-agent"
           { nativeBuildInputs = [ jdk ]; } ''

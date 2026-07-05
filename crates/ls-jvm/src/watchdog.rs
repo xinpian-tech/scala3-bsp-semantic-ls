@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 
 use ls_pc_abi::payloads::TargetConfig;
 
+use crate::backend::VtableBackend;
 use crate::dispatch::{Advance, GenerationState};
 use crate::mirror::{ReplayPlan, TargetMirror};
 
@@ -235,6 +236,30 @@ impl<B: PcBackend> Supervisor<B> {
             }
             std::thread::sleep(Duration::from_millis(1));
         }
+    }
+}
+
+/// Control-lane accessors for the production backend. These serve the doctor /
+/// server control ops (`plugin_status`, `restart_instances`, `shutdown`) on the
+/// control lane (worker 1) so they run even while the dispatch lane is busy;
+/// they are generic-free because only the real vtable backend implements them.
+impl Supervisor<VtableBackend> {
+    /// Fetch the island's plugin-status report over the control lane.
+    pub fn plugin_status(&self) -> Result<Vec<u8>, i32> {
+        self.backend.plugin_status()
+    }
+
+    /// Shut down and recreate the PC instances — the cooperative recovery lever,
+    /// also the doctor's explicit restart. Returns the vtable status. The Rust
+    /// replay mirror is untouched, so registered targets and open buffers remain
+    /// valid without the editor re-registering or reopening them.
+    pub fn restart_instances(&mut self) -> i32 {
+        self.backend.restart_instances()
+    }
+
+    /// Orderly PC shutdown before process exit. Returns the vtable status.
+    pub fn shutdown(&self) -> i32 {
+        self.backend.shutdown()
     }
 }
 
