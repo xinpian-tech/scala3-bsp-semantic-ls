@@ -147,8 +147,14 @@ unsafe extern "C" fn vt_pc_dispatch_loop(worker_index: i32) {
 /// it through the `free` slot.
 unsafe extern "C" fn vt_symbol_definition(symbol: LsStr, from_uri: LsStr, out: *mut LsBuf) -> i32 {
     match std::panic::catch_unwind(|| {
-        let symbol = read_utf8(symbol.ptr, symbol.len);
-        let from_uri = read_utf8(from_uri.ptr, from_uri.len);
+        let symbol = match read_utf8_strict(symbol.ptr, symbol.len) {
+            Ok(s) => s,
+            Err(status) => return status,
+        };
+        let from_uri = match read_utf8_strict(from_uri.ptr, from_uri.len) {
+            Ok(s) => s,
+            Err(status) => return status,
+        };
         run_resolver(
             SYMBOL_DEFINITION_RESOLVER.get().map(|r| r.as_ref()),
             &symbol,
@@ -161,8 +167,9 @@ unsafe extern "C" fn vt_symbol_definition(symbol: LsStr, from_uri: LsStr, out: *
     }
 }
 
-/// Validates an incoming PC vtable registration: non-null and matching ABI
-/// version. Split out so the registration contract is unit-tested directly.
+/// Validates an incoming PC vtable registration: non-null pointer, matching ABI
+/// version, and every op slot a non-null function pointer. Split out so the
+/// registration contract is unit-tested directly.
 fn validate_pc_registration(pc: *const PcVtable) -> i32 {
     if pc.is_null() {
         return STATUS_BAD_ARG;
@@ -173,7 +180,27 @@ fn validate_pc_registration(pc: *const PcVtable) -> i32 {
     if abi != ABI_VERSION {
         return STATUS_ABI_MISMATCH;
     }
+    if !all_pc_slots_non_null(pc) {
+        return STATUS_BAD_ARG;
+    }
     STATUS_OK
+}
+
+/// Every PC vtable op slot must be a non-null function pointer. The island builds
+/// all 15 upcall stubs, so a null slot means a malformed registration; reject it
+/// here rather than reading a null `fn`-typed field later (which is UB). Slots
+/// are read as raw pointer bits — never materialized as an invalid `fn` value.
+fn all_pc_slots_non_null(pc: *const PcVtable) -> bool {
+    use std::mem::size_of;
+    // `#[repr(C)]`, 64-bit ABI (`assert!(size_of::<*const c_void>() == 8)` in
+    // `ls_pc_abi`): `abi_version` (u64) is the first pointer-sized word, followed
+    // by the pointer-sized op slots with no padding. Counting words keeps this
+    // correct if a slot is added (the whole struct is covered).
+    let words = size_of::<PcVtable>() / size_of::<usize>();
+    let base = pc as *const usize;
+    // SAFETY: `pc` is non-null and points at a `PcVtable` for the call; word `i`
+    // for `i in 1..words` is one op slot, read as raw bits.
+    (1..words).all(|i| unsafe { base.add(i).read_unaligned() } != 0)
 }
 
 fn register_pc_vtable_inner(pc: *const PcVtable) -> i32 {
@@ -253,6 +280,18 @@ fn read_utf8(ptr: *const u8, len: u32) -> String {
     // SAFETY: the Java FFM caller passes a valid `ptr`/`len` for the call.
     let bytes = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
     String::from_utf8_lossy(bytes).into_owned()
+}
+
+/// Like [`read_utf8`] but rejects a null pointer paired with a positive length
+/// (a malformed borrowed string) as `STATUS_BAD_ARG` rather than silently
+/// treating it as empty. Used for the `symbol_definition` arguments, which must
+/// be well-formed; the lenient [`read_utf8`] stays for best-effort log capture.
+/// This mirrors the island-side `readLsStr`, which rejects the same shape.
+fn read_utf8_strict(ptr: *const u8, len: u32) -> Result<String, i32> {
+    if len != 0 && ptr.is_null() {
+        return Err(STATUS_BAD_ARG);
+    }
+    Ok(read_utf8(ptr, len))
 }
 
 /// The process's Rust vtable. Its address is the `-javaagent` argument; the
@@ -368,6 +407,58 @@ mod tests {
         let b = b"island up";
         assert_eq!(read_utf8(b.as_ptr(), b.len() as u32), "island up");
         assert_eq!(read_utf8(b.as_ptr(), 0), "");
+    }
+
+    #[test]
+    fn read_utf8_strict_rejects_a_null_pointer_with_positive_length() {
+        // A null pointer paired with a positive length is malformed, not empty.
+        assert_eq!(read_utf8_strict(std::ptr::null(), 5), Err(STATUS_BAD_ARG));
+        // (null, 0) is a valid empty string; real bytes decode normally.
+        assert_eq!(read_utf8_strict(std::ptr::null(), 0), Ok(String::new()));
+        let b = b"pkg/A#";
+        assert_eq!(
+            read_utf8_strict(b.as_ptr(), b.len() as u32),
+            Ok("pkg/A#".to_string())
+        );
+    }
+
+    #[test]
+    fn vt_symbol_definition_rejects_a_null_argument_pointer() {
+        // A borrowed argument with a null pointer + positive length must map to a
+        // typed bad-arg status, not silently resolve for an empty symbol.
+        let mut out = LsBuf {
+            ptr: std::ptr::null_mut(),
+            len: 0,
+        };
+        let bad = LsStr {
+            ptr: std::ptr::null(),
+            len: 5,
+        };
+        let empty = LsStr {
+            ptr: std::ptr::null(),
+            len: 0,
+        };
+        // SAFETY: `out` is a valid writable LsBuf; the args are borrowed structs.
+        let status = unsafe { vt_symbol_definition(bad, empty, std::ptr::addr_of_mut!(out)) };
+        assert_eq!(status, STATUS_BAD_ARG);
+    }
+
+    #[test]
+    fn registration_rejects_a_null_pc_slot() {
+        // A vtable with the correct ABI version but a null op slot must be
+        // refused — reading/calling a null `fn` slot later would be UB.
+        let words = std::mem::size_of::<PcVtable>() / std::mem::size_of::<usize>();
+        let mut raw = vec![7usize; words]; // non-null filler in every slot
+        raw[0] = ABI_VERSION as usize; // the abi_version word
+        assert_eq!(
+            validate_pc_registration(raw.as_ptr() as *const PcVtable),
+            STATUS_OK
+        );
+        raw[words - 1] = 0; // null the last op slot (spawn_dispatch)
+        assert_eq!(
+            validate_pc_registration(raw.as_ptr() as *const PcVtable),
+            STATUS_BAD_ARG
+        );
     }
 
     #[test]

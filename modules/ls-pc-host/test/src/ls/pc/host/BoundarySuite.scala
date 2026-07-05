@@ -48,6 +48,37 @@ class BoundarySuite extends munit.FunSuite:
       )
     finally arena.close()
 
+  test("writeResponse rejects a null out before allocating (no buffer leaked)"):
+    val arena = Arena.ofConfined()
+    try
+      var allocs = 0
+      val counting = new LsAllocator:
+        def alloc(size: Int): MemorySegment =
+          allocs += 1
+          arena.allocate(size.toLong)
+      assertEquals(
+        PcHostRuntime.writeResponse(MemorySegment.NULL, Array[Byte](1, 2, 3), counting),
+        boundary_h.STATUS_BAD_ARG()
+      )
+      assertEquals(allocs, 0, "a null out must not allocate a buffer")
+    finally arena.close()
+
+  test("writeResponse frees the allocated buffer when writing back into out fails"):
+    val arena = Arena.ofConfined()
+    try
+      var freed = List.empty[Int]
+      val recording = new LsAllocator:
+        def alloc(size: Int): MemorySegment = arena.allocate(size.toLong)
+        override def free(ptr: MemorySegment, size: Int): Unit = freed = size :: freed
+      // An `out` smaller than an LsBuf (its `ptr` field needs 8 bytes at offset 0)
+      // makes the post-allocation write throw, exercising the eager-free path.
+      val tooSmall = arena.allocate(4L)
+      intercept[RuntimeException] {
+        PcHostRuntime.writeResponse(tooSmall, Array[Byte](1, 2, 3, 4, 5), recording)
+      }
+      assertEquals(freed, List(5), "the Rust-owned buffer is freed on the error path")
+    finally arena.close()
+
   test("runResponse maps a decode failure to STATUS_DECODE"):
     val arena = Arena.ofConfined()
     try

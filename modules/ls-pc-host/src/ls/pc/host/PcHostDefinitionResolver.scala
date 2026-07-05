@@ -43,12 +43,17 @@ final class PcHostDefinitionResolver(vtable: MemorySegment, log: String => Unit)
         else
           val ptr = LsBuf.ptr(out)
           val len = LsBuf.len(out)
-          // Copy the payload out of Rust memory, THEN hand the buffer back.
-          val bytes = readResponse(ptr, len)
-          if ptr.address() != 0 && len > 0 then
-            FreeFn.invoke(RustVtable.free(vtable), ptr, len)
-          if bytes.isEmpty then Vector.empty
-          else Payloads.LocationsResult.decode(bytes).locations.iterator.map(toLsp).toVector
+          try
+            // Copy the payload out of Rust memory and decode it.
+            val bytes = readResponse(ptr, len)
+            if bytes.isEmpty then Vector.empty
+            else Payloads.LocationsResult.decode(bytes).locations.iterator.map(toLsp).toVector
+          finally
+            // Always hand a non-null Rust-owned buffer back — even if the copy or
+            // decode above threw, or the length had its high bit set (so a signed
+            // `len > 0` guard would have skipped it) — passing the raw 32-bit
+            // length so `free` matches the original `alloc` size.
+            if ptr.address() != 0 then FreeFn.invoke(RustVtable.free(vtable), ptr, len)
       catch
         case t: Throwable =>
           log(s"symbol_definition downcall failed: $t")

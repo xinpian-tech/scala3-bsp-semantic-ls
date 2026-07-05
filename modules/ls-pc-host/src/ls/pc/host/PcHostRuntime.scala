@@ -3,7 +3,7 @@ package ls.pc.host
 import java.lang.foreign.{MemorySegment, ValueLayout}
 import java.nio.charset.StandardCharsets.UTF_8
 
-import ls.pc.host.boundary.{boundary_h, AllocFn, LsBuf, LsStr, RustVtable}
+import ls.pc.host.boundary.{boundary_h, AllocFn, FreeFn, LsBuf, LsStr, RustVtable}
 import ls.pc.host.codec.CodecException
 
 /** Allocates Rust-owned response buffers. `alloc(size)` returns an
@@ -13,6 +13,14 @@ import ls.pc.host.codec.CodecException
   */
 trait LsAllocator:
   def alloc(size: Int): MemorySegment
+
+  /** Frees a buffer obtained from [[alloc]]. The default is a no-op for
+    * arena-backed allocators (the arena releases the memory on close); the real
+    * vtable allocator overrides it to call the Rust `free` slot, so a failure
+    * after a successful allocation can release the Rust-owned buffer eagerly
+    * instead of leaking it.
+    */
+  def free(ptr: MemorySegment, size: Int): Unit = ()
 
 /** The island-side boundary runtime: owns the `alloc` downcall built from the
   * registered Rust vtable and marshals bytes across the FFM boundary for the 15
@@ -51,7 +59,11 @@ object PcHostRuntime:
     */
   def fromVtable(vtable: MemorySegment): PcHostRuntime =
     val allocFn = RustVtable.alloc(vtable)
-    PcHostRuntime(size => AllocFn.invoke(allocFn, size))
+    val freeFn = RustVtable.free(vtable)
+    PcHostRuntime(new LsAllocator:
+      def alloc(size: Int): MemorySegment = AllocFn.invoke(allocFn, size)
+      override def free(ptr: MemorySegment, size: Int): Unit = FreeFn.invoke(freeFn, ptr, size)
+    )
 
   /** Reads a borrowed `LsStr` argument (UTF-8, no NUL) into a Scala string. The
     * ABI `len` is a `u32` that jextract surfaces as a signed `Int`, so a
@@ -87,11 +99,23 @@ object PcHostRuntime:
     * envelope, so `bytes` is never empty.)
     */
   def writeResponse(out: MemorySegment, bytes: Array[Byte], allocator: LsAllocator): Int =
-    val raw = allocator.alloc(bytes.length)
-    if raw.address() == 0 then boundary_h.STATUS_ALLOC()
+    // Reject a null `out` before allocating, so a buffer is never allocated for a
+    // caller we cannot write back to (which would leak it).
+    if out == null || out.address() == 0 then boundary_h.STATUS_BAD_ARG()
     else
-      val dst = raw.reinterpret(bytes.length.toLong)
-      MemorySegment.copy(bytes, 0, dst, ValueLayout.JAVA_BYTE, 0L, bytes.length)
-      LsBuf.ptr(out, raw)
-      LsBuf.len(out, bytes.length)
-      boundary_h.STATUS_OK()
+      val raw = allocator.alloc(bytes.length)
+      if raw.address() == 0 then boundary_h.STATUS_ALLOC()
+      else
+        try
+          val dst = raw.reinterpret(bytes.length.toLong)
+          MemorySegment.copy(bytes, 0, dst, ValueLayout.JAVA_BYTE, 0L, bytes.length)
+          LsBuf.ptr(out, raw)
+          LsBuf.len(out, bytes.length)
+          boundary_h.STATUS_OK()
+        catch
+          case t: Throwable =>
+            // The buffer is Rust-allocated; free it eagerly so a failure after
+            // allocation (e.g. writing into a bad `out`) does not leak it, then
+            // let the op's status mapping handle the throwable.
+            allocator.free(raw, bytes.length)
+            throw t

@@ -337,6 +337,7 @@ fn live_symbol_definition_prunes_and_round_trips_over_the_boundary() {
 
     // Definition on `List` (line 1, just after `  val xs = Li`) — a cross-file
     // symbol the PC resolves through SymbolSearch.definition → our resolver.
+    let allocs_before = ls_pc_abi::memory::live_allocations();
     let reply = sup
         .request(PcRequest::Query {
             kind: QueryKind::Definition,
@@ -346,6 +347,15 @@ fn live_symbol_definition_prunes_and_round_trips_over_the_boundary() {
         })
         .expect("definition query");
     let result = DefinitionResult::decode(&reply).expect("decode definition");
+
+    // The island resolver freed the Rust-owned symbol_definition response buffer
+    // across the boundary (and the Rust backend freed the query response), so no
+    // allocation leaks after the round-trip — the resolver's `finally`-free path.
+    assert_eq!(
+        ls_pc_abi::memory::live_allocations(),
+        allocs_before,
+        "the symbol_definition response buffer must be freed by the island resolver"
+    );
 
     // The resolver's location came back through the PC across the boundary.
     assert!(
