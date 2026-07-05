@@ -1,0 +1,15 @@
+[package]
+name = "ls-pc-abi"
+description = "Presentation-compiler C ABI: every flat #[repr(C)] boundary struct for the embedded-JVM PC island (the Rust vtable + the 15-op PC vtable, request/response records), a two-sided layout canary, and lossless flat encode/decode for all op payloads. The single cbindgen contract source the Java layout mirror is generated from."
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+
+[dev-dependencies]
+proptest = { workspace = true }

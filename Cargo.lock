@@ -161,6 +161,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ls-pc-abi"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+]
+
+[[package]]
 name = "ls-semanticdb"
 version = "0.1.0"
 dependencies = [
