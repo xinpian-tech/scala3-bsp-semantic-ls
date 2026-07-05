@@ -94,16 +94,20 @@ pub fn facts_a(uri: &str) -> DocFacts {
     }
 }
 
-pub fn workspace_for() -> Arc<WorkspaceTargets> {
-    let fx = fixtures_root();
-    let src = sources_root();
+/// The three-target workspace rooted at an arbitrary fixtures dir (its `out-a`/
+/// `out-b`/`out-c` SemanticDB roots) sharing one `sources` sourceroot.
+pub fn workspace_at(fx_root: &Path, src: &Path) -> Arc<WorkspaceTargets> {
     Arc::new(WorkspaceTargets::new(vec![
-        TargetSpec::new("fixture-a", fx.join("out-a"), src.clone())
+        TargetSpec::new("fixture-a", fx_root.join("out-a"), src.to_path_buf())
             .with_doc_facts(Arc::new(facts_a)),
-        TargetSpec::new("fixture-b", fx.join("out-b"), src.clone())
+        TargetSpec::new("fixture-b", fx_root.join("out-b"), src.to_path_buf())
             .with_deps(vec!["fixture-a".to_string()]),
-        TargetSpec::new("fixture-c", fx.join("out-c"), src),
+        TargetSpec::new("fixture-c", fx_root.join("out-c"), src.to_path_buf()),
     ]))
+}
+
+pub fn workspace_for() -> Arc<WorkspaceTargets> {
+    workspace_at(&fixtures_root(), &sources_root())
 }
 
 /// A store stack over the master corpus: an isolated store dir + an
@@ -136,3 +140,67 @@ fn build_stack(make: impl FnOnce(Store) -> QueryOrchestrator) -> Stack {
 
 /// The whole corpus source uri set size (docs indexed count).
 pub const SOURCE_COUNT: usize = 25;
+
+// ---- mutable temp copy (for rename mutation tests) ----
+
+fn copy_dir_recursive(src: &Path, dst: &Path) {
+    std::fs::create_dir_all(dst).unwrap();
+    for entry in std::fs::read_dir(src).unwrap() {
+        let entry = entry.unwrap();
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_dir_recursive(&from, &to);
+        } else {
+            std::fs::copy(&from, &to).unwrap();
+        }
+    }
+}
+
+/// An isolated deep copy of the committed corpus (sources + `out-a`/`out-b`/
+/// `out-c`) under a temp dir, plus an orchestrator that has ingested it — for
+/// tests that mutate sources or SemanticDB after ingest.
+pub struct MutableStack {
+    fx_root: tempfile::TempDir,
+    _store: tempfile::TempDir,
+    pub orch: QueryOrchestrator,
+}
+
+impl MutableStack {
+    pub fn source_path(&self, uri: &str) -> PathBuf {
+        self.fx_root.path().join("sources").join(uri)
+    }
+
+    pub fn semanticdb_path(&self, out: &str, uri: &str) -> PathBuf {
+        self.fx_root
+            .path()
+            .join(out)
+            .join("META-INF/semanticdb")
+            .join(format!("{uri}.semanticdb"))
+    }
+
+    pub fn workspace(&self) -> Arc<WorkspaceTargets> {
+        workspace_at(self.fx_root.path(), &self.fx_root.path().join("sources"))
+    }
+}
+
+/// Deep-copies the committed corpus into temp dirs and ingests it once.
+pub fn clone_and_ingest() -> MutableStack {
+    let fx_root = tempfile::tempdir().unwrap();
+    let src = fixtures_root();
+    for name in ["sources", "out-a", "out-b", "out-c"] {
+        copy_dir_recursive(&src.join(name), &fx_root.path().join(name));
+    }
+    let store = tempfile::tempdir().unwrap();
+    let orch = QueryOrchestrator::with_defaults(Store::open(store.path()).unwrap());
+    orch.ingest(workspace_at(
+        fx_root.path(),
+        &fx_root.path().join("sources"),
+    ))
+    .unwrap();
+    MutableStack {
+        fx_root,
+        _store: store,
+        orch,
+    }
+}
