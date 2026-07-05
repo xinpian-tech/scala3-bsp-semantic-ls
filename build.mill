@@ -205,6 +205,37 @@ object pcHostSpike extends ScalaModule {
   }
 }
 
+/** Embedded-JVM presentation-compiler island host.
+  *
+  * The production counterpart to [[pcHostSpike]]: a Scala 3 premain agent (not
+  * an ls-* server layer, so it does NOT extend [[LsModule]]) consuming the
+  * jextract-generated `ls.pc.host.boundary` FFM bindings (regenerated from the
+  * Rust ABI by scripts/regen-pc-host-bindings.sh). Built as a `-javaagent` jar
+  * whose `premain` fires inside `JNI_CreateJavaVM`; the Rust `ls-jvm` crate
+  * loads it to reach the presentation compiler over the flat C ABI.
+  */
+object pcHost extends ScalaModule {
+  override def moduleDir = super.moduleDir / os.up / "modules" / "ls-pc-host"
+  def scalaVersion = Deps.scalaVer
+
+  override def javaHome = Task {
+    Task.env.get("JAVA_HOME").map(p => PathRef(os.Path(p), quick = true))
+  }
+
+  def scalacOptions = Seq("-deprecation", "-feature", "-unchecked")
+  def javacOptions = Seq("--release", "25")
+
+  // Loaded via -javaagent; the JVM invokes PcHostAgent.premain during VM init.
+  override def manifest = Task {
+    super.manifest().add("Premain-Class" -> "ls.pc.host.PcHostAgent")
+  }
+
+  object test extends ScalaTests with TestModule.Munit {
+    def mvnDeps = Seq(Deps.munit)
+    def forkArgs = Seq("--enable-native-access=ALL-UNNAMED")
+  }
+}
+
 /** Benchmark + JFR harness. */
 object bench extends LsModule {
   def dirName = "ls-bench"

@@ -59,6 +59,20 @@
           touch $out
         '';
 
+        # The production island host agent jar plus a check that it builds
+        # offline and is a valid -javaagent (its manifest declares the premain).
+        pcHostAgentJar = pkgs.callPackage ./nix/pc-host-agent.nix { inherit mill jdk; };
+        pc-host-agent-check = pkgs.runCommand "check-pc-host-agent"
+          { nativeBuildInputs = [ jdk ]; } ''
+          jar="${pcHostAgentJar}/pc-host-agent.jar"
+          echo "=== pc-host agent manifest ==="
+          jar xf "$jar" META-INF/MANIFEST.MF
+          cat META-INF/MANIFEST.MF
+          grep -q "Premain-Class: ls.pc.host.PcHostAgent" META-INF/MANIFEST.MF \
+            || { echo "pc-host agent jar is missing its Premain-Class"; exit 1; }
+          touch $out
+        '';
+
         # The pinned zaozi source with our patches applied (SemanticDB emission,
         # which our SemanticDB-first server requires). Exposed to the dev shell
         # as ZAOZI_SRC so scripts/it-zaozi.sh builds a pinned, reproducible tree
@@ -80,6 +94,7 @@
           inherit pkgs jdk mill self;
         }) // rust.checks // {
           spike-boundary = spike-boundary-check;
+          pc-host-agent = pc-host-agent-check;
         };
 
         packages = {
@@ -97,6 +112,8 @@
           rust-workspace = rust.package;
           # The embedded-JVM boundary spike island agent jar (-javaagent premain).
           spike-agent-jar = spikeAgentJar;
+          # The production presentation-compiler island host agent jar.
+          pc-host-agent-jar = pcHostAgentJar;
         };
       }) // { inherit inputs; };
 }
