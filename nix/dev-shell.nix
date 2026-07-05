@@ -10,10 +10,23 @@ pkgs.mkShell {
     pkg-config
     git
     jq
+
+    # Rust toolchain for the v2 core rewrite (crates/). Nixpkgs-native stable
+    # toolchain, pinned transitively through the flake lock — no extra inputs.
+    rustc
+    cargo
+    clippy
+    rustfmt
+    rust-analyzer
+    # protoc for the SemanticDB prost codegen; cbindgen for the C-ABI header.
+    protobuf
+    rust-cbindgen
   ];
 
   JAVA_HOME = "${jdk}";
   LS_JAVA_VERSION = "25";
+  # Rust standard-library source so rust-analyzer resolves std in the dev shell.
+  RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
   # The SQLite shared library consumed by the ls-sqlite-ffm FFM binding.
   # System SQLite is never used; only the Nix-provided library is a valid
   # runtime dependency.

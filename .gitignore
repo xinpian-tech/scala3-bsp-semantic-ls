@@ -17,3 +17,9 @@ mill-java-opts
 
 # Agent runtime state (ephemeral sub-agent worktrees)
 .claude/
+
+# Rust / cargo (v2 core workspace). Cargo.lock IS committed (application
+# workspace), only build artifacts are ignored.
+/target/
+target/
+**/*.rs.bk

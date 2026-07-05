@@ -1,0 +1,13 @@
+[package]
+name = "ls-index-model"
+description = "Pure model primitives (ids, spans, flags, symbols, rename-safety reasons, errors) for the Rust language server."
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+proptest = { workspace = true }

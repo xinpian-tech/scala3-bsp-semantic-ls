@@ -1,0 +1,17 @@
+# Cargo workspace for the v2 Rust core. Lives at the repository root next to the
+# mill build (build.mill); the crate sources live under crates/, sibling to the
+# JVM-island modules under modules/.
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+repository = "https://github.com/xinpian-tech/scala3-bsp-smantic-ls"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[workspace.dependencies]
+proptest = "1"
