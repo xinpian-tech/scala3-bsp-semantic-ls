@@ -320,6 +320,54 @@ fn unsorted_group_postings_rejected() {
     }));
 }
 
+/// Mutate `header.bin`, recompute its self-checksum over `[0, 56)`, then let
+/// `recorrupt` recompute the `header.bin` CRC in `checksums.bin`. This produces
+/// a *fully self-consistent* corrupt header (both the internal header checksum
+/// and the file CRC agree) that must still be rejected.
+fn recorrupt_header(dir: &Path, mutate: impl FnOnce(&mut Vec<u8>)) -> SegmentError {
+    recorrupt(dir, "header.bin", |b| {
+        mutate(b);
+        let hc = crc32c::crc32c(&b[..56]) as u64;
+        b[56..64].copy_from_slice(&hc.to_le_bytes());
+    })
+}
+
+#[test]
+fn header_high_bit_ref_group_count_rejected() {
+    let (_t, dir) = write_base();
+    // ref_group_count (u64 @ 24) is 1; high bits truncate back to 1 under `as`.
+    assert_structural(recorrupt_header(&dir, |b| {
+        b[24..32].copy_from_slice(&0x1_0000_0001u64.to_le_bytes())
+    }));
+}
+
+#[test]
+fn header_high_bit_rename_group_count_rejected() {
+    let (_t, dir) = write_base();
+    // rename_group_count (u64 @ 32) is 0; high bits truncate back to 0 under `as`.
+    assert_structural(recorrupt_header(&dir, |b| {
+        b[32..40].copy_from_slice(&0x1_0000_0000u64.to_le_bytes())
+    }));
+}
+
+#[test]
+fn header_high_bit_doc_count_rejected() {
+    let (_t, dir) = write_base();
+    // doc_count (u64 @ 40) is 3; high bits truncate back to 3 under `as`.
+    assert_structural(recorrupt_header(&dir, |b| {
+        b[40..48].copy_from_slice(&0x1_0000_0003u64.to_le_bytes())
+    }));
+}
+
+#[test]
+fn header_nonzero_flags_rejected() {
+    let (_t, dir) = write_base();
+    // flags (u16 @ 6) is reserved and must be zero.
+    assert_structural(recorrupt_header(&dir, |b| {
+        b[6..8].copy_from_slice(&1u16.to_le_bytes())
+    }));
+}
+
 // ---- writer input validation ----
 
 fn expect_invalid(data: &SegmentData) {

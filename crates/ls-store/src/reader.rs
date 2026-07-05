@@ -152,6 +152,10 @@ impl SegmentReader {
         if version != format::VERSION {
             return Err(SegmentError::BadVersion { found: version });
         }
+        // flags (uint16 @ 6) is reserved and must be zero.
+        if read_u16(header, 6).unwrap() != 0 {
+            return Err(structural("header flags nonzero"));
+        }
         let stored_header_crc = read_u64(header, format::HEADER_CHECKSUM_OFFSET).unwrap();
         let computed = crc32c(&header[..format::HEADER_CHECKSUM_OFFSET]) as u64;
         if stored_header_crc != computed {
@@ -159,9 +163,17 @@ impl SegmentReader {
         }
         let segment_id = read_u64(header, 8).unwrap();
         let created_at_ms = read_i64(header, 16).unwrap();
-        let ref_group_count = read_u64(header, 24).unwrap();
-        let rename_group_count = read_u64(header, 32).unwrap();
-        let doc_count = read_u64(header, 40).unwrap();
+        // The counts index u32-domain structures. Reject any raw u64 value that
+        // does not fit u32 BEFORE narrowing — otherwise high-bit corruption
+        // (e.g. 1 -> 0x1_0000_0001) would truncate back to a value that spoofs a
+        // match against the group/doc index-declared counts. try_from, not `as`.
+        let count = |off: usize, what: &'static str| -> Result<u32> {
+            u32::try_from(read_u64(header, off).unwrap())
+                .map_err(|_| structural(&format!("header {what} exceeds u32")))
+        };
+        let ref_group_count = count(24, "ref_group_count")?;
+        let rename_group_count = count(32, "rename_group_count")?;
+        let doc_count = count(40, "doc_count")?;
         let occurrence_count = read_u64(header, 48).unwrap();
 
         // --- checksums.bin: list exactly the 14 files, in order, CRC each. ---
@@ -171,9 +183,9 @@ impl SegmentReader {
             files: mapped.try_into().unwrap_or_else(|_| unreachable!()),
             segment_id,
             created_at_ms,
-            ref_group_count: ref_group_count as u32,
-            rename_group_count: rename_group_count as u32,
-            doc_count: doc_count as u32,
+            ref_group_count,
+            rename_group_count,
+            doc_count,
             occurrence_count,
             symbol_count: 0,
             target_count: 0,
