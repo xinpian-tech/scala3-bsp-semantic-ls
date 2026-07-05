@@ -3,20 +3,23 @@
 //! Boot is the plan's zero-JNIEnv protocol: the first PC request `dlopen`s
 //! libjvm and calls the single boot symbol `JNI_CreateJavaVM` ([`boot`]) with
 //! the [`RustVtable`] address as the `-javaagent` argument. The premain fires
-//! inside that call, mirrors the ABI layout, and downcalls `register_pc_vtable`
-//! plus enters the loaned dispatch threads; the Rust side rendezvouses on that
-//! registration under a deadline, and on timeout fails with a typed boot error
-//! carrying the captured island log for the doctor.
+//! inside that call, mirrors the ABI layout, downcalls `register_pc_vtable`,
+//! and enters the loaned dispatch threads; the Rust side rendezvouses on that
+//! registration under a deadline. A bad-ABI registration fails fast with a
+//! typed error; a silent premain times out with the captured island log.
 //!
-//! Steady state is driven by the [`watchdog::Supervisor`]: PC requests serialize
-//! on the loaned dispatch lane under a per-request deadline, a wedge fails the
-//! request typed and escalates the recovery ladder (cancel → restart_instances
-//! → a fresh dispatch generation with the [`mirror`]ed targets/buffers replayed
-//! → island-fatal past the abandoned-generation cap). Before any of this the
-//! [`stdout_guard`] keeps island/plugin writes to fd 1 off the LSP stream.
+//! Steady state is driven by the [`watchdog::Supervisor`] over the
+//! [`backend::VtableBackend`]: PC requests serialize on the loaned dispatch
+//! lane (worker 0) under a per-request deadline, control ops run on worker 1,
+//! and a wedge escalates the recovery ladder (restart_instances → a fresh
+//! dispatch generation via `spawn_dispatch` with the [`mirror`]ed
+//! targets/buffers replayed → island-fatal past the abandoned-generation cap).
+//! Before any of this the [`stdout_guard`] keeps island/plugin writes to fd 1
+//! off the LSP stream.
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 
+pub mod backend;
 pub mod boot;
 pub mod dispatch;
 mod jni;
@@ -25,7 +28,8 @@ pub mod stdout_guard;
 pub mod watchdog;
 
 use std::path::{Path, PathBuf};
-use std::sync::{Condvar, Mutex, OnceLock};
+use std::ptr::NonNull;
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use ls_pc_abi::abi::{LsBuf, LsStr};
@@ -35,17 +39,24 @@ use ls_pc_abi::{
     STATUS_OK,
 };
 
+use backend::{IslandRuntime, VtableBackend};
+use watchdog::Supervisor;
+
 pub use boot::{libjvm_mapped, BootError};
 pub use stdout_guard::StdoutGuard;
 
 // ---------------------------------------------------------------------------
 // Boot rendezvous (the premain registers the PC vtable and enters the loaned
-// dispatch threads; the boot caller blocks here until both land, or times out).
+// dispatch threads; the boot caller blocks here until both land, the
+// registration fails terminally, or the deadline elapses).
 // ---------------------------------------------------------------------------
 
 struct RendezvousState {
-    pc_vtable_addr: Option<usize>,
+    registered: bool,
     dispatch_ready: bool,
+    /// A terminal registration failure status (e.g. an ABI mismatch), so the
+    /// boot caller fails fast rather than waiting out the rendezvous deadline.
+    terminal_failure: Option<i32>,
     island_log: Vec<String>,
 }
 
@@ -55,16 +66,22 @@ struct Rendezvous {
 }
 
 static RENDEZVOUS: OnceLock<Rendezvous> = OnceLock::new();
+static ISLAND_RUNTIME: OnceLock<Arc<IslandRuntime>> = OnceLock::new();
 
 fn rendezvous() -> &'static Rendezvous {
     RENDEZVOUS.get_or_init(|| Rendezvous {
         state: Mutex::new(RendezvousState {
-            pc_vtable_addr: None,
+            registered: false,
             dispatch_ready: false,
+            terminal_failure: None,
             island_log: Vec::new(),
         }),
         cv: Condvar::new(),
     })
+}
+
+fn island_runtime() -> &'static Arc<IslandRuntime> {
+    ISLAND_RUNTIME.get().expect("island runtime not registered")
 }
 
 /// The island log captured through the `log` downcall (surfaced by the doctor
@@ -101,8 +118,7 @@ unsafe extern "C" fn vt_register_pc_vtable(pc: *const PcVtable) -> i32 {
 }
 
 /// Entry point for a Java-loaned thread; it never returns. Worker 0 is the
-/// dispatch lane and signals dispatch readiness; the live op pump attaches
-/// through the [`watchdog::Supervisor`] backend.
+/// dispatch lane, worker 1 the control lane.
 unsafe extern "C" fn vt_pc_dispatch_loop(worker_index: i32) {
     let _ = std::panic::catch_unwind(|| dispatch_loop_inner(worker_index));
 }
@@ -137,27 +153,35 @@ fn validate_pc_registration(pc: *const PcVtable) -> i32 {
 
 fn register_pc_vtable_inner(pc: *const PcVtable) -> i32 {
     let status = validate_pc_registration(pc);
+    let reg = rendezvous();
     if status != STATUS_OK {
+        // Record a terminal failure so the boot caller returns immediately.
+        let mut st = reg.state.lock().expect("rendezvous state lock");
+        st.terminal_failure = Some(status);
+        reg.cv.notify_all();
         return status;
     }
-    let reg = rendezvous();
+    // Build the runtime from the validated non-null vtable (its address is
+    // process-stable; the island owns the memory for the process lifetime).
+    let handle = NonNull::new(pc as *mut PcVtable).expect("validated non-null");
+    let _ = ISLAND_RUNTIME.set(IslandRuntime::new(handle));
+
     let mut st = reg.state.lock().expect("rendezvous state lock");
-    st.pc_vtable_addr = Some(pc as usize);
+    st.registered = true;
     reg.cv.notify_all();
     STATUS_OK
 }
 
 fn dispatch_loop_inner(worker_index: i32) {
+    let rt = island_runtime();
     if worker_index == 0 {
-        let reg = rendezvous();
-        if let Ok(mut st) = reg.state.lock() {
+        if let Ok(mut st) = rendezvous().state.lock() {
             st.dispatch_ready = true;
-            reg.cv.notify_all();
+            rendezvous().cv.notify_all();
         }
-    }
-    // The loaned thread is owned by the island for the process lifetime.
-    loop {
-        std::thread::park();
+        rt.enter_dispatch_worker();
+    } else {
+        rt.enter_control_worker();
     }
 }
 
@@ -201,8 +225,8 @@ static RUST_VTABLE: RustVtable = RustVtable {
 // Boot orchestration.
 // ---------------------------------------------------------------------------
 
-/// Where the embedded JVM and PC-host assembly live, and how long to wait for
-/// the premain to register.
+/// Where the embedded JVM and PC-host assembly live, the rendezvous deadline,
+/// and the steady-state supervisor tuning.
 pub struct IslandConfig<'a> {
     /// `$JAVA_HOME/lib/server/libjvm.so`.
     pub libjvm: &'a Path,
@@ -212,19 +236,43 @@ pub struct IslandConfig<'a> {
     pub extra_classpath: &'a [PathBuf],
     /// Deadline for the premain to complete `register_pc_vtable` + dispatch.
     pub rendezvous_timeout: Duration,
+    /// Abandoned dispatch generations tolerated before the island is fatal.
+    pub max_abandoned_generations: u32,
+    /// Per-request dispatch deadline (the `orTimeout` semantics).
+    pub request_deadline: Duration,
+    /// Grace period after `restart_instances` to see the dispatch lane free.
+    pub cancel_grace: Duration,
 }
 
-/// Boot the embedded JVM and block until the premain registers the PC vtable and
-/// the loaned dispatch lane is ready, or the rendezvous deadline elapses.
+/// Boot the embedded JVM, block until the premain registers the PC vtable and
+/// the loaned dispatch lane is ready, and return the [`Supervisor`] the LSP
+/// server drives. Fails fast on a bad-ABI registration; times out (with the
+/// captured island log) on a silent premain.
 ///
 /// The [`StdoutGuard`] must already be installed by the caller (the LSP server),
 /// so fd 1 is aliased to stderr before the JVM can grab it and the server keeps
 /// the private stdout for the protocol stream.
-pub fn boot_island(config: &IslandConfig) -> Result<(), BootError> {
+pub fn boot_island(config: &IslandConfig) -> Result<Supervisor<VtableBackend>, BootError> {
     let vtable_addr = std::ptr::addr_of!(RUST_VTABLE) as usize;
     let options = boot::boot_options(config.agent_jar, config.extra_classpath, vtable_addr);
     boot::create_java_vm(config.libjvm, &options).map_err(BootError::Boot)?;
-    wait_for_registration(config.rendezvous_timeout)
+    wait_for_registration(config.rendezvous_timeout)?;
+
+    let backend = VtableBackend::new(Arc::clone(island_runtime()));
+    Ok(Supervisor::new(
+        backend,
+        config.max_abandoned_generations,
+        config.request_deadline,
+        config.cancel_grace,
+    ))
+}
+
+fn terminal_boot_error(status: i32) -> BootError {
+    if status == STATUS_ABI_MISMATCH {
+        BootError::AbiMismatch
+    } else {
+        BootError::Boot(format!("island refused registration: status {status}"))
+    }
 }
 
 fn wait_for_registration(timeout: Duration) -> Result<(), BootError> {
@@ -232,7 +280,10 @@ fn wait_for_registration(timeout: Duration) -> Result<(), BootError> {
     let deadline = Instant::now() + timeout;
     let mut st = reg.state.lock().expect("rendezvous state lock");
     loop {
-        if st.pc_vtable_addr.is_some() && st.dispatch_ready {
+        if let Some(status) = st.terminal_failure {
+            return Err(terminal_boot_error(status));
+        }
+        if st.registered && st.dispatch_ready {
             return Ok(());
         }
         let now = Instant::now();
@@ -241,13 +292,8 @@ fn wait_for_registration(timeout: Duration) -> Result<(), BootError> {
                 island_log: st.island_log.clone(),
             });
         }
-        let (guard, res) = reg.cv.wait_timeout(st, deadline - now).expect("cv wait");
+        let (guard, _res) = reg.cv.wait_timeout(st, deadline - now).expect("cv wait");
         st = guard;
-        if res.timed_out() && !(st.pc_vtable_addr.is_some() && st.dispatch_ready) {
-            return Err(BootError::RendezvousTimeout {
-                island_log: st.island_log.clone(),
-            });
-        }
     }
 }
 
@@ -267,7 +313,6 @@ mod tests {
     fn registration_rejects_null_and_bad_abi() {
         assert_eq!(validate_pc_registration(std::ptr::null()), STATUS_BAD_ARG);
 
-        // A vtable whose ABI version does not match is refused.
         let mut bad = pc_vtable_stub();
         bad.abi_version = ABI_VERSION + 1;
         assert_eq!(
@@ -283,8 +328,25 @@ mod tests {
     }
 
     #[test]
+    fn bad_abi_registration_fails_fast_without_timeout() {
+        // A bad-ABI registration records a terminal failure and notifies the
+        // rendezvous, so the boot caller returns `AbiMismatch` immediately
+        // rather than waiting out the (here 10s) rendezvous deadline.
+        let mut bad = pc_vtable_stub();
+        bad.abi_version = ABI_VERSION + 1;
+        assert_eq!(
+            register_pc_vtable_inner(std::ptr::addr_of!(bad)),
+            STATUS_ABI_MISMATCH
+        );
+
+        let start = Instant::now();
+        let err = wait_for_registration(Duration::from_secs(10)).unwrap_err();
+        assert!(matches!(err, BootError::AbiMismatch));
+        assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
     fn rust_vtable_carries_the_versioned_layout_contract() {
-        // The island validates these two words before mirroring the layout.
         assert_eq!(RUST_VTABLE.abi_version, ABI_VERSION);
         assert_eq!(RUST_VTABLE.layout_canary, LAYOUT_CANARY);
     }
@@ -310,8 +372,6 @@ mod tests {
     /// A minimal valid `PcVtable` for registration-contract tests: correct ABI
     /// version, every op pointed at a trivial stub.
     fn pc_vtable_stub() -> PcVtable {
-        use ls_pc_abi::abi::LsStr;
-
         unsafe extern "C" fn req(_p: *const u8, _l: u32) -> i32 {
             STATUS_OK
         }

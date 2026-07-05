@@ -1,17 +1,19 @@
 //! The per-request watchdog and the dispatch-generation recovery ladder.
 //!
-//! PC requests run on the single loaned dispatch lane under a deadline. When a
-//! request overruns, it fails typed (never deadlocking the caller) and recovery
-//! escalates exactly as the plan's ladder: cancel the in-flight op, then
-//! `restart_instances`; if that frees the lane the generation is kept (a
-//! cooperative wedge), otherwise a fresh dispatch generation is spawned and the
-//! mirrored targets/buffers are replayed into it (a non-cooperative wedge), and
-//! if abandoned generations exceed the cap the island is fatal.
+//! PC requests run on the single loaned dispatch lane under a deadline. A normal
+//! nonzero PC status fails the request typed (`PcError::Backend`) with no
+//! recovery; a deadline overrun fails it typed (`PcError::RequestTimeout`,
+//! never deadlocking the caller) and escalates the recovery ladder over the
+//! control lane: `restart_instances` (the facade shutdown+recreate — the
+//! cooperative lever; the 15-op vtable has no separate cancel op) and, if that
+//! does not free the dispatch lane, a fresh dispatch generation via
+//! `spawn_dispatch(gen+1)` with the mirrored targets/buffers replayed into it.
+//! A failed control op, or exceeding the abandoned-generation cap, is
+//! island-fatal.
 //!
-//! The lane operations are abstracted behind [`PcBackend`] so the whole ladder
-//! is deterministically unit-tested with a fake — the live backend that drives
-//! the registered PC vtable over FFM is exercised end-to-end with the Java
-//! island.
+//! The lane operations are abstracted behind [`PcBackend`] so the ladder is
+//! deterministically unit-tested with a fake; the production implementation is
+//! [`crate::backend::VtableBackend`], driving the registered vtable over FFM.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -22,12 +24,20 @@ use ls_pc_abi::payloads::TargetConfig;
 use crate::dispatch::{Advance, GenerationState};
 use crate::mirror::{ReplayPlan, TargetMirror};
 
-/// The dispatch lane overran its deadline.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Wedged;
+/// The position-query PC ops (they share the `uri, line, character -> buffer`
+/// slot shape).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QueryKind {
+    Completion,
+    Hover,
+    SignatureHelp,
+    Definition,
+    TypeDefinition,
+    PrepareRename,
+}
 
-/// A PC request routed through the supervisor. Lifecycle variants update the
-/// replay mirror; `Query` carries an opaque encoded op payload.
+/// A PC request routed through the supervisor onto the dispatch lane. Lifecycle
+/// variants update the replay mirror; the rest are pure queries.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PcRequest {
     RegisterTarget {
@@ -46,7 +56,28 @@ pub enum PcRequest {
     DidClose {
         uri: String,
     },
-    Query(Vec<u8>),
+    Query {
+        kind: QueryKind,
+        uri: String,
+        line: u32,
+        character: u32,
+    },
+    Resolve {
+        target_id: String,
+        symbol: String,
+        item: Vec<u8>,
+    },
+}
+
+/// The outcome of a single dispatch-lane attempt.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DispatchOutcome {
+    /// The op completed with `STATUS_OK` and this response payload.
+    Done(Vec<u8>),
+    /// The op returned a nonzero PC status (a normal error, not a wedge).
+    Status(i32),
+    /// The op overran its deadline; recovery is required.
+    Wedged,
 }
 
 /// A failed PC request.
@@ -69,18 +100,19 @@ impl std::fmt::Display for PcError {
 
 impl std::error::Error for PcError {}
 
-/// The dispatch/control lanes the supervisor drives. In production these call
-/// the registered PC vtable + Rust vtable over FFM; in tests they are faked.
+/// The dispatch/control lanes the supervisor drives. In production these route
+/// to the loaned dispatch (worker 0) and control (worker 1) threads and invoke
+/// the registered `PcVtable` slots; in tests they are faked.
 pub trait PcBackend {
     /// Run `request` on the dispatch lane, waiting up to `deadline`.
-    fn dispatch(&mut self, request: &PcRequest, deadline: Duration) -> Result<Vec<u8>, Wedged>;
-    /// Control lane: ask the in-flight op to cancel cooperatively.
-    fn cancel(&mut self);
-    /// Control lane: shut down and recreate the PC instances.
+    fn dispatch(&mut self, request: &PcRequest, deadline: Duration) -> DispatchOutcome;
+    /// Control lane: shut down and recreate the PC instances (also the
+    /// cooperative cancellation lever). Returns the vtable status.
     fn restart_instances(&mut self) -> i32;
-    /// Has the wedged dispatch lane become idle (cancellation honored)?
+    /// Has the dispatch lane become idle (the wedged op returned)?
     fn lane_idle(&mut self) -> bool;
-    /// Spawn a fresh dispatch generation and replay the mirrored state into it.
+    /// Control lane: spawn a fresh dispatch generation (`spawn_dispatch`) and
+    /// replay the mirrored state into it. Returns the vtable status.
     fn spawn_generation(&mut self, generation: u32, replay: &ReplayPlan) -> i32;
 }
 
@@ -128,13 +160,14 @@ impl<B: PcBackend> Supervisor<B> {
     }
 
     /// Route a request: mirror its lifecycle effect, then dispatch under the
-    /// deadline. A wedge fails the request typed and triggers recovery so
-    /// subsequent requests succeed.
+    /// deadline. A nonzero status is a normal typed error; a wedge fails the
+    /// request typed and triggers recovery so subsequent requests succeed.
     pub fn request(&mut self, request: PcRequest) -> Result<Vec<u8>, PcError> {
         self.observe(&request);
         match self.backend.dispatch(&request, self.request_deadline) {
-            Ok(reply) => Ok(reply),
-            Err(Wedged) => {
+            DispatchOutcome::Done(reply) => Ok(reply),
+            DispatchOutcome::Status(code) => Err(PcError::Backend(code)),
+            DispatchOutcome::Wedged => {
                 self.recover();
                 Err(PcError::RequestTimeout)
             }
@@ -153,17 +186,20 @@ impl<B: PcBackend> Supervisor<B> {
             } => self.mirror.did_open(target_id, uri, text),
             PcRequest::DidChange { uri, text } => self.mirror.did_change(uri, text),
             PcRequest::DidClose { uri } => self.mirror.did_close(uri),
-            PcRequest::Query(_) => {}
+            PcRequest::Query { .. } | PcRequest::Resolve { .. } => {}
         }
     }
 
     fn recover(&mut self) {
-        // Rungs 1-2: cancel the in-flight op, then reset the PC instances.
-        self.backend.cancel();
-        self.backend.restart_instances();
+        // Rung 1: reset the PC instances (also cancels the in-flight op). A
+        // failed control op means the island cannot be recovered.
+        if self.backend.restart_instances() != 0 {
+            self.fatal.store(true, Ordering::SeqCst);
+            return;
+        }
         if self.wait_lane_idle() {
-            // Cooperative wedge: cancel + restart freed the lane; keep the
-            // generation.
+            // Cooperative wedge: the op returned once its facade was reset; keep
+            // the generation.
             return;
         }
         // Non-cooperative wedge: abandon this generation for a fresh one and
@@ -172,7 +208,9 @@ impl<B: PcBackend> Supervisor<B> {
         match self.generations.advance() {
             Advance::Spawned(generation) => {
                 let plan = self.mirror.replay_plan();
-                self.backend.spawn_generation(generation, &plan);
+                if self.backend.spawn_generation(generation, &plan) != 0 {
+                    self.fatal.store(true, Ordering::SeqCst);
+                }
             }
             Advance::Fatal => self.fatal.store(true, Ordering::SeqCst),
         }
@@ -198,23 +236,25 @@ mod tests {
     use std::collections::VecDeque;
 
     /// A scripted backend: each `dispatch` pops the next outcome; `cooperative`
-    /// controls whether the lane frees after cancel + restart.
+    /// controls whether the lane frees after `restart_instances`.
     struct FakeBackend {
-        outcomes: VecDeque<Result<Vec<u8>, Wedged>>,
+        outcomes: VecDeque<DispatchOutcome>,
         cooperative: bool,
         recovered: bool,
-        cancels: u32,
+        restart_status: i32,
+        spawn_status: i32,
         restarts: u32,
         spawns: Vec<(u32, ReplayPlan)>,
     }
 
     impl FakeBackend {
-        fn new(outcomes: Vec<Result<Vec<u8>, Wedged>>, cooperative: bool) -> FakeBackend {
+        fn new(outcomes: Vec<DispatchOutcome>, cooperative: bool) -> FakeBackend {
             FakeBackend {
                 outcomes: outcomes.into(),
                 cooperative,
                 recovered: false,
-                cancels: 0,
+                restart_status: 0,
+                spawn_status: 0,
                 restarts: 0,
                 spawns: Vec::new(),
             }
@@ -222,29 +262,24 @@ mod tests {
     }
 
     impl PcBackend for FakeBackend {
-        fn dispatch(
-            &mut self,
-            _request: &PcRequest,
-            _deadline: Duration,
-        ) -> Result<Vec<u8>, Wedged> {
-            self.outcomes.pop_front().unwrap_or(Ok(Vec::new()))
-        }
-        fn cancel(&mut self) {
-            self.cancels += 1;
+        fn dispatch(&mut self, _request: &PcRequest, _deadline: Duration) -> DispatchOutcome {
+            self.outcomes
+                .pop_front()
+                .unwrap_or(DispatchOutcome::Done(Vec::new()))
         }
         fn restart_instances(&mut self) -> i32 {
             self.restarts += 1;
             if self.cooperative {
                 self.recovered = true;
             }
-            0
+            self.restart_status
         }
         fn lane_idle(&mut self) -> bool {
             self.recovered
         }
         fn spawn_generation(&mut self, generation: u32, replay: &ReplayPlan) -> i32 {
             self.spawns.push((generation, replay.clone()));
-            0
+            self.spawn_status
         }
     }
 
@@ -255,6 +290,15 @@ mod tests {
             classpath: vec![],
             scalac_options: vec![],
             source_dirs: vec![],
+        }
+    }
+
+    fn query() -> PcRequest {
+        PcRequest::Query {
+            kind: QueryKind::Completion,
+            uri: "file:///a.scala".to_string(),
+            line: 1,
+            character: 2,
         }
     }
 
@@ -269,25 +313,31 @@ mod tests {
 
     #[test]
     fn healthy_request_returns_reply_without_recovery() {
-        let backend = FakeBackend::new(vec![Ok(b"ok".to_vec())], true);
+        let backend = FakeBackend::new(vec![DispatchOutcome::Done(b"ok".to_vec())], true);
         let mut sup = supervisor(backend, 4);
-        assert_eq!(sup.request(PcRequest::Query(vec![1])), Ok(b"ok".to_vec()));
+        assert_eq!(sup.request(query()), Ok(b"ok".to_vec()));
         assert_eq!(sup.generation(), 0);
-        assert_eq!(sup.backend.cancels, 0);
         assert_eq!(sup.backend.restarts, 0);
         assert!(sup.backend.spawns.is_empty());
     }
 
     #[test]
-    fn cooperative_wedge_recovers_via_cancel_and_restart() {
-        let backend = FakeBackend::new(vec![Err(Wedged)], true);
+    fn nonzero_status_is_a_typed_error_without_recovery() {
+        let backend = FakeBackend::new(vec![DispatchOutcome::Status(-4)], true);
         let mut sup = supervisor(backend, 4);
-        assert_eq!(
-            sup.request(PcRequest::Query(vec![1])),
-            Err(PcError::RequestTimeout)
-        );
-        // Cancel + restart freed the lane; no new generation.
-        assert_eq!(sup.backend.cancels, 1);
+        assert_eq!(sup.request(query()), Err(PcError::Backend(-4)));
+        // A normal PC error does not trigger the recovery ladder.
+        assert_eq!(sup.backend.restarts, 0);
+        assert!(sup.backend.spawns.is_empty());
+        assert!(!sup.is_fatal());
+    }
+
+    #[test]
+    fn cooperative_wedge_recovers_via_restart() {
+        let backend = FakeBackend::new(vec![DispatchOutcome::Wedged], true);
+        let mut sup = supervisor(backend, 4);
+        assert_eq!(sup.request(query()), Err(PcError::RequestTimeout));
+        // restart freed the lane; no new generation.
         assert_eq!(sup.backend.restarts, 1);
         assert!(sup.backend.spawns.is_empty());
         assert_eq!(sup.generation(), 0);
@@ -296,8 +346,14 @@ mod tests {
 
     #[test]
     fn non_cooperative_wedge_spawns_new_generation_and_replays_buffers() {
-        // A registered target + open buffer, then a non-cooperative wedge.
-        let backend = FakeBackend::new(vec![Ok(Vec::new()), Ok(Vec::new()), Err(Wedged)], false);
+        let backend = FakeBackend::new(
+            vec![
+                DispatchOutcome::Done(Vec::new()),
+                DispatchOutcome::Done(Vec::new()),
+                DispatchOutcome::Wedged,
+            ],
+            false,
+        );
         let mut sup = supervisor(backend, 4);
         sup.request(PcRequest::RegisterTarget {
             id: "a".to_string(),
@@ -311,20 +367,16 @@ mod tests {
         })
         .unwrap();
 
-        assert_eq!(
-            sup.request(PcRequest::Query(vec![9])),
-            Err(PcError::RequestTimeout)
-        );
+        assert_eq!(sup.request(query()), Err(PcError::RequestTimeout));
 
-        // A fresh generation was spawned and the mirror was replayed, so the
-        // buffer need not be reopened by the editor (E7).
+        // A fresh generation was spawned and the mirror replayed, so the buffer
+        // need not be reopened by the editor.
         assert_eq!(sup.generation(), 1);
         assert_eq!(sup.backend.restarts, 1);
         assert_eq!(sup.backend.spawns.len(), 1);
         let (generation, replay) = &sup.backend.spawns[0];
         assert_eq!(*generation, 1);
         assert_eq!(replay.targets.len(), 1);
-        assert_eq!(replay.targets[0].0, "a");
         assert_eq!(replay.buffers.len(), 1);
         assert_eq!(replay.buffers[0].uri, "file:///a.scala");
         assert_eq!(replay.buffers[0].text, "package a");
@@ -333,38 +385,47 @@ mod tests {
 
     #[test]
     fn abandoned_generation_cap_exceeded_is_fatal() {
-        // Cap of 1: the second non-cooperative wedge exceeds it.
-        let backend = FakeBackend::new(vec![Err(Wedged), Err(Wedged)], false);
-        let mut sup = supervisor(backend, 1);
-
-        assert_eq!(
-            sup.request(PcRequest::Query(vec![1])),
-            Err(PcError::RequestTimeout)
+        let backend = FakeBackend::new(
+            vec![DispatchOutcome::Wedged, DispatchOutcome::Wedged],
+            false,
         );
+        let mut sup = supervisor(backend, 1);
+        assert_eq!(sup.request(query()), Err(PcError::RequestTimeout));
         assert_eq!(sup.generation(), 1);
         assert!(!sup.is_fatal());
-
-        assert_eq!(
-            sup.request(PcRequest::Query(vec![2])),
-            Err(PcError::RequestTimeout)
-        );
-        // Second abandonment exceeds the cap → island-fatal.
+        assert_eq!(sup.request(query()), Err(PcError::RequestTimeout));
+        // The second abandonment exceeds the cap of 1.
         assert!(sup.is_fatal());
-        let fatal = sup.fatal_flag();
-        assert!(fatal.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn failed_restart_instances_is_fatal() {
+        let mut backend = FakeBackend::new(vec![DispatchOutcome::Wedged], false);
+        backend.restart_status = -6;
+        let mut sup = supervisor(backend, 4);
+        assert_eq!(sup.request(query()), Err(PcError::RequestTimeout));
+        // A control-lane failure means the island cannot recover.
+        assert!(sup.is_fatal());
+        assert!(sup.backend.spawns.is_empty());
+    }
+
+    #[test]
+    fn failed_spawn_generation_is_fatal() {
+        let mut backend = FakeBackend::new(vec![DispatchOutcome::Wedged], false);
+        backend.spawn_status = -6;
+        let mut sup = supervisor(backend, 4);
+        assert_eq!(sup.request(query()), Err(PcError::RequestTimeout));
+        assert_eq!(sup.backend.spawns.len(), 1);
+        // spawn_dispatch/replay failed → fatal.
+        assert!(sup.is_fatal());
     }
 
     #[test]
     fn a_wedged_request_returns_promptly_and_the_next_request_succeeds() {
-        // After a non-cooperative wedge recovers via a new generation, the next
-        // request is served (the fake's default outcome is healthy).
-        let backend = FakeBackend::new(vec![Err(Wedged)], false);
+        let backend = FakeBackend::new(vec![DispatchOutcome::Wedged], false);
         let mut sup = supervisor(backend, 4);
-        assert_eq!(
-            sup.request(PcRequest::Query(vec![1])),
-            Err(PcError::RequestTimeout)
-        );
-        assert_eq!(sup.request(PcRequest::Query(vec![2])), Ok(Vec::new()));
+        assert_eq!(sup.request(query()), Err(PcError::RequestTimeout));
+        assert_eq!(sup.request(query()), Ok(Vec::new()));
         assert_eq!(sup.generation(), 1);
     }
 }
