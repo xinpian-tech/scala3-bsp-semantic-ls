@@ -11,6 +11,9 @@ pub enum SemanticdbError {
     Parse(String),
     /// A `.semanticdb` file could not be read from disk.
     Io(String),
+    /// A source-relative path was empty, absolute, or escaped the semanticdb
+    /// root (mirrors the Scala locator's `IllegalArgumentException`).
+    InvalidPath(String),
 }
 
 impl fmt::Display for SemanticdbError {
@@ -18,6 +21,7 @@ impl fmt::Display for SemanticdbError {
         match self {
             SemanticdbError::Parse(m) => write!(f, "semanticdb parse error: {m}"),
             SemanticdbError::Io(m) => write!(f, "semanticdb io error: {m}"),
+            SemanticdbError::InvalidPath(m) => write!(f, "semanticdb invalid path: {m}"),
         }
     }
 }

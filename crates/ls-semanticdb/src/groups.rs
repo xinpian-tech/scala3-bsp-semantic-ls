@@ -16,6 +16,7 @@ use crate::symbols::{self, Descriptor};
 
 /// Exact alias groups plus the symbol -> group-index maps and the pure-semantic
 /// unsafe mask per rename group.
+#[derive(PartialEq, Eq)]
 pub struct AliasGroups {
     pub ref_groups: Vec<HashSet<SymbolKey>>,
     pub ref_group_index: HashMap<SymbolKey, usize>,

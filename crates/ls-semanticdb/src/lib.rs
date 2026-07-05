@@ -19,6 +19,7 @@ mod wire;
 
 pub mod batch;
 pub mod groups;
+pub mod locator;
 pub mod md5;
 pub mod model;
 pub mod normalize;
@@ -29,6 +30,7 @@ pub mod symbols;
 pub use batch::SemanticBatch;
 pub use error::{SemanticdbError, SemanticdbResult};
 pub use groups::AliasGroups;
+pub use locator::SemanticdbLocator;
 pub use md5::FreshnessCheck;
 pub use model::{SdbDocument, SdbDocuments, SdbOccurrence, SdbRange, SdbSymbolInfo};
 pub use normalize::normalize;
