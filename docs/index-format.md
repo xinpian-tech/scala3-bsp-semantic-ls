@@ -401,8 +401,9 @@ search-ranking layer.
 
 1. `header.bin` is exactly 64 bytes, magic and version match, header
    checksum matches;
-2. `checksums.bin` lists exactly the 11 files above, in order, and every CRC
-   matches the mapped file bytes;
+2. `checksums.bin` lists exactly the 14 checksummed files above (the v1 core
+   plus the `target-meta.bin` / `symbol-meta.bin` / `search.bin` extension
+   sections), in order, and every CRC matches the mapped file bytes;
 3. structural cross-checks: group-index counts match header counts and file
    sizes; postings file sizes match `8 + columns*4*record_count`; the sum of
    the four postings record counts equals `occurrence_count`; doc-index and

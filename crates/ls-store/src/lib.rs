@@ -9,24 +9,33 @@
 //!
 //! [`SegmentWriter::write`] builds a segment; [`SegmentReader::open`] mmaps and
 //! validates it whole, rejecting any corruption with a typed [`SegmentError`].
-//! The manifest / generational workspace-state / snapshot lifecycle is a
-//! separate layer built on top of this one.
+//! On top of the segment layer, [`Store`] adds the `manifest.json` single commit
+//! point, generational `workspace-state-<gen>.bin` files, and the immutable
+//! [`Snapshot`] lifecycle (publish → recover → janitor) with typed
+//! [`StoreError`]s.
 
 pub mod crc;
 pub mod data;
+mod durable;
 pub mod error;
 pub mod format;
+pub mod manifest;
 mod reader;
+mod snapshot;
 mod wire;
+pub mod workspace_state;
 mod writer;
 
 pub use data::{
     DocOcc, GroupOcc, RenameProfile, SearchRow, SegmentData, SegmentDoc, SegmentSymbol, SymbolMeta,
     TargetMeta,
 };
-pub use error::{Result, SegmentError};
+pub use error::{Result, SegmentError, StoreError, StoreResult};
+pub use manifest::{Manifest, MANIFEST_SCHEMA_VERSION};
 pub use reader::{
     BlockView, DocEntryView, DocRecord, GroupIndexView, GroupRecord, IntervalView, OccurrenceHit,
     SegmentReader, SymbolView,
 };
+pub use snapshot::{Failpoint, Snapshot, Store};
+pub use workspace_state::{WorkspaceState, STATE_VERSION};
 pub use writer::SegmentWriter;

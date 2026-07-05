@@ -96,6 +96,7 @@ pub struct BlockView {
 }
 
 /// A validated, mmapped segment.
+#[derive(Debug)]
 pub struct SegmentReader {
     files: [Mmap; 14],
     segment_id: u64,

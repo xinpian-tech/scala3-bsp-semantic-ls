@@ -511,9 +511,7 @@ fn flip_byte(path: &Path, offset: usize) {
 }
 
 fn open_err(dir: &Path) -> ls_store::SegmentError {
-    SegmentReader::open(dir)
-        .err()
-        .expect("expected open to fail")
+    SegmentReader::open(dir).expect_err("expected open to fail")
 }
 
 #[test]

@@ -55,3 +55,57 @@ impl From<std::io::Error> for SegmentError {
 
 /// Convenience alias for segment results.
 pub type Result<T> = std::result::Result<T, SegmentError>;
+
+/// A store-level failure. Wraps [`SegmentError`] and adds the manifest /
+/// workspace-state / pairing failures the snapshot layer can raise. Never
+/// panics on corrupt on-disk state.
+#[derive(Debug)]
+pub enum StoreError {
+    /// A wrapped segment read/write failure.
+    Segment(SegmentError),
+    /// Filesystem I/O failure.
+    Io(std::io::Error),
+    /// `manifest.json` was missing a field, unparseable, or structurally invalid.
+    ManifestCorrupt { detail: String },
+    /// A `workspace-state-<gen>.bin` file was corrupt (magic/checksum/length).
+    StateCorrupt { detail: String },
+    /// The manifest and its paired state/segment disagree (generation, checksum,
+    /// or record counts).
+    PairMismatch { detail: String },
+    /// A manifest or state file declared a schema version newer than supported.
+    FutureSchema { what: String, found: u64 },
+}
+
+impl std::fmt::Display for StoreError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StoreError::Segment(e) => write!(f, "{e}"),
+            StoreError::Io(e) => write!(f, "store io error: {e}"),
+            StoreError::ManifestCorrupt { detail } => write!(f, "manifest corrupt: {detail}"),
+            StoreError::StateCorrupt { detail } => write!(f, "workspace-state corrupt: {detail}"),
+            StoreError::PairMismatch { detail } => {
+                write!(f, "segment/state pair mismatch: {detail}")
+            }
+            StoreError::FutureSchema { what, found } => {
+                write!(f, "unsupported future {what} schema version: {found}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for StoreError {}
+
+impl From<SegmentError> for StoreError {
+    fn from(e: SegmentError) -> Self {
+        StoreError::Segment(e)
+    }
+}
+
+impl From<std::io::Error> for StoreError {
+    fn from(e: std::io::Error) -> Self {
+        StoreError::Io(e)
+    }
+}
+
+/// Convenience alias for store results.
+pub type StoreResult<T> = std::result::Result<T, StoreError>;

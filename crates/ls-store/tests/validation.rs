@@ -119,9 +119,7 @@ fn recorrupt(dir: &Path, filename: &str, mutate: impl FnOnce(&mut Vec<u8>)) -> S
     let crc = crc32c::crc32c(&bytes);
     std::fs::write(&path, &bytes).unwrap();
     patch_checksum(dir, filename, crc);
-    SegmentReader::open(dir)
-        .err()
-        .expect("expected self-consistent corruption to be rejected")
+    SegmentReader::open(dir).expect_err("expected self-consistent corruption to be rejected")
 }
 
 fn assert_structural(e: SegmentError) {
