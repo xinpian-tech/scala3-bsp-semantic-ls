@@ -274,7 +274,7 @@ impl QueryOrchestrator {
             Some(spec) => spec,
             // No `.semanticdb` for this uri. A source that IS a workspace target
             // source but produced no SemanticDB is a hard `NoSemanticdb` (no
-            // fallback, E1 parity); a source outside every target is `NotIndexed`.
+            // fallback); a source outside every target is `NotIndexed`.
             None => {
                 return Err(if self.source_target_of(uri).is_some() {
                     LsError::NoSemanticdb {
