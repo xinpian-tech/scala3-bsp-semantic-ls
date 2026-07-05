@@ -256,8 +256,22 @@ pub struct Diagnostic {
     pub range: Option<Range>,
     #[serde(default)]
     pub severity: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<DiagnosticCode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
     #[serde(default)]
     pub message: String,
+}
+
+/// A diagnostic code. LSP allows `integer | string`, matching the Scala jsonrpc
+/// `Either[String, Integer]`; both spellings must survive so the diagnostic
+/// router can publish them unchanged.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum DiagnosticCode {
+    Integer(i64),
+    String(String),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

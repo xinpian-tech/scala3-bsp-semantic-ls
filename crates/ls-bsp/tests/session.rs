@@ -14,7 +14,8 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 
 use ls_bsp::protocol::{
-    DidChangeBuildTarget, LogMessageParams, PublishDiagnosticsParams, ShowMessageParams,
+    DiagnosticCode, DidChangeBuildTarget, LogMessageParams, PublishDiagnosticsParams,
+    ShowMessageParams,
 };
 use ls_bsp::uri::{path_to_uri, uri_to_path};
 use ls_bsp::wire::{read_message, write_message};
@@ -210,6 +211,8 @@ impl FakeBuildServer {
                 "diagnostics": [{
                     "range": {"start": {"line": 0, "character": 1}, "end": {"line": 0, "character": 5}},
                     "severity": 2,
+                    "code": "E123",
+                    "source": "sc",
                     "message": "value unused in fake target",
                 }],
                 "reset": true,
@@ -702,10 +705,11 @@ fn compile_round_trip_ok_diagnostics_and_messages_forwarded() {
             .expect("a publishDiagnostics");
         assert_eq!(diag.text_document.uri, path_to_uri(&fx.b_source_file));
         assert_eq!(diag.origin_id, Some("origin-42".to_string()));
-        assert_eq!(
-            diag.diagnostics.first().map(|d| d.message.clone()),
-            Some("value unused in fake target".to_string())
-        );
+        let entry = diag.diagnostics.first().expect("a diagnostic entry");
+        assert_eq!(entry.message, "value unused in fake target");
+        // source and code must survive so the diagnostic router can publish them.
+        assert_eq!(entry.source, Some("sc".to_string()));
+        assert_eq!(entry.code, Some(DiagnosticCode::String("E123".to_string())));
         assert!(fx
             .logs
             .lock()
