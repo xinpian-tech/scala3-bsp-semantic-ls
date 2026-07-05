@@ -31,15 +31,26 @@ pub fn path_to_uri(path: &Path) -> String {
     out
 }
 
-/// Inverse of [`path_to_uri`]. An optional authority component (`file://host/…`)
-/// is dropped; the path starts at its first `/`.
+/// Inverse of [`path_to_uri`], accepting the spellings `Path.of(URI.create(…))`
+/// does: the authority forms `file:///abs` and `file://host/abs` (the authority
+/// is dropped), and the single-slash `file:/abs` (no authority). Non-file
+/// schemes and pathless file URIs are rejected.
 pub fn uri_to_path(uri: &str) -> Result<PathBuf, String> {
     let rest = uri
-        .strip_prefix("file://")
+        .strip_prefix("file:")
         .ok_or_else(|| format!("not a file uri: {uri}"))?;
-    let path_part = match rest.find('/') {
-        Some(i) => &rest[i..],
-        None => return Err(format!("file uri has no path: {uri}")),
+    let path_part = if let Some(after_authority) = rest.strip_prefix("//") {
+        // Authority form: the path starts at the first `/` after `file://`
+        // (an empty authority for `file:///…`), and the authority is dropped.
+        match after_authority.find('/') {
+            Some(i) => &after_authority[i..],
+            None => return Err(format!("file uri has no path: {uri}")),
+        }
+    } else if rest.starts_with('/') {
+        // Single-slash form `file:/abs`: the path is the remainder verbatim.
+        rest
+    } else {
+        return Err(format!("file uri has no path: {uri}"));
     };
     let bytes = percent_decode(path_part)?;
     let s = String::from_utf8(bytes).map_err(|e| format!("bad utf8 in uri {uri}: {e}"))?;
@@ -122,6 +133,26 @@ mod tests {
     fn rejects_non_file_and_pathless_uris() {
         assert!(uri_to_path("https://example/x").is_err());
         assert!(uri_to_path("file://").is_err());
+        assert!(uri_to_path("file:").is_err());
+        assert!(uri_to_path("file://host").is_err());
+    }
+
+    #[test]
+    fn accepts_single_slash_file_uri_and_canonicalizes() {
+        // `file:/abs` (no authority) resolves the same absolute path as the
+        // three-slash `file:///abs`, matching `Path.of(URI.create(...))`.
+        assert_eq!(
+            uri_to_path("file:/tmp/a.scala").unwrap(),
+            PathBuf::from("/tmp/a.scala")
+        );
+        assert_eq!(
+            uri_to_path("file:/tmp/a.scala").unwrap(),
+            uri_to_path("file:///tmp/a.scala").unwrap()
+        );
+        // Decode + normalize + re-encode canonicalizes a single-slash `..`
+        // spelling to the three-slash form.
+        let p = normalize(&uri_to_path("file:/tmp/a/../a/B.scala").unwrap());
+        assert_eq!(path_to_uri(&p), "file:///tmp/a/B.scala");
     }
 
     #[test]

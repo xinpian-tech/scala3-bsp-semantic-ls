@@ -503,6 +503,28 @@ fn symbol_definition_prunes_with_a_percent_encoded_sourceroot() {
 }
 
 #[test]
+fn symbol_definition_prunes_with_single_slash_file_uri() {
+    let dir = TempDir::new("symdefslash");
+    let (ws, core_s, app_s, _dup_s) = build_def_workspace(&dir);
+    let orch = orchestrator(&dir, ws);
+    // Some clients spell the buffer uri with a single slash (`file:/…`) instead
+    // of `file:///…`; it must still resolve to the owning target and prune the
+    // disconnected duplicate rather than falling through to an unscoped lookup.
+    let single = file_uri(&app_s, "a/A.scala").replacen("file://", "file:", 1);
+    assert!(
+        single.starts_with("file:/") && !single.starts_with("file://"),
+        "expected a single-slash file uri: {single}"
+    );
+    let locs = orch.symbol_definition("pkg/S#", &single);
+    assert_eq!(
+        locs.len(),
+        1,
+        "single-slash from_uri must still prune to the visible (core) def"
+    );
+    assert_eq!(locs[0].uri, file_uri(&core_s, "c/S.scala"));
+}
+
+#[test]
 fn symbol_definition_normalizes_dotdot_spellings_in_from_uri() {
     let dir = TempDir::new("symdefdots");
     let (ws, core_s, app_s, _dup_s) = build_def_workspace(&dir);
