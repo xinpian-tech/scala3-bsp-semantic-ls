@@ -91,7 +91,11 @@ object PcHostAgent:
     val host = PcHost(
       runtime,
       FacadePcOps(buildFacade()),
-      generation => startLoanedThread(s"pc-dispatch-gen-$generation", generation)
+      // A recovery generation loans a fresh DISPATCH thread (worker role 0, like
+      // the boot dispatch lane); the generation identifies the Rust-side staged
+      // channel it will pick up, not the worker role. Passing the generation as
+      // the worker index would route it to the control worker and wedge boot.
+      generation => startLoanedThread(s"pc-dispatch-gen-$generation", 0)
     )
 
     val pc = PcVtable.allocate(arena)

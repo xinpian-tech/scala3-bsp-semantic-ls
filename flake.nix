@@ -91,6 +91,19 @@
           PC_HOST_AGENT_JAR = "${pcHostAgentJar}/pc-host-agent.jar";
           LS_PC_TARGET_CLASSPATH = "${scalaLibraryJar}:${scala3LibraryJar}";
         });
+
+        # The live dispatch-generation recovery check: same real JVM + assembly +
+        # classpath, but the test arms the Java fault hook (via IslandConfig) so a
+        # real completion wedges and the watchdog must recover through the real
+        # spawn_dispatch slot, then hit the generation cap → fatal.
+        pc-recovery-check = craneLib.cargoTest (rust.commonArgs // {
+          inherit (rust) cargoArtifacts;
+          cargoTestExtraArgs = "-p ls-jvm --test live_recovery";
+          nativeBuildInputs = [ jdk ];
+          LS_LIBJVM = "${jdk.home}/lib/server/libjvm.so";
+          PC_HOST_AGENT_JAR = "${pcHostAgentJar}/pc-host-agent.jar";
+          LS_PC_TARGET_CLASSPATH = "${scalaLibraryJar}:${scala3LibraryJar}";
+        });
         pc-host-agent-check = pkgs.runCommand "check-pc-host-agent"
           { nativeBuildInputs = [ jdk ]; } ''
           jar="${pcHostAgentJar}/pc-host-agent.jar"
@@ -125,6 +138,7 @@
           spike-boundary = spike-boundary-check;
           pc-host-agent = pc-host-agent-check;
           pc-boundary = pc-boundary-check;
+          pc-recovery = pc-recovery-check;
         };
 
         packages = {

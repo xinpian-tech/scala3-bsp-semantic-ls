@@ -37,6 +37,7 @@ final class FacadePcOps(facade: PcFacade) extends PcOps:
   def didChange(uri: String, text: String): Unit = facade.didChange(uri, text)
   def didClose(uri: String): Unit = facade.didClose(uri)
   def completion(uri: String, line: Int, character: Int): l.CompletionList =
+    TestFault.maybeWedgeCompletion(uri)
     facade.completion(uri, line, character)
   def completionItemResolve(targetId: String, item: l.CompletionItem, symbol: String): l.CompletionItem =
     facade.completionItemResolve(targetId, item, symbol)
@@ -52,3 +53,28 @@ final class FacadePcOps(facade: PcFacade) extends PcOps:
   def pluginStatus: PcPluginStatusReport = facade.pluginStatus
   def restartInstances(): Unit = facade.activeTargets.foreach(facade.restartTarget)
   def shutdown(): Unit = facade.shutdown()
+
+/** Test-only dispatch-lane fault injection, controlled by the
+  * `ls.pc.host.testFault` JVM system property (unset in production → a no-op).
+  *
+  * When set to `busyCompletion`, a completion whose URI carries the wedge marker
+  * enters a bounded, non-cooperative busy loop that ignores interrupts and a PC
+  * restart, so the Rust watchdog cannot free the dispatch lane cooperatively and
+  * must recover it by loaning a fresh dispatch generation. It exists to exercise
+  * that recovery path over the real embedded-JVM boundary; it is inert unless the
+  * property is explicitly set.
+  */
+object TestFault:
+  private final val Property = "ls.pc.host.testFault"
+  private final val BusyCompletion = "busyCompletion"
+  private final val WedgeUriMarker = "wedge"
+  // Long enough to outlast the watchdog's recovery window, bounded so a leaked
+  // (abandoned) dispatch thread cannot hang a test process forever.
+  private final val BusyLoopMillis = 60000L
+
+  def maybeWedgeCompletion(uri: String): Unit =
+    if BusyCompletion == System.getProperty(Property) && uri.toLowerCase.contains(WedgeUriMarker) then
+      val deadline = System.currentTimeMillis() + BusyLoopMillis
+      while System.currentTimeMillis() < deadline do
+        try Thread.sleep(20L)
+        catch case _: InterruptedException => () // non-cooperative: ignore interrupts

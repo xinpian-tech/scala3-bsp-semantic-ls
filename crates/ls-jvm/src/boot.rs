@@ -41,14 +41,15 @@ impl std::error::Error for BootError {}
 /// The exact VM options the plan mandates, in order: the agent (and any extra
 /// PC-host assembly) on the class path, native-access enabled for FFM, compact
 /// object headers, the workspace root (when known) so the island can find its
-/// per-workspace plugin config, and the `-javaagent` carrying the Rust vtable
-/// address as its argument. Pure string assembly, so it is unit-tested without
-/// booting a JVM.
+/// per-workspace plugin config, any caller-supplied extra `-D`/JVM options, and
+/// the `-javaagent` carrying the Rust vtable address as its argument. Pure
+/// string assembly, so it is unit-tested without booting a JVM.
 pub fn boot_options(
     agent_jar: &Path,
     extra_classpath: &[PathBuf],
     vtable_addr: usize,
     workspace_root: Option<&Path>,
+    extra_jvm_options: &[String],
 ) -> Vec<String> {
     let mut class_path = agent_jar.display().to_string();
     for entry in extra_classpath {
@@ -66,6 +67,9 @@ pub fn boot_options(
     if let Some(root) = workspace_root {
         options.push(format!("-Dls.pc.host.workspace={}", root.display()));
     }
+    // Caller-supplied JVM options (e.g. tuning flags, or a test fault property);
+    // kept before the agent so the `-javaagent` stays last.
+    options.extend(extra_jvm_options.iter().cloned());
     options.push(format!(
         "-javaagent:{}=0x{vtable_addr:x}",
         agent_jar.display()
@@ -140,7 +144,7 @@ mod tests {
 
     #[test]
     fn boot_options_are_exactly_the_plan_option_set() {
-        let opts = boot_options(Path::new("/opt/pc-host.jar"), &[], 0xdead_beef, None);
+        let opts = boot_options(Path::new("/opt/pc-host.jar"), &[], 0xdead_beef, None, &[]);
         assert_eq!(
             opts,
             vec![
@@ -159,6 +163,7 @@ mod tests {
             &[PathBuf::from("/b/pc.jar"), PathBuf::from("/c/x.jar")],
             0x10,
             None,
+            &[],
         );
         assert_eq!(opts[0], "-Djava.class.path=/a/agent.jar:/b/pc.jar:/c/x.jar");
         // The agent argument still points at the agent jar, not the extras.
@@ -172,6 +177,7 @@ mod tests {
             &[],
             0x20,
             Some(Path::new("/home/u/project")),
+            &[],
         );
         assert_eq!(
             opts,
@@ -181,6 +187,28 @@ mod tests {
                 "-XX:+UseCompactObjectHeaders".to_string(),
                 "-Dls.pc.host.workspace=/home/u/project".to_string(),
                 "-javaagent:/opt/pc-host.jar=0x20".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn extra_jvm_options_are_inserted_before_the_agent() {
+        let opts = boot_options(
+            Path::new("/opt/pc-host.jar"),
+            &[],
+            0x30,
+            Some(Path::new("/ws")),
+            &["-Dls.pc.host.testFault=busyCompletion".to_string()],
+        );
+        assert_eq!(
+            opts,
+            vec![
+                "-Djava.class.path=/opt/pc-host.jar".to_string(),
+                "--enable-native-access=ALL-UNNAMED".to_string(),
+                "-XX:+UseCompactObjectHeaders".to_string(),
+                "-Dls.pc.host.workspace=/ws".to_string(),
+                "-Dls.pc.host.testFault=busyCompletion".to_string(),
+                "-javaagent:/opt/pc-host.jar=0x30".to_string(),
             ]
         );
     }

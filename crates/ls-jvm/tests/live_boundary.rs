@@ -111,6 +111,7 @@ impl LiveIsland {
             agent_jar: &env.agent_jar,
             extra_classpath: &[],
             workspace_root: Some(workspace),
+            extra_jvm_options: &[],
             rendezvous_timeout: Duration::from_secs(30),
             max_abandoned_generations: 4,
             // Generous: the first query pays the one-time compiler warm-up.
@@ -240,6 +241,14 @@ fn hover_text(hover: &HoverResult) -> String {
     }
 }
 
+/// The resolution symbol a completion item carries in its `data` (mtags puts the
+/// SemanticDB symbol in `CompletionItem.data.symbol`), if present.
+fn resolution_symbol(item: &CompletionItem) -> Option<String> {
+    item.data
+        .as_deref()
+        .and_then(|data| json_str_field(data, "symbol"))
+}
+
 /// Extract a JSON string field's value from opaque `data` bytes (the completion
 /// item's `data` is canonical JSON carrying the resolution symbol).
 fn json_str_field(data: &[u8], field: &str) -> Option<String> {
@@ -283,23 +292,26 @@ fn live_island_answers_the_full_pc_operation_surface() {
         labels.len()
     );
 
-    // completion_resolve: resolve a real completion item using the symbol its
-    // `data` carries; the resolved item round-trips the codec and keeps its
-    // label (a live resolve executed over the boundary).
+    // completion_resolve: pick a completion item that carries a non-empty
+    // resolution `symbol` in its `data`, resolve it, and require a real
+    // enrichment (the PC fills in detail/documentation on resolve) in addition
+    // to label stability — not just an unchanged echo.
     let resolvable = completion
         .items
         .iter()
-        .find(|item| item.data.is_some())
-        .expect("at least one completion item carries resolution data");
-    let symbol = resolvable
-        .data
-        .as_deref()
-        .and_then(|data| json_str_field(data, "symbol"))
-        .unwrap_or_default();
+        .find(|item| resolution_symbol(item).is_some_and(|symbol| !symbol.is_empty()))
+        .expect("a completion item carrying a non-empty resolution symbol in its data");
+    let symbol = resolution_symbol(resolvable).expect("resolution symbol");
     let resolved = island.resolve(&symbol, resolvable);
     assert_eq!(
         resolved.label, resolvable.label,
-        "completion_resolve must return the same item, enriched"
+        "completion_resolve must return the same item"
+    );
+    let enriched = resolved.detail.as_deref().is_some_and(|d| !d.is_empty())
+        || resolved.documentation.is_some();
+    assert!(
+        enriched,
+        "completion_resolve must enrich the item with detail/documentation; got {resolved:?}"
     );
 
     // hover: on the `greet` application (line 8) → markup from the live compiler.

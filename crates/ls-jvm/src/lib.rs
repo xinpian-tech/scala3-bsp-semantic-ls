@@ -238,6 +238,9 @@ pub struct IslandConfig<'a> {
     /// `-Dls.pc.host.workspace` so the premain loads the per-workspace PC
     /// plugin config. `None` runs the island with config-less settings.
     pub workspace_root: Option<&'a Path>,
+    /// Extra `-D`/JVM options for the boot (tuning, or a test fault property).
+    /// Inserted before the `-javaagent`; empty for the ordinary boot.
+    pub extra_jvm_options: &'a [String],
     /// Deadline for the premain to complete `register_pc_vtable` + dispatch.
     pub rendezvous_timeout: Duration,
     /// Abandoned dispatch generations tolerated before the island is fatal.
@@ -263,6 +266,7 @@ pub fn boot_island(config: &IslandConfig) -> Result<Supervisor<VtableBackend>, B
         config.extra_classpath,
         vtable_addr,
         config.workspace_root,
+        config.extra_jvm_options,
     );
     boot::create_java_vm(config.libjvm, &options).map_err(BootError::Boot)?;
     wait_for_registration(config.rendezvous_timeout)?;
