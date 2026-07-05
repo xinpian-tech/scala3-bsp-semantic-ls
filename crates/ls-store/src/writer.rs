@@ -91,7 +91,7 @@ impl SegmentWriter {
         let symbol_index = serialize_symbol_index(data, &sorted_indices);
         let target_meta = serialize_target_meta(data);
         let symbol_meta = serialize_symbol_meta(data, &sorted_indices);
-        let search = serialize_search(data);
+        let search = serialize_search(data, &caller_to_sorted);
 
         let occurrence_count = ref_layout.doc_ord.len()
             + def_layout.doc_ord.len()
@@ -669,7 +669,7 @@ fn serialize_symbol_meta(data: &SegmentData, sorted_indices: &[usize]) -> Vec<u8
     buf.into_vec()
 }
 
-fn serialize_search(data: &SegmentData) -> Vec<u8> {
+fn serialize_search(data: &SegmentData, caller_to_sorted: &[i32]) -> Vec<u8> {
     let mut rows: Vec<&crate::data::SearchRow> = data.search_rows.iter().collect();
     rows.sort_by(|a, b| {
         a.normalized_name
@@ -682,7 +682,9 @@ fn serialize_search(data: &SegmentData) -> Vec<u8> {
         let (off, len) = push_str(&mut blob, &r.normalized_name);
         rowbuf.put_i32(off);
         rowbuf.put_i32(len);
-        rowbuf.put_i32(r.symbol_ord);
+        // Input `symbol_ord` is a caller ordinal; remap to the sorted on-disk
+        // ordinal so search rows resolve the same symbol as symbol-meta.bin.
+        rowbuf.put_i32(caller_to_sorted[r.symbol_ord as usize]);
         rowbuf.put_i32(0); // pad
     }
     let mut buf = LeBuf::with_capacity(16 + rows.len() * 16 + blob.len());

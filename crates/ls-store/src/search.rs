@@ -1,12 +1,12 @@
-//! Workspace-symbol search — a Rust port of `ls.sqlite.FuzzyRank` plus the
-//! deterministic, bounded query layer that replaces FTS5 bm25 (DEC-4).
+//! Workspace-symbol search — a Rust port of `ls.sqlite.FuzzyRank` plus a
+//! deterministic, bounded query layer over a segment's search section.
 //!
 //! [`normalize`] / [`initials`] / [`score`] mirror `FuzzyRank.scala` exactly.
 //! [`SearchIndex`] is built once from a [`SegmentReader`]: it resolves each
 //! `search.bin` row's symbol metadata (display / owner / package / kind /
-//! def-doc) and indexes the display/owner/package tokens, so
-//! [`SearchIndex::workspace_symbol_search`] can match multi-token queries across
-//! those fields and rank by the fuzzy tiers, while
+//! def-doc / def-target + persistent ids) and indexes the display/owner/package
+//! tokens, so [`SearchIndex::workspace_symbol_search`] can match multi-token
+//! queries across those fields and rank by the fuzzy tiers, while
 //! [`SearchIndex::workspace_symbol_name_exists`] answers exact-name membership.
 
 use std::collections::{HashMap, HashSet};
@@ -125,7 +125,9 @@ fn max_hump_hits(nq: &[char], nn: &[char], humps: &[bool]) -> Option<i32> {
     (res > NEG).then_some(res)
 }
 
-/// A resolved workspace-symbol hit.
+/// A resolved workspace-symbol hit. Carries the on-disk ordinals plus the
+/// persistent ids (`symbol_id` / `doc_id` / `target_id`) that mirror the Scala
+/// `WorkspaceSymbolHit` identity.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorkspaceSymbolHit {
     pub symbol_ord: u32,
@@ -135,6 +137,14 @@ pub struct WorkspaceSymbolHit {
     pub kind: i32,
     /// Defining document ordinal (`-1` = unknown).
     pub def_doc_ord: i32,
+    /// Defining target ordinal (`-1` = unknown).
+    pub def_target_ord: i32,
+    /// Persistent symbol id (from `symbol-index.bin`).
+    pub symbol_id: i64,
+    /// Persistent id of the defining document (`-1` = unknown).
+    pub doc_id: i64,
+    /// Persistent id of the defining target (`-1` = unknown).
+    pub target_id: i64,
 }
 
 struct Row {
@@ -144,6 +154,10 @@ struct Row {
     package_name: String,
     kind: i32,
     def_doc_ord: i32,
+    def_target_ord: i32,
+    symbol_id: i64,
+    doc_id: i64,
+    target_id: i64,
 }
 
 /// An in-memory workspace-symbol index built once from a segment.
@@ -204,6 +218,21 @@ impl SearchIndex {
                 continue;
             }
             let meta = reader.symbol_meta(sym as u32);
+            let view = reader.symbol_view(sym as u32);
+            // Resolve persistent ids, guarding the `-1`/unknown ordinals.
+            let doc_id = if meta.def_doc_ord >= 0 && (meta.def_doc_ord as u32) < reader.doc_count()
+            {
+                reader.doc_id_of(meta.def_doc_ord as u32)
+            } else {
+                -1
+            };
+            let target_id = if view.def_target_ord >= 0
+                && (view.def_target_ord as usize) < reader.target_count()
+            {
+                reader.target_id_of(view.def_target_ord as u32)
+            } else {
+                -1
+            };
             let row = rows.len() as u32;
             for field in [&meta.display, &meta.owner, &meta.package_name] {
                 for tok in field_tokens(field) {
@@ -228,6 +257,10 @@ impl SearchIndex {
                 package_name: meta.package_name,
                 kind: meta.kind,
                 def_doc_ord: meta.def_doc_ord,
+                def_target_ord: view.def_target_ord,
+                symbol_id: view.symbol_id,
+                doc_id,
+                target_id,
             });
         }
         tokens.sort();
@@ -331,6 +364,10 @@ impl SearchIndex {
             package_name: r.package_name.clone(),
             kind: r.kind,
             def_doc_ord: r.def_doc_ord,
+            def_target_ord: r.def_target_ord,
+            symbol_id: r.symbol_id,
+            doc_id: r.doc_id,
+            target_id: r.target_id,
         }
     }
 }

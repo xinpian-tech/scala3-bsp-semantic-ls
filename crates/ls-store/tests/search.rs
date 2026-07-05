@@ -204,6 +204,108 @@ fn no_match_and_empty_queries_return_empty() {
 }
 
 #[test]
+fn unsorted_input_resolves_correct_metadata_and_identity() {
+    // Caller order is Zeta then Alpha; on disk the symbol dictionary sorts to
+    // [Alpha, Zeta] and symbol-meta.bin is remapped with it. The search rows use
+    // CALLER ordinals, so unless the writer remaps them a search for "Alpha"
+    // resolves Zeta's metadata. Distinct doc/target ids prove full hit identity.
+    let symbols = vec![
+        SegmentSymbol {
+            semantic_symbol: "z/pkg/Zeta#".into(),
+            symbol_id: 200,
+            ref_group_ord: -1,
+            rename_group_ord: -1,
+            def_target_ord: 0,
+        },
+        SegmentSymbol {
+            semantic_symbol: "a/pkg/Alpha#".into(),
+            symbol_id: 201,
+            ref_group_ord: -1,
+            rename_group_ord: -1,
+            def_target_ord: 1,
+        },
+    ];
+    let meta = |display: &str, owner: &str, pkg: &str, kind: i32, doc: i32| SymbolMeta {
+        display: display.into(),
+        owner: owner.into(),
+        package_name: pkg.into(),
+        kind,
+        properties: 0,
+        def_packed_start: 0,
+        def_packed_end: 0,
+        def_doc_ord: doc,
+    };
+    let data = SegmentData {
+        docs: vec![
+            SegmentDoc {
+                uri: "file:///Z.scala".into(),
+                doc_id: 500,
+                epoch: 1,
+                target_ord: 0,
+                generated: false,
+                readonly: false,
+            },
+            SegmentDoc {
+                uri: "file:///A.scala".into(),
+                doc_id: 501,
+                epoch: 1,
+                target_ord: 1,
+                generated: false,
+                readonly: false,
+            },
+        ],
+        targets: vec![1000, 1001],
+        symbols,
+        ref_occurrences: vec![],
+        def_occurrences: vec![],
+        rename_occurrences: vec![],
+        rename_profiles: vec![],
+        doc_occurrences: vec![vec![], vec![]],
+        target_meta: vec![TargetMeta::default(), TargetMeta::default()],
+        // Parallel to caller symbols (Zeta, Alpha).
+        symbol_meta: vec![
+            meta("Zeta", "zowner", "z.pkg", 3, 0),
+            meta("Alpha", "aowner", "a.pkg", 5, 1),
+        ],
+        // Caller ordinals: Zeta = 0, Alpha = 1.
+        search_rows: vec![
+            SearchRow {
+                normalized_name: normalize("Zeta"),
+                symbol_ord: 0,
+            },
+            SearchRow {
+                normalized_name: normalize("Alpha"),
+                symbol_ord: 1,
+            },
+        ],
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = SegmentWriter::write(tmp.path(), 1, &data, 0).expect("write");
+    let reader = SegmentReader::open(&dir).expect("open");
+    let idx = reader.build_search_index();
+
+    let hits = idx.workspace_symbol_search("Alpha", 10);
+    assert_eq!(hits.len(), 1);
+    let h = &hits[0];
+    assert_eq!(h.display, "Alpha");
+    assert_eq!(h.owner, "aowner");
+    assert_eq!(h.package_name, "a.pkg");
+    assert_eq!(h.kind, 5);
+    // Full identity resolves to Alpha, not Zeta.
+    assert_eq!(h.symbol_id, 201);
+    assert_eq!(h.def_doc_ord, 1);
+    assert_eq!(h.doc_id, 501);
+    assert_eq!(h.def_target_ord, 1);
+    assert_eq!(h.target_id, 1001);
+    // symbol_ord is the on-disk (sorted) ordinal: Alpha sorts first.
+    assert_eq!(h.symbol_ord, 0);
+
+    // And membership resolves the same way.
+    assert!(idx.workspace_symbol_name_exists("Alpha"));
+    assert!(idx.workspace_symbol_name_exists("Zeta"));
+}
+
+#[test]
 fn fuzzy_candidate_pull_stays_bounded() {
     // More single-first-char candidates than the cap: the fuzzy pull must stop
     // at FUZZY_CANDIDATE_CAP rather than scan the whole corpus.

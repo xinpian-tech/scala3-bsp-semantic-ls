@@ -366,10 +366,12 @@ fn round_trip_all_record_shapes() {
     assert_eq!(r.symbol_meta(1), data.symbol_meta[0]);
     assert_eq!(r.symbol_meta(2), data.symbol_meta[2]);
 
-    // search.bin: rows sorted by normalized_name
+    // search.bin: rows sorted by normalized_name, and each row's caller
+    // symbol_ord remapped to the sorted on-disk ordinal (caller 0 "b/Foo#" -> 1,
+    // caller 1 "a/Bar." -> 0) so it resolves the same symbol as symbol-meta.bin.
     assert_eq!(r.search_row_count(), 2);
-    assert_eq!(r.search_row(0), ("bar".to_string(), 0));
-    assert_eq!(r.search_row(1), ("foo".to_string(), 1));
+    assert_eq!(r.search_row(0), ("bar".to_string(), 1)); // caller 0 -> sorted 1
+    assert_eq!(r.search_row(1), ("foo".to_string(), 0)); // caller 1 -> sorted 0
 }
 
 #[test]
