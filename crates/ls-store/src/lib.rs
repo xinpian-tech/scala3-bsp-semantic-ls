@@ -21,6 +21,7 @@ pub mod error;
 pub mod format;
 pub mod manifest;
 mod reader;
+pub mod search;
 mod snapshot;
 mod wire;
 pub mod workspace_state;
@@ -36,6 +37,7 @@ pub use reader::{
     BlockView, DocEntryView, DocRecord, GroupIndexView, GroupRecord, IntervalView, OccurrenceHit,
     SegmentReader, SymbolView,
 };
+pub use search::{SearchIndex, WorkspaceSymbolHit, FUZZY_CANDIDATE_CAP};
 pub use snapshot::{Failpoint, Snapshot, Store};
 pub use workspace_state::{WorkspaceState, STATE_VERSION};
 pub use writer::SegmentWriter;
