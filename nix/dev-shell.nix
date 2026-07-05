@@ -21,6 +21,9 @@ pkgs.mkShell {
     # protoc for the SemanticDB prost codegen; cbindgen for the C-ABI header.
     protobuf
     rust-cbindgen
+    # jextract generates the Java/Scala FFM bindings from the cbindgen C-ABI
+    # header (island boundary); used by the ls-pc-host island + the M0 spike.
+    jextract
   ];
 
   JAVA_HOME = "${jdk}";

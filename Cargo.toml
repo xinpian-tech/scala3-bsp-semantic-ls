@@ -13,5 +13,10 @@ repository = "https://github.com/xinpian-tech/scala3-bsp-smantic-ls"
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
 
+# Name the virtual workspace so crane derives stable derivation names instead of
+# emitting a placeholder-name warning (the root manifest has no [package]).
+[workspace.metadata.crane]
+name = "ls-workspace"
+
 [workspace.dependencies]
 proptest = "1"

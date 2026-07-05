@@ -180,6 +180,31 @@ object zaoziPcplugin extends ScalaModule {
   }
 }
 
+/** M0 embedded-JVM boundary-viability spike island.
+  *
+  * A Scala 3 premain agent (not an ls-* server layer, so it does NOT extend
+  * [[LsModule]]) that consumes the jextract-generated `spike.boundary` FFM
+  * bindings (regenerated from the Rust ABI by scripts/regen-spike-bindings.sh).
+  * Built as a `-javaagent` jar whose `premain` fires inside `JNI_CreateJavaVM`;
+  * the Rust `ls-jvm-spike` crate loads it to prove the FFM boundary end-to-end.
+  */
+object pcHostSpike extends ScalaModule {
+  override def moduleDir = super.moduleDir / os.up / "modules" / "ls-pc-host-spike"
+  def scalaVersion = Deps.scalaVer
+
+  override def javaHome = Task {
+    Task.env.get("JAVA_HOME").map(p => PathRef(os.Path(p), quick = true))
+  }
+
+  def scalacOptions = Seq("-deprecation", "-feature", "-unchecked")
+  def javacOptions = Seq("--release", "25")
+
+  // Loaded via -javaagent; the JVM invokes SpikeAgent.premain during VM init.
+  override def manifest = Task {
+    super.manifest().add("Premain-Class" -> "spike.SpikeAgent")
+  }
+}
+
 /** Benchmark + JFR harness. */
 object bench extends LsModule {
   def dirName = "ls-bench"

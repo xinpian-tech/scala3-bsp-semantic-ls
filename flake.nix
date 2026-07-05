@@ -40,6 +40,24 @@
         craneLib = crane.mkLib pkgs;
         rust = import ./nix/rust.nix { inherit pkgs craneLib; };
 
+        # M0 embedded-JVM boundary spike: the mill-built island agent jar plus an
+        # end-to-end check that boots the JVM through the crane-built spike binary
+        # and drives every boundary scenario (echo / containment / timeout).
+        spikeAgentJar = pkgs.callPackage ./nix/spike-agent.nix { inherit mill jdk; };
+        spike-boundary-check = pkgs.runCommand "check-spike-boundary"
+          { nativeBuildInputs = [ jdk ]; } ''
+          export LS_LIBJVM="${jdk.home}/lib/server/libjvm.so"
+          export SPIKE_AGENT_JAR="${spikeAgentJar}/spike-agent.jar"
+          bin="${rust.package}/bin/ls-jvm-spike"
+          for s in echo java-throw rust-panic timeout; do
+            echo "=== M0 boundary scenario: $s ==="
+            result=$("$bin" "$s")
+            echo "$result"
+            echo "$result" | grep -q "SPIKE_OK" || { echo "scenario $s did not report SPIKE_OK"; exit 1; }
+          done
+          touch $out
+        '';
+
         # The pinned zaozi source with our patches applied (SemanticDB emission,
         # which our SemanticDB-first server requires). Exposed to the dev shell
         # as ZAOZI_SRC so scripts/it-zaozi.sh builds a pinned, reproducible tree
@@ -59,7 +77,9 @@
 
         checks = (import ./nix/checks.nix {
           inherit pkgs jdk mill self;
-        }) // rust.checks;
+        }) // rust.checks // {
+          spike-boundary = spike-boundary-check;
+        };
 
         packages = {
           default = pkgs.callPackage ./nix/package.nix {
@@ -74,6 +94,8 @@
           inherit zaozi-src;
           # The crane-built Rust cargo workspace (crates/).
           rust-workspace = rust.package;
+          # The M0 spike island agent jar (-javaagent premain).
+          spike-agent-jar = spikeAgentJar;
         };
       }) // { inherit inputs; };
 }
