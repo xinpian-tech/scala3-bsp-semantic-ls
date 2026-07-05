@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Regenerate the island boundary bindings for the M0 spike:
+# Regenerate the island boundary bindings for the embedded-JVM boundary spike:
 #   Rust ABI  --cbindgen-->  boundary.h  --jextract-->  Scala/Java FFM bindings
 #
 # Run inside `nix develop` (provides cbindgen, jextract, and the JDK). The

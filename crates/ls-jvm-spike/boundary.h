@@ -28,8 +28,14 @@ typedef void (*PcDispatchLoopFn)(int32_t worker_index);
 
 // The Rust vtable handed to the premain (its address is the agent argument).
 // The island mirrors this layout through jextract-generated FFM bindings.
+//
+// `layout_canary` is a deterministic hash the island independently recomputes
+// from the ABI struct sizes/offsets at bootstrap; a mismatch means the two
+// sides disagree on the binary layout, and the island refuses to register (so
+// boot is refused).
 typedef struct RustVtable {
     uint64_t abi_version;
+    uint64_t layout_canary;
     LogFn log;
     RegisterPcVtableFn register_pc_vtable;
     PcDispatchLoopFn pc_dispatch_loop;

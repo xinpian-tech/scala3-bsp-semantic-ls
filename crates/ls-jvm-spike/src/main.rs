@@ -1,4 +1,4 @@
-//! Scenario driver for the M0 spike.
+//! Scenario driver for the embedded-JVM boundary spike.
 //!
 //! Each JVM-boot scenario runs in its own process (`JNI_CreateJavaVM` is a
 //! process-global singleton that cannot be re-created), so the integration
@@ -16,6 +16,7 @@ fn main() {
         "java-throw" => run_java_throw(),
         "rust-panic" => run_rust_panic(),
         "timeout" => run_timeout(),
+        "bad-canary" => run_bad_canary(),
         other => Err(format!("unknown scenario: {other:?}")),
     };
     match result {
@@ -59,7 +60,7 @@ fn boot(scenario: &str, rendezvous: Duration) -> Result<(), BootError> {
 /// Happy path: an echo payload round-trips on the loaned dispatch thread.
 fn run_echo() -> Result<String, String> {
     boot("normal", Duration::from_secs(15)).map_err(|e| e.to_string())?;
-    let payload = b"hello m0 boundary";
+    let payload = b"hello boundary echo";
     let echoed = ls_jvm_spike::echo(payload).map_err(|e| format!("echo failed: {e}"))?;
     if echoed == payload {
         Ok(format!(
@@ -115,6 +116,27 @@ fn run_timeout() -> Result<String, String> {
                 Err("timed out but captured no island log".to_string())
             } else {
                 Ok(format!("rendezvous timed out; island log: {island_log:?}"))
+            }
+        }
+        Err(other) => Err(format!("expected rendezvous timeout, got {other}")),
+    }
+}
+
+/// A perturbed layout canary makes the island refuse to register, so boot is
+/// refused (rendezvous timeout) with the mismatch recorded in the island log.
+fn run_bad_canary() -> Result<String, String> {
+    match boot("bad-canary", Duration::from_secs(3)) {
+        Ok(()) => Err("expected boot refusal on canary mismatch, but boot succeeded".to_string()),
+        Err(BootError::RendezvousTimeout { island_log }) => {
+            if island_log
+                .iter()
+                .any(|line| line.contains("canary mismatch"))
+            {
+                Ok("layout canary mismatch refused boot; island log recorded it".to_string())
+            } else {
+                Err(format!(
+                    "timed out but island log has no canary mismatch: {island_log:?}"
+                ))
             }
         }
         Err(other) => Err(format!("expected rendezvous timeout, got {other}")),

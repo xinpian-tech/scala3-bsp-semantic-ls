@@ -1,6 +1,6 @@
 [package]
 name = "ls-jvm-spike"
-description = "M0 boundary-viability spike: boot an embedded JVM via JNI_CreateJavaVM + an FFM premain, register a PC echo vtable on Java-loaned threads, and prove echo round-trip + Throwable/panic containment + rendezvous timeout — FFM only, zero JNIEnv, no jni crate."
+description = "Embedded-JVM boundary-viability spike: boot an embedded JVM via JNI_CreateJavaVM + an FFM premain, register a PC echo vtable on Java-loaned threads, and prove echo round-trip + Throwable/panic containment + rendezvous timeout + layout-canary refusal — FFM only, zero JNIEnv, no jni crate."
 version.workspace = true
 edition.workspace = true
 repository.workspace = true

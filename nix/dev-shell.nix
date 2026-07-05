@@ -22,7 +22,7 @@ pkgs.mkShell {
     protobuf
     rust-cbindgen
     # jextract generates the Java/Scala FFM bindings from the cbindgen C-ABI
-    # header (island boundary); used by the ls-pc-host island + the M0 spike.
+    # header (island boundary); used by the ls-pc-host island + the boundary spike.
     jextract
   ];
 

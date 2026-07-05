@@ -6,12 +6,13 @@ import java.nio.charset.StandardCharsets.UTF_8
 
 import spike.boundary.{EchoFn, LogFn, PcDispatchLoopFn, PcVtable, RegisterPcVtableFn, RustVtable, boundary_h}
 
-/** M0 boundary-viability island (Scala premain).
+/** Embedded-JVM boundary-viability island (Scala premain).
   *
   * Loaded via `-javaagent`, this premain fires inside `JNI_CreateJavaVM` (no
   * main class). Using Java FFM through the jextract-generated `spike.boundary`
   * bindings (no JNI, no JNIEnv), it reads the Rust vtable at the address passed
-  * as the agent argument, builds the echo upcall stub, registers a PC vtable,
+  * as the agent argument, recomputes the layout canary and refuses to register
+  * on a mismatch, otherwise builds the echo upcall stub, registers a PC vtable,
   * and loans two platform threads to Rust: they enter `pc_dispatch_loop` and
   * never return. The whole boundary is exercised end-to-end by the Rust spike.
   */
@@ -32,6 +33,18 @@ object SpikeAgent:
         System.err.println(s"[spike-agent] ABI mismatch rust=$abi java=$AbiVersion")
         return
       log(s"premain: FFM bindings ready, scenario=$scenario")
+
+      // Bootstrap layout-canary check: recompute the canary from this side's
+      // struct sizes/offsets and compare to the one the Rust side embedded. A
+      // mismatch means the two sides disagree on the binary layout, so refuse
+      // to register (boot is refused via the Rust rendezvous timeout).
+      val expectedCanary = RustVtable.layout_canary(vtable)
+      val computedCanary = layoutCanary()
+      if computedCanary != expectedCanary then
+        log(
+          f"layout canary mismatch: rust=0x$expectedCanary%016x island=0x$computedCanary%016x; refusing to register"
+        )
+        return
 
       if scenario == "timeout" then
         // Deliberately never register: exercise the Rust rendezvous timeout
@@ -100,3 +113,40 @@ object SpikeAgent:
     catch
       case t: Throwable =>
         System.err.println(s"[spike-agent] log failed: $t")
+
+  // FNV-1a (64-bit). Must stay byte-for-byte identical to the Rust side: the
+  // same nine layout facts, in the same order, hashed as little-endian u64s.
+  private val FnvOffset: Long = 0xcbf29ce484222325L
+  private val FnvPrime: Long = 0x100000001b3L
+
+  private def fnv1a(values: Array[Long]): Long =
+    var hash = FnvOffset
+    var i = 0
+    while i < values.length do
+      val value = values(i)
+      var b = 0
+      while b < 8 do
+        hash ^= (value >>> (b * 8)) & 0xffL
+        hash *= FnvPrime
+        b += 1
+      i += 1
+    hash
+
+  /** Recompute the boundary layout canary from this side's jextract
+    * sizes/offsets — the cross-language contract with `compute_layout_canary`
+    * in the Rust crate.
+    */
+  private def layoutCanary(): Long =
+    fnv1a(
+      Array[Long](
+        RustVtable.sizeof(),
+        RustVtable.`abi_version$offset`(),
+        RustVtable.`layout_canary$offset`(),
+        RustVtable.`log$offset`(),
+        RustVtable.`register_pc_vtable$offset`(),
+        RustVtable.`pc_dispatch_loop$offset`(),
+        PcVtable.sizeof(),
+        PcVtable.`abi_version$offset`(),
+        PcVtable.`echo$offset`()
+      )
+    )

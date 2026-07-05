@@ -58,3 +58,10 @@ fn rust_panic_is_contained() {
 fn rendezvous_timeout_reports_island_log() {
     check("timeout");
 }
+
+/// A perturbed layout canary makes the island refuse to register; boot is
+/// refused with the mismatch recorded in the island log.
+#[test]
+fn perturbed_layout_canary_refuses_boot() {
+    check("bad-canary");
+}

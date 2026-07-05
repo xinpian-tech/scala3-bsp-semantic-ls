@@ -180,7 +180,7 @@ object zaoziPcplugin extends ScalaModule {
   }
 }
 
-/** M0 embedded-JVM boundary-viability spike island.
+/** Embedded-JVM boundary-viability spike island.
   *
   * A Scala 3 premain agent (not an ls-* server layer, so it does NOT extend
   * [[LsModule]]) that consumes the jextract-generated `spike.boundary` FFM

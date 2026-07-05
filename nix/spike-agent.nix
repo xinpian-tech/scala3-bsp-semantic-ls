@@ -1,4 +1,4 @@
-# The M0 spike island agent jar (mill `pcHostSpike.assembly`).
+# The embedded-JVM boundary spike island agent jar (mill `pcHostSpike.assembly`).
 #
 # A self-contained `-javaagent` assembly (Scala premain + jextract FFM bindings
 # + scala-library) whose `premain` fires inside `JNI_CreateJavaVM`. Built offline
@@ -57,7 +57,7 @@ stdenvNoCC.mkDerivation {
   dontPatchELF = true;
 
   meta = {
-    description = "M0 embedded-JVM boundary spike island (-javaagent premain, FFM/jextract).";
+    description = "Embedded-JVM boundary spike island (-javaagent premain, FFM/jextract).";
     platforms = lib.platforms.linux;
   };
 }

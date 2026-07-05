@@ -16,6 +16,7 @@ import static java.lang.foreign.MemoryLayout.PathElement.*;
  * {@snippet lang=c :
  * struct RustVtable {
  *     uint64_t abi_version;
+ *     uint64_t layout_canary;
  *     LogFn log;
  *     RegisterPcVtableFn register_pc_vtable;
  *     PcDispatchLoopFn pc_dispatch_loop;
@@ -30,6 +31,7 @@ public class RustVtable {
 
     private static final GroupLayout $LAYOUT = MemoryLayout.structLayout(
         boundary_h.C_LONG.withName("abi_version"),
+        boundary_h.C_LONG.withName("layout_canary"),
         boundary_h.C_POINTER.withName("log"),
         boundary_h.C_POINTER.withName("register_pc_vtable"),
         boundary_h.C_POINTER.withName("pc_dispatch_loop")
@@ -84,6 +86,50 @@ public class RustVtable {
      */
     public static void abi_version(MemorySegment struct, long fieldValue) {
         struct.set(abi_version$LAYOUT, abi_version$OFFSET, fieldValue);
+    }
+
+    private static final OfLong layout_canary$LAYOUT = (OfLong)$LAYOUT.select(groupElement("layout_canary"));
+
+    /**
+     * Layout for field:
+     * {@snippet lang=c :
+     * uint64_t layout_canary
+     * }
+     */
+    public static final OfLong layout_canary$layout() {
+        return layout_canary$LAYOUT;
+    }
+
+    private static final long layout_canary$OFFSET = $LAYOUT.byteOffset(groupElement("layout_canary"));
+
+    /**
+     * Offset for field:
+     * {@snippet lang=c :
+     * uint64_t layout_canary
+     * }
+     */
+    public static final long layout_canary$offset() {
+        return layout_canary$OFFSET;
+    }
+
+    /**
+     * Getter for field:
+     * {@snippet lang=c :
+     * uint64_t layout_canary
+     * }
+     */
+    public static long layout_canary(MemorySegment struct) {
+        return struct.get(layout_canary$LAYOUT, layout_canary$OFFSET);
+    }
+
+    /**
+     * Setter for field:
+     * {@snippet lang=c :
+     * uint64_t layout_canary
+     * }
+     */
+    public static void layout_canary(MemorySegment struct, long fieldValue) {
+        struct.set(layout_canary$LAYOUT, layout_canary$OFFSET, fieldValue);
     }
 
     /**

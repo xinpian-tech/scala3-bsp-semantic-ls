@@ -1,11 +1,11 @@
-//! M0 embedded-JVM boundary-viability spike.
+//! Embedded-JVM boundary-viability spike.
 //!
 //! Boots an in-process JVM through the single JNI Invocation-API boot symbol,
 //! `JNI_CreateJavaVM`, resolved by `dlopen`/`dlsym` — no `jni` crate, no
 //! `jni.h`, no bindgen, and no JNIEnv usage. The three argument structs are the
 //! only JNI surface and are hand-declared `#[repr(C)]` below.
 //!
-//! What this proves (the M0 unknowns):
+//! What this proves (the boundary unknowns):
 //! * a `-javaagent` premain fires under `JNI_CreateJavaVM` with no main class;
 //! * the premain can build Java FFM downcalls from the raw Rust vtable address
 //!   and an upcall stub for a PC (echo) vtable, register it, and spawn platform
@@ -78,9 +78,15 @@ pub type EchoFn =
 
 /// The Rust vtable handed to the premain (its address is the agent argument).
 /// The island mirrors this layout through jextract-generated FFM bindings.
+///
+/// `layout_canary` is a deterministic hash the island independently recomputes
+/// from the ABI struct sizes/offsets at bootstrap; a mismatch means the two
+/// sides disagree on the binary layout, and the island refuses to register (so
+/// boot is refused).
 #[repr(C)]
 pub struct RustVtable {
     pub abi_version: u64,
+    pub layout_canary: u64,
     pub log: LogFn,
     pub register_pc_vtable: RegisterPcVtableFn,
     pub pc_dispatch_loop: PcDispatchLoopFn,
@@ -95,13 +101,63 @@ pub struct PcVtable {
 
 // The island reads slots at fixed offsets, so the layout must not drift.
 const _: () = {
-    assert!(std::mem::size_of::<RustVtable>() == 32);
+    assert!(std::mem::size_of::<RustVtable>() == 40);
     assert!(std::mem::size_of::<PcVtable>() == 16);
     assert!(std::mem::size_of::<*const c_void>() == 8);
 };
 
+/// FNV-1a (64-bit) offset basis and prime.
+const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+/// A deterministic canary over the boundary layout facts. The island recomputes
+/// the identical value from its jextract `sizeof()`/`$offset()` accessors, so
+/// the field order and hashing below are the cross-language contract: FNV-1a
+/// over nine `u64`s (little-endian bytes), in exactly this order.
+const fn compute_layout_canary() -> u64 {
+    let facts = [
+        std::mem::size_of::<RustVtable>() as u64,
+        std::mem::offset_of!(RustVtable, abi_version) as u64,
+        std::mem::offset_of!(RustVtable, layout_canary) as u64,
+        std::mem::offset_of!(RustVtable, log) as u64,
+        std::mem::offset_of!(RustVtable, register_pc_vtable) as u64,
+        std::mem::offset_of!(RustVtable, pc_dispatch_loop) as u64,
+        std::mem::size_of::<PcVtable>() as u64,
+        std::mem::offset_of!(PcVtable, abi_version) as u64,
+        std::mem::offset_of!(PcVtable, echo) as u64,
+    ];
+    let mut hash = FNV_OFFSET;
+    let mut i = 0;
+    while i < facts.len() {
+        let value = facts[i];
+        let mut byte = 0;
+        while byte < 8 {
+            hash ^= (value >> (byte * 8)) & 0xff;
+            hash = hash.wrapping_mul(FNV_PRIME);
+            byte += 1;
+        }
+        i += 1;
+    }
+    hash
+}
+
+/// The expected layout canary (a compile-time constant).
+const LAYOUT_CANARY: u64 = compute_layout_canary();
+
 static RUST_VTABLE: RustVtable = RustVtable {
     abi_version: ABI_VERSION,
+    layout_canary: LAYOUT_CANARY,
+    log: vt_log,
+    register_pc_vtable: vt_register_pc_vtable,
+    pc_dispatch_loop: vt_pc_dispatch_loop,
+};
+
+/// A vtable whose canary is deliberately perturbed while the layout itself is
+/// unchanged; the `bad-canary` scenario hands this to the premain to prove the
+/// island refuses to register on a layout-canary mismatch.
+static RUST_VTABLE_PERTURBED: RustVtable = RustVtable {
+    abi_version: ABI_VERSION,
+    layout_canary: LAYOUT_CANARY ^ 0x5bad_ca9a_5bad_ca9a,
     log: vt_log,
     register_pc_vtable: vt_register_pc_vtable,
     pc_dispatch_loop: vt_pc_dispatch_loop,
@@ -316,7 +372,14 @@ pub fn boot(
         job_rx: Mutex::new(Some(job_rx)),
     });
 
-    let vtable_addr = std::ptr::addr_of!(RUST_VTABLE) as usize;
+    // The `bad-canary` scenario hands the premain a vtable whose layout canary
+    // is perturbed (the layout is unchanged), so the island's recomputed canary
+    // disagrees and it refuses to register.
+    let vtable_addr = if scenario == "bad-canary" {
+        std::ptr::addr_of!(RUST_VTABLE_PERTURBED) as usize
+    } else {
+        std::ptr::addr_of!(RUST_VTABLE) as usize
+    };
     let agent_arg = format!("0x{vtable_addr:x}");
     boot_with_agent(libjvm, agent_jar, &agent_arg, scenario).map_err(BootError::Boot)?;
 
@@ -461,5 +524,16 @@ mod tests {
     #[test]
     fn vtable_abi_is_registered_version() {
         assert_eq!(RUST_VTABLE.abi_version, ABI_VERSION);
+    }
+
+    #[test]
+    fn layout_canary_is_stable_and_perturbable() {
+        // Deterministic and non-trivial.
+        assert_eq!(RUST_VTABLE.layout_canary, LAYOUT_CANARY);
+        assert_eq!(compute_layout_canary(), LAYOUT_CANARY);
+        assert_ne!(LAYOUT_CANARY, 0);
+        assert_ne!(LAYOUT_CANARY, FNV_OFFSET);
+        // The perturbed vtable used by the bad-canary scenario really differs.
+        assert_ne!(RUST_VTABLE_PERTURBED.layout_canary, LAYOUT_CANARY);
     }
 }

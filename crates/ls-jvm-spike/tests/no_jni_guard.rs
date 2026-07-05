@@ -1,4 +1,4 @@
-//! Repository hygiene guard: the M0 boundary must stay FFM-only.
+//! Repository hygiene guard: the embedded-JVM boundary must stay FFM-only.
 //!
 //! Fails if the spike ever grows a `jni` crate dependency, includes a JNI C
 //! header, or references a `JNIEnv` — i.e. anything beyond the single
