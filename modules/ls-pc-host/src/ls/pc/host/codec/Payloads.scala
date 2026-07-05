@@ -398,3 +398,463 @@ object Payloads:
         i += 1
       r.finish()
       PluginStatus(compilerPlugins.result(), servicePlugins.result(), disabled.result())
+
+  // -------------------------------------------------------------------------
+  // Completion / resolve / signature-help carriers (the resolved LSP4J 1.0.0
+  // field surface: e.g. CompletionItem.textEditText, Command.tooltip,
+  // CompletionList.applyKind). Opaque JSON fields (CompletionItem.data,
+  // Command.arguments, itemDefaults.data) are carried verbatim as bytes.
+  // -------------------------------------------------------------------------
+
+  private def writeOptStrList(w: Writer, list: Option[Seq[String]]): Unit = list match
+    case Some(items) =>
+      w.u32(1)
+      w.strList(items)
+    case None => w.u32(0)
+
+  private def readOptStrList(r: Reader): Option[Seq[String]] =
+    if r.u32() == 0 then None else Some(r.strList())
+
+  /** A documentation body (LSP4J `Either<String, MarkupContent>`). */
+  enum Documentation:
+    case Plain(value: String)
+    case Markup(content: MarkupContent)
+
+  object Documentation:
+    def writeOpt(w: Writer, doc: Option[Documentation]): Unit = doc match
+      case None => w.u32(0)
+      case Some(Documentation.Plain(s)) =>
+        w.u32(1)
+        w.str(s)
+      case Some(Documentation.Markup(m)) =>
+        w.u32(2)
+        MarkupContent.write(w, m)
+
+    def readOpt(r: Reader): Option[Documentation] = r.u32() match
+      case 0 => None
+      case 1 => Some(Documentation.Plain(r.str()))
+      case 2 => Some(Documentation.Markup(MarkupContent.read(r)))
+      case tag => throw CodecException(s"invalid documentation variant tag $tag")
+
+  /** A text edit (a range plus its replacement text). */
+  final case class TextEdit(range: Rng, newText: String)
+
+  object TextEdit:
+    def write(w: Writer, e: TextEdit): Unit =
+      Rng.write(w, e.range)
+      w.str(e.newText)
+
+    def read(r: Reader): TextEdit =
+      val range = Rng.read(r)
+      val newText = r.str()
+      TextEdit(range, newText)
+
+  /** An insert/replace completion edit (LSP4J `InsertReplaceEdit`). */
+  final case class InsertReplaceEdit(newText: String, insert: Rng, replace: Rng)
+
+  /** A completion item's edit (LSP4J `Either<TextEdit, InsertReplaceEdit>`). */
+  enum CompletionEdit:
+    case Plain(edit: TextEdit)
+    case InsertReplace(edit: InsertReplaceEdit)
+
+  object CompletionEdit:
+    def write(w: Writer, e: CompletionEdit): Unit = e match
+      case CompletionEdit.Plain(edit) =>
+        w.u32(0)
+        TextEdit.write(w, edit)
+      case CompletionEdit.InsertReplace(edit) =>
+        w.u32(1)
+        w.str(edit.newText)
+        Rng.write(w, edit.insert)
+        Rng.write(w, edit.replace)
+
+    def read(r: Reader): CompletionEdit = r.u32() match
+      case 0 => CompletionEdit.Plain(TextEdit.read(r))
+      case 1 =>
+        val newText = r.str()
+        val insert = Rng.read(r)
+        val replace = Rng.read(r)
+        CompletionEdit.InsertReplace(InsertReplaceEdit(newText, insert, replace))
+      case tag => throw CodecException(s"invalid completion edit variant tag $tag")
+
+  /** Additional label details (LSP4J `CompletionItemLabelDetails`). */
+  final case class LabelDetails(detail: Option[String], description: Option[String])
+
+  /** A completion item's `command` (LSP4J `Command`); `arguments` is the opaque
+    * serialized JSON argument array, carried verbatim.
+    */
+  final case class Command(
+      title: String,
+      tooltip: Option[String],
+      command: String,
+      arguments: Option[Seq[Byte]]
+  )
+
+  /** One completion item — the full resolved LSP4J 1.0.0 `CompletionItem` surface. */
+  final case class CompletionItem(
+      label: String,
+      labelDetails: Option[LabelDetails],
+      kind: Option[Int],
+      tags: Option[Seq[Int]],
+      detail: Option[String],
+      documentation: Option[Documentation],
+      deprecated: Option[Boolean],
+      preselect: Option[Boolean],
+      sortText: Option[String],
+      filterText: Option[String],
+      insertText: Option[String],
+      insertTextFormat: Option[Int],
+      insertTextMode: Option[Int],
+      textEdit: Option[CompletionEdit],
+      textEditText: Option[String],
+      additionalTextEdits: Option[Seq[TextEdit]],
+      commitCharacters: Option[Seq[String]],
+      command: Option[Command],
+      data: Option[Seq[Byte]]
+  ):
+    /** `completion_resolve` response (a single enriched item). */
+    def encode(): Array[Byte] =
+      val w = Writer()
+      CompletionItem.write(w, this)
+      w.finish(KindCompletionItem)
+
+  object CompletionItem:
+    def write(w: Writer, item: CompletionItem): Unit =
+      w.str(item.label)
+      item.labelDetails match
+        case Some(d) =>
+          w.u32(1)
+          w.optStr(d.detail)
+          w.optStr(d.description)
+        case None => w.u32(0)
+      w.optI32(item.kind)
+      item.tags match
+        case Some(tags) =>
+          w.u32(1)
+          w.u32(tags.length)
+          tags.foreach(w.i32)
+        case None => w.u32(0)
+      w.optStr(item.detail)
+      Documentation.writeOpt(w, item.documentation)
+      w.optBool(item.deprecated)
+      w.optBool(item.preselect)
+      w.optStr(item.sortText)
+      w.optStr(item.filterText)
+      w.optStr(item.insertText)
+      w.optI32(item.insertTextFormat)
+      w.optI32(item.insertTextMode)
+      item.textEdit match
+        case Some(edit) =>
+          w.u32(1)
+          CompletionEdit.write(w, edit)
+        case None => w.u32(0)
+      w.optStr(item.textEditText)
+      item.additionalTextEdits match
+        case Some(edits) =>
+          w.u32(1)
+          w.u32(edits.length)
+          edits.foreach(TextEdit.write(w, _))
+        case None => w.u32(0)
+      writeOptStrList(w, item.commitCharacters)
+      item.command match
+        case Some(c) =>
+          w.u32(1)
+          w.str(c.title)
+          w.optStr(c.tooltip)
+          w.str(c.command)
+          w.optBytes(c.arguments.map(_.toArray))
+        case None => w.u32(0)
+      w.optBytes(item.data.map(_.toArray))
+
+    def read(r: Reader): CompletionItem =
+      val label = r.str()
+      val labelDetails =
+        if r.u32() != 0 then
+          val detail = r.optStr()
+          val description = r.optStr()
+          Some(LabelDetails(detail, description))
+        else None
+      val kind = r.optI32()
+      val tags =
+        if r.u32() != 0 then
+          val n = r.count()
+          val b = Vector.newBuilder[Int]
+          var i = 0
+          while i < n do
+            b += r.i32()
+            i += 1
+          Some(b.result())
+        else None
+      val detail = r.optStr()
+      val documentation = Documentation.readOpt(r)
+      val deprecated = r.optBool()
+      val preselect = r.optBool()
+      val sortText = r.optStr()
+      val filterText = r.optStr()
+      val insertText = r.optStr()
+      val insertTextFormat = r.optI32()
+      val insertTextMode = r.optI32()
+      val textEdit = if r.u32() != 0 then Some(CompletionEdit.read(r)) else None
+      val textEditText = r.optStr()
+      val additionalTextEdits =
+        if r.u32() != 0 then
+          val n = r.count()
+          val b = Vector.newBuilder[TextEdit]
+          var i = 0
+          while i < n do
+            b += TextEdit.read(r)
+            i += 1
+          Some(b.result())
+        else None
+      val commitCharacters = readOptStrList(r)
+      val command =
+        if r.u32() != 0 then
+          val title = r.str()
+          val tooltip = r.optStr()
+          val cmd = r.str()
+          val arguments = r.optBytes().map(_.toSeq)
+          Some(Command(title, tooltip, cmd, arguments))
+        else None
+      val data = r.optBytes().map(_.toSeq)
+      CompletionItem(
+        label,
+        labelDetails,
+        kind,
+        tags,
+        detail,
+        documentation,
+        deprecated,
+        preselect,
+        sortText,
+        filterText,
+        insertText,
+        insertTextFormat,
+        insertTextMode,
+        textEdit,
+        textEditText,
+        additionalTextEdits,
+        commitCharacters,
+        command,
+        data
+      )
+
+    def decode(buf: Array[Byte]): CompletionItem =
+      val r = Reader(buf, KindCompletionItem)
+      val item = read(r)
+      r.finish()
+      item
+
+  /** A range or an insert/replace range pair (LSP4J completion-list
+    * `itemDefaults.editRange`).
+    */
+  enum EditRange:
+    case Range(range: Rng)
+    case InsertReplace(insert: Rng, replace: Rng)
+
+  object EditRange:
+    def writeOpt(w: Writer, editRange: Option[EditRange]): Unit = editRange match
+      case None => w.u32(0)
+      case Some(EditRange.Range(range)) =>
+        w.u32(1)
+        Rng.write(w, range)
+      case Some(EditRange.InsertReplace(insert, replace)) =>
+        w.u32(2)
+        Rng.write(w, insert)
+        Rng.write(w, replace)
+
+    def readOpt(r: Reader): Option[EditRange] = r.u32() match
+      case 0 => None
+      case 1 => Some(EditRange.Range(Rng.read(r)))
+      case 2 =>
+        val insert = Rng.read(r)
+        val replace = Rng.read(r)
+        Some(EditRange.InsertReplace(insert, replace))
+      case tag => throw CodecException(s"invalid edit range variant tag $tag")
+
+  /** Completion-list defaults (LSP4J `CompletionItemDefaults`). */
+  final case class CompletionItemDefaults(
+      commitCharacters: Option[Seq[String]],
+      editRange: Option[EditRange],
+      insertTextFormat: Option[Int],
+      insertTextMode: Option[Int],
+      data: Option[Seq[Byte]]
+  )
+
+  object CompletionItemDefaults:
+    def write(w: Writer, d: CompletionItemDefaults): Unit =
+      writeOptStrList(w, d.commitCharacters)
+      EditRange.writeOpt(w, d.editRange)
+      w.optI32(d.insertTextFormat)
+      w.optI32(d.insertTextMode)
+      w.optBytes(d.data.map(_.toArray))
+
+    def read(r: Reader): CompletionItemDefaults =
+      val commitCharacters = readOptStrList(r)
+      val editRange = EditRange.readOpt(r)
+      val insertTextFormat = r.optI32()
+      val insertTextMode = r.optI32()
+      val data = r.optBytes().map(_.toSeq)
+      CompletionItemDefaults(commitCharacters, editRange, insertTextFormat, insertTextMode, data)
+
+  /** How a `CompletionList` applies its `itemDefaults` (LSP4J `CompletionApplyKind`). */
+  final case class CompletionApplyKind(commitCharacters: Option[Int], data: Option[Int])
+
+  object CompletionApplyKind:
+    def writeOpt(w: Writer, applyKind: Option[CompletionApplyKind]): Unit = applyKind match
+      case Some(k) =>
+        w.u32(1)
+        w.optI32(k.commitCharacters)
+        w.optI32(k.data)
+      case None => w.u32(0)
+
+    def readOpt(r: Reader): Option[CompletionApplyKind] =
+      if r.u32() == 0 then None
+      else
+        val commitCharacters = r.optI32()
+        val data = r.optI32()
+        Some(CompletionApplyKind(commitCharacters, data))
+
+  /** A completion response list (LSP4J `CompletionList`). An empty `items` is a
+    * real empty list (distinct from a null hover / prepare-rename).
+    */
+  final case class CompletionList(
+      isIncomplete: Boolean,
+      itemDefaults: Option[CompletionItemDefaults],
+      applyKind: Option[CompletionApplyKind],
+      items: Seq[CompletionItem]
+  ):
+    def encode(): Array[Byte] =
+      val w = Writer()
+      w.bool32(isIncomplete)
+      itemDefaults match
+        case Some(d) =>
+          w.u32(1)
+          CompletionItemDefaults.write(w, d)
+        case None => w.u32(0)
+      CompletionApplyKind.writeOpt(w, applyKind)
+      w.u32(items.length)
+      items.foreach(CompletionItem.write(w, _))
+      w.finish(KindCompletionList)
+
+  object CompletionList:
+    def decode(buf: Array[Byte]): CompletionList =
+      val r = Reader(buf, KindCompletionList)
+      val isIncomplete = r.bool32()
+      val itemDefaults = if r.u32() != 0 then Some(CompletionItemDefaults.read(r)) else None
+      val applyKind = CompletionApplyKind.readOpt(r)
+      val n = r.count()
+      val items = Vector.newBuilder[CompletionItem]
+      var i = 0
+      while i < n do
+        items += CompletionItem.read(r)
+        i += 1
+      r.finish()
+      CompletionList(isIncomplete, itemDefaults, applyKind, items.result())
+
+  /** `completion_resolve` params (mirrors `PcWorkerResolveParams`). */
+  final case class ResolveParams(targetId: String, symbol: String, item: CompletionItem):
+    def encode(): Array[Byte] =
+      val w = Writer()
+      w.str(targetId)
+      w.str(symbol)
+      CompletionItem.write(w, item)
+      w.finish(KindResolveParams)
+
+  object ResolveParams:
+    def decode(buf: Array[Byte]): ResolveParams =
+      val r = Reader(buf, KindResolveParams)
+      val targetId = r.str()
+      val symbol = r.str()
+      val item = CompletionItem.read(r)
+      r.finish()
+      ResolveParams(targetId, symbol, item)
+
+  /** A parameter label (LSP4J `Either<String, Tuple.Two<Integer, Integer>>`). */
+  enum ParameterLabel:
+    case Str(value: String)
+    case Offsets(start: Int, end: Int)
+
+  object ParameterLabel:
+    def write(w: Writer, l: ParameterLabel): Unit = l match
+      case ParameterLabel.Str(s) =>
+        w.u32(0)
+        w.str(s)
+      case ParameterLabel.Offsets(start, end) =>
+        w.u32(1)
+        w.u32(start)
+        w.u32(end)
+
+    def read(r: Reader): ParameterLabel = r.u32() match
+      case 0 => ParameterLabel.Str(r.str())
+      case 1 =>
+        val start = r.u32()
+        val end = r.u32()
+        ParameterLabel.Offsets(start, end)
+      case tag => throw CodecException(s"invalid parameter label variant tag $tag")
+
+  /** One parameter of a signature (LSP4J `ParameterInformation`). */
+  final case class ParameterInfo(label: ParameterLabel, documentation: Option[Documentation])
+
+  /** One signature (LSP4J `SignatureInformation`). */
+  final case class SignatureInfo(
+      label: String,
+      documentation: Option[Documentation],
+      parameters: Option[Seq[ParameterInfo]],
+      activeParameter: Option[Int]
+  )
+
+  /** A signature-help response (LSP4J `SignatureHelp`). */
+  final case class SignatureHelp(
+      signatures: Seq[SignatureInfo],
+      activeSignature: Option[Int],
+      activeParameter: Option[Int]
+  ):
+    def encode(): Array[Byte] =
+      val w = Writer()
+      w.u32(signatures.length)
+      signatures.foreach { sig =>
+        w.str(sig.label)
+        Documentation.writeOpt(w, sig.documentation)
+        sig.parameters match
+          case Some(params) =>
+            w.u32(1)
+            w.u32(params.length)
+            params.foreach { p =>
+              ParameterLabel.write(w, p.label)
+              Documentation.writeOpt(w, p.documentation)
+            }
+          case None => w.u32(0)
+        w.optI32(sig.activeParameter)
+      }
+      w.optI32(activeSignature)
+      w.optI32(activeParameter)
+      w.finish(KindSignatureHelp)
+
+  object SignatureHelp:
+    def decode(buf: Array[Byte]): SignatureHelp =
+      val r = Reader(buf, KindSignatureHelp)
+      val sigCount = r.count()
+      val signatures = Vector.newBuilder[SignatureInfo]
+      var i = 0
+      while i < sigCount do
+        val label = r.str()
+        val documentation = Documentation.readOpt(r)
+        val parameters =
+          if r.u32() != 0 then
+            val paramCount = r.count()
+            val params = Vector.newBuilder[ParameterInfo]
+            var j = 0
+            while j < paramCount do
+              val paramLabel = ParameterLabel.read(r)
+              val paramDoc = Documentation.readOpt(r)
+              params += ParameterInfo(paramLabel, paramDoc)
+              j += 1
+            Some(params.result())
+          else None
+        val activeParameter = r.optI32()
+        signatures += SignatureInfo(label, documentation, parameters, activeParameter)
+        i += 1
+      val activeSignature = r.optI32()
+      val activeParameter = r.optI32()
+      r.finish()
+      SignatureHelp(signatures.result(), activeSignature, activeParameter)

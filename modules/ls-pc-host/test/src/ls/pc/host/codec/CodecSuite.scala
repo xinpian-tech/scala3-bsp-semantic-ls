@@ -156,6 +156,158 @@ class CodecSuite extends munit.FunSuite:
       PluginStatus.decode
     )
 
+  // ---- LSP4J-carrier payloads (completion / resolve / signature help). ----
+
+  private def itemFull: CompletionItem =
+    CompletionItem(
+      "map",
+      Some(LabelDetails(Some("[B]"), None)),
+      Some(2),
+      Some(Seq(1)),
+      Some("def map"),
+      Some(Documentation.Markup(MarkupContent("markdown", "maps"))),
+      Some(false),
+      Some(true),
+      Some("00"),
+      Some("map"),
+      None,
+      Some(2),
+      Some(1),
+      Some(CompletionEdit.InsertReplace(InsertReplaceEdit("map()", Rng(1, 2, 1, 2), Rng(1, 2, 1, 5)))),
+      Some("map()"),
+      Some(Seq(TextEdit(Rng(0, 0, 0, 0), "import x\n"))),
+      Some(Seq(".")),
+      Some(Command("trigger", Some("tip"), "editor.action", Some(Seq[Byte](0x7b, 0x7d)))),
+      Some(Seq[Byte](1, 2, 3))
+    )
+
+  private def itemPlain: CompletionItem =
+    CompletionItem(
+      "id",
+      None,
+      None,
+      None,
+      None,
+      Some(Documentation.Plain("plain doc")),
+      None,
+      None,
+      None,
+      None,
+      Some("id"),
+      None,
+      None,
+      Some(CompletionEdit.Plain(TextEdit(Rng(3, 0, 3, 2), "id"))),
+      None,
+      None,
+      None,
+      None,
+      None
+    )
+
+  private def itemNone: CompletionItem =
+    CompletionItem(
+      "",
+      None,
+      None,
+      None,
+      None,
+      None,
+      None,
+      None,
+      None,
+      None,
+      None,
+      None,
+      None,
+      None,
+      None,
+      None,
+      None,
+      None,
+      None
+    )
+
+  test("a fully-populated completion item (all 1.0.0 fields) round-trips"):
+    parity("completion_item_full", itemFull, _.encode(), CompletionItem.decode)
+
+  test("a completion item with a plain text edit and plain documentation round-trips"):
+    parity("completion_item_plain", itemPlain, _.encode(), CompletionItem.decode)
+
+  test("a bare completion item (all optionals absent) round-trips"):
+    parity("completion_item_none", itemNone, _.encode(), CompletionItem.decode)
+
+  test("a completion list with defaults, apply-kind, and items round-trips"):
+    parity(
+      "completion_list",
+      CompletionList(
+        isIncomplete = true,
+        Some(
+          CompletionItemDefaults(
+            Some(Seq(".", ",")),
+            Some(EditRange.InsertReplace(Rng(1, 0, 1, 0), Rng(1, 0, 1, 4))),
+            Some(2),
+            None,
+            Some(Seq[Byte](9))
+          )
+        ),
+        Some(CompletionApplyKind(Some(1), None)),
+        Seq(itemFull, itemNone)
+      ),
+      _.encode(),
+      CompletionList.decode
+    )
+
+  test("an empty completion list round-trips (empty items distinct from null)"):
+    parity(
+      "completion_list_empty",
+      CompletionList(isIncomplete = false, None, None, Seq.empty),
+      _.encode(),
+      CompletionList.decode
+    )
+
+  test("resolve params (an item to enrich) round-trips"):
+    parity(
+      "resolve_params",
+      ResolveParams("t1", "a/B#map().", itemPlain),
+      _.encode(),
+      ResolveParams.decode
+    )
+
+  test("signature help (both parameter-label variants, docs) round-trips"):
+    parity(
+      "signature_help",
+      SignatureHelp(
+        Seq(
+          SignatureInfo(
+            "def f(x: Int): Int",
+            Some(Documentation.Plain("f doc")),
+            Some(
+              Seq(
+                ParameterInfo(ParameterLabel.Str("x: Int"), None),
+                ParameterInfo(
+                  ParameterLabel.Offsets(6, 12),
+                  Some(Documentation.Markup(MarkupContent("markdown", "the arg")))
+                )
+              )
+            ),
+            Some(0)
+          )
+        ),
+        Some(0),
+        Some(1)
+      ),
+      _.encode(),
+      SignatureHelp.decode
+    )
+
+  test("an empty signature help round-trips"):
+    parity(
+      "signature_help_empty",
+      SignatureHelp(Seq.empty, None, None),
+      _.encode(),
+      SignatureHelp.decode
+    )
+
   // ---- Malformed buffers decode to a typed error, never a crash. ----
 
   test("a bad envelope magic is a typed decode error"):
@@ -190,3 +342,18 @@ class CodecSuite extends munit.FunSuite:
     w.u32(0) // origin
     val buf = w.finish(Payloads.KindLocations)
     intercept[CodecException](LocationsResult.decode(buf))
+
+  test("a required string with invalid UTF-8 is a typed decode error"):
+    // Reject malformed UTF-8 like Rust's str::from_utf8, not substitute U+FFFD.
+    val w = Codec.Writer()
+    w.str("y")
+    val buf = w.finish(0x7fffffff)
+    buf(buf.length - 1) = 0xff.toByte // corrupt the "y" blob byte (0xff is never valid UTF-8)
+    intercept[CodecException](Codec.Reader(buf, 0x7fffffff).str())
+
+  test("an optional string with invalid UTF-8 is a typed decode error"):
+    val w = Codec.Writer()
+    w.optStr(Some("y"))
+    val buf = w.finish(0x7fffffff)
+    buf(buf.length - 1) = 0xff.toByte
+    intercept[CodecException](Codec.Reader(buf, 0x7fffffff).optStr())

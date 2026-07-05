@@ -1,6 +1,8 @@
 package ls.pc.host.codec
 
 import java.io.ByteArrayOutputStream
+import java.nio.ByteBuffer
+import java.nio.charset.{CharacterCodingException, CodingErrorAction}
 import java.nio.charset.StandardCharsets.UTF_8
 
 /** A payload failed to decode (or encode). The boundary maps this to a typed
@@ -172,7 +174,14 @@ object Codec:
       val end = offset + len
       if offset < 0 || len < 0 || end < 0 || end > blobLen then
         throw CodecException("blob slice out of range")
-      String(buf, blobStart + offset, len, UTF_8)
+      // Strict decode: reject malformed UTF-8 with a typed error, matching the
+      // Rust `str::from_utf8` contract, rather than substituting U+FFFD as the
+      // `String(bytes, UTF_8)` constructor silently would.
+      val decoder = UTF_8.newDecoder()
+        .onMalformedInput(CodingErrorAction.REPORT)
+        .onUnmappableCharacter(CodingErrorAction.REPORT)
+      try decoder.decode(ByteBuffer.wrap(buf, blobStart + offset, len)).toString
+      catch case _: CharacterCodingException => throw CodecException("blob string is not valid UTF-8")
 
     private def blobBytes(offset: Int, len: Int): Array[Byte] =
       val end = offset + len
