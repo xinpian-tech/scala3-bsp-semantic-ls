@@ -189,6 +189,10 @@ object PcHostAgent:
     val pluginManager = PcPluginManager(
       PcPluginInitContext(settings.workspaceRoot, settings.generatedSourcesRoot, m => log(s"pc-plugin: $m"))
     )
+    // Load `<root>/.scala3-bsp-semantic-ls/pc-plugins.json` (compiler + service
+    // plugins) into the manager before the facade reads it, matching the
+    // retained worker; a bad config is logged, not fatal.
+    settings.workspaceRoot.foreach(root => PcHostConfig.applyWorkspacePlugins(pluginManager, root, log))
     PcFacade(pluginManager, settings)
 
   /** Runs an upcall body, containing any Java `Throwable` to a status code so it

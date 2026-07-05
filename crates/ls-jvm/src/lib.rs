@@ -234,6 +234,10 @@ pub struct IslandConfig<'a> {
     pub agent_jar: &'a Path,
     /// Any additional class-path entries (the PC-host assembly).
     pub extra_classpath: &'a [PathBuf],
+    /// The workspace root, when the LS runs inside one; handed to the island as
+    /// `-Dls.pc.host.workspace` so the premain loads the per-workspace PC
+    /// plugin config. `None` runs the island with config-less settings.
+    pub workspace_root: Option<&'a Path>,
     /// Deadline for the premain to complete `register_pc_vtable` + dispatch.
     pub rendezvous_timeout: Duration,
     /// Abandoned dispatch generations tolerated before the island is fatal.
@@ -254,7 +258,12 @@ pub struct IslandConfig<'a> {
 /// the private stdout for the protocol stream.
 pub fn boot_island(config: &IslandConfig) -> Result<Supervisor<VtableBackend>, BootError> {
     let vtable_addr = std::ptr::addr_of!(RUST_VTABLE) as usize;
-    let options = boot::boot_options(config.agent_jar, config.extra_classpath, vtable_addr);
+    let options = boot::boot_options(
+        config.agent_jar,
+        config.extra_classpath,
+        vtable_addr,
+        config.workspace_root,
+    );
     boot::create_java_vm(config.libjvm, &options).map_err(BootError::Boot)?;
     wait_for_registration(config.rendezvous_timeout)?;
 
