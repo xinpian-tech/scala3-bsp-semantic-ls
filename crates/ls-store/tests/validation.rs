@@ -181,6 +181,61 @@ fn negative_record_count_rejected() {
     }));
 }
 
+#[test]
+fn zeroed_block_target_words_rejected() {
+    let (_t, dir) = write_base();
+    // block-index.bin: block0 target_words lane (base 16, field @ +40 = 56) → 0.
+    // A filtered scan would otherwise skip the real record.
+    assert_structural(recorrupt(&dir, "block-index.bin", |b| {
+        b[56..64].copy_from_slice(&0u64.to_le_bytes())
+    }));
+}
+
+#[test]
+fn corrupted_block_editable_count_rejected() {
+    let (_t, dir) = write_base();
+    // block-index.bin: block0 editable_count (base 16, field @ +12 = 28) → 5
+    // (the real record is not editable, so recompute expects 0).
+    assert_structural(recorrupt(&dir, "block-index.bin", |b| {
+        b[28..32].copy_from_slice(&5i32.to_le_bytes())
+    }));
+}
+
+#[test]
+fn corrupted_interval_first_line_rejected() {
+    let (_t, dir) = write_base();
+    // doc-index.bin: interval0 first_line (interval_base 24+3*48=168, @ +0).
+    assert_structural(recorrupt(&dir, "doc-index.bin", |b| {
+        b[168..172].copy_from_slice(&99i32.to_le_bytes())
+    }));
+}
+
+#[test]
+fn corrupted_interval_last_line_rejected() {
+    let (_t, dir) = write_base();
+    // doc-index.bin: interval0 last_line (@ 168 + 4 = 172) → 0 (real is 1); a
+    // too-low last_line would make symbol_at skip the block.
+    assert_structural(recorrupt(&dir, "doc-index.bin", |b| {
+        b[172..176].copy_from_slice(&0i32.to_le_bytes())
+    }));
+}
+
+#[test]
+fn checksums_negative_name_len_rejected_without_panic() {
+    let (_t, dir) = write_base();
+    // checksums.bin is not itself checksummed: mutate its first entry's name_len
+    // (@ offset 8) to -1. `verify_checksums` must reject, not overflow/panic.
+    let cpath = dir.join("checksums.bin");
+    let mut c = std::fs::read(&cpath).unwrap();
+    c[8..12].copy_from_slice(&(-1i32).to_le_bytes());
+    std::fs::write(&cpath, &c).unwrap();
+    match SegmentReader::open(&dir) {
+        Err(SegmentError::ChecksumListMismatch { .. }) => {}
+        Err(other) => panic!("expected ChecksumListMismatch, got {other:?}"),
+        Ok(_) => panic!("expected rejection, but the segment opened"),
+    }
+}
+
 // ---- writer input validation ----
 
 fn expect_invalid(data: &SegmentData) {

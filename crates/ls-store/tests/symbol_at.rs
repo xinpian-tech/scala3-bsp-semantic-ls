@@ -145,6 +145,27 @@ fn naive(raw: &[(i32, u32, u32, u32, u32)], line: u32, ch: u32) -> Option<i32> {
 }
 
 #[test]
+fn high_line_positions_use_unsigned_packed_order() {
+    // Lines >= 524288 make `line << 12` exceed 2^31, so the packed position has
+    // its sign bit set. A wide low-start occurrence (packed_start 0) precedes a
+    // narrow high-line one on disk; signed comparison would break-early at the
+    // first record and miss the real smallest hit.
+    let (_t, r) = segment(
+        vec![vec![
+            dococc(0, 0, 0, 600_000, 5, 0),        // spans down to a high line
+            dococc(1, 524_288, 0, 524_288, 10, 0), // narrow, on line 524288
+        ]],
+        2,
+    );
+    let hit = r.symbol_at(0, 524_288, 5).expect("covering hit");
+    assert_eq!(hit.symbol_ord, 1); // the narrow high-line occurrence wins
+    assert_eq!(hit.span, Span::new(524_288, 0, 524_288, 10));
+    // The wide occurrence still wins where the narrow one does not cover.
+    assert_eq!(r.symbol_at(0, 524_288, 20).unwrap().symbol_ord, 0);
+    assert_eq!(r.symbol_at(0, 300_000, 0).unwrap().symbol_ord, 0);
+}
+
+#[test]
 fn bruteforce_matches_naive_scan() {
     // Overlapping, nested, single-point, and multi-line occurrences.
     let raw: Vec<(i32, u32, u32, u32, u32)> = vec![

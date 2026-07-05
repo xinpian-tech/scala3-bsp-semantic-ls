@@ -383,7 +383,7 @@ byte  blob[blob_length]
 `sym_props` bits), `def_packed_start` (int32), `def_packed_end` (int32),
 `def_doc_ord` (int32, `-1` = unknown), pad (int32 = 0).
 
-### search.bin (fuzzy-search plumbing; ranking filled by task6)
+### search.bin (fuzzy-search plumbing; ranking filled by the search-ranking layer)
 
 ```
 int64 row_count              // rows sorted by normalized_name (UTF-8 bytes)
@@ -393,8 +393,9 @@ byte  name_blob[name_blob_length]
 ```
 
 `SearchRow` (16 bytes): `normalized_name` (str ref, 8), `symbol_ord` (int32),
-pad (int32 = 0). task4 writes and validates this section (empty is valid); the
-FuzzyRank scoring and initials table land in task6.
+pad (int32 = 0). The segment layer writes and validates this section (empty is
+valid); the FuzzyRank scoring and initials table are added by the
+search-ranking layer.
 
 ## Open-time validation (implemented by `ls.postings.SegmentReader.open`)
 

@@ -614,7 +614,10 @@ impl SegmentReader {
             return (None, 0);
         }
 
-        let query = Span::pack(line, character) as i32;
+        // Packed positions are `u32` and must be compared unsigned: `line << 12`
+        // exceeds 2^31 for lines >= 524288, so signed comparison would misorder
+        // them. Line numbers (< 2^20) stay `i32`.
+        let query = Span::pack(line, character);
         let line = line as i32;
         let dp = self.file(DOC_POSTINGS);
         let n = read_i64(dp, 0).unwrap();
@@ -625,7 +628,7 @@ impl SegmentReader {
         let interval_base = 24 + self.doc_count as usize * format::DOC_ENTRY_SIZE;
 
         let mut blocks_scanned = 0u32;
-        let mut best: Option<(i32, i32, i32, i32)> = None; // (packed_start, packed_end, sym, flags)
+        let mut best: Option<(u32, u32, i32, i32)> = None; // (packed_start, packed_end, sym, flags)
         for b in 0..interval_count {
             let ie = interval_base + (interval_first + b) as usize * format::INTERVAL_ENTRY_SIZE;
             let first_line = read_i32(di, ie).unwrap();
@@ -641,11 +644,11 @@ impl SegmentReader {
             let rec_count = read_i32(di, ie + 16).unwrap() as i64;
             for k in 0..rec_count {
                 let r = rec_first + k;
-                let ps = read_i32(dp, (col_start + 4 * r) as usize).unwrap();
+                let ps = read_u32(dp, (col_start + 4 * r) as usize).unwrap();
                 if ps > query {
                     break; // records are sorted by packed_start
                 }
-                let pe = read_i32(dp, (col_end + 4 * r) as usize).unwrap();
+                let pe = read_u32(dp, (col_end + 4 * r) as usize).unwrap();
                 if pe >= query {
                     let size = pe - ps;
                     if best.is_none_or(|(bs, be, _, _)| size < be - bs) {
@@ -666,10 +669,10 @@ impl SegmentReader {
                     Role::Reference
                 };
                 let span = Span::new(
-                    Span::unpack_line(ps as u32),
-                    Span::unpack_char(ps as u32),
-                    Span::unpack_line(pe as u32),
-                    Span::unpack_char(pe as u32),
+                    Span::unpack_line(ps),
+                    Span::unpack_char(ps),
+                    Span::unpack_line(pe),
+                    Span::unpack_char(pe),
                 );
                 let hit = OccurrenceHit {
                     symbol_ord: sym,
@@ -828,12 +831,27 @@ impl SegmentReader {
         // group offset/count tiling + block first_record/record_count partition,
         // in writer block order (ref groups, then def, then rename).
         let mut block_cursor = 0usize;
-        self.validate_role_groups(REF_GROUP_INDEX, ref_groups, ref_recs, &mut block_cursor, bc)?;
-        self.validate_role_groups(DEF_GROUP_INDEX, ref_groups, def_recs, &mut block_cursor, bc)?;
+        self.validate_role_groups(
+            REF_GROUP_INDEX,
+            ref_groups,
+            ref_recs,
+            REF_POSTINGS,
+            &mut block_cursor,
+            bc,
+        )?;
+        self.validate_role_groups(
+            DEF_GROUP_INDEX,
+            ref_groups,
+            def_recs,
+            DEF_POSTINGS,
+            &mut block_cursor,
+            bc,
+        )?;
         self.validate_role_groups(
             RENAME_GROUP_INDEX,
             rename_groups,
             rename_recs,
+            RENAME_POSTINGS,
             &mut block_cursor,
             bc,
         )?;
@@ -935,16 +953,22 @@ impl SegmentReader {
         Ok(())
     }
 
-    /// Every doc-postings record's `symbol_ord` in range.
+    /// Every doc-postings record's `symbol_ord` in range and packed span
+    /// non-inverted (unsigned `packed_start <= packed_end`).
     fn validate_doc_records(&self, recs: usize) -> Result<()> {
         let file = self.file(DOC_POSTINGS);
         let name = format::DOC_POSTINGS_FILE;
+        let start_col = 8 + 4 * recs;
+        let end_col = 8 + 8 * recs;
         for r in 0..recs {
             check_ord(
                 req_i32(file, 8 + 4 * r, name)?,
                 self.symbol_count,
                 "doc symbol_ord",
             )?;
+            let ps = req_u32(file, start_col + 4 * r, name)?;
+            let pe = req_u32(file, end_col + 4 * r, name)?;
+            expect(ps <= pe, "doc postings inverted span")?;
         }
         Ok(())
     }
@@ -956,6 +980,7 @@ impl SegmentReader {
         gi_idx: usize,
         group_count: usize,
         postings_recs: usize,
+        postings_idx: usize,
         block_cursor: &mut usize,
         block_count: usize,
     ) -> Result<()> {
@@ -988,6 +1013,7 @@ impl SegmentReader {
                         *block_cursor + k,
                         acc + k * 256,
                         (count - k * 256).min(256),
+                        postings_idx,
                     )?;
                 }
                 *block_cursor += num_blocks;
@@ -998,10 +1024,17 @@ impl SegmentReader {
         Ok(())
     }
 
-    /// One block: `first_record`/`record_count` match the partition, aggregate
-    /// counts are self-consistent, `doc_ord` bounds are in range, and the target
-    /// bitset sets no bit `>= target_count`.
-    fn validate_block(&self, block: usize, want_first: usize, want_count: usize) -> Result<()> {
+    /// One block: `first_record`/`record_count` match the partition, and *every*
+    /// exact aggregate (editable/role counts, doc/epoch min-max, target bitset)
+    /// is recomputed from the owning postings records and required to match, so
+    /// tampered skip metadata cannot silently drop records from a filtered scan.
+    fn validate_block(
+        &self,
+        block: usize,
+        want_first: usize,
+        want_count: usize,
+        postings_idx: usize,
+    ) -> Result<()> {
         let bi = self.file(BLOCK_INDEX);
         let name = format::BLOCK_INDEX_FILE;
         let base = self.block_base(block);
@@ -1011,31 +1044,66 @@ impl SegmentReader {
         )?;
         let rc = req_i32(bi, base + 8, name)?;
         expect(rc >= 0 && rc as usize == want_count, "block record_count")?;
-        let editable = req_i32(bi, base + 12, name)?;
-        let ref_role = req_i32(bi, base + 16, name)?;
-        let def_role = req_i32(bi, base + 20, name)?;
-        expect(editable >= 0 && editable <= rc, "block editable_count")?;
-        expect(
-            ref_role >= 0 && def_role >= 0 && ref_role + def_role == rc,
-            "block role counts",
-        )?;
-        let dmin = req_i32(bi, base + 24, name)?;
-        let dmax = req_i32(bi, base + 28, name)?;
-        expect(
-            dmin >= 0 && dmin <= dmax && (dmax as usize) < self.doc_count as usize,
-            "block doc_ord range",
-        )?;
-        for w in 0..self.words {
-            let word = req_u64(bi, base + 40 + 8 * w, name)?;
-            let valid = self.target_count.saturating_sub(w * 64).min(64);
-            if valid < 64 {
-                let mask = if valid == 0 {
-                    u64::MAX
-                } else {
-                    !((1u64 << valid) - 1)
-                };
-                expect(word & mask == 0, "block target bit out of range")?;
+
+        // Recompute the exact aggregates from the owning postings records
+        // [want_first, want_first + want_count). validate_group_records already
+        // range-checked every doc_ord/target_ord, so these reads are in-bounds.
+        let pf = self.file(postings_idx);
+        let recs = read_i64(pf, 0).unwrap();
+        let doc_col = 8;
+        let epoch_col = 8 + 4 * recs;
+        let target_col = 8 + 8 * recs;
+        let flags_col = 8 + 20 * recs;
+        let mut editable = 0i32;
+        let mut ref_role = 0i32;
+        let mut def_role = 0i32;
+        let mut dmin = i32::MAX;
+        let mut dmax = i32::MIN;
+        let mut emin = i32::MAX;
+        let mut emax = i32::MIN;
+        let mut words = vec![0u64; self.words];
+        for k in 0..want_count as i64 {
+            let r = want_first as i64 + k;
+            let doc = read_i32(pf, (doc_col + 4 * r) as usize).unwrap();
+            let epoch = read_i32(pf, (epoch_col + 4 * r) as usize).unwrap();
+            let target = read_i32(pf, (target_col + 4 * r) as usize).unwrap();
+            let flags = read_i32(pf, (flags_col + 4 * r) as usize).unwrap() as u32;
+            if occ_flags::has(flags, occ_flags::EDITABLE) {
+                editable += 1;
             }
+            if occ_flags::has(flags, occ_flags::DEFINITION) {
+                def_role += 1;
+            } else {
+                ref_role += 1;
+            }
+            dmin = dmin.min(doc);
+            dmax = dmax.max(doc);
+            emin = emin.min(epoch);
+            emax = emax.max(epoch);
+            let t = target as usize;
+            words[t >> 6] |= 1u64 << (t & 63);
+        }
+        expect(
+            req_i32(bi, base + 12, name)? == editable,
+            "block editable_count",
+        )?;
+        expect(
+            req_i32(bi, base + 16, name)? == ref_role,
+            "block ref_role_count",
+        )?;
+        expect(
+            req_i32(bi, base + 20, name)? == def_role,
+            "block def_role_count",
+        )?;
+        expect(req_i32(bi, base + 24, name)? == dmin, "block doc_ord_min")?;
+        expect(req_i32(bi, base + 28, name)? == dmax, "block doc_ord_max")?;
+        expect(req_i32(bi, base + 32, name)? == emin, "block epoch_min")?;
+        expect(req_i32(bi, base + 36, name)? == emax, "block epoch_max")?;
+        for (w, &word) in words.iter().enumerate() {
+            expect(
+                req_u64(bi, base + 40 + 8 * w, name)? == word,
+                "block target_words",
+            )?;
         }
         Ok(())
     }
@@ -1050,6 +1118,10 @@ impl SegmentReader {
         doc_recs: usize,
     ) -> Result<()> {
         let di = self.file(DOC_INDEX);
+        let dp = self.file(DOC_POSTINGS);
+        let dp_name = format::DOC_POSTINGS_FILE;
+        let dp_start_col = 8 + 4 * doc_recs;
+        let dp_end_col = 8 + 8 * doc_recs;
         let name = format::DOC_INDEX_FILE;
         let interval_base = 24 + doc_count * 48;
         let uri_blob_start = interval_base + interval_count * 24;
@@ -1100,13 +1172,34 @@ impl SegmentReader {
                 for k in 0..want_iv {
                     expect(iv_cursor + k < interval_count, "interval index range")?;
                     let ib = interval_base + (iv_cursor + k) * 24;
+                    let iv_offset = post_acc + k * 256;
+                    let iv_count = (post_count - k * 256).min(256);
                     expect(
-                        req_i64(di, ib + 8, name)? as u64 == (post_acc + k * 256) as u64,
+                        req_i64(di, ib + 8, name)? as u64 == iv_offset as u64,
                         "interval offset",
                     )?;
                     expect(
-                        req_i32(di, ib + 16, name)? as usize == (post_count - k * 256).min(256),
+                        req_i32(di, ib + 16, name)? as usize == iv_count,
                         "interval count",
+                    )?;
+                    // Recompute the pruning metadata from the covered records:
+                    // first_line = start line of the first record, last_line =
+                    // max end line across the interval. Tampering these could
+                    // make symbol_at skip a real covering occurrence.
+                    let first_line =
+                        Span::unpack_line(req_u32(dp, dp_start_col + 4 * iv_offset, dp_name)?);
+                    let mut last_line = 0u32;
+                    for j in 0..iv_count {
+                        let pe = req_u32(dp, dp_end_col + 4 * (iv_offset + j), dp_name)?;
+                        last_line = last_line.max(Span::unpack_line(pe));
+                    }
+                    expect(
+                        req_i32(di, ib, name)? == first_line as i32,
+                        "interval first_line",
+                    )?;
+                    expect(
+                        req_i32(di, ib + 4, name)? == last_line as i32,
+                        "interval last_line",
                     )?;
                 }
                 iv_cursor += want_iv;
@@ -1212,37 +1305,47 @@ fn map_file(path: &Path) -> Result<Mmap> {
 }
 
 fn verify_checksums(checksums: &[u8], mapped: &[Mmap]) -> Result<()> {
+    let mismatch = |detail: String| SegmentError::ChecksumListMismatch { detail };
+    let truncated = || SegmentError::Truncated {
+        file: format::CHECKSUMS_FILE.into(),
+    };
     let count = req_i64(checksums, 0, format::CHECKSUMS_FILE)?;
-    if count as usize != format::CHECKSUMMED_FILES.len() {
-        return Err(SegmentError::ChecksumListMismatch {
-            detail: format!("entry_count {count}"),
-        });
+    if count < 0 || count as usize != format::CHECKSUMMED_FILES.len() {
+        return Err(mismatch(format!("entry_count {count}")));
     }
     let mut off = 8usize;
     for (i, expected_name) in format::CHECKSUMMED_FILES.iter().enumerate() {
-        let name_len = req_i32(checksums, off, format::CHECKSUMS_FILE)? as usize;
-        off += 4;
-        let name = checksums
-            .get(off..off + name_len)
-            .ok_or_else(|| SegmentError::Truncated {
-                file: format::CHECKSUMS_FILE.into(),
-            })?;
-        if name != expected_name.as_bytes() {
-            return Err(SegmentError::ChecksumListMismatch {
-                detail: format!(
-                    "entry {i} is {:?}, expected {expected_name}",
-                    String::from_utf8_lossy(name)
-                ),
-            });
+        let name_len = req_i32(checksums, off, format::CHECKSUMS_FILE)?;
+        if name_len < 0 {
+            return Err(mismatch(format!("entry {i} negative name_len {name_len}")));
         }
-        off += name_len;
-        let stored = req_u64(checksums, off, format::CHECKSUMS_FILE)?;
-        off += 8;
+        // Checked cursor arithmetic so a malformed length can never overflow.
+        let name_start = off.checked_add(4).ok_or_else(truncated)?;
+        let name_end = name_start
+            .checked_add(name_len as usize)
+            .ok_or_else(truncated)?;
+        let name = checksums.get(name_start..name_end).ok_or_else(truncated)?;
+        if name != expected_name.as_bytes() {
+            return Err(mismatch(format!(
+                "entry {i} is {:?}, expected {expected_name}",
+                String::from_utf8_lossy(name)
+            )));
+        }
+        let stored = req_u64(checksums, name_end, format::CHECKSUMS_FILE)?;
+        off = name_end.checked_add(8).ok_or_else(truncated)?;
         if crc32c(&mapped[i][..]) as u64 != stored {
             return Err(SegmentError::ChecksumMismatch {
                 file: (*expected_name).into(),
             });
         }
+    }
+    // No trailing bytes may hide after the expected entries.
+    if off != checksums.len() {
+        return Err(mismatch(format!(
+            "trailing bytes: {} of {}",
+            off,
+            checksums.len()
+        )));
     }
     Ok(())
 }
@@ -1328,4 +1431,7 @@ fn req_u64(b: &[u8], off: usize, file: &str) -> Result<u64> {
 }
 fn req_i32(b: &[u8], off: usize, file: &str) -> Result<i32> {
     read_i32(b, off).ok_or_else(|| SegmentError::Truncated { file: file.into() })
+}
+fn req_u32(b: &[u8], off: usize, file: &str) -> Result<u32> {
+    read_u32(b, off).ok_or_else(|| SegmentError::Truncated { file: file.into() })
 }
