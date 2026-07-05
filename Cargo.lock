@@ -141,6 +141,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ls-semanticdb"
+version = "0.1.0"
+dependencies = [
+ "ls-index-model",
+]
+
+[[package]]
 name = "ls-store"
 version = "0.1.0"
 dependencies = [

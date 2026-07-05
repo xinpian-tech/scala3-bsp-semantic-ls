@@ -1,0 +1,13 @@
+[package]
+name = "ls-semanticdb"
+description = "SemanticDB parse, md5 freshness, symbol-string grammar, normalization, and alias-group building for the Rust language server."
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+ls-index-model = { path = "../ls-index-model" }

@@ -19,7 +19,9 @@
 mod bitset;
 mod error;
 mod flags;
+mod groups;
 mod ids;
+mod semantics;
 mod symbol;
 mod text;
 
@@ -28,9 +30,11 @@ pub mod unsafe_reason;
 pub use bitset::TargetBitset;
 pub use error::LsError;
 pub use flags::{occ_flags, Role};
+pub use groups::RenameProfile;
 pub use ids::{
     DocId, DocOrd, RefGroupId, RefGroupOrd, RenameGroupId, RenameGroupOrd, SymbolId, SymbolOrd,
     TargetId, TargetOrd,
 };
+pub use semantics::{NormalizedDocument, Occurrence, SymbolInfo};
 pub use symbol::{sym_props, SymKind, SymbolKey};
 pub use text::{Loc, Pos, Span};
