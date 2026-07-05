@@ -30,11 +30,26 @@ impl TargetBitset {
         TargetBitset { words, size }
     }
 
-    /// Wrap a raw word array as a bitset of `size` ordinals. In debug builds,
-    /// checks the array is long enough to address every ordinal so misuse fails
-    /// at construction rather than at an arbitrary later query.
-    pub fn from_words(size: u32, words: Vec<u64>) -> Self {
-        debug_assert!(words.len() >= word_count(size), "words too short for size");
+    /// Wrap a raw word array as a bitset of `size` ordinals, normalizing it so
+    /// the membership set is exactly `[0, size)` regardless of the input.
+    ///
+    /// The vector is padded with zeros (or truncated) to the required word
+    /// count, and any unused high bits in the final word are cleared. This keeps
+    /// [`contains`](Self::contains), [`iter`](Self::iter),
+    /// [`intersects`](Self::intersects), and [`cardinality`](Self::cardinality)
+    /// mutually consistent — and panic-free in release builds — even for raw
+    /// input such as a block's target bitset read straight out of an mmap
+    /// segment.
+    pub fn from_words(size: u32, mut words: Vec<u64>) -> Self {
+        let n = word_count(size);
+        words.resize(n, 0);
+        if n > 0 {
+            // Bits actually addressed by the final word: 1..=64.
+            let used = (size as usize) - (n - 1) * 64;
+            if used < 64 {
+                words[n - 1] &= (1u64 << used) - 1;
+            }
+        }
         TargetBitset { words, size }
     }
 
@@ -83,24 +98,22 @@ impl TargetBitset {
 
     /// Iterate the set member ordinals in ascending order — exactly the ordinals
     /// for which [`contains`](Self::contains) is true (O(popcount), not O(size)).
+    ///
+    /// Every constructor normalizes its backing words to hold no bits `>= size`,
+    /// so no range filter is needed here.
     pub fn iter(&self) -> impl Iterator<Item = u32> + '_ {
-        let size = self.size;
-        self.words
-            .iter()
-            .enumerate()
-            .flat_map(|(wi, &word)| {
-                let base = (wi as u32) * 64;
-                let mut w = word;
-                std::iter::from_fn(move || {
-                    if w == 0 {
-                        return None;
-                    }
-                    let bit = w.trailing_zeros();
-                    w &= w - 1;
-                    Some(base + bit)
-                })
+        self.words.iter().enumerate().flat_map(|(wi, &word)| {
+            let base = (wi as u32) * 64;
+            let mut w = word;
+            std::iter::from_fn(move || {
+                if w == 0 {
+                    return None;
+                }
+                let bit = w.trailing_zeros();
+                w &= w - 1;
+                Some(base + bit)
             })
-            .filter(move |&o| o < size)
+        })
     }
 }
 
@@ -145,6 +158,30 @@ mod target_graph_suite {
         assert_eq!(TargetBitset::empty(10).iter().count(), 0);
         assert_eq!(bs.iter().count() as u32, bs.cardinality());
         assert!(bs.iter().all(|o| bs.contains(o)));
+    }
+
+    #[test]
+    fn from_words_normalizes_and_is_release_safe() {
+        // A too-short backing vector is padded — no panic, no phantom members.
+        let short = TargetBitset::from_words(130, vec![]);
+        assert!(!short.contains(129));
+        assert_eq!(short.cardinality(), 0);
+        assert_eq!(short.iter().count(), 0);
+        // Unused high bits in the final word are masked off.
+        let one = TargetBitset::from_words(1, vec![u64::MAX]);
+        assert_eq!(one.cardinality(), 1);
+        assert_eq!(one.iter().collect::<Vec<_>>(), vec![0]);
+        assert!(one.contains(0));
+        assert!(!one.contains(1));
+        // Extra words beyond the size are truncated.
+        let trimmed = TargetBitset::from_words(1, vec![1, u64::MAX, u64::MAX]);
+        assert_eq!(trimmed.cardinality(), 1);
+        assert_eq!(trimmed.iter().collect::<Vec<_>>(), vec![0]);
+        // A full-word size keeps every addressed bit.
+        let full = TargetBitset::from_words(64, vec![u64::MAX]);
+        assert_eq!(full.cardinality(), 64);
+        assert!(full.contains(63));
+        assert!(!full.contains(64));
     }
 
     #[test]

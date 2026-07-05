@@ -5,6 +5,10 @@
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
 
+    # Crane builds the Rust cargo workspace (crates/) reproducibly and supplies
+    # the fmt/clippy/test/build checks wired into `nix flake check`.
+    crane.url = "github:ipetkov/crane";
+
     # Hard requirement.
     mill-ivy-fetcher.url = "github:Avimitin/mill-ivy-fetcher";
 
@@ -18,7 +22,7 @@
     };
   };
 
-  outputs = { self, nixpkgs, flake-utils, mill-ivy-fetcher, zaozi }@inputs:
+  outputs = { self, nixpkgs, flake-utils, crane, mill-ivy-fetcher, zaozi }@inputs:
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = import nixpkgs {
@@ -31,6 +35,10 @@
 
         jdk = pkgs.jdk25;
         mill = pkgs.millVersions.mill_1_1_2 or pkgs.mill;
+
+        # Crane library + the Rust cargo workspace (crates/) build and checks.
+        craneLib = crane.mkLib pkgs;
+        rust = import ./nix/rust.nix { inherit pkgs craneLib; };
 
         # The pinned zaozi source with our patches applied (SemanticDB emission,
         # which our SemanticDB-first server requires). Exposed to the dev shell
@@ -49,9 +57,9 @@
 
         formatter = pkgs.nixpkgs-fmt;
 
-        checks = import ./nix/checks.nix {
+        checks = (import ./nix/checks.nix {
           inherit pkgs jdk mill self;
-        };
+        }) // rust.checks;
 
         packages = {
           default = pkgs.callPackage ./nix/package.nix {
@@ -64,6 +72,8 @@
           inherit (pkgs) mill-ivy-fetcher;
           # The patched, pinned zaozi source (real-repo real-BSP workspace).
           inherit zaozi-src;
+          # The crane-built Rust cargo workspace (crates/).
+          rust-workspace = rust.package;
         };
       }) // { inherit inputs; };
 }

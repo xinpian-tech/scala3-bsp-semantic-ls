@@ -27,6 +27,12 @@ pkgs.mkShell {
   LS_JAVA_VERSION = "25";
   # Rust standard-library source so rust-analyzer resolves std in the dev shell.
   RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
+  # protoc for the SemanticDB prost codegen (ls-semanticdb).
+  PROTOC = "${pkgs.protobuf}/bin/protoc";
+  # The embedded JVM's libjvm.so, dlopen'd by ls-jvm for the in-process island.
+  # On nixpkgs jdk25 it lives under ${jdk.home} (= ${jdk}/lib/openjdk), NOT
+  # $JAVA_HOME/lib/server — expose the exact path (mirrors LS_SQLITE_LIB).
+  LS_LIBJVM = "${jdk.home}/lib/server/libjvm.so";
   # The SQLite shared library consumed by the ls-sqlite-ffm FFM binding.
   # System SQLite is never used; only the Nix-provided library is a valid
   # runtime dependency.

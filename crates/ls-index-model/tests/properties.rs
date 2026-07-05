@@ -82,4 +82,21 @@ proptest! {
         prop_assert_eq!(bsa.intersects(&bsb), overlap);
         prop_assert_eq!(bsa.intersects_words(&bsb.to_words()), overlap);
     }
+
+    /// `from_words` normalizes arbitrary raw input: membership stays within
+    /// `[0, size)`, cardinality agrees with iteration, and `contains` never
+    /// panics for any ordinal (the release-safety property).
+    #[test]
+    fn from_words_normalizes_arbitrary_input(
+        size in 0u32..512,
+        raw in prop::collection::vec(any::<u64>(), 0..12),
+    ) {
+        let bs = TargetBitset::from_words(size, raw);
+        prop_assert_eq!(bs.cardinality() as usize, bs.iter().count());
+        prop_assert!(bs.iter().all(|o| o < size));
+        prop_assert!(bs.iter().all(|o| bs.contains(o)));
+        for o in [0u32, size.saturating_sub(1), size, size.saturating_add(1), u32::MAX] {
+            let _ = bs.contains(o); // must not panic
+        }
+    }
 }
