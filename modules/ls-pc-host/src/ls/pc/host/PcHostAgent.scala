@@ -4,7 +4,9 @@ import java.io.{FileDescriptor, FileOutputStream, PrintStream}
 import java.lang.foreign.{Arena, MemorySegment, ValueLayout}
 import java.lang.instrument.Instrumentation
 import java.nio.charset.StandardCharsets.UTF_8
+import java.nio.file.Path
 
+import ls.pc.{PcFacade, PcPluginInitContext, PcPluginManager, PcSettings}
 import ls.pc.host.boundary.{
   boundary_h,
   LogFn,
@@ -33,17 +35,14 @@ import ls.pc.host.boundary.{
   * dispatch, worker 1 = control): they enter `pc_dispatch_loop` and never
   * return.
   *
-  * The upcall stubs route to the [[PcHost]] op seam; the request/response codec
-  * and the live `PcFacade` wiring behind that seam land in a subsequent slice.
+  * The upcall stubs route to a [[PcHost]] instance that decodes each request,
+  * calls the live in-process `PcFacade`, converts the result, and writes the
+  * flat response through the boundary-marshalling runtime.
   */
 object PcHostAgent:
   private val AbiVersion: Long = boundary_h.ABI_VERSION().toLong
   private var arena: Arena = null
   private var vtable: MemorySegment = null
-  // The boundary-marshalling runtime, built from the registered vtable's `alloc`
-  // slot. Held for the op wiring (a later slice) that routes each request/
-  // response through it.
-  private var runtime: PcHostRuntime = null
 
   def premain(args: String, inst: Instrumentation): Unit =
     try
@@ -85,92 +84,112 @@ object PcHostAgent:
     System.setOut(PrintStream(FileOutputStream(FileDescriptor.err), true, UTF_8))
 
   private def registerAndLoan(): Unit =
+    // The op seam: the boundary-marshalling runtime (built from the registered
+    // vtable's `alloc` slot), the live in-process facade, and the fresh-thread
+    // loaner `spawn_dispatch` uses for a recovery generation.
+    val runtime = PcHostRuntime.fromVtable(vtable)
+    val host = PcHost(
+      runtime,
+      FacadePcOps(buildFacade()),
+      generation => startLoanedThread(s"pc-dispatch-gen-$generation", generation)
+    )
+
     val pc = PcVtable.allocate(arena)
     PcVtable.abi_version(pc, AbiVersion)
 
     PcVtable.register_target(
       pc,
-      PcRequestFn.allocate((p, n) => contained("register_target")(PcHost.registerTarget(p, n)), arena)
+      PcRequestFn.allocate((p, n) => contained("register_target")(host.registerTarget(p, n)), arena)
     )
     PcVtable.did_open(
       pc,
-      PcRequestFn.allocate((p, n) => contained("did_open")(PcHost.didOpen(p, n)), arena)
+      PcRequestFn.allocate((p, n) => contained("did_open")(host.didOpen(p, n)), arena)
     )
     PcVtable.did_change(
       pc,
-      PcRequestFn.allocate((p, n) => contained("did_change")(PcHost.didChange(p, n)), arena)
+      PcRequestFn.allocate((p, n) => contained("did_change")(host.didChange(p, n)), arena)
     )
     PcVtable.did_close(
       pc,
-      PcUriFn.allocate(uri => contained("did_close")(PcHost.didClose(uri)), arena)
+      PcUriFn.allocate(uri => contained("did_close")(host.didClose(uri)), arena)
     )
     PcVtable.completion(
       pc,
-      PcQueryFn.allocate((u, l, c, o) => contained("completion")(PcHost.completion(u, l, c, o)), arena)
+      PcQueryFn.allocate((u, l, c, o) => contained("completion")(host.completion(u, l, c, o)), arena)
     )
     PcVtable.completion_resolve(
       pc,
       PcResolveFn.allocate(
-        (t, s, ip, il, o) => contained("completion_resolve")(PcHost.completionResolve(t, s, ip, il, o)),
+        (t, s, ip, il, o) => contained("completion_resolve")(host.completionResolve(t, s, ip, il, o)),
         arena
       )
     )
     PcVtable.hover(
       pc,
-      PcQueryFn.allocate((u, l, c, o) => contained("hover")(PcHost.hover(u, l, c, o)), arena)
+      PcQueryFn.allocate((u, l, c, o) => contained("hover")(host.hover(u, l, c, o)), arena)
     )
     PcVtable.signature_help(
       pc,
       PcQueryFn.allocate(
-        (u, l, c, o) => contained("signature_help")(PcHost.signatureHelp(u, l, c, o)),
+        (u, l, c, o) => contained("signature_help")(host.signatureHelp(u, l, c, o)),
         arena
       )
     )
     PcVtable.definition(
       pc,
-      PcQueryFn.allocate((u, l, c, o) => contained("definition")(PcHost.definition(u, l, c, o)), arena)
+      PcQueryFn.allocate((u, l, c, o) => contained("definition")(host.definition(u, l, c, o)), arena)
     )
     PcVtable.type_definition(
       pc,
       PcQueryFn.allocate(
-        (u, l, c, o) => contained("type_definition")(PcHost.typeDefinition(u, l, c, o)),
+        (u, l, c, o) => contained("type_definition")(host.typeDefinition(u, l, c, o)),
         arena
       )
     )
     PcVtable.prepare_rename(
       pc,
       PcQueryFn.allocate(
-        (u, l, c, o) => contained("prepare_rename")(PcHost.prepareRename(u, l, c, o)),
+        (u, l, c, o) => contained("prepare_rename")(host.prepareRename(u, l, c, o)),
         arena
       )
     )
     PcVtable.plugin_status(
       pc,
-      PcStatusOutFn.allocate(o => contained("plugin_status")(PcHost.pluginStatus(o)), arena)
+      PcStatusOutFn.allocate(o => contained("plugin_status")(host.pluginStatus(o)), arena)
     )
     PcVtable.restart_instances(
       pc,
-      PcVoidFn.allocate(() => contained("restart_instances")(PcHost.restartInstances()), arena)
+      PcVoidFn.allocate(() => contained("restart_instances")(host.restartInstances()), arena)
     )
     PcVtable.shutdown(
       pc,
-      PcVoidFn.allocate(() => contained("shutdown")(PcHost.shutdown()), arena)
+      PcVoidFn.allocate(() => contained("shutdown")(host.shutdown()), arena)
     )
     PcVtable.spawn_dispatch(
       pc,
-      PcSpawnDispatchFn.allocate(gen => contained("spawn_dispatch")(PcHost.spawnDispatch(gen)), arena)
+      PcSpawnDispatchFn.allocate(gen => contained("spawn_dispatch")(host.spawnDispatch(gen)), arena)
     )
 
     val rc = RegisterPcVtableFn.invoke(RustVtable.register_pc_vtable(vtable), pc)
     log(s"premain: register_pc_vtable rc=$rc")
     if rc != 0 then return
 
-    // Build the boundary-marshalling runtime from the registered vtable's
-    // `alloc` slot, ready for the op wiring to move payloads across the boundary.
-    runtime = PcHostRuntime.fromVtable(vtable)
-
     startLoanedThread("pc-dispatch", 0)
     startLoanedThread("pc-control", 1)
+
+  /** Builds the in-process presentation-compiler facade the op seam drives. The
+    * workspace root comes from the `ls.pc.host.workspace` system property the
+    * Rust host sets before boot; without it, ephemeral (workspace-less)
+    * settings are used.
+    */
+  private def buildFacade(): PcFacade =
+    val settings = Option(System.getProperty("ls.pc.host.workspace")) match
+      case Some(root) => PcSettings.forWorkspace(Path.of(root))
+      case None => PcSettings.ephemeral()
+    val pluginManager = PcPluginManager(
+      PcPluginInitContext(settings.workspaceRoot, settings.generatedSourcesRoot, m => log(s"pc-plugin: $m"))
+    )
+    PcFacade(pluginManager, settings)
 
   /** Runs an upcall body, containing any Java `Throwable` to a status code so it
     * never escapes across the native boundary and unwinds into Rust.
