@@ -12,8 +12,11 @@ pub mod model;
 pub mod protocol;
 pub mod semanticdb;
 pub mod session;
-pub mod uri;
 pub mod wire;
+
+/// `file://` URI <-> path conversion, shared from the model crate (kept as
+/// `ls_bsp::uri` so existing callers are unchanged).
+pub use ls_index_model::uri;
 
 pub use client::BspClientHandlers;
 pub use discovery::{BspConnectionDetails, BspConnectionFile, BspDiscovery, BspDiscoveryResult};

@@ -12,9 +12,10 @@
 //!      republishes the segment so the next query resolves from the snapshot).
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use ls_index_model::uri;
 use ls_index_model::{Loc, LsError, NormalizedDocument, Occurrence, Role, Span, TargetBitset};
 use ls_semanticdb::{md5, normalize, parse_file, SemanticdbLocator};
 use ls_store::{GroupRecord, SearchIndex, Snapshot, Store, StoreResult, WorkspaceSymbolHit};
@@ -512,10 +513,10 @@ impl QueryOrchestrator {
                 return;
             }
             let span = Span::new(sl, sc, Span::unpack_line(pe), Span::unpack_char(pe));
-            out.push(Loc::new(
-                sdb_uri_to_file_uri(&meta.sourceroot, seg.uri_of(doc_ord)),
-                span,
-            ));
+            // Absolute source path = sourceroot / sdb-uri, emitted as a
+            // percent-encoded `file://` uri (mirrors `Uris.fromSdbUri` + `toUri`).
+            let abs = uri::normalize(&Path::new(&meta.sourceroot).join(seg.uri_of(doc_ord)));
+            out.push(Loc::new(uri::path_to_uri(&abs), span));
         });
         dedupe_and_sort_locs(out)
     }
@@ -524,29 +525,26 @@ impl QueryOrchestrator {
     /// found by its deepest containing sourceroot, or `None` when no target owns
     /// the buffer (definitions are then unscoped). Reads only the immutable
     /// workspace graph.
+    ///
+    /// `from_uri` is a `file://` uri: it is percent-decoded and lexically
+    /// normalized, and each candidate sourceroot is normalized too, so an
+    /// encoded path (a sourceroot with a space) still matches its owning target
+    /// rather than falling through to an unscoped (leaky) lookup.
     fn requesting_forward_closure(&self, from_uri: &str) -> Option<HashSet<String>> {
         let ws = self.workspace()?;
-        let path = file_uri_to_path(from_uri)?;
+        let path = uri::normalize(&uri::uri_to_path(from_uri).ok()?);
         let spec = ws
             .targets
             .iter()
-            .filter(|t| path.starts_with(&t.sourceroot))
-            .max_by_key(|t| t.sourceroot.components().count())?;
+            .filter_map(|t| {
+                let root = uri::normalize(&t.sourceroot);
+                path.starts_with(&root)
+                    .then_some((t, root.components().count()))
+            })
+            .max_by_key(|(_, depth)| *depth)
+            .map(|(t, _)| t)?;
         Some(ws.forward_dependency_closure(&spec.bsp_id))
     }
-}
-
-/// `file://` uri -> absolute path. Linux-first: strips the scheme + empty
-/// authority; percent-decoding is not needed for the paths the PC passes.
-fn file_uri_to_path(uri: &str) -> Option<PathBuf> {
-    uri.strip_prefix("file://").map(PathBuf::from)
-}
-
-/// Absolute source path of a sourceroot-relative SemanticDB uri, as a `file://`
-/// uri (the LSP form editors expect). Mirrors `Uris.fromSdbUri` + `toUri`.
-fn sdb_uri_to_file_uri(sourceroot: &str, sdb_uri: &str) -> String {
-    let root = sourceroot.trim_end_matches('/');
-    format!("file://{root}/{sdb_uri}")
 }
 
 /// Dedupe by (uri, span) and sort by (uri, start, end) — a stable order for

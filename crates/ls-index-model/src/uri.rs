@@ -1,7 +1,12 @@
-//! Minimal `file://` URI <-> path conversion. The two directions are exact
-//! inverses for absolute paths, which is all the BSP layer round-trips.
+//! `file://` URI <-> path conversion shared across the Rust server crates.
+//!
+//! The two directions are exact inverses for absolute paths (all the BSP layer
+//! and the PC go-to-definition callback round-trip). [`normalize`] collapses
+//! `.`/`..` lexically so equivalent spellings compare equal, mirroring the
+//! retained `ls.core.Uris` semantics (`Path.toUri` / `URI -> Path` +
+//! `.normalize()`).
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 const HEX: &[u8; 16] = b"0123456789ABCDEF";
 
@@ -41,6 +46,23 @@ pub fn uri_to_path(uri: &str) -> Result<PathBuf, String> {
     Ok(PathBuf::from(s))
 }
 
+/// Lexically normalize a path: collapse `.` and `..` components without touching
+/// the filesystem (no symlink resolution), so equivalent spellings of the same
+/// absolute path compare equal. Matches Java `Path.normalize`.
+pub fn normalize(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
 fn percent_decode(s: &str) -> Result<Vec<u8>, String> {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
@@ -68,5 +90,46 @@ fn hex_val(b: u8) -> Option<u8> {
         b'a'..=b'f' => Some(b - b'a' + 10),
         b'A'..=b'F' => Some(b - b'A' + 10),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn round_trips_a_path_with_spaces_and_reserved_bytes() {
+        let p = Path::new("/tmp/ws with space/A B.scala");
+        let uri = path_to_uri(p);
+        assert_eq!(uri, "file:///tmp/ws%20with%20space/A%20B.scala");
+        assert_eq!(uri_to_path(&uri).unwrap(), p);
+    }
+
+    #[test]
+    fn decodes_percent_escapes_and_drops_authority() {
+        assert_eq!(
+            uri_to_path("file:///a/b%20c.scala").unwrap(),
+            PathBuf::from("/a/b c.scala")
+        );
+        // an authority component is dropped; the path starts at its first `/`.
+        assert_eq!(
+            uri_to_path("file://host/a/b.scala").unwrap(),
+            PathBuf::from("/a/b.scala")
+        );
+    }
+
+    #[test]
+    fn rejects_non_file_and_pathless_uris() {
+        assert!(uri_to_path("https://example/x").is_err());
+        assert!(uri_to_path("file://").is_err());
+    }
+
+    #[test]
+    fn normalize_collapses_dot_and_dotdot() {
+        assert_eq!(
+            normalize(Path::new("/tmp/a/./b/../c")),
+            PathBuf::from("/tmp/a/c")
+        );
+        assert_eq!(normalize(Path::new("/tmp/a/b")), PathBuf::from("/tmp/a/b"));
     }
 }

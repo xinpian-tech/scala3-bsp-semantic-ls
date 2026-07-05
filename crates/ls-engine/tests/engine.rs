@@ -12,6 +12,7 @@ use ls_engine::{
     current_thread_label, identifiers, symbol_encoding, NoopOverlay, QueryOrchestrator,
     ReferencesEngine, RenameEngine, ResolutionSource, TargetSpec, WorkspaceTargets,
 };
+use ls_index_model::uri::path_to_uri;
 use ls_index_model::{DocId, LsError, Role, Span, SymbolKey};
 use ls_store::Store;
 
@@ -418,14 +419,10 @@ fn build_def_workspace(dir: &TempDir) -> (Arc<WorkspaceTargets>, PathBuf, PathBu
     (Arc::new(ws), core_s, app_s, dup_s)
 }
 
-/// The `file://` uri of `rel` under `sourceroot`, matching the resolver's
-/// absolutization.
+/// The canonical (percent-encoded) `file://` uri of `rel` under `sourceroot`,
+/// matching the resolver's absolutization exactly.
 fn file_uri(sourceroot: &std::path::Path, rel: &str) -> String {
-    format!(
-        "file://{}/{}",
-        sourceroot.to_str().unwrap().trim_end_matches('/'),
-        rel
-    )
+    path_to_uri(&sourceroot.join(rel))
 }
 
 #[test]
@@ -475,6 +472,59 @@ fn symbol_definition_unknown_and_empty_symbols_answer_empty() {
     let from = file_uri(&app_s, "a/A.scala");
     assert!(orch.symbol_definition("pkg/Nope#", &from).is_empty());
     assert!(orch.symbol_definition("", &from).is_empty());
+}
+
+#[test]
+fn symbol_definition_prunes_with_a_percent_encoded_sourceroot() {
+    // The temp dir name carries spaces, so every sourceroot does too, and the PC
+    // passes a percent-encoded `file://` uri. Before the uri was decoded, the
+    // encoded `from_uri` failed the sourceroot match, the request went unscoped,
+    // and the disconnected `dup` duplicate leaked.
+    let dir = TempDir::new("sym def space");
+    let (ws, core_s, app_s, _dup_s) = build_def_workspace(&dir);
+    let orch = orchestrator(&dir, ws);
+    let from = file_uri(&app_s, "a/A.scala");
+    assert!(
+        from.contains("%20"),
+        "spaced sourceroot uri must be encoded: {from}"
+    );
+    let locs = orch.symbol_definition("pkg/S#", &from);
+    assert_eq!(
+        locs.len(),
+        1,
+        "the encoded from_uri must still prune to the visible (core) def"
+    );
+    assert_eq!(locs[0].uri, file_uri(&core_s, "c/S.scala"));
+    assert!(
+        locs[0].uri.contains("%20"),
+        "the result uri must be percent-encoded: {}",
+        locs[0].uri
+    );
+}
+
+#[test]
+fn symbol_definition_normalizes_dotdot_spellings_in_from_uri() {
+    let dir = TempDir::new("symdefdots");
+    let (ws, core_s, app_s, _dup_s) = build_def_workspace(&dir);
+    let orch = orchestrator(&dir, ws);
+    // A `..` that steps into a sibling name and back must normalize to the app
+    // target — otherwise the raw prefix check misses and the request goes
+    // unscoped (leaking the disconnected duplicate).
+    let parent = app_s
+        .parent()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .trim_end_matches('/');
+    let app_name = app_s.file_name().unwrap().to_str().unwrap();
+    let weird = format!("file://{parent}/nope/../{app_name}/a/A.scala");
+    let locs = orch.symbol_definition("pkg/S#", &weird);
+    assert_eq!(
+        locs.len(),
+        1,
+        "a dot-dot spelling must still resolve + prune"
+    );
+    assert_eq!(locs[0].uri, file_uri(&core_s, "c/S.scala"));
 }
 
 #[test]

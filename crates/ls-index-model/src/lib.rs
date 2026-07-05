@@ -26,6 +26,7 @@ mod symbol;
 mod text;
 
 pub mod unsafe_reason;
+pub mod uri;
 
 pub use bitset::TargetBitset;
 pub use error::LsError;
