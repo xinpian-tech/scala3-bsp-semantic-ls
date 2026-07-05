@@ -30,8 +30,11 @@ impl TargetBitset {
         TargetBitset { words, size }
     }
 
-    /// Wrap a raw word array as a bitset of `size` ordinals.
+    /// Wrap a raw word array as a bitset of `size` ordinals. In debug builds,
+    /// checks the array is long enough to address every ordinal so misuse fails
+    /// at construction rather than at an arbitrary later query.
     pub fn from_words(size: u32, words: Vec<u64>) -> Self {
+        debug_assert!(words.len() >= word_count(size), "words too short for size");
         TargetBitset { words, size }
     }
 
@@ -77,11 +80,33 @@ impl TargetBitset {
     pub fn cardinality(&self) -> u32 {
         self.words.iter().map(|w| w.count_ones()).sum()
     }
+
+    /// Iterate the set member ordinals in ascending order — exactly the ordinals
+    /// for which [`contains`](Self::contains) is true (O(popcount), not O(size)).
+    pub fn iter(&self) -> impl Iterator<Item = u32> + '_ {
+        let size = self.size;
+        self.words
+            .iter()
+            .enumerate()
+            .flat_map(|(wi, &word)| {
+                let base = (wi as u32) * 64;
+                let mut w = word;
+                std::iter::from_fn(move || {
+                    if w == 0 {
+                        return None;
+                    }
+                    let bit = w.trailing_zeros();
+                    w &= w - 1;
+                    Some(base + bit)
+                })
+            })
+            .filter(move |&o| o < size)
+    }
 }
 
 /// Words needed to hold `size` bits (`ceil(size / 64)`).
 #[inline]
-fn word_count(size: u32) -> usize {
+const fn word_count(size: u32) -> usize {
     ((size as usize) + 63) >> 6
 }
 
@@ -111,6 +136,15 @@ mod target_graph_suite {
         assert!(!a.intersects(&c));
         assert!(a.intersects_words(&b.to_words()));
         assert!(!a.intersects_words(&c.to_words()));
+    }
+
+    #[test]
+    fn iter_enumerates_members_ascending() {
+        let bs = TargetBitset::of(200, [3, 64, 199, 3]);
+        assert_eq!(bs.iter().collect::<Vec<_>>(), vec![3, 64, 199]);
+        assert_eq!(TargetBitset::empty(10).iter().count(), 0);
+        assert_eq!(bs.iter().count() as u32, bs.cardinality());
+        assert!(bs.iter().all(|o| bs.contains(o)));
     }
 
     #[test]

@@ -60,6 +60,11 @@ impl Span {
     /// Pack a single position into one `u32` as `(line << 12) | char`, the
     /// columnar postings encoding. Lines above [`Span::LINE_MAX`] and characters
     /// above [`Span::CHAR_MASK`] saturate rather than overflow into neighbours.
+    ///
+    /// The Scala original returns a signed `Int` with the identical bit pattern
+    /// (negative once bit 31 is set, i.e. for lines `>= 524288`); this port
+    /// exposes it as `u32`, so packed positions always order correctly under
+    /// unsigned comparison — the ordering the columnar postings rely on.
     #[inline]
     pub const fn pack(line: u32, character: u32) -> u32 {
         let l = if line < Self::LINE_MAX {

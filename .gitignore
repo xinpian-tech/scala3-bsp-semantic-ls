@@ -19,7 +19,6 @@ mill-java-opts
 .claude/
 
 # Rust / cargo (v2 core workspace). Cargo.lock IS committed (application
-# workspace), only build artifacts are ignored.
+# workspace); only build artifacts are ignored.
 /target/
-target/
 **/*.rs.bk

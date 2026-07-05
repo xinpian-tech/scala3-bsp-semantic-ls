@@ -31,49 +31,54 @@ pub enum LsError {
     NoSemanticdb { uri: String },
 }
 
-impl LsError {
-    /// The operator-facing message, byte-for-byte compatible with the Scala
-    /// `LsError.message`.
-    pub fn message(&self) -> String {
+impl fmt::Display for LsError {
+    /// Renders the operator-facing message, byte-for-byte compatible with the
+    /// Scala `LsError.message`.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            LsError::IndexUnavailable { target } => format!(
+            LsError::IndexUnavailable { target } => write!(
+                f,
                 "target {target} has no SemanticDB output; workspace symbol, references and rename are disabled for it"
             ),
             LsError::StaleIndex { uri } => {
-                format!("index for {uri} is stale (md5 mismatch) and could not be refreshed")
+                write!(f, "index for {uri} is stale (md5 mismatch) and could not be refreshed")
             }
-            LsError::CompileFailed { target } => format!(
+            LsError::CompileFailed { target } => write!(
+                f,
                 "buildTarget/compile failed for {target}; rename requires a fresh successful compile"
             ),
             LsError::RenameRejected { reasons } => {
-                let mut s = String::from("rename rejected:");
+                f.write_str("rename rejected:")?;
                 for r in reasons {
-                    s.push_str("\n  - ");
-                    s.push_str(r);
+                    write!(f, "\n  - {r}")?;
                 }
-                s
+                Ok(())
             }
-            LsError::PcOnlySymbol => "This symbol is provided by a PC-only plugin and is not present in fresh SemanticDB. \
-Workspace-wide references and cross-file rename are unavailable for this symbol."
-                .to_string(),
+            LsError::PcOnlySymbol => f.write_str(
+                "This symbol is provided by a PC-only plugin and is not present in fresh SemanticDB. \
+Workspace-wide references and cross-file rename are unavailable for this symbol.",
+            ),
             LsError::NoSymbolAtCursor {
                 uri,
                 line,
                 character,
-            } => format!("no symbol occurrence at {uri}:{line}:{character}"),
+            } => write!(f, "no symbol occurrence at {uri}:{line}:{character}"),
             LsError::NotIndexed { uri } => {
-                format!("{uri} is not part of any indexed build target")
+                write!(f, "{uri} is not part of any indexed build target")
             }
-            LsError::NoSemanticdb { uri } => format!(
+            LsError::NoSemanticdb { uri } => write!(
+                f,
                 "{uri} has no SemanticDB output; every source must be compiled with -Xsemanticdb"
             ),
         }
     }
 }
 
-impl fmt::Display for LsError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.message())
+impl LsError {
+    /// The operator-facing message, byte-for-byte compatible with the Scala
+    /// `LsError.message`. Delegates to the [`Display`](fmt::Display) impl.
+    pub fn message(&self) -> String {
+        self.to_string()
     }
 }
 
@@ -143,10 +148,14 @@ Workspace-wide references and cross-file rename are unavailable for this symbol.
     }
 
     #[test]
-    fn display_matches_message() {
+    fn display_renders_message() {
         let e = LsError::NotIndexed {
             uri: "file:///x".into(),
         };
-        assert_eq!(e.to_string(), e.message());
+        assert_eq!(
+            e.to_string(),
+            "file:///x is not part of any indexed build target"
+        );
+        assert_eq!(e.message(), e.to_string());
     }
 }

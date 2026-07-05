@@ -15,47 +15,42 @@ pub const UNSUPPORTED_SYMBOL_FAMILY: u64 = 1 << 7;
 pub const DEPENDENCY_SOURCE: u64 = 1 << 8;
 pub const OPAQUE_TYPE: u64 = 1 << 9;
 
-/// Expand a reason mask into one message per set bit, in bit order. An empty
-/// mask yields an empty list (the symbol is safe to rename).
-pub fn explain(mask: u64) -> Vec<String> {
+/// Expand a reason mask into one static message per set bit, in bit order. An
+/// empty mask yields an empty list (the symbol is safe to rename). The messages
+/// are compile-time constants; callers needing owned strings (e.g. to build
+/// [`LsError::RenameRejected`](crate::LsError::RenameRejected)) collect via
+/// `.map(str::to_string)`.
+pub fn explain(mask: u64) -> Vec<&'static str> {
     let mut msgs = Vec::new();
     if mask & EXTERNAL != 0 {
-        msgs.push("symbol is defined outside the workspace".to_string());
+        msgs.push("symbol is defined outside the workspace");
     }
     if mask & GENERATED_OCCURRENCE != 0 {
-        msgs.push("symbol has occurrences in generated sources".to_string());
+        msgs.push("symbol has occurrences in generated sources");
     }
     if mask & READONLY_OCCURRENCE != 0 {
-        msgs.push("symbol has occurrences in readonly sources".to_string());
+        msgs.push("symbol has occurrences in readonly sources");
     }
     if mask & OVERRIDE_FAMILY != 0 {
-        msgs.push(
-            "symbol participates in an override family that cannot be renamed safely".to_string(),
-        );
+        msgs.push("symbol participates in an override family that cannot be renamed safely");
     }
     if mask & SYNTHETIC_ONLY != 0 {
-        msgs.push("symbol only has synthetic occurrences".to_string());
+        msgs.push("symbol only has synthetic occurrences");
     }
     if mask & PC_ONLY != 0 {
-        msgs.push(
-            "symbol is provided by a PC-only plugin and is not present in fresh SemanticDB"
-                .to_string(),
-        );
+        msgs.push("symbol is provided by a PC-only plugin and is not present in fresh SemanticDB");
     }
     if mask & SHARED_SOURCE_DISAGREEMENT != 0 {
-        msgs.push("targets sharing this source disagree on the rename group".to_string());
+        msgs.push("targets sharing this source disagree on the rename group");
     }
     if mask & UNSUPPORTED_SYMBOL_FAMILY != 0 {
-        msgs.push(
-            "symbol family (e.g. apply/unapply, exported symbol) is not safely renameable"
-                .to_string(),
-        );
+        msgs.push("symbol family (e.g. apply/unapply, exported symbol) is not safely renameable");
     }
     if mask & DEPENDENCY_SOURCE != 0 {
-        msgs.push("symbol has occurrences in dependency sources".to_string());
+        msgs.push("symbol has occurrences in dependency sources");
     }
     if mask & OPAQUE_TYPE != 0 {
-        msgs.push("opaque type rename is not supported (conservative policy)".to_string());
+        msgs.push("opaque type rename is not supported (conservative policy)");
     }
     msgs
 }
