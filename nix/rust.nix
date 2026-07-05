@@ -40,6 +40,11 @@ in
   # `nix build .#rust-workspace`
   package = workspace;
 
+  # Exposed so the flake can build an extra cargo-test check (the live
+  # embedded-JVM boundary test) that reuses the shared dependency artifacts and
+  # source fileset but adds boot env + a scoped test filter.
+  inherit commonArgs cargoArtifacts;
+
   # Merged into `nix flake check`.
   checks = {
     rust-build = workspace;

@@ -13,3 +13,8 @@ workspace = true
 ls-pc-abi = { path = "../ls-pc-abi" }
 libloading = "0.8"
 libc = "0.2"
+
+[dev-dependencies]
+# The live-boundary integration test names flat payload types directly to
+# decode real compiler responses; integration tests only see dev-dependencies.
+ls-pc-abi = { path = "../ls-pc-abi" }
