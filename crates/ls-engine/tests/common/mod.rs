@@ -242,6 +242,43 @@ impl CompileService for FailCompiler {
     }
 }
 
+/// A compiler that records the exact target list it was asked to compile.
+#[derive(Default)]
+pub struct RecordingCompiler {
+    seen: std::sync::Mutex<Option<Vec<String>>>,
+}
+
+impl RecordingCompiler {
+    pub fn recorded(&self) -> Option<Vec<String>> {
+        self.seen.lock().unwrap().clone()
+    }
+}
+
+impl CompileService for RecordingCompiler {
+    fn compile(&self, targets: &[String]) -> CompileOutcome {
+        *self.seen.lock().unwrap() = Some(targets.to_vec());
+        CompileOutcome::Ok
+    }
+}
+
+/// Writes a corrupt `.semanticdb` (a length-delimited field whose declared
+/// length exceeds the buffer), for malformed-ingest tests.
+pub fn write_corrupt(targetroot: &Path, uri: &str) {
+    let file = targetroot
+        .join("META-INF/semanticdb")
+        .join(format!("{uri}.semanticdb"));
+    fs::create_dir_all(file.parent().unwrap()).unwrap();
+    // tag=field1/wire2, then a length varint of 127 with no payload → truncated.
+    fs::write(&file, [0x0A, 0x7F]).unwrap();
+}
+
+/// Writes only a source file (no `.semanticdb`), for no-SemanticDB tests.
+pub fn write_source_only(sourceroot: &Path, uri: &str, source: &str) {
+    let src = sourceroot.join(uri);
+    fs::create_dir_all(src.parent().unwrap()).unwrap();
+    fs::write(&src, source).unwrap();
+}
+
 // ---- test overlay ----
 
 pub struct TestOverlay {

@@ -270,11 +270,23 @@ impl QueryOrchestrator {
     }
 
     fn raw_normalized_doc(&self, uri: &str) -> Result<NormalizedDocument, LsError> {
-        let spec = self
-            .primary_spec_of(uri)
-            .ok_or_else(|| LsError::NotIndexed {
-                uri: uri.to_string(),
-            })?;
+        let spec = match self.primary_spec_of(uri) {
+            Some(spec) => spec,
+            // No `.semanticdb` for this uri. A source that IS a workspace target
+            // source but produced no SemanticDB is a hard `NoSemanticdb` (no
+            // fallback, E1 parity); a source outside every target is `NotIndexed`.
+            None => {
+                return Err(if self.source_target_of(uri).is_some() {
+                    LsError::NoSemanticdb {
+                        uri: uri.to_string(),
+                    }
+                } else {
+                    LsError::NotIndexed {
+                        uri: uri.to_string(),
+                    }
+                });
+            }
+        };
         let locator = SemanticdbLocator::new(spec.semanticdb_root.clone());
         let file = locator
             .semanticdb_file_for(uri)
@@ -328,6 +340,18 @@ impl QueryOrchestrator {
 
     pub fn primary_bsp_of(&self, uri: &str) -> Option<String> {
         self.primary_spec_of(uri).map(|s| s.bsp_id)
+    }
+
+    /// The first target in workspace order whose sourceroot actually contains
+    /// `uri` as a regular file — workspace membership regardless of whether the
+    /// target produced any `.semanticdb` output. Distinguishes a
+    /// no-SemanticDB workspace source from a truly outside-workspace uri.
+    pub fn source_target_of(&self, uri: &str) -> Option<TargetSpec> {
+        let ws = self.workspace()?;
+        ws.targets
+            .iter()
+            .find(|spec| spec.sourceroot.join(uri).is_file())
+            .cloned()
     }
 
     /// Every target's `.semanticdb` file that contains `uri` (workspace order),

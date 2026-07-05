@@ -37,6 +37,14 @@ use crate::state::{DocState, IngestState};
 use crate::symbol_encoding::encode_key;
 use crate::targets::WorkspaceTargets;
 
+/// A `.semanticdb` file that could not be decoded, kept as typed per-file
+/// evidence so a broken SemanticDB producer cannot silently reduce coverage.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SemanticdbFileError {
+    pub file: String,
+    pub error: String,
+}
+
 /// Result of one full-generation publish.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IngestReport {
@@ -50,6 +58,9 @@ pub struct IngestReport {
     pub rename_group_count: usize,
     pub stale_uris: Vec<String>,
     pub skipped_uris: Vec<String>,
+    /// `.semanticdb` files whose payload failed to decode (skipped, ingest
+    /// continued). Distinct from `skipped_uris`, which is source-file-missing.
+    pub parse_errors: Vec<SemanticdbFileError>,
     pub duration_ms: u64,
 }
 
@@ -80,6 +91,7 @@ pub fn ingest(
     let mut shared_count = 0usize;
     let mut stale_uris: Vec<String> = Vec::new();
     let mut skipped_uris: Vec<String> = Vec::new();
+    let mut parse_errors: Vec<SemanticdbFileError> = Vec::new();
     let mut new_state = IngestState::default();
 
     for (target_ord, spec) in workspace.targets.iter().enumerate() {
@@ -87,7 +99,15 @@ pub fn ingest(
         for file in locator.list_semanticdb_files() {
             let documents = match parse_file(&file) {
                 Ok(d) => d.documents,
-                Err(_) => continue, // malformed file: skip, keep ingesting
+                // Malformed file: record the typed per-file error, count it, and
+                // keep ingesting the remaining valid files.
+                Err(e) => {
+                    parse_errors.push(SemanticdbFileError {
+                        file: file.to_string_lossy().into_owned(),
+                        error: e.to_string(),
+                    });
+                    continue;
+                }
             };
             for sdb in documents {
                 let uri = sdb.uri.clone();
@@ -367,6 +387,7 @@ pub fn ingest(
         rename_group_count,
         stale_uris,
         skipped_uris,
+        parse_errors,
         duration_ms: t0.elapsed().as_millis() as u64,
     };
     Ok((report, snapshot))

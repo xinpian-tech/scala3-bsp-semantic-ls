@@ -9,8 +9,8 @@ use std::sync::Arc;
 
 use common::*;
 use ls_engine::{
-    current_thread_label, identifiers, symbol_encoding, QueryOrchestrator, ReferencesEngine,
-    RenameEngine, ResolutionSource, TargetSpec, WorkspaceTargets,
+    current_thread_label, identifiers, symbol_encoding, NoopOverlay, QueryOrchestrator,
+    ReferencesEngine, RenameEngine, ResolutionSource, TargetSpec, WorkspaceTargets,
 };
 use ls_index_model::{DocId, LsError, Role, Span, SymbolKey};
 use ls_store::Store;
@@ -334,4 +334,254 @@ fn doc_ord_of(snap: &ls_store::Snapshot, uri: &str) -> u32 {
     (0..snap.segment().doc_count())
         .find(|&d| snap.segment().uri_of(d) == uri)
         .unwrap()
+}
+
+/// A three-target graph: `core` defines `pkg/S#`; `app` depends on `core` and
+/// references it; `other` is disconnected but reuses the symbol string.
+fn build_prune_workspace(dir: &TempDir) -> Arc<WorkspaceTargets> {
+    let core_t = dir.sub("coretarget");
+    let core_s = dir.sub("coresrc");
+    let app_t = dir.sub("apptarget");
+    let app_s = dir.sub("appsrc");
+    let other_t = dir.sub("othertarget");
+    let other_s = dir.sub("othersrc");
+    write_doc(
+        &core_t,
+        &core_s,
+        &DocFixture::new("c/S.scala", "class S\n")
+            .symbol(sym("pkg/S#", KIND_CLASS, 0, "S"))
+            .occurrence(occ(rng(0, 6, 0, 7), "pkg/S#", DEFINITION)),
+    );
+    write_doc(
+        &app_t,
+        &app_s,
+        &DocFixture::new("a/A.scala", "val a = new S\n").occurrence(occ(
+            rng(0, 12, 0, 13),
+            "pkg/S#",
+            REFERENCE,
+        )),
+    );
+    write_doc(
+        &other_t,
+        &other_s,
+        &DocFixture::new("o/O.scala", "val o = new S\n").occurrence(occ(
+            rng(0, 12, 0, 13),
+            "pkg/S#",
+            REFERENCE,
+        )),
+    );
+    Arc::new(WorkspaceTargets::new(vec![
+        TargetSpec::new("core", core_t, core_s),
+        TargetSpec::new("app", app_t, app_s).with_deps(vec!["core".to_string()]),
+        TargetSpec::new("other", other_t, other_s),
+    ]))
+}
+
+#[test]
+fn no_semanticdb_source_returns_hard_error() {
+    let dir = TempDir::new("nosdb");
+    // One real target so the segment is non-empty.
+    let lib_t = dir.sub("libtarget");
+    let lib_s = dir.sub("libsrc");
+    write_doc(
+        &lib_t,
+        &lib_s,
+        &DocFixture::new("l/L.scala", "class L\n")
+            .symbol(sym("pkg/L#", KIND_CLASS, 0, "L"))
+            .occurrence(occ(rng(0, 6, 0, 7), "pkg/L#", DEFINITION)),
+    );
+    // A target whose source exists but produced no SemanticDB.
+    let app_t = dir.sub("apptarget");
+    let app_s = dir.sub("appsrc");
+    write_source_only(&app_s, "n/N.scala", "class N\n");
+    let ws = WorkspaceTargets::new(vec![
+        TargetSpec::new("lib", lib_t, lib_s),
+        TargetSpec::new("app", app_t, app_s),
+    ]);
+    let store = Store::open(&dir.sub("store")).unwrap();
+    let orch = QueryOrchestrator::with_defaults(store);
+    orch.ingest(Arc::new(ws)).unwrap();
+
+    assert!(matches!(
+        orch.symbol_at_cursor("n/N.scala", 0, 6),
+        Err(LsError::NoSemanticdb { .. })
+    ));
+    let refs = ReferencesEngine::new(&orch);
+    assert!(matches!(
+        refs.references("n/N.scala", 0, 6, false),
+        Err(LsError::NoSemanticdb { .. })
+    ));
+    let compiler = OkCompiler;
+    let rename = RenameEngine::new(&orch, &compiler);
+    assert!(matches!(
+        rename.prepare_rename("n/N.scala", 0, 6),
+        Err(LsError::NoSemanticdb { .. })
+    ));
+    assert!(matches!(
+        rename.rename("n/N.scala", 0, 6, "Renamed"),
+        Err(LsError::NoSemanticdb { .. })
+    ));
+    // A uri outside every target sourceroot stays NotIndexed.
+    assert!(matches!(
+        orch.symbol_at_cursor("outside/Z.scala", 0, 0),
+        Err(LsError::NotIndexed { .. })
+    ));
+}
+
+#[test]
+fn malformed_semanticdb_is_counted_and_ingest_continues() {
+    let dir = TempDir::new("malformed");
+    let targetroot = dir.sub("target");
+    let sourceroot = dir.sub("sources");
+    write_doc(
+        &targetroot,
+        &sourceroot,
+        &DocFixture::new("a/A.scala", "class A\n")
+            .symbol(sym("pkg/A#", KIND_CLASS, 0, "A"))
+            .occurrence(occ(rng(0, 6, 0, 7), "pkg/A#", DEFINITION)),
+    );
+    write_corrupt(&targetroot, "z/Z.scala");
+    let ws = WorkspaceTargets::new(vec![TargetSpec::new("app", targetroot, sourceroot)]);
+    let store = Store::open(&dir.sub("store")).unwrap();
+    let orch = QueryOrchestrator::with_defaults(store);
+    let report = orch.ingest(Arc::new(ws)).unwrap();
+    assert_eq!(report.docs_indexed, 1, "valid doc still indexed");
+    assert_eq!(report.parse_errors.len(), 1, "corrupt file counted");
+    assert!(report.parse_errors[0].file.contains("Z.scala"));
+    assert!(!report.parse_errors[0].error.is_empty());
+}
+
+#[test]
+fn references_pruned_to_reverse_dependency_closure() {
+    let dir = TempDir::new("prune");
+    let ws = build_prune_workspace(&dir);
+    let orch = orchestrator(&dir, ws);
+    let engine = ReferencesEngine::new(&orch);
+    let result = engine.references("c/S.scala", 0, 6, false).unwrap();
+    let uris: Vec<&str> = result.hits.iter().map(|h| h.loc.uri.as_str()).collect();
+    assert_eq!(result.hits.len(), 1, "only the closure reference: {uris:?}");
+    assert!(uris.contains(&"a/A.scala"), "app (dep of core) included");
+    assert!(!uris.contains(&"o/O.scala"), "disconnected other pruned");
+}
+
+#[test]
+fn compile_domain_is_reverse_dependency_closure() {
+    let dir = TempDir::new("compiledomain");
+    let ws = build_prune_workspace(&dir);
+    let orch = orchestrator(&dir, ws);
+    let compiler = RecordingCompiler::default();
+    let engine = RenameEngine::new(&orch, &compiler);
+    let _ = engine.rename("c/S.scala", 0, 6, "Renamed");
+    assert_eq!(
+        compiler.recorded(),
+        Some(vec!["app".to_string(), "core".to_string()]),
+        "compile domain is the sorted reverse-dependency closure of the def target"
+    );
+}
+
+#[test]
+fn references_raw_fallback_serves_same_doc() {
+    let dir = TempDir::new("rawfallback");
+    let (ws, targetroot, sourceroot) = build_ab(&dir);
+    let store = Store::open(&dir.sub("store")).unwrap();
+    let orch = QueryOrchestrator::new(store, Box::new(NoopOverlay), false); // write-through OFF
+    orch.ingest(ws).unwrap();
+    let c = DocFixture::new("c/C.scala", "class C:\n  def me: C = this\n")
+        .symbol(sym("pkg/C#", KIND_CLASS, 0, "C"))
+        .occurrence(occ(rng(0, 6, 0, 7), "pkg/C#", DEFINITION))
+        .occurrence(occ(rng(1, 10, 1, 11), "pkg/C#", REFERENCE));
+    write_doc(&targetroot, &sourceroot, &c);
+
+    let engine = ReferencesEngine::new(&orch);
+    let result = engine.references("c/C.scala", 0, 6, false).unwrap();
+    assert!(result.needs_reindex, "raw path leaves needs_reindex set");
+    assert_eq!(result.hits.len(), 1);
+    assert_eq!(result.hits[0].loc.uri, "c/C.scala");
+    assert_eq!(result.hits[0].loc.span, Span::new(1, 10, 1, 11));
+}
+
+#[test]
+fn rename_synthetic_only_symbol_rejected() {
+    let dir = TempDir::new("synthetic");
+    let targetroot = dir.sub("target");
+    let sourceroot = dir.sub("sources");
+    // `pkg/X#gen().` is referenced but never defined; its owner `pkg/X#` is.
+    let x = DocFixture::new("x/X.scala", "class X:\n  def use = gen\n")
+        .symbol(sym("pkg/X#", KIND_CLASS, 0, "X"))
+        .symbol(sym("pkg/X#use().", KIND_METHOD, 0, "use"))
+        .symbol(sym("pkg/X#gen().", KIND_METHOD, 0, "gen"))
+        .occurrence(occ(rng(0, 6, 0, 7), "pkg/X#", DEFINITION))
+        .occurrence(occ(rng(1, 6, 1, 9), "pkg/X#use().", DEFINITION))
+        .occurrence(occ(rng(1, 12, 1, 15), "pkg/X#gen().", REFERENCE));
+    write_doc(&targetroot, &sourceroot, &x);
+    let ws = WorkspaceTargets::new(vec![TargetSpec::new("app", targetroot, sourceroot)]);
+    let orch = orchestrator(&dir, Arc::new(ws));
+    let compiler = OkCompiler;
+    let engine = RenameEngine::new(&orch, &compiler);
+    let err = engine.rename("x/X.scala", 1, 12, "Renamed").unwrap_err();
+    assert!(matches!(err, LsError::RenameRejected { .. }));
+}
+
+#[test]
+fn rename_shared_source_disagreement_rejected() {
+    let dir = TempDir::new("disagree");
+    let t0 = dir.sub("t0");
+    let s0 = dir.sub("s0");
+    let t1 = dir.sub("t1");
+    let s1 = dir.sub("s1");
+    // The same uri, same source, but different symbols at the edit span.
+    write_doc(
+        &t0,
+        &s0,
+        &DocFixture::new("s/S.scala", "class S\n")
+            .symbol(sym("pkg/S#", KIND_CLASS, 0, "S"))
+            .occurrence(occ(rng(0, 6, 0, 7), "pkg/S#", DEFINITION)),
+    );
+    write_doc(
+        &t1,
+        &s1,
+        &DocFixture::new("s/S.scala", "class S\n")
+            .symbol(sym("other/S#", KIND_CLASS, 0, "S"))
+            .occurrence(occ(rng(0, 6, 0, 7), "other/S#", DEFINITION)),
+    );
+    let ws = WorkspaceTargets::new(vec![
+        TargetSpec::new("t0", t0, s0),
+        TargetSpec::new("t1", t1, s1),
+    ]);
+    let orch = orchestrator(&dir, Arc::new(ws));
+    let compiler = OkCompiler;
+    let engine = RenameEngine::new(&orch, &compiler);
+    let err = engine.rename("s/S.scala", 0, 6, "Renamed").unwrap_err();
+    assert!(matches!(err, LsError::RenameRejected { .. }));
+}
+
+#[test]
+fn rename_md5_stale_before_emit_rejected() {
+    let dir = TempDir::new("md5stale");
+    let targetroot = dir.sub("target");
+    let sourceroot = dir.sub("sources");
+    write_doc(
+        &targetroot,
+        &sourceroot,
+        &DocFixture::new("a/A.scala", "class S\n")
+            .symbol(sym("pkg/S#", KIND_CLASS, 0, "S"))
+            .occurrence(occ(rng(0, 6, 0, 7), "pkg/S#", DEFINITION)),
+    );
+    write_doc(
+        &targetroot,
+        &sourceroot,
+        &DocFixture::new("b/B.scala", "val b = new S\n").occurrence(occ(
+            rng(0, 12, 0, 13),
+            "pkg/S#",
+            REFERENCE,
+        )),
+    );
+    let ws = WorkspaceTargets::new(vec![TargetSpec::new("app", targetroot, sourceroot.clone())]);
+    let orch = orchestrator(&dir, Arc::new(ws));
+    // Make B stale (append a comment; the ref token on line 0 is unchanged).
+    std::fs::write(sourceroot.join("b/B.scala"), "val b = new S\n// changed\n").unwrap();
+    let compiler = OkCompiler;
+    let engine = RenameEngine::new(&orch, &compiler);
+    let err = engine.rename("a/A.scala", 0, 6, "Renamed").unwrap_err();
+    assert!(matches!(err, LsError::StaleIndex { uri } if uri == "b/B.scala"));
 }

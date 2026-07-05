@@ -16,7 +16,7 @@ pub mod rename;
 pub mod symbol_encoding;
 pub mod targets;
 
-pub use ingest::{ingest, IngestReport};
+pub use ingest::{ingest, IngestReport, SemanticdbFileError};
 pub use orchestrator::{current_thread_label, CursorSymbol, QueryOrchestrator, ResolutionSource};
 pub use overlay::{DirtyBufferOverlay, NoopOverlay, OverlayHit};
 pub use references::{ReferenceHit, ReferencesEngine, ReferencesResult};
