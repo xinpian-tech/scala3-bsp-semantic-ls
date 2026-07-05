@@ -341,6 +341,61 @@ listed here (whole-file CRC).
 A reader must verify every entry at open and reject the segment on the first
 mismatch, missing file, unexpected entry name or count.
 
+> **v2 extension (`ls-store`, `crates/ls-store`).** The Rust v2 writer appends
+> three snapshot-resident sections — `target-meta.bin`, `symbol-meta.bin`,
+> `search.bin` (below) — to the checksummed set, so its `checksums.bin` has
+> `entry_count = 14` and the canonical order continues with `target-meta.bin`,
+> `symbol-meta.bin`, `search.bin` after `block-index.bin`. The twelve v1 files
+> are byte-identical to this spec; the legacy Scala writer emits the original
+> eleven. `magic` and `version` are unchanged.
+
+## v2 extension sections (`ls-store`)
+
+These sections replace the former SQLite tables (`targets`, `symbol_metadata`)
+and the FTS5 search index with immutable, mmap-resident, CRC32C-validated files.
+All fields are little-endian; strings are `(int32 offset, int32 len)` refs into
+a trailing blob, as elsewhere.
+
+### target-meta.bin (per-target metadata, indexed by `target_ord`)
+
+```
+int64 target_count           // == symbol-index target_count
+int64 blob_length
+TargetMetaEntry[target_count] // 48 bytes each
+byte  blob[blob_length]
+```
+
+`TargetMetaEntry` (48 bytes): `bsp_id` (str ref, 8), `scala_version` (str ref,
+8), `sourceroot` (str ref, 8), `semanticdb_root` (str ref, 8),
+`content_hash` (int64), `options_hash` (int64).
+
+### symbol-meta.bin (per-symbol metadata, symbol-index sorted order)
+
+```
+int64 symbol_count           // == symbol-index symbol_count
+int64 blob_length
+SymbolMetaEntry[symbol_count] // 48 bytes each, same order as symbol-index.bin
+byte  blob[blob_length]
+```
+
+`SymbolMetaEntry` (48 bytes): `display` (str ref, 8), `owner` (str ref, 8),
+`package` (str ref, 8), `kind` (int32, a `SymKind` code), `properties` (int32,
+`sym_props` bits), `def_packed_start` (int32), `def_packed_end` (int32),
+`def_doc_ord` (int32, `-1` = unknown), pad (int32 = 0).
+
+### search.bin (fuzzy-search plumbing; ranking filled by task6)
+
+```
+int64 row_count              // rows sorted by normalized_name (UTF-8 bytes)
+int64 name_blob_length
+SearchRow[row_count]         // 16 bytes each
+byte  name_blob[name_blob_length]
+```
+
+`SearchRow` (16 bytes): `normalized_name` (str ref, 8), `symbol_ord` (int32),
+pad (int32 = 0). task4 writes and validates this section (empty is valid); the
+FuzzyRank scoring and initials table land in task6.
+
 ## Open-time validation (implemented by `ls.postings.SegmentReader.open`)
 
 1. `header.bin` is exactly 64 bytes, magic and version match, header

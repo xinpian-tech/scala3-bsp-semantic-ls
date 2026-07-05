@@ -1,0 +1,18 @@
+[package]
+name = "ls-store"
+description = "Immutable mmap index-segment storage: a faithful port of the ls.postings v1 on-disk segment format (docs/index-format.md) — little-endian, CRC32C-validated segment reader/writer plus the target-meta/symbol-meta/search sections."
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+ls-index-model = { path = "../ls-index-model" }
+crc32c = "0.6"
+memmap2 = "0.9"
+
+[dev-dependencies]
+tempfile = "3"
