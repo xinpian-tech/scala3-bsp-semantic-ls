@@ -1,6 +1,6 @@
 [package]
 name = "ls-bsp"
-description = "BSP client: .bsp/*.json connection-file discovery, the Scala 3 build-target project model with exact dependency-graph queries, and SemanticDB-flag extraction. A behavior-preserving port of the ls.bsp discovery/model/flags layer."
+description = "BSP client: .bsp/*.json connection-file discovery, the JSON-RPC session over a build-server process, the Scala 3 build-target project model with exact dependency-graph queries, and SemanticDB-flag extraction. A behavior-preserving port of the ls.bsp layer."
 version.workspace = true
 edition.workspace = true
 repository.workspace = true
@@ -15,4 +15,6 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 [dev-dependencies]
+ls-index-model = { path = "../ls-index-model" }
+serde_json = "1"
 tempfile = "3"
