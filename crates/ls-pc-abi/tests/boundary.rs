@@ -15,8 +15,8 @@ use ls_pc_abi::abi::{
 };
 use ls_pc_abi::payloads::{
     origin, CompilerPlugin, CompletionItem, CompletionList, DefinitionResult, DisabledPlugin,
-    HoverResult, Location, LocationsResult, PluginStatus, PrepareRenameResult, ResolveParams, Rng,
-    ServicePlugin, SignatureHelp, SignatureInfo,
+    Documentation, HoverResult, Location, LocationsResult, PluginStatus, PrepareRenameResult,
+    ResolveParams, Rng, ServicePlugin, SignatureHelp, SignatureInfo,
 };
 use ls_pc_abi::{
     compute_layout_canary, memory, LsBuf, LsStr, PcVtable, RustVtable, ABI_VERSION, LAYOUT_CANARY,
@@ -53,23 +53,34 @@ fn empty_buf() -> LsBuf {
     }
 }
 
+fn bare_item(label: String) -> CompletionItem {
+    CompletionItem {
+        label,
+        label_details: None,
+        kind: Some(1),
+        tags: None,
+        detail: None,
+        documentation: None,
+        deprecated: None,
+        preselect: None,
+        sort_text: None,
+        filter_text: None,
+        insert_text: None,
+        insert_text_format: Some(1),
+        insert_text_mode: None,
+        text_edit: None,
+        additional_text_edits: None,
+        commit_characters: None,
+        command: None,
+        data: None,
+    }
+}
+
 fn single_item_list(label: String) -> CompletionList {
     CompletionList {
         is_incomplete: false,
-        items: vec![CompletionItem {
-            label,
-            kind: 1,
-            detail: None,
-            documentation: None,
-            sort_text: None,
-            filter_text: None,
-            insert_text: None,
-            insert_text_format: 1,
-            text_edit: None,
-            additional_text_edits: vec![],
-            commit_characters: vec![],
-            data: None,
-        }],
+        item_defaults: None,
+        items: vec![bare_item(label)],
     }
 }
 
@@ -122,10 +133,11 @@ unsafe extern "C" fn stub_signature_help(
         signatures: vec![SignatureInfo {
             label: "f(x: Int): Int".to_string(),
             documentation: None,
-            parameters: vec![],
+            parameters: None,
+            active_parameter: None,
         }],
-        active_signature: 0,
-        active_parameter: 0,
+        active_signature: Some(0),
+        active_parameter: Some(0),
     }
     .encode();
     if unsafe { memory::write_response(&payload, out) } {
@@ -193,7 +205,7 @@ unsafe extern "C" fn stub_resolve(
         Err(_) => return ls_pc_abi::STATUS_DECODE,
     };
     // Enrich the item, as a real resolve would.
-    item.documentation = Some("resolved".to_string());
+    item.documentation = Some(Documentation::Plain("resolved".to_string()));
     let payload = item.encode();
     if unsafe { memory::write_response(&payload, out) } {
         STATUS_OK
@@ -410,7 +422,10 @@ fn boundary_calls_round_trip_and_free_without_leaking() {
             STATUS_OK
         );
         let resolved = CompletionItem::decode(unsafe { as_slice(&out) }).unwrap();
-        assert_eq!(resolved.documentation.as_deref(), Some("resolved"));
+        assert_eq!(
+            resolved.documentation,
+            Some(Documentation::Plain("resolved".to_string()))
+        );
         unsafe { (rust.free)(out.ptr, out.len) };
 
         // symbol_definition callback through the Rust vtable.

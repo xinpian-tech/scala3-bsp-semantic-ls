@@ -1,17 +1,177 @@
 //! Every op payload round-trips through its `encode`/`decode` pair without loss,
-//! including the nullable-vs-empty distinctions and the definition origin tags.
-//! Ported from the fidelity guarantees today's `ls.pc.worker` carriers hold.
+//! including the full LSP4J carrier surface (label details, tags, deprecated/
+//! preselect, documentation variants, insert/replace edits, command, item
+//! defaults, hover contents variants, signature parameter label offsets), the
+//! nullable-vs-empty distinctions, and the definition origin tags.
 
 use ls_pc_abi::payloads::{
-    origin, CompilerPlugin, CompletionItem, CompletionList, DefinitionResult, DidChangeParams,
-    DidOpenParams, DisabledPlugin, Hover, HoverResult, Location, LocationsResult, ParameterInfo,
+    origin, Command, CompilerPlugin, CompletionEdit, CompletionItem, CompletionItemDefaults,
+    CompletionList, DefinitionResult, DidChangeParams, DidOpenParams, DisabledPlugin,
+    Documentation, EditRange, Hover, HoverContents, HoverResult, InsertReplaceEdit, LabelDetails,
+    Location, LocationsResult, MarkedStringItem, MarkupContent, ParameterInfo, ParameterLabel,
     PluginStatus, PositionParams, PrepareRenameResult, ResolveParams, Rng, ServicePlugin,
     SignatureHelp, SignatureInfo, TargetConfig, TextEdit,
 };
 use proptest::prelude::*;
 
+/// A completion item with only its required `label` set (everything else null).
+fn bare_item(label: &str) -> CompletionItem {
+    CompletionItem {
+        label: label.to_string(),
+        label_details: None,
+        kind: None,
+        tags: None,
+        detail: None,
+        documentation: None,
+        deprecated: None,
+        preselect: None,
+        sort_text: None,
+        filter_text: None,
+        insert_text: None,
+        insert_text_format: None,
+        insert_text_mode: None,
+        text_edit: None,
+        additional_text_edits: None,
+        commit_characters: None,
+        command: None,
+        data: None,
+    }
+}
+
+fn range(a: u32, b: u32, c: u32, d: u32) -> Rng {
+    Rng {
+        start_line: a,
+        start_character: b,
+        end_line: c,
+        end_character: d,
+    }
+}
+
 // ---------------------------------------------------------------------------
-// Explicit edge cases (the distinctions Codex called out).
+// Carrier parity: the previously-dropped LSP4J fields survive a round trip.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn completion_item_full_lsp4j_surface_round_trips() {
+    let item = CompletionItem {
+        label: "map".to_string(),
+        label_details: Some(LabelDetails {
+            detail: Some("[B](f: A => B)".to_string()),
+            description: Some("scala.collection".to_string()),
+        }),
+        kind: Some(2),
+        tags: Some(vec![1]),
+        detail: Some("def map[B](f: A => B): List[B]".to_string()),
+        documentation: Some(Documentation::Markup(MarkupContent {
+            kind: "markdown".to_string(),
+            value: "**maps** the list".to_string(),
+        })),
+        deprecated: Some(true),
+        preselect: Some(false),
+        sort_text: Some("00".to_string()),
+        filter_text: Some("map".to_string()),
+        insert_text: None,
+        insert_text_format: Some(2),
+        insert_text_mode: Some(1),
+        text_edit: Some(CompletionEdit::InsertReplace(InsertReplaceEdit {
+            new_text: "map($0)".to_string(),
+            insert: range(0, 0, 0, 3),
+            replace: range(0, 0, 0, 5),
+        })),
+        additional_text_edits: Some(vec![TextEdit {
+            range: range(1, 0, 1, 0),
+            new_text: "import scala.collection\n".to_string(),
+        }]),
+        commit_characters: Some(vec![".".to_string()]),
+        command: Some(Command {
+            title: "trigger".to_string(),
+            command: "editor.action.triggerSuggest".to_string(),
+            arguments: Some(br#"[{"uri":"file:///a"}]"#.to_vec()),
+        }),
+        data: Some(br#"{"symbol":"scala/collection/List#map()."}"#.to_vec()),
+    };
+    assert_eq!(CompletionItem::decode(&item.encode()).unwrap(), item);
+}
+
+#[test]
+fn completion_edit_plain_variant_round_trips() {
+    let mut item = bare_item("f");
+    item.text_edit = Some(CompletionEdit::Plain(TextEdit {
+        range: range(0, 0, 0, 1),
+        new_text: "f()".to_string(),
+    }));
+    assert_eq!(CompletionItem::decode(&item.encode()).unwrap(), item);
+}
+
+#[test]
+fn completion_list_item_defaults_round_trip() {
+    let list = CompletionList {
+        is_incomplete: true,
+        item_defaults: Some(CompletionItemDefaults {
+            commit_characters: Some(vec![".".to_string(), "(".to_string()]),
+            edit_range: Some(EditRange::InsertReplace {
+                insert: range(0, 0, 0, 2),
+                replace: range(0, 0, 0, 4),
+            }),
+            insert_text_format: Some(2),
+            insert_text_mode: None,
+            data: Some(b"defaults".to_vec()),
+        }),
+        items: vec![bare_item("a")],
+    };
+    assert_eq!(CompletionList::decode(&list.encode()).unwrap(), list);
+
+    // editRange as a plain Range is a distinct variant.
+    let mut plain = list.clone();
+    plain.item_defaults.as_mut().unwrap().edit_range = Some(EditRange::Range(range(0, 0, 0, 3)));
+    assert_eq!(CompletionList::decode(&plain.encode()).unwrap(), plain);
+}
+
+#[test]
+fn hover_marked_string_contents_round_trips() {
+    // The MarkedString-list contents variant (not just MarkupContent).
+    let hover = HoverResult(Some(Hover {
+        contents: HoverContents::Marked(vec![
+            MarkedStringItem::Plain("plain".to_string()),
+            MarkedStringItem::Marked {
+                language: "scala".to_string(),
+                value: "def f: Int".to_string(),
+            },
+        ]),
+        range: Some(range(2, 1, 2, 4)),
+    }));
+    assert_eq!(HoverResult::decode(&hover.encode()).unwrap(), hover);
+}
+
+#[test]
+fn signature_parameter_label_offsets_round_trip() {
+    let help = SignatureHelp {
+        signatures: vec![SignatureInfo {
+            label: "f(x: Int, y: Int): Int".to_string(),
+            documentation: Some(Documentation::Plain("adds".to_string())),
+            parameters: Some(vec![
+                ParameterInfo {
+                    label: ParameterLabel::Offsets { start: 2, end: 8 },
+                    documentation: Some(Documentation::Markup(MarkupContent {
+                        kind: "markdown".to_string(),
+                        value: "the x".to_string(),
+                    })),
+                },
+                ParameterInfo {
+                    label: ParameterLabel::Str("y: Int".to_string()),
+                    documentation: None,
+                },
+            ]),
+            active_parameter: Some(0),
+        }],
+        active_signature: Some(0),
+        active_parameter: Some(1),
+    };
+    assert_eq!(SignatureHelp::decode(&help.encode()).unwrap(), help);
+}
+
+// ---------------------------------------------------------------------------
+// Nullable-vs-empty and origin edge cases.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -20,34 +180,17 @@ fn hover_null_is_distinct_from_present_empty() {
     assert_eq!(HoverResult::decode(&null.encode()).unwrap(), null);
 
     let present_empty = HoverResult(Some(Hover {
-        contents: String::new(),
-        kind: 1,
+        contents: HoverContents::Markup(MarkupContent {
+            kind: "plaintext".to_string(),
+            value: String::new(),
+        }),
         range: None,
     }));
     assert_eq!(
         HoverResult::decode(&present_empty.encode()).unwrap(),
         present_empty
     );
-    // The two encode to different buffers — null is not "empty contents".
     assert_ne!(null.encode(), present_empty.encode());
-}
-
-#[test]
-fn hover_range_is_independently_nullable() {
-    let with_range = HoverResult(Some(Hover {
-        contents: "x: Int".to_string(),
-        kind: 1,
-        range: Some(Rng {
-            start_line: 1,
-            start_character: 2,
-            end_line: 1,
-            end_character: 5,
-        }),
-    }));
-    assert_eq!(
-        HoverResult::decode(&with_range.encode()).unwrap(),
-        with_range
-    );
 }
 
 #[test]
@@ -60,23 +203,40 @@ fn prepare_rename_null_is_distinct_from_zero_range() {
 }
 
 #[test]
+fn optional_scalars_distinguish_none_from_zero_and_false() {
+    let mut some = bare_item("x");
+    some.kind = Some(0);
+    some.deprecated = Some(false);
+    some.preselect = Some(false);
+    let none = bare_item("x");
+    assert_eq!(CompletionItem::decode(&some.encode()).unwrap(), some);
+    assert_eq!(CompletionItem::decode(&none.encode()).unwrap(), none);
+    assert_ne!(some.encode(), none.encode());
+}
+
+#[test]
+fn nullable_list_distinguishes_none_from_empty() {
+    let mut none = bare_item("x");
+    none.commit_characters = None;
+    none.tags = None;
+    let mut empty = bare_item("x");
+    empty.commit_characters = Some(vec![]);
+    empty.tags = Some(vec![]);
+    assert_eq!(CompletionItem::decode(&none.encode()).unwrap(), none);
+    assert_eq!(CompletionItem::decode(&empty.encode()).unwrap(), empty);
+    assert_ne!(none.encode(), empty.encode());
+}
+
+#[test]
 fn empty_completion_list_round_trips() {
     let empty = CompletionList {
         is_incomplete: false,
+        item_defaults: None,
         items: vec![],
     };
     let decoded = CompletionList::decode(&empty.encode()).unwrap();
     assert_eq!(decoded, empty);
     assert!(decoded.items.is_empty());
-
-    let incomplete_empty = CompletionList {
-        is_incomplete: true,
-        items: vec![],
-    };
-    assert_eq!(
-        CompletionList::decode(&incomplete_empty.encode()).unwrap(),
-        incomplete_empty
-    );
 }
 
 #[test]
@@ -86,12 +246,7 @@ fn definition_preserves_per_location_origin_tags() {
         locations: vec![
             Location {
                 uri: "file:///a.scala".to_string(),
-                range: Rng {
-                    start_line: 3,
-                    start_character: 6,
-                    end_line: 3,
-                    end_character: 9,
-                },
+                range: range(3, 6, 3, 9),
                 origin: origin::WORKSPACE,
             },
             Location {
@@ -116,38 +271,14 @@ fn definition_preserves_per_location_origin_tags() {
 }
 
 #[test]
-fn completion_item_optional_and_opaque_fields_round_trip() {
-    // A `data` payload with an embedded NUL and non-textual bytes must survive
-    // verbatim; `Some(vec![])` is distinct from `None`.
-    let item = CompletionItem {
-        label: "map".to_string(),
-        kind: 2,
-        detail: Some("def map[B](f: A => B): List[B]".to_string()),
-        documentation: None,
-        sort_text: Some(String::new()),
-        filter_text: None,
-        insert_text: None,
-        insert_text_format: 2,
-        text_edit: Some(TextEdit {
-            range: Rng {
-                start_line: 0,
-                start_character: 0,
-                end_line: 0,
-                end_character: 3,
-            },
-            new_text: "map($0)".to_string(),
-        }),
-        additional_text_edits: vec![],
-        commit_characters: vec![".".to_string(), "(".to_string()],
-        data: Some(vec![0u8, 1, 2, 0, 255]),
-    };
+fn opaque_data_bytes_survive_and_empty_is_distinct_from_none() {
+    let mut item = bare_item("x");
+    item.data = Some(vec![0u8, 1, 2, 0, 255]);
     assert_eq!(CompletionItem::decode(&item.encode()).unwrap(), item);
 
-    let empty_data = CompletionItem {
-        data: Some(vec![]),
-        ..item.clone()
-    };
-    let no_data = CompletionItem { data: None, ..item };
+    let mut empty_data = bare_item("x");
+    empty_data.data = Some(vec![]);
+    let no_data = bare_item("x");
     assert_eq!(
         CompletionItem::decode(&empty_data.encode()).unwrap(),
         empty_data
@@ -166,61 +297,200 @@ fn unicode_strings_round_trip() {
 }
 
 // ---------------------------------------------------------------------------
-// Property-based round trips.
+// Property strategies for the expanded shapes.
 // ---------------------------------------------------------------------------
 
 fn rng_strat() -> impl Strategy<Value = Rng> {
-    (any::<u32>(), any::<u32>(), any::<u32>(), any::<u32>()).prop_map(
-        |(start_line, start_character, end_line, end_character)| Rng {
-            start_line,
-            start_character,
-            end_line,
-            end_character,
-        },
-    )
+    (any::<u32>(), any::<u32>(), any::<u32>(), any::<u32>())
+        .prop_map(|(a, b, c, d)| range(a, b, c, d))
 }
 
 fn text_edit_strat() -> impl Strategy<Value = TextEdit> {
     (rng_strat(), ".*").prop_map(|(range, new_text)| TextEdit { range, new_text })
 }
 
+fn markup_strat() -> impl Strategy<Value = MarkupContent> {
+    (".*", ".*").prop_map(|(kind, value)| MarkupContent { kind, value })
+}
+
+fn documentation_strat() -> impl Strategy<Value = Documentation> {
+    prop_oneof![
+        ".*".prop_map(Documentation::Plain),
+        markup_strat().prop_map(Documentation::Markup),
+    ]
+}
+
+fn opt_bytes() -> impl Strategy<Value = Option<Vec<u8>>> {
+    proptest::option::of(proptest::collection::vec(any::<u8>(), 0..8))
+}
+
+fn completion_edit_strat() -> impl Strategy<Value = CompletionEdit> {
+    prop_oneof![
+        text_edit_strat().prop_map(CompletionEdit::Plain),
+        (".*", rng_strat(), rng_strat()).prop_map(|(new_text, insert, replace)| {
+            CompletionEdit::InsertReplace(InsertReplaceEdit {
+                new_text,
+                insert,
+                replace,
+            })
+        }),
+    ]
+}
+
+fn command_strat() -> impl Strategy<Value = Command> {
+    (".*", ".*", opt_bytes()).prop_map(|(title, command, arguments)| Command {
+        title,
+        command,
+        arguments,
+    })
+}
+
+fn label_details_strat() -> impl Strategy<Value = LabelDetails> {
+    (proptest::option::of(".*"), proptest::option::of(".*")).prop_map(|(detail, description)| {
+        LabelDetails {
+            detail,
+            description,
+        }
+    })
+}
+
+fn completion_item_strat() -> impl Strategy<Value = CompletionItem> {
+    let head = (
+        ".*",
+        proptest::option::of(label_details_strat()),
+        proptest::option::of(any::<i32>()),
+        proptest::option::of(proptest::collection::vec(any::<i32>(), 0..3)),
+        proptest::option::of(".*"),
+        proptest::option::of(documentation_strat()),
+        proptest::option::of(any::<bool>()),
+        proptest::option::of(any::<bool>()),
+        proptest::option::of(".*"),
+    );
+    let tail = (
+        proptest::option::of(".*"),
+        proptest::option::of(".*"),
+        proptest::option::of(any::<i32>()),
+        proptest::option::of(any::<i32>()),
+        proptest::option::of(completion_edit_strat()),
+        proptest::option::of(proptest::collection::vec(text_edit_strat(), 0..3)),
+        proptest::option::of(proptest::collection::vec(".*", 0..3)),
+        proptest::option::of(command_strat()),
+        opt_bytes(),
+    );
+    (head, tail).prop_map(
+        |(
+            (
+                label,
+                label_details,
+                kind,
+                tags,
+                detail,
+                documentation,
+                deprecated,
+                preselect,
+                sort_text,
+            ),
+            (
+                filter_text,
+                insert_text,
+                insert_text_format,
+                insert_text_mode,
+                text_edit,
+                additional_text_edits,
+                commit_characters,
+                command,
+                data,
+            ),
+        )| CompletionItem {
+            label,
+            label_details,
+            kind,
+            tags,
+            detail,
+            documentation,
+            deprecated,
+            preselect,
+            sort_text,
+            filter_text,
+            insert_text,
+            insert_text_format,
+            insert_text_mode,
+            text_edit,
+            additional_text_edits,
+            commit_characters,
+            command,
+            data,
+        },
+    )
+}
+
+fn item_defaults_strat() -> impl Strategy<Value = CompletionItemDefaults> {
+    let edit_range = prop_oneof![
+        rng_strat().prop_map(EditRange::Range),
+        (rng_strat(), rng_strat())
+            .prop_map(|(insert, replace)| EditRange::InsertReplace { insert, replace }),
+    ];
+    (
+        proptest::option::of(proptest::collection::vec(".*", 0..3)),
+        proptest::option::of(edit_range),
+        proptest::option::of(any::<i32>()),
+        proptest::option::of(any::<i32>()),
+        opt_bytes(),
+    )
+        .prop_map(
+            |(commit_characters, edit_range, insert_text_format, insert_text_mode, data)| {
+                CompletionItemDefaults {
+                    commit_characters,
+                    edit_range,
+                    insert_text_format,
+                    insert_text_mode,
+                    data,
+                }
+            },
+        )
+}
+
+fn hover_contents_strat() -> impl Strategy<Value = HoverContents> {
+    let marked = prop_oneof![
+        ".*".prop_map(MarkedStringItem::Plain),
+        (".*", ".*").prop_map(|(language, value)| MarkedStringItem::Marked { language, value }),
+    ];
+    prop_oneof![
+        markup_strat().prop_map(HoverContents::Markup),
+        proptest::collection::vec(marked, 0..3).prop_map(HoverContents::Marked),
+    ]
+}
+
+fn signature_strat() -> impl Strategy<Value = SignatureInfo> {
+    let param_label = prop_oneof![
+        ".*".prop_map(ParameterLabel::Str),
+        (any::<u32>(), any::<u32>())
+            .prop_map(|(start, end)| ParameterLabel::Offsets { start, end }),
+    ];
+    let param = (param_label, proptest::option::of(documentation_strat())).prop_map(
+        |(label, documentation)| ParameterInfo {
+            label,
+            documentation,
+        },
+    );
+    (
+        ".*",
+        proptest::option::of(documentation_strat()),
+        proptest::option::of(proptest::collection::vec(param, 0..4)),
+        proptest::option::of(any::<i32>()),
+    )
+        .prop_map(
+            |(label, documentation, parameters, active_parameter)| SignatureInfo {
+                label,
+                documentation,
+                parameters,
+                active_parameter,
+            },
+        )
+}
+
 fn location_strat() -> impl Strategy<Value = Location> {
     (".*", rng_strat(), 0u32..3).prop_map(|(uri, range, origin)| Location { uri, range, origin })
-}
-
-prop_compose! {
-    fn completion_item_strat()(
-        label in ".*",
-        kind in any::<i32>(),
-        detail in proptest::option::of(".*"),
-        documentation in proptest::option::of(".*"),
-        sort_text in proptest::option::of(".*"),
-        filter_text in proptest::option::of(".*"),
-        insert_text in proptest::option::of(".*"),
-        insert_text_format in any::<i32>(),
-        text_edit in proptest::option::of(text_edit_strat()),
-        additional_text_edits in proptest::collection::vec(text_edit_strat(), 0..4),
-        commit_characters in proptest::collection::vec(".*", 0..4),
-        data in proptest::option::of(proptest::collection::vec(any::<u8>(), 0..16)),
-    ) -> CompletionItem {
-        CompletionItem {
-            label, kind, detail, documentation, sort_text, filter_text, insert_text,
-            insert_text_format, text_edit, additional_text_edits, commit_characters, data,
-        }
-    }
-}
-
-prop_compose! {
-    fn signature_strat()(
-        label in ".*",
-        documentation in proptest::option::of(".*"),
-        parameters in proptest::collection::vec(
-            (".*", proptest::option::of(".*")).prop_map(|(label, documentation)| ParameterInfo { label, documentation }),
-            0..4,
-        ),
-    ) -> SignatureInfo {
-        SignatureInfo { label, documentation, parameters }
-    }
 }
 
 prop_compose! {
@@ -272,11 +542,17 @@ proptest! {
     }
 
     #[test]
+    fn completion_item_round_trips(item in completion_item_strat()) {
+        prop_assert_eq!(CompletionItem::decode(&item.encode()).unwrap(), item);
+    }
+
+    #[test]
     fn completion_list_round_trips(
         is_incomplete in any::<bool>(),
-        items in proptest::collection::vec(completion_item_strat(), 0..6),
+        item_defaults in proptest::option::of(item_defaults_strat()),
+        items in proptest::collection::vec(completion_item_strat(), 0..5),
     ) {
-        let list = CompletionList { is_incomplete, items };
+        let list = CompletionList { is_incomplete, item_defaults, items };
         prop_assert_eq!(CompletionList::decode(&list.encode()).unwrap(), list);
     }
 
@@ -293,11 +569,10 @@ proptest! {
     #[test]
     fn hover_round_trips(
         present in any::<bool>(),
-        contents in ".*",
-        kind in any::<i32>(),
+        contents in hover_contents_strat(),
         range in proptest::option::of(rng_strat()),
     ) {
-        let hover = present.then_some(Hover { contents, kind, range });
+        let hover = present.then_some(Hover { contents, range });
         let result = HoverResult(hover);
         prop_assert_eq!(HoverResult::decode(&result.encode()).unwrap(), result);
     }
@@ -305,8 +580,8 @@ proptest! {
     #[test]
     fn signature_help_round_trips(
         signatures in proptest::collection::vec(signature_strat(), 0..4),
-        active_signature in any::<i32>(),
-        active_parameter in any::<i32>(),
+        active_signature in proptest::option::of(any::<i32>()),
+        active_parameter in proptest::option::of(any::<i32>()),
     ) {
         let help = SignatureHelp { signatures, active_signature, active_parameter };
         prop_assert_eq!(SignatureHelp::decode(&help.encode()).unwrap(), help);

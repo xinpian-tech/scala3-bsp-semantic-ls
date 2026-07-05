@@ -1,9 +1,14 @@
 //! Owned mirrors of today's PC carriers with lossless flat encode/decode over
-//! the [`crate::codec`] buffer format. Request payloads (target config, did_open,
-//! did_change, position, resolve) and response payloads (completion list/item,
-//! hover, signature help, definition, prepare-rename, plugin status, locations)
-//! each round-trip through their `encode`/`decode` pair. Nullable results carry
-//! a presence flag so `None` is distinct from an empty value.
+//! the [`crate::codec`] buffer format. The response carriers are the LSP4J
+//! 0.24.0 result objects the worker returns (`CompletionList`/`CompletionItem`,
+//! `Hover`, `SignatureHelp`, `Range`, `Location`), so the mirrors model the full
+//! LSP4J field surface a plugin, presentation compiler, or resolve response can
+//! populate — every optional scalar, every nullable list, and every `Either`
+//! variant — not just the baseline subset. Genuinely opaque JSON fields
+//! (`CompletionItem.data`, `Command.arguments`, `itemDefaults.data`) are carried
+//! as opaque bytes the island reconstructs deterministically; the ABI never
+//! interprets them as JSON. Nullable results carry a presence flag so `None` is
+//! distinct from an empty value.
 
 use crate::codec::{AbiError, Reader, Writer};
 
@@ -29,6 +34,10 @@ pub mod origin {
     pub const PLUGIN: u32 = 2;
 }
 
+fn bad_tag(what: &str, tag: u32) -> AbiError {
+    AbiError(format!("invalid {what} variant tag {tag}"))
+}
+
 fn write_str_list(w: &mut Writer, list: &[String]) {
     w.u32(list.len() as u32);
     for s in list {
@@ -43,6 +52,24 @@ fn read_str_list(r: &mut Reader) -> Result<Vec<String>, AbiError> {
         out.push(r.str()?);
     }
     Ok(out)
+}
+
+fn write_opt_str_list(w: &mut Writer, list: &Option<Vec<String>>) {
+    match list {
+        Some(items) => {
+            w.u32(1);
+            write_str_list(w, items);
+        }
+        None => w.u32(0),
+    }
+}
+
+fn read_opt_str_list(r: &mut Reader) -> Result<Option<Vec<String>>, AbiError> {
+    if r.u32()? == 0 {
+        Ok(None)
+    } else {
+        Ok(Some(read_str_list(r)?))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -115,6 +142,109 @@ impl TextEdit {
         let range = Rng::read(r)?;
         let new_text = r.str()?;
         Ok(TextEdit { range, new_text })
+    }
+}
+
+/// An insert/replace completion edit (LSP4J `InsertReplaceEdit`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InsertReplaceEdit {
+    pub new_text: String,
+    pub insert: Rng,
+    pub replace: Rng,
+}
+
+/// A completion item's edit: either a plain `TextEdit` or an `InsertReplaceEdit`
+/// (LSP4J `Either<TextEdit, InsertReplaceEdit>`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CompletionEdit {
+    Plain(TextEdit),
+    InsertReplace(InsertReplaceEdit),
+}
+
+impl CompletionEdit {
+    fn write(&self, w: &mut Writer) {
+        match self {
+            CompletionEdit::Plain(edit) => {
+                w.u32(0);
+                edit.write(w);
+            }
+            CompletionEdit::InsertReplace(edit) => {
+                w.u32(1);
+                w.str(&edit.new_text);
+                edit.insert.write(w);
+                edit.replace.write(w);
+            }
+        }
+    }
+
+    fn read(r: &mut Reader) -> Result<CompletionEdit, AbiError> {
+        match r.u32()? {
+            0 => Ok(CompletionEdit::Plain(TextEdit::read(r)?)),
+            1 => {
+                let new_text = r.str()?;
+                let insert = Rng::read(r)?;
+                let replace = Rng::read(r)?;
+                Ok(CompletionEdit::InsertReplace(InsertReplaceEdit {
+                    new_text,
+                    insert,
+                    replace,
+                }))
+            }
+            tag => Err(bad_tag("completion edit", tag)),
+        }
+    }
+}
+
+/// Markup content (LSP4J `MarkupContent`): `kind` is the markup kind string
+/// (`"plaintext"`/`"markdown"`) and `value` the body.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MarkupContent {
+    pub kind: String,
+    pub value: String,
+}
+
+impl MarkupContent {
+    fn write(&self, w: &mut Writer) {
+        w.str(&self.kind);
+        w.str(&self.value);
+    }
+
+    fn read(r: &mut Reader) -> Result<MarkupContent, AbiError> {
+        let kind = r.str()?;
+        let value = r.str()?;
+        Ok(MarkupContent { kind, value })
+    }
+}
+
+/// A documentation body (LSP4J `Either<String, MarkupContent>`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Documentation {
+    Plain(String),
+    Markup(MarkupContent),
+}
+
+impl Documentation {
+    fn write_opt(w: &mut Writer, doc: &Option<Documentation>) {
+        match doc {
+            None => w.u32(0),
+            Some(Documentation::Plain(s)) => {
+                w.u32(1);
+                w.str(s);
+            }
+            Some(Documentation::Markup(m)) => {
+                w.u32(2);
+                m.write(w);
+            }
+        }
+    }
+
+    fn read_opt(r: &mut Reader) -> Result<Option<Documentation>, AbiError> {
+        match r.u32()? {
+            0 => Ok(None),
+            1 => Ok(Some(Documentation::Plain(r.str()?))),
+            2 => Ok(Some(Documentation::Markup(MarkupContent::read(r)?))),
+            tag => Err(bad_tag("documentation", tag)),
+        }
     }
 }
 
@@ -306,33 +436,76 @@ impl ResolveParams {
 // Completion.
 // ---------------------------------------------------------------------------
 
-/// One completion item (the fields today's Scala PC populates).
+/// Additional label details (LSP4J `CompletionItemLabelDetails`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LabelDetails {
+    pub detail: Option<String>,
+    pub description: Option<String>,
+}
+
+/// A completion item's `command` (LSP4J `Command`). `arguments` is the opaque
+/// serialized JSON argument array, carried verbatim.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Command {
+    pub title: String,
+    pub command: String,
+    pub arguments: Option<Vec<u8>>,
+}
+
+/// One completion item — the full LSP4J 0.24.0 `CompletionItem` surface.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CompletionItem {
     pub label: String,
-    pub kind: i32,
+    pub label_details: Option<LabelDetails>,
+    pub kind: Option<i32>,
+    pub tags: Option<Vec<i32>>,
     pub detail: Option<String>,
-    pub documentation: Option<String>,
+    pub documentation: Option<Documentation>,
+    pub deprecated: Option<bool>,
+    pub preselect: Option<bool>,
     pub sort_text: Option<String>,
     pub filter_text: Option<String>,
     pub insert_text: Option<String>,
-    pub insert_text_format: i32,
-    pub text_edit: Option<TextEdit>,
-    pub additional_text_edits: Vec<TextEdit>,
-    pub commit_characters: Vec<String>,
+    pub insert_text_format: Option<i32>,
+    pub insert_text_mode: Option<i32>,
+    pub text_edit: Option<CompletionEdit>,
+    pub additional_text_edits: Option<Vec<TextEdit>>,
+    pub commit_characters: Option<Vec<String>>,
+    pub command: Option<Command>,
     pub data: Option<Vec<u8>>,
 }
 
 impl CompletionItem {
     fn write(&self, w: &mut Writer) {
         w.str(&self.label);
-        w.i32(self.kind);
+        match &self.label_details {
+            Some(details) => {
+                w.u32(1);
+                w.opt_str(details.detail.as_deref());
+                w.opt_str(details.description.as_deref());
+            }
+            None => w.u32(0),
+        }
+        w.opt_i32(self.kind);
+        match &self.tags {
+            Some(tags) => {
+                w.u32(1);
+                w.u32(tags.len() as u32);
+                for tag in tags {
+                    w.i32(*tag);
+                }
+            }
+            None => w.u32(0),
+        }
         w.opt_str(self.detail.as_deref());
-        w.opt_str(self.documentation.as_deref());
+        Documentation::write_opt(w, &self.documentation);
+        w.opt_bool(self.deprecated);
+        w.opt_bool(self.preselect);
         w.opt_str(self.sort_text.as_deref());
         w.opt_str(self.filter_text.as_deref());
         w.opt_str(self.insert_text.as_deref());
-        w.i32(self.insert_text_format);
+        w.opt_i32(self.insert_text_format);
+        w.opt_i32(self.insert_text_mode);
         match &self.text_edit {
             Some(edit) => {
                 w.u32(1);
@@ -340,47 +513,108 @@ impl CompletionItem {
             }
             None => w.u32(0),
         }
-        w.u32(self.additional_text_edits.len() as u32);
-        for edit in &self.additional_text_edits {
-            edit.write(w);
+        match &self.additional_text_edits {
+            Some(edits) => {
+                w.u32(1);
+                w.u32(edits.len() as u32);
+                for edit in edits {
+                    edit.write(w);
+                }
+            }
+            None => w.u32(0),
         }
-        write_str_list(w, &self.commit_characters);
+        write_opt_str_list(w, &self.commit_characters);
+        match &self.command {
+            Some(command) => {
+                w.u32(1);
+                w.str(&command.title);
+                w.str(&command.command);
+                w.opt_bytes(command.arguments.as_deref());
+            }
+            None => w.u32(0),
+        }
         w.opt_bytes(self.data.as_deref());
     }
 
     fn read(r: &mut Reader) -> Result<CompletionItem, AbiError> {
         let label = r.str()?;
-        let kind = r.i32()?;
-        let detail = r.opt_str()?;
-        let documentation = r.opt_str()?;
-        let sort_text = r.opt_str()?;
-        let filter_text = r.opt_str()?;
-        let insert_text = r.opt_str()?;
-        let insert_text_format = r.i32()?;
-        let text_edit = if r.u32()? != 0 {
-            Some(TextEdit::read(r)?)
+        let label_details = if r.u32()? != 0 {
+            let detail = r.opt_str()?;
+            let description = r.opt_str()?;
+            Some(LabelDetails {
+                detail,
+                description,
+            })
         } else {
             None
         };
-        let edit_count = r.count()?;
-        let mut additional_text_edits = Vec::with_capacity(edit_count);
-        for _ in 0..edit_count {
-            additional_text_edits.push(TextEdit::read(r)?);
-        }
-        let commit_characters = read_str_list(r)?;
+        let kind = r.opt_i32()?;
+        let tags = if r.u32()? != 0 {
+            let n = r.count()?;
+            let mut tags = Vec::with_capacity(n);
+            for _ in 0..n {
+                tags.push(r.i32()?);
+            }
+            Some(tags)
+        } else {
+            None
+        };
+        let detail = r.opt_str()?;
+        let documentation = Documentation::read_opt(r)?;
+        let deprecated = r.opt_bool()?;
+        let preselect = r.opt_bool()?;
+        let sort_text = r.opt_str()?;
+        let filter_text = r.opt_str()?;
+        let insert_text = r.opt_str()?;
+        let insert_text_format = r.opt_i32()?;
+        let insert_text_mode = r.opt_i32()?;
+        let text_edit = if r.u32()? != 0 {
+            Some(CompletionEdit::read(r)?)
+        } else {
+            None
+        };
+        let additional_text_edits = if r.u32()? != 0 {
+            let n = r.count()?;
+            let mut edits = Vec::with_capacity(n);
+            for _ in 0..n {
+                edits.push(TextEdit::read(r)?);
+            }
+            Some(edits)
+        } else {
+            None
+        };
+        let commit_characters = read_opt_str_list(r)?;
+        let command = if r.u32()? != 0 {
+            let title = r.str()?;
+            let command = r.str()?;
+            let arguments = r.opt_bytes()?;
+            Some(Command {
+                title,
+                command,
+                arguments,
+            })
+        } else {
+            None
+        };
         let data = r.opt_bytes()?;
         Ok(CompletionItem {
             label,
+            label_details,
             kind,
+            tags,
             detail,
             documentation,
+            deprecated,
+            preselect,
             sort_text,
             filter_text,
             insert_text,
             insert_text_format,
+            insert_text_mode,
             text_edit,
             additional_text_edits,
             commit_characters,
+            command,
             data,
         })
     }
@@ -400,11 +634,85 @@ impl CompletionItem {
     }
 }
 
-/// A completion response list. An empty `items` is a real empty list (distinct
-/// from a null hover / prepare-rename).
+/// A range or an insert/replace range pair (LSP4J completion-list
+/// `itemDefaults.editRange` = `Either<Range, InsertReplaceRange>`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EditRange {
+    Range(Rng),
+    InsertReplace { insert: Rng, replace: Rng },
+}
+
+impl EditRange {
+    fn write_opt(w: &mut Writer, edit_range: &Option<EditRange>) {
+        match edit_range {
+            None => w.u32(0),
+            Some(EditRange::Range(range)) => {
+                w.u32(1);
+                range.write(w);
+            }
+            Some(EditRange::InsertReplace { insert, replace }) => {
+                w.u32(2);
+                insert.write(w);
+                replace.write(w);
+            }
+        }
+    }
+
+    fn read_opt(r: &mut Reader) -> Result<Option<EditRange>, AbiError> {
+        match r.u32()? {
+            0 => Ok(None),
+            1 => Ok(Some(EditRange::Range(Rng::read(r)?))),
+            2 => {
+                let insert = Rng::read(r)?;
+                let replace = Rng::read(r)?;
+                Ok(Some(EditRange::InsertReplace { insert, replace }))
+            }
+            tag => Err(bad_tag("edit range", tag)),
+        }
+    }
+}
+
+/// Completion-list defaults (LSP4J `CompletionItemDefaults`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompletionItemDefaults {
+    pub commit_characters: Option<Vec<String>>,
+    pub edit_range: Option<EditRange>,
+    pub insert_text_format: Option<i32>,
+    pub insert_text_mode: Option<i32>,
+    pub data: Option<Vec<u8>>,
+}
+
+impl CompletionItemDefaults {
+    fn write(&self, w: &mut Writer) {
+        write_opt_str_list(w, &self.commit_characters);
+        EditRange::write_opt(w, &self.edit_range);
+        w.opt_i32(self.insert_text_format);
+        w.opt_i32(self.insert_text_mode);
+        w.opt_bytes(self.data.as_deref());
+    }
+
+    fn read(r: &mut Reader) -> Result<CompletionItemDefaults, AbiError> {
+        let commit_characters = read_opt_str_list(r)?;
+        let edit_range = EditRange::read_opt(r)?;
+        let insert_text_format = r.opt_i32()?;
+        let insert_text_mode = r.opt_i32()?;
+        let data = r.opt_bytes()?;
+        Ok(CompletionItemDefaults {
+            commit_characters,
+            edit_range,
+            insert_text_format,
+            insert_text_mode,
+            data,
+        })
+    }
+}
+
+/// A completion response list (LSP4J `CompletionList`). An empty `items` is a
+/// real empty list (distinct from a null hover / prepare-rename).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CompletionList {
     pub is_incomplete: bool,
+    pub item_defaults: Option<CompletionItemDefaults>,
     pub items: Vec<CompletionItem>,
 }
 
@@ -412,6 +720,13 @@ impl CompletionList {
     pub fn encode(&self) -> Vec<u8> {
         let mut w = Writer::new();
         w.bool32(self.is_incomplete);
+        match &self.item_defaults {
+            Some(defaults) => {
+                w.u32(1);
+                defaults.write(&mut w);
+            }
+            None => w.u32(0),
+        }
         w.u32(self.items.len() as u32);
         for item in &self.items {
             item.write(&mut w);
@@ -422,6 +737,11 @@ impl CompletionList {
     pub fn decode(buf: &[u8]) -> Result<CompletionList, AbiError> {
         let mut r = Reader::new(buf, KIND_COMPLETION_LIST)?;
         let is_incomplete = r.bool32()?;
+        let item_defaults = if r.u32()? != 0 {
+            Some(CompletionItemDefaults::read(&mut r)?)
+        } else {
+            None
+        };
         let count = r.count()?;
         let mut items = Vec::with_capacity(count);
         for _ in 0..count {
@@ -430,6 +750,7 @@ impl CompletionList {
         r.finish()?;
         Ok(CompletionList {
             is_incomplete,
+            item_defaults,
             items,
         })
     }
@@ -439,12 +760,76 @@ impl CompletionList {
 // Hover (nullable).
 // ---------------------------------------------------------------------------
 
-/// Hover markup plus an optional range. `kind` mirrors the LSP markup kind
-/// (`0` plaintext, `1` markdown).
+/// One entry of a marked-string hover (LSP4J `Either<String, MarkedString>`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MarkedStringItem {
+    Plain(String),
+    Marked { language: String, value: String },
+}
+
+/// Hover contents (LSP4J `Either<List<Either<String, MarkedString>>, MarkupContent>`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HoverContents {
+    Markup(MarkupContent),
+    Marked(Vec<MarkedStringItem>),
+}
+
+impl HoverContents {
+    fn write(&self, w: &mut Writer) {
+        match self {
+            HoverContents::Markup(markup) => {
+                w.u32(0);
+                markup.write(w);
+            }
+            HoverContents::Marked(items) => {
+                w.u32(1);
+                w.u32(items.len() as u32);
+                for item in items {
+                    match item {
+                        MarkedStringItem::Plain(s) => {
+                            w.u32(0);
+                            w.str(s);
+                        }
+                        MarkedStringItem::Marked { language, value } => {
+                            w.u32(1);
+                            w.str(language);
+                            w.str(value);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn read(r: &mut Reader) -> Result<HoverContents, AbiError> {
+        match r.u32()? {
+            0 => Ok(HoverContents::Markup(MarkupContent::read(r)?)),
+            1 => {
+                let n = r.count()?;
+                let mut items = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let item = match r.u32()? {
+                        0 => MarkedStringItem::Plain(r.str()?),
+                        1 => {
+                            let language = r.str()?;
+                            let value = r.str()?;
+                            MarkedStringItem::Marked { language, value }
+                        }
+                        tag => return Err(bad_tag("marked string", tag)),
+                    };
+                    items.push(item);
+                }
+                Ok(HoverContents::Marked(items))
+            }
+            tag => Err(bad_tag("hover contents", tag)),
+        }
+    }
+}
+
+/// Hover contents plus an optional range (LSP4J `Hover`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Hover {
-    pub contents: String,
-    pub kind: i32,
+    pub contents: HoverContents,
     pub range: Option<Rng>,
 }
 
@@ -459,8 +844,7 @@ impl HoverResult {
         match &self.0 {
             Some(hover) => {
                 w.u32(1);
-                w.str(&hover.contents);
-                w.i32(hover.kind);
+                hover.contents.write(&mut w);
                 Rng::write_opt(&mut w, &hover.range);
             }
             None => w.u32(0),
@@ -471,14 +855,9 @@ impl HoverResult {
     pub fn decode(buf: &[u8]) -> Result<HoverResult, AbiError> {
         let mut r = Reader::new(buf, KIND_HOVER)?;
         let hover = if r.u32()? != 0 {
-            let contents = r.str()?;
-            let kind = r.i32()?;
+            let contents = HoverContents::read(&mut r)?;
             let range = Rng::read_opt(&mut r)?;
-            Some(Hover {
-                contents,
-                kind,
-                range,
-            })
+            Some(Hover { contents, range })
         } else {
             None
         };
@@ -491,27 +870,64 @@ impl HoverResult {
 // Signature help.
 // ---------------------------------------------------------------------------
 
-/// One parameter of a signature.
+/// A parameter label: either the text or a `[start, end)` offset pair into the
+/// signature label (LSP4J `Either<String, Tuple.Two<Integer, Integer>>`).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ParameterInfo {
-    pub label: String,
-    pub documentation: Option<String>,
+pub enum ParameterLabel {
+    Str(String),
+    Offsets { start: u32, end: u32 },
 }
 
-/// One signature.
+impl ParameterLabel {
+    fn write(&self, w: &mut Writer) {
+        match self {
+            ParameterLabel::Str(s) => {
+                w.u32(0);
+                w.str(s);
+            }
+            ParameterLabel::Offsets { start, end } => {
+                w.u32(1);
+                w.u32(*start);
+                w.u32(*end);
+            }
+        }
+    }
+
+    fn read(r: &mut Reader) -> Result<ParameterLabel, AbiError> {
+        match r.u32()? {
+            0 => Ok(ParameterLabel::Str(r.str()?)),
+            1 => {
+                let start = r.u32()?;
+                let end = r.u32()?;
+                Ok(ParameterLabel::Offsets { start, end })
+            }
+            tag => Err(bad_tag("parameter label", tag)),
+        }
+    }
+}
+
+/// One parameter of a signature (LSP4J `ParameterInformation`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ParameterInfo {
+    pub label: ParameterLabel,
+    pub documentation: Option<Documentation>,
+}
+
+/// One signature (LSP4J `SignatureInformation`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SignatureInfo {
     pub label: String,
-    pub documentation: Option<String>,
-    pub parameters: Vec<ParameterInfo>,
+    pub documentation: Option<Documentation>,
+    pub parameters: Option<Vec<ParameterInfo>>,
+    pub active_parameter: Option<i32>,
 }
 
-/// A signature-help response.
+/// A signature-help response (LSP4J `SignatureHelp`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SignatureHelp {
     pub signatures: Vec<SignatureInfo>,
-    pub active_signature: i32,
-    pub active_parameter: i32,
+    pub active_signature: Option<i32>,
+    pub active_parameter: Option<i32>,
 }
 
 impl SignatureHelp {
@@ -520,15 +936,22 @@ impl SignatureHelp {
         w.u32(self.signatures.len() as u32);
         for sig in &self.signatures {
             w.str(&sig.label);
-            w.opt_str(sig.documentation.as_deref());
-            w.u32(sig.parameters.len() as u32);
-            for param in &sig.parameters {
-                w.str(&param.label);
-                w.opt_str(param.documentation.as_deref());
+            Documentation::write_opt(&mut w, &sig.documentation);
+            match &sig.parameters {
+                Some(params) => {
+                    w.u32(1);
+                    w.u32(params.len() as u32);
+                    for param in params {
+                        param.label.write(&mut w);
+                        Documentation::write_opt(&mut w, &param.documentation);
+                    }
+                }
+                None => w.u32(0),
             }
+            w.opt_i32(sig.active_parameter);
         }
-        w.i32(self.active_signature);
-        w.i32(self.active_parameter);
+        w.opt_i32(self.active_signature);
+        w.opt_i32(self.active_parameter);
         w.finish(KIND_SIGNATURE_HELP)
     }
 
@@ -538,25 +961,32 @@ impl SignatureHelp {
         let mut signatures = Vec::with_capacity(sig_count);
         for _ in 0..sig_count {
             let label = r.str()?;
-            let documentation = r.opt_str()?;
-            let param_count = r.count()?;
-            let mut parameters = Vec::with_capacity(param_count);
-            for _ in 0..param_count {
-                let plabel = r.str()?;
-                let pdoc = r.opt_str()?;
-                parameters.push(ParameterInfo {
-                    label: plabel,
-                    documentation: pdoc,
-                });
-            }
+            let documentation = Documentation::read_opt(&mut r)?;
+            let parameters = if r.u32()? != 0 {
+                let param_count = r.count()?;
+                let mut params = Vec::with_capacity(param_count);
+                for _ in 0..param_count {
+                    let label = ParameterLabel::read(&mut r)?;
+                    let documentation = Documentation::read_opt(&mut r)?;
+                    params.push(ParameterInfo {
+                        label,
+                        documentation,
+                    });
+                }
+                Some(params)
+            } else {
+                None
+            };
+            let active_parameter = r.opt_i32()?;
             signatures.push(SignatureInfo {
                 label,
                 documentation,
                 parameters,
+                active_parameter,
             });
         }
-        let active_signature = r.i32()?;
-        let active_parameter = r.i32()?;
+        let active_signature = r.opt_i32()?;
+        let active_parameter = r.opt_i32()?;
         r.finish()?;
         Ok(SignatureHelp {
             signatures,

@@ -176,23 +176,63 @@ pub struct PcVtable {
 // ---------------------------------------------------------------------------
 
 const _: () = {
-    assert!(std::mem::size_of::<*const c_void>() == 8);
-    assert!(std::mem::size_of::<LsStr>() == 16);
-    assert!(std::mem::size_of::<LsBytes>() == 16);
-    assert!(std::mem::size_of::<LsBuf>() == 16);
-    assert!(std::mem::size_of::<BlobStr>() == 8);
-    assert!(std::mem::size_of::<Position>() == 8);
-    assert!(std::mem::size_of::<AbiRange>() == 16);
-    assert!(std::mem::size_of::<LocationRecord>() == 28);
-    // RustVtable: two u64 + 6 fn pointers.
-    assert!(std::mem::size_of::<RustVtable>() == 64);
-    assert!(std::mem::offset_of!(RustVtable, abi_version) == 0);
-    assert!(std::mem::offset_of!(RustVtable, layout_canary) == 8);
-    assert!(std::mem::offset_of!(RustVtable, alloc) == 16);
-    assert!(std::mem::offset_of!(RustVtable, symbol_definition) == 56);
-    // PcVtable: one u64 + 15 fn pointers.
-    assert!(std::mem::size_of::<PcVtable>() == 128);
-    assert!(std::mem::offset_of!(PcVtable, abi_version) == 0);
-    assert!(std::mem::offset_of!(PcVtable, register_target) == 8);
-    assert!(std::mem::offset_of!(PcVtable, spawn_dispatch) == 120);
+    use std::mem::{offset_of, size_of};
+
+    assert!(size_of::<*const c_void>() == 8);
+
+    // Primitive struct sizes + every field offset.
+    assert!(size_of::<LsStr>() == 16);
+    assert!(offset_of!(LsStr, ptr) == 0);
+    assert!(offset_of!(LsStr, len) == 8);
+    assert!(size_of::<LsBytes>() == 16);
+    assert!(offset_of!(LsBytes, ptr) == 0);
+    assert!(offset_of!(LsBytes, len) == 8);
+    assert!(size_of::<LsBuf>() == 16);
+    assert!(offset_of!(LsBuf, ptr) == 0);
+    assert!(offset_of!(LsBuf, len) == 8);
+    assert!(size_of::<BlobStr>() == 8);
+    assert!(offset_of!(BlobStr, offset) == 0);
+    assert!(offset_of!(BlobStr, len) == 4);
+    assert!(size_of::<Position>() == 8);
+    assert!(offset_of!(Position, line) == 0);
+    assert!(offset_of!(Position, character) == 4);
+    assert!(size_of::<AbiRange>() == 16);
+    assert!(offset_of!(AbiRange, start_line) == 0);
+    assert!(offset_of!(AbiRange, start_character) == 4);
+    assert!(offset_of!(AbiRange, end_line) == 8);
+    assert!(offset_of!(AbiRange, end_character) == 12);
+    assert!(size_of::<LocationRecord>() == 28);
+    assert!(offset_of!(LocationRecord, uri) == 0);
+    assert!(offset_of!(LocationRecord, range) == 8);
+    assert!(offset_of!(LocationRecord, origin) == 24);
+
+    // RustVtable: two u64 + 6 fn pointers; assert every slot offset.
+    assert!(size_of::<RustVtable>() == 64);
+    assert!(offset_of!(RustVtable, abi_version) == 0);
+    assert!(offset_of!(RustVtable, layout_canary) == 8);
+    assert!(offset_of!(RustVtable, alloc) == 16);
+    assert!(offset_of!(RustVtable, free) == 24);
+    assert!(offset_of!(RustVtable, log) == 32);
+    assert!(offset_of!(RustVtable, register_pc_vtable) == 40);
+    assert!(offset_of!(RustVtable, pc_dispatch_loop) == 48);
+    assert!(offset_of!(RustVtable, symbol_definition) == 56);
+
+    // PcVtable: one u64 + 15 fn pointers; assert every slot offset.
+    assert!(size_of::<PcVtable>() == 128);
+    assert!(offset_of!(PcVtable, abi_version) == 0);
+    assert!(offset_of!(PcVtable, register_target) == 8);
+    assert!(offset_of!(PcVtable, did_open) == 16);
+    assert!(offset_of!(PcVtable, did_change) == 24);
+    assert!(offset_of!(PcVtable, did_close) == 32);
+    assert!(offset_of!(PcVtable, completion) == 40);
+    assert!(offset_of!(PcVtable, completion_resolve) == 48);
+    assert!(offset_of!(PcVtable, hover) == 56);
+    assert!(offset_of!(PcVtable, signature_help) == 64);
+    assert!(offset_of!(PcVtable, definition) == 72);
+    assert!(offset_of!(PcVtable, type_definition) == 80);
+    assert!(offset_of!(PcVtable, prepare_rename) == 88);
+    assert!(offset_of!(PcVtable, plugin_status) == 96);
+    assert!(offset_of!(PcVtable, restart_instances) == 104);
+    assert!(offset_of!(PcVtable, shutdown) == 112);
+    assert!(offset_of!(PcVtable, spawn_dispatch) == 120);
 };

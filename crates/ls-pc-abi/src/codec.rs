@@ -94,6 +94,36 @@ impl Writer {
         }
     }
 
+    /// An optional `i32`: a presence flag then the value. `None` and
+    /// `Some(0)` are distinct.
+    pub fn opt_i32(&mut self, v: Option<i32>) {
+        match v {
+            Some(x) => {
+                self.u32(1);
+                self.i32(x);
+            }
+            None => {
+                self.u32(0);
+                self.i32(0);
+            }
+        }
+    }
+
+    /// An optional bool: a presence flag then the value (both `u32`). `None`
+    /// and `Some(false)` are distinct.
+    pub fn opt_bool(&mut self, v: Option<bool>) {
+        match v {
+            Some(x) => {
+                self.u32(1);
+                self.bool32(x);
+            }
+            None => {
+                self.u32(0);
+                self.u32(0);
+            }
+        }
+    }
+
     /// A flattened `[start, end)` range: four `u32`s.
     pub fn range(
         &mut self,
@@ -255,6 +285,18 @@ impl<'a> Reader<'a> {
             return Ok(None);
         }
         Ok(Some(self.blob_slice(offset, len)?.to_vec()))
+    }
+
+    pub fn opt_i32(&mut self) -> Result<Option<i32>, AbiError> {
+        let present = self.u32()?;
+        let value = self.i32()?;
+        Ok(if present == 0 { None } else { Some(value) })
+    }
+
+    pub fn opt_bool(&mut self) -> Result<Option<bool>, AbiError> {
+        let present = self.u32()?;
+        let value = self.bool32()?;
+        Ok(if present == 0 { None } else { Some(value) })
     }
 
     /// Reads a flattened range as `(start_line, start_character, end_line, end_character)`.

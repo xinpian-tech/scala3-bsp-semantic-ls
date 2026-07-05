@@ -35,14 +35,23 @@ fn fnv_over_facts(facts: &[u64]) -> u64 {
 
 #[test]
 fn canary_algorithm_detects_single_fact_drift() {
-    // A representative fact vector (primitive sizes + a vtable size).
-    let base = [16u64, 16, 16, 8, 8, 16, 28, 64, 128];
+    // A representative slice of the real fact ordering: sizes AND field offsets,
+    // including a `LocationRecord` whose fields are `(uri@0, range@8, origin@24)`
+    // and a vtable slot at offset 8. The offsets are the facts that were
+    // previously unguarded; perturbing any one of them must flip the digest.
+    let base = [
+        16u64, 0, 8, // LsStr: size, ptr@0, len@8
+        8, 0, 4, // BlobStr: size, offset@0, len@4
+        16, 0, 4, 8, 12, // AbiRange: size + four offsets
+        28, 0, 8, 24, // LocationRecord: size, uri@0, range@8, origin@24
+        128, 8, // PcVtable: size + register_target slot @8
+    ];
     let baseline = fnv_over_facts(&base);
     assert_eq!(fnv_over_facts(&base), baseline);
 
     for i in 0..base.len() {
         let mut drifted = base;
-        drifted[i] += 4; // e.g. a struct grew by one 4-byte field
+        drifted[i] += 4; // e.g. a struct grew, or a field/slot moved
         assert_ne!(
             fnv_over_facts(&drifted),
             baseline,
@@ -50,9 +59,9 @@ fn canary_algorithm_detects_single_fact_drift() {
         );
     }
 
-    // Reordering two facts must also change the digest (slot order is part of
-    // the contract, not just the multiset of sizes).
+    // A same-size reorder of two field offsets must also change the digest
+    // (slot/field order is part of the contract, not just the multiset).
     let mut swapped = base;
-    swapped.swap(7, 8);
+    swapped.swap(1, 2); // swap LsStr ptr/len offsets
     assert_ne!(fnv_over_facts(&swapped), baseline);
 }

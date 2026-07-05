@@ -1,6 +1,7 @@
 //! Malformed input at the decode boundary must yield a typed [`AbiError`], never
 //! a panic or out-of-bounds read: truncated buffers, corrupted envelopes,
-//! fabricated list counts, out-of-range blob slices, and arbitrary bytes.
+//! fabricated list counts, out-of-range blob slices, invalid enum-variant tags,
+//! and arbitrary bytes.
 
 use ls_pc_abi::codec::{Reader, Writer, MAGIC};
 use ls_pc_abi::payloads::{
@@ -29,23 +30,34 @@ fn decode_all(bytes: &[u8]) {
     let _ = LocationsResult::decode(bytes);
 }
 
+fn bare_item(label: &str) -> CompletionItem {
+    CompletionItem {
+        label: label.to_string(),
+        label_details: None,
+        kind: None,
+        tags: None,
+        detail: None,
+        documentation: None,
+        deprecated: None,
+        preselect: None,
+        sort_text: None,
+        filter_text: None,
+        insert_text: None,
+        insert_text_format: None,
+        insert_text_mode: None,
+        text_edit: None,
+        additional_text_edits: None,
+        commit_characters: None,
+        command: None,
+        data: Some(b"symbol".to_vec()),
+    }
+}
+
 fn sample_completion_list() -> Vec<u8> {
     CompletionList {
         is_incomplete: true,
-        items: vec![CompletionItem {
-            label: "hello".to_string(),
-            kind: 1,
-            detail: Some("detail".to_string()),
-            documentation: None,
-            sort_text: None,
-            filter_text: None,
-            insert_text: Some("hello".to_string()),
-            insert_text_format: 1,
-            text_edit: None,
-            additional_text_edits: vec![],
-            commit_characters: vec![],
-            data: Some(b"symbol".to_vec()),
-        }],
+        item_defaults: None,
+        items: vec![bare_item("hello")],
     }
     .encode()
 }
@@ -86,11 +98,11 @@ fn length_mismatch_is_rejected() {
 
 #[test]
 fn fabricated_huge_count_is_rejected_without_allocating() {
-    // Patch the item-count field (body offset 4, after the is_incomplete u32)
-    // to u32::MAX. The reader must reject it against the remaining body rather
-    // than attempt a gigantic allocation.
+    // Patch the item-count field to u32::MAX. The reader must reject it against
+    // the remaining body rather than attempt a gigantic allocation. The count
+    // follows the is_incomplete flag (4) and the null itemDefaults flag (4).
     let mut buf = sample_completion_list();
-    let count_at = 16 + 4;
+    let count_at = 16 + 8;
     buf[count_at..count_at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
     assert!(CompletionList::decode(&buf).is_err());
 }
@@ -123,15 +135,30 @@ fn invalid_utf8_in_blob_is_rejected() {
 }
 
 #[test]
+fn invalid_enum_variant_tag_is_rejected() {
+    // A present hover whose contents variant tag is neither 0 (Markup) nor 1
+    // (MarkedString). Body: present flag (u32=1) then the contents tag (u32).
+    let buf = HoverResult(Some(ls_pc_abi::payloads::Hover {
+        contents: ls_pc_abi::payloads::HoverContents::Markup(ls_pc_abi::payloads::MarkupContent {
+            kind: "plaintext".to_string(),
+            value: "x".to_string(),
+        }),
+        range: None,
+    }))
+    .encode();
+    let mut buf = buf;
+    let tag_at = 16 + 4;
+    buf[tag_at..tag_at + 4].copy_from_slice(&99u32.to_le_bytes());
+    assert!(HoverResult::decode(&buf).is_err());
+}
+
+#[test]
 fn reader_rejects_trailing_body_bytes() {
     // A valid envelope whose body has an unconsumed tail.
     let mut w = Writer::new();
     w.u32(7);
     w.u32(9);
     let buf = w.finish(4); // KIND_POSITION expects uri + line + character
-                           // PositionParams reads a string (2 u32) + 2 u32 = 4 u32s = 16 body bytes,
-                           // but this body is only 8 bytes, so it underruns rather than trailing —
-                           // assert it simply errors without panic.
     assert!(PositionParams::decode(&buf).is_err());
     // And a reader constructed directly rejects the leftover tail.
     let mut reader = Reader::new(&buf, 4).unwrap();
@@ -162,40 +189,20 @@ proptest! {
 
     #[test]
     fn single_byte_corruption_of_valid_buffer_never_panics(
-        list in prop_completion_list(),
+        labels in proptest::collection::vec(".*", 0..4),
         index in any::<prop::sample::Index>(),
         xor in 1u8..=255,
     ) {
+        let list = CompletionList {
+            is_incomplete: true,
+            item_defaults: None,
+            items: labels.iter().map(|l| bare_item(l)).collect(),
+        };
         let mut buf = list.encode();
         if !buf.is_empty() {
             let i = index.index(buf.len());
             buf[i] ^= xor;
             decode_all(&buf);
-        }
-    }
-}
-
-prop_compose! {
-    fn prop_completion_list()(
-        is_incomplete in any::<bool>(),
-        labels in proptest::collection::vec(".*", 0..4),
-    ) -> CompletionList {
-        CompletionList {
-            is_incomplete,
-            items: labels.into_iter().map(|label| CompletionItem {
-                label,
-                kind: 1,
-                detail: None,
-                documentation: None,
-                sort_text: None,
-                filter_text: None,
-                insert_text: None,
-                insert_text_format: 1,
-                text_edit: None,
-                additional_text_edits: vec![],
-                commit_characters: vec![],
-                data: None,
-            }).collect(),
         }
     }
 }
