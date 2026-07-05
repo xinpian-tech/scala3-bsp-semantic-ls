@@ -5,11 +5,12 @@
 //! published with the fsync + atomic-rename protocol. The format is extended
 //! with the snapshot-resident [`TargetMeta`] and [`SymbolMeta`] sections
 //! (`target-meta.bin` / `symbol-meta.bin`) and the `search.bin` plumbing that
-//! task6 fills.
+//! the search-ranking layer fills.
 //!
 //! [`SegmentWriter::write`] builds a segment; [`SegmentReader::open`] mmaps and
 //! validates it whole, rejecting any corruption with a typed [`SegmentError`].
-//! The manifest / generational workspace-state / snapshot lifecycle is task5.
+//! The manifest / generational workspace-state / snapshot lifecycle is a
+//! separate layer built on top of this one.
 
 pub mod crc;
 pub mod data;
@@ -25,7 +26,7 @@ pub use data::{
 };
 pub use error::{Result, SegmentError};
 pub use reader::{
-    BlockView, DocEntryView, DocRecord, GroupIndexView, GroupRecord, IntervalView, SegmentReader,
-    SymbolView,
+    BlockView, DocEntryView, DocRecord, GroupIndexView, GroupRecord, IntervalView, OccurrenceHit,
+    SegmentReader, SymbolView,
 };
 pub use writer::SegmentWriter;

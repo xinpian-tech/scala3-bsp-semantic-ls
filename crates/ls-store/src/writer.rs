@@ -129,30 +129,114 @@ impl SegmentWriter {
     }
 }
 
-/// Validate the writer input (structural parallelism + non-empty distinct URIs).
+/// Validate the writer input: structural parallelism, non-empty URIs, and every
+/// ordinal + span in range — so layout can index `caller_to_sorted` /
+/// `target_words` without panicking. Malformed input returns `InvalidInput`.
 fn validate(data: &SegmentData) -> Result<()> {
-    let invalid = |detail: String| Err(SegmentError::InvalidInput { detail });
+    let invalid = |detail: &str| {
+        Err(SegmentError::InvalidInput {
+            detail: detail.into(),
+        })
+    };
     if data.def_occurrences.len() != data.ref_occurrences.len() {
-        return invalid("def/ref group counts differ".into());
+        return invalid("def/ref group counts differ");
     }
     if data.rename_profiles.len() != data.rename_occurrences.len() {
-        return invalid("rename profile/group counts differ".into());
+        return invalid("rename profile/group counts differ");
     }
     if data.doc_occurrences.len() != data.docs.len() {
-        return invalid("doc occurrence/doc counts differ".into());
+        return invalid("doc occurrence/doc counts differ");
     }
     if !data.target_meta.is_empty() && data.target_meta.len() != data.targets.len() {
-        return invalid("target_meta must be empty or parallel to targets".into());
+        return invalid("target_meta must be empty or parallel to targets");
     }
     if !data.symbol_meta.is_empty() && data.symbol_meta.len() != data.symbols.len() {
-        return invalid("symbol_meta must be empty or parallel to symbols".into());
+        return invalid("symbol_meta must be empty or parallel to symbols");
     }
+
+    let n_docs = data.docs.len();
+    let n_targets = data.targets.len();
+    let n_symbols = data.symbols.len();
+    let n_ref = data.ref_occurrences.len();
+    let n_rename = data.rename_occurrences.len();
+
     for doc in &data.docs {
         if doc.uri.is_empty() {
-            return invalid("empty doc uri".into());
+            return invalid("empty doc uri");
+        }
+        if !ord_in(doc.target_ord, n_targets) {
+            return invalid("doc target_ord out of range");
+        }
+    }
+    for groups in [
+        &data.ref_occurrences,
+        &data.def_occurrences,
+        &data.rename_occurrences,
+    ] {
+        for group in groups {
+            for occ in group {
+                if !ord_in(occ.doc_ord, n_docs) {
+                    return invalid("occurrence doc_ord out of range");
+                }
+                if !ord_in(occ.target_ord, n_targets) {
+                    return invalid("occurrence target_ord out of range");
+                }
+                if !span_ok(&occ.span) {
+                    return invalid("occurrence span out of range");
+                }
+            }
+        }
+    }
+    for doc_occs in &data.doc_occurrences {
+        for occ in doc_occs {
+            if !ord_in(occ.symbol_ord, n_symbols) {
+                return invalid("doc occurrence symbol_ord out of range");
+            }
+            if !span_ok(&occ.span) {
+                return invalid("doc occurrence span out of range");
+            }
+        }
+    }
+    for s in &data.symbols {
+        if !ord_opt(s.ref_group_ord, n_ref) {
+            return invalid("symbol ref_group_ord out of range");
+        }
+        if !ord_opt(s.rename_group_ord, n_rename) {
+            return invalid("symbol rename_group_ord out of range");
+        }
+        if !ord_opt(s.def_target_ord, n_targets) {
+            return invalid("symbol def_target_ord out of range");
+        }
+    }
+    for row in &data.search_rows {
+        if !ord_in(row.symbol_ord, n_symbols) {
+            return invalid("search row symbol_ord out of range");
+        }
+    }
+    for m in &data.symbol_meta {
+        if !ord_opt(m.def_doc_ord, n_docs) {
+            return invalid("symbol_meta def_doc_ord out of range");
         }
     }
     Ok(())
+}
+
+fn ord_in(v: i32, n: usize) -> bool {
+    v >= 0 && (v as usize) < n
+}
+
+fn ord_opt(v: i32, n: usize) -> bool {
+    v == -1 || ord_in(v, n)
+}
+
+/// A span's coordinates must fit the packed representation (char < 2^12, line ≤
+/// `LINE_MAX`) and be non-inverted (`packed_start <= packed_end`).
+fn span_ok(s: &Span) -> bool {
+    s.start_char <= Span::CHAR_MASK
+        && s.end_char <= Span::CHAR_MASK
+        && s.start_line <= Span::LINE_MAX
+        && s.end_line <= Span::LINE_MAX
+        && Span::pack(s.start_line, s.start_char) <= Span::pack(s.end_line, s.end_char)
 }
 
 /// Indices of `data.symbols` sorted by unsigned UTF-8 byte comparison; rejects

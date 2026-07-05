@@ -7,7 +7,7 @@ use std::path::Path;
 
 use memmap2::Mmap;
 
-use ls_index_model::{occ_flags, TargetBitset};
+use ls_index_model::{occ_flags, Role, Span, TargetBitset};
 
 use crate::crc::crc32c;
 use crate::data::{RenameProfile, SymbolMeta, TargetMeta};
@@ -68,6 +68,16 @@ pub struct SymbolView {
     pub ref_group_ord: i32,
     pub rename_group_ord: i32,
     pub def_target_ord: i32,
+}
+
+/// The occurrence covering a queried position (`symbol_at`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OccurrenceHit {
+    pub symbol_ord: i32,
+    pub doc_ord: u32,
+    pub span: Span,
+    pub role: Role,
+    pub flags: i32,
 }
 
 /// One `BlockEntry`.
@@ -580,14 +590,126 @@ impl SegmentReader {
         }
     }
 
+    /// Exact symbol-at-position over the doc interval-block index. Containment is
+    /// start/end-inclusive on packed positions; the smallest covering span wins,
+    /// then the earliest `packed_start`, then the first record in sort order
+    /// (`docs/index-format.md`; a port of `SegmentReader.symbolAt`).
+    pub fn symbol_at(&self, doc_ord: u32, line: u32, character: u32) -> Option<OccurrenceHit> {
+        self.symbol_at_counting(doc_ord, line, character).0
+    }
+
+    /// As [`symbol_at`], also returning how many interval blocks were scanned
+    /// (a diagnostic for asserting block-index pruning effectiveness).
+    pub fn symbol_at_counting(
+        &self,
+        doc_ord: u32,
+        line: u32,
+        character: u32,
+    ) -> (Option<OccurrenceHit>, u32) {
+        let di = self.file(DOC_INDEX);
+        let base = Self::doc_entry_base(doc_ord as usize);
+        let interval_first = read_i32(di, base + 28).unwrap();
+        let interval_count = read_i32(di, base + 44).unwrap();
+        if interval_first < 0 || interval_count == 0 {
+            return (None, 0);
+        }
+
+        let query = Span::pack(line, character) as i32;
+        let line = line as i32;
+        let dp = self.file(DOC_POSTINGS);
+        let n = read_i64(dp, 0).unwrap();
+        let col_sym = 8;
+        let col_start = 8 + 4 * n;
+        let col_end = 8 + 8 * n;
+        let col_flags = 8 + 12 * n;
+        let interval_base = 24 + self.doc_count as usize * format::DOC_ENTRY_SIZE;
+
+        let mut blocks_scanned = 0u32;
+        let mut best: Option<(i32, i32, i32, i32)> = None; // (packed_start, packed_end, sym, flags)
+        for b in 0..interval_count {
+            let ie = interval_base + (interval_first + b) as usize * format::INTERVAL_ENTRY_SIZE;
+            let first_line = read_i32(di, ie).unwrap();
+            if first_line > line {
+                break; // interval blocks are sorted by first start line
+            }
+            let last_line = read_i32(di, ie + 4).unwrap();
+            if last_line < line {
+                continue;
+            }
+            blocks_scanned += 1;
+            let rec_first = read_i64(di, ie + 8).unwrap();
+            let rec_count = read_i32(di, ie + 16).unwrap() as i64;
+            for k in 0..rec_count {
+                let r = rec_first + k;
+                let ps = read_i32(dp, (col_start + 4 * r) as usize).unwrap();
+                if ps > query {
+                    break; // records are sorted by packed_start
+                }
+                let pe = read_i32(dp, (col_end + 4 * r) as usize).unwrap();
+                if pe >= query {
+                    let size = pe - ps;
+                    if best.is_none_or(|(bs, be, _, _)| size < be - bs) {
+                        let sym = read_i32(dp, (col_sym + 4 * r) as usize).unwrap();
+                        let flags = read_i32(dp, (col_flags + 4 * r) as usize).unwrap();
+                        best = Some((ps, pe, sym, flags));
+                    }
+                }
+            }
+        }
+
+        match best {
+            None => (None, blocks_scanned),
+            Some((ps, pe, sym, flags)) => {
+                let role = if occ_flags::has(flags as u32, occ_flags::DEFINITION) {
+                    Role::Definition
+                } else {
+                    Role::Reference
+                };
+                let span = Span::new(
+                    Span::unpack_line(ps as u32),
+                    Span::unpack_char(ps as u32),
+                    Span::unpack_line(pe as u32),
+                    Span::unpack_char(pe as u32),
+                );
+                let hit = OccurrenceHit {
+                    symbol_ord: sym,
+                    doc_ord,
+                    span,
+                    role,
+                    flags,
+                };
+                (Some(hit), blocks_scanned)
+            }
+        }
+    }
+
     // ---- structural validation ----
+    //
+    // `open` must reject a *self-consistent* corrupt segment (bytes mutated and
+    // `checksums.bin` recomputed), not just CRC-mismatched bytes, and must never
+    // panic. Every count is bounded before use (no overflow/negative), every
+    // embedded ref/ordinal is range-checked, and the group/block and
+    // doc/interval partitions are validated against their postings — so all the
+    // accessors' unchecked reads are sound after `open` succeeds.
 
     fn validate_structure(mut self) -> Result<SegmentReader> {
         // symbol-index counts anchor the target/symbol cross-checks.
         let sym = self.file(SYMBOL_INDEX);
-        let symbol_count = req_i64(sym, 0, format::SYMBOL_INDEX_FILE)? as usize;
-        let target_count = req_i64(sym, 8, format::SYMBOL_INDEX_FILE)? as usize;
-        let sym_blob = req_i64(sym, 16, format::SYMBOL_INDEX_FILE)? as usize;
+        let symbol_count = bounded(
+            req_i64(sym, 0, format::SYMBOL_INDEX_FILE)?,
+            sym.len(),
+            "symbol_count",
+        )?;
+        let target_count = bounded(
+            req_i64(sym, 8, format::SYMBOL_INDEX_FILE)?,
+            sym.len(),
+            "target_count",
+        )?;
+        let sym_blob = bounded(
+            req_i64(sym, 16, format::SYMBOL_INDEX_FILE)?,
+            sym.len(),
+            "sym_blob_len",
+        )?;
         expect(
             sym.len() == 24 + symbol_count * 32 + target_count * 8 + sym_blob,
             "symbol-index size",
@@ -596,12 +718,10 @@ impl SegmentReader {
         self.target_count = target_count;
         self.words = target_word_count(target_count);
 
-        // group indices.
-        self.check_group_index(REF_GROUP_INDEX, self.ref_group_count as usize, false)?;
-        self.check_group_index(DEF_GROUP_INDEX, self.ref_group_count as usize, false)?;
-        self.check_group_index(RENAME_GROUP_INDEX, self.rename_group_count as usize, true)?;
+        let ref_groups = self.ref_group_count as usize;
+        let rename_groups = self.rename_group_count as usize;
 
-        // group postings (6 columns) + accumulate occurrence count.
+        // group + doc postings column sizes (+ occurrence count).
         let ref_recs = self.check_columns(REF_POSTINGS, 6)?;
         let def_recs = self.check_columns(DEF_POSTINGS, 6)?;
         let rename_recs = self.check_columns(RENAME_POSTINGS, 6)?;
@@ -611,43 +731,120 @@ impl SegmentReader {
             "occurrence_count sum",
         )?;
 
-        // doc-index.
+        // group index sizes.
+        self.check_group_index(REF_GROUP_INDEX, ref_groups, false)?;
+        self.check_group_index(DEF_GROUP_INDEX, ref_groups, false)?;
+        self.check_group_index(RENAME_GROUP_INDEX, rename_groups, true)?;
+
+        // doc-index size.
         let di = self.file(DOC_INDEX);
-        let dc = req_i64(di, 0, format::DOC_INDEX_FILE)? as usize;
-        let ic = req_i64(di, 8, format::DOC_INDEX_FILE)? as usize;
-        let ub = req_i64(di, 16, format::DOC_INDEX_FILE)? as usize;
+        let dc = bounded(
+            req_i64(di, 0, format::DOC_INDEX_FILE)?,
+            di.len(),
+            "doc_count",
+        )?;
+        let ic = bounded(
+            req_i64(di, 8, format::DOC_INDEX_FILE)?,
+            di.len(),
+            "interval_count",
+        )?;
+        let ub = bounded(
+            req_i64(di, 16, format::DOC_INDEX_FILE)?,
+            di.len(),
+            "uri_blob_len",
+        )?;
         expect(dc == self.doc_count as usize, "doc-index doc_count")?;
         expect(di.len() == 24 + dc * 48 + ic * 24 + ub, "doc-index size")?;
 
-        // block-index.
+        // block-index size.
         let bi = self.file(BLOCK_INDEX);
-        let bc = req_i64(bi, 0, format::BLOCK_INDEX_FILE)? as usize;
-        let wc = req_i32(bi, 8, format::BLOCK_INDEX_FILE)? as usize;
-        let bs = req_i32(bi, 12, format::BLOCK_INDEX_FILE)?;
-        expect(wc == self.words, "block target_word_count")?;
-        expect(bs == format::BLOCK_SIZE, "block_size")?;
-        expect(bi.len() == 16 + bc * (40 + 8 * wc), "block-index size")?;
+        let bc = bounded(
+            req_i64(bi, 0, format::BLOCK_INDEX_FILE)?,
+            bi.len(),
+            "block_count",
+        )?;
+        expect(
+            req_i32(bi, 8, format::BLOCK_INDEX_FILE)? as i64 == self.words as i64,
+            "block target_word_count",
+        )?;
+        expect(
+            req_i32(bi, 12, format::BLOCK_INDEX_FILE)? == format::BLOCK_SIZE,
+            "block_size",
+        )?;
+        expect(
+            bi.len() == 16 + bc * (40 + 8 * self.words),
+            "block-index size",
+        )?;
 
-        // extension sections.
+        // extension section sizes.
         let tm = self.file(TARGET_META);
-        let tmc = req_i64(tm, 0, format::TARGET_META_FILE)? as usize;
-        let tmb = req_i64(tm, 8, format::TARGET_META_FILE)? as usize;
-        expect(tmc == target_count, "target-meta count")?;
+        let tmc = bounded(
+            req_i64(tm, 0, format::TARGET_META_FILE)?,
+            tm.len(),
+            "target-meta count",
+        )?;
+        let tmb = bounded(
+            req_i64(tm, 8, format::TARGET_META_FILE)?,
+            tm.len(),
+            "target-meta blob",
+        )?;
+        expect(tmc == target_count, "target-meta count match")?;
         expect(tm.len() == 16 + tmc * 48 + tmb, "target-meta size")?;
 
         let sm = self.file(SYMBOL_META);
-        let smc = req_i64(sm, 0, format::SYMBOL_META_FILE)? as usize;
-        let smb = req_i64(sm, 8, format::SYMBOL_META_FILE)? as usize;
-        expect(smc == symbol_count, "symbol-meta count")?;
+        let smc = bounded(
+            req_i64(sm, 0, format::SYMBOL_META_FILE)?,
+            sm.len(),
+            "symbol-meta count",
+        )?;
+        let smb = bounded(
+            req_i64(sm, 8, format::SYMBOL_META_FILE)?,
+            sm.len(),
+            "symbol-meta blob",
+        )?;
+        expect(smc == symbol_count, "symbol-meta count match")?;
         expect(sm.len() == 16 + smc * 48 + smb, "symbol-meta size")?;
 
         let se = self.file(SEARCH);
-        let src = req_i64(se, 0, format::SEARCH_FILE)? as usize;
-        let srb = req_i64(se, 8, format::SEARCH_FILE)? as usize;
+        let src = bounded(
+            req_i64(se, 0, format::SEARCH_FILE)?,
+            se.len(),
+            "search rows",
+        )?;
+        let srb = bounded(
+            req_i64(se, 8, format::SEARCH_FILE)?,
+            se.len(),
+            "search blob",
+        )?;
         expect(se.len() == 16 + src * 16 + srb, "search size")?;
 
-        // Cache per-doc epochs for scan filtering.
-        let mut doc_epochs = Vec::with_capacity(self.doc_count as usize);
+        // ---- deep validation: embedded refs, ordinals, partitions ----
+        self.validate_symbol_dict(sym_blob)?;
+        self.validate_group_records(REF_POSTINGS, ref_recs)?;
+        self.validate_group_records(DEF_POSTINGS, def_recs)?;
+        self.validate_group_records(RENAME_POSTINGS, rename_recs)?;
+        self.validate_doc_records(doc_recs)?;
+
+        // group offset/count tiling + block first_record/record_count partition,
+        // in writer block order (ref groups, then def, then rename).
+        let mut block_cursor = 0usize;
+        self.validate_role_groups(REF_GROUP_INDEX, ref_groups, ref_recs, &mut block_cursor, bc)?;
+        self.validate_role_groups(DEF_GROUP_INDEX, ref_groups, def_recs, &mut block_cursor, bc)?;
+        self.validate_role_groups(
+            RENAME_GROUP_INDEX,
+            rename_groups,
+            rename_recs,
+            &mut block_cursor,
+            bc,
+        )?;
+        expect(block_cursor == bc, "block_count total")?;
+
+        // doc entries: uri/target refs + postings & interval tiling.
+        self.validate_doc_index(dc, ic, ub, doc_recs)?;
+        self.validate_meta_and_search(tmc, tmb, smc, smb, src, srb)?;
+
+        // cache per-doc epochs for scan filtering (safe after validation).
+        let mut doc_epochs = Vec::with_capacity(dc);
         for d in 0..self.doc_count {
             doc_epochs.push(self.epoch_of(d));
         }
@@ -658,7 +855,7 @@ impl SegmentReader {
     fn check_group_index(&self, idx: usize, count: usize, with_profiles: bool) -> Result<()> {
         let file = self.file(idx);
         let name = format::CHECKSUMMED_FILES[idx];
-        let declared = req_i64(file, 0, name)? as usize;
+        let declared = bounded(req_i64(file, 0, name)?, file.len(), "group count")?;
         expect(declared == count, "group index count")?;
         let mut need = 8 + count * format::GROUP_INDEX_ENTRY_SIZE;
         if with_profiles {
@@ -668,15 +865,332 @@ impl SegmentReader {
         Ok(())
     }
 
-    fn check_columns(&self, idx: usize, columns: usize) -> Result<i64> {
+    fn check_columns(&self, idx: usize, columns: usize) -> Result<usize> {
         let file = self.file(idx);
         let name = format::CHECKSUMMED_FILES[idx];
-        let n = req_i64(file, 0, name)?;
-        expect(
-            file.len() == 8 + columns * 4 * n as usize,
-            "postings columns size",
-        )?;
+        let n = bounded(req_i64(file, 0, name)?, file.len(), "record_count")?;
+        expect(file.len() == 8 + columns * 4 * n, "postings columns size")?;
         Ok(n)
+    }
+
+    /// Symbol dictionary: string refs in-bounds + UTF-8, strictly sorted (no
+    /// duplicates), and every group/def ordinal in range.
+    fn validate_symbol_dict(&self, sym_blob: usize) -> Result<()> {
+        let file = self.file(SYMBOL_INDEX);
+        let name = format::SYMBOL_INDEX_FILE;
+        let blob_start = 24 + self.symbol_count * 32 + self.target_count * 8;
+        let mut prev: Option<&[u8]> = None;
+        for i in 0..self.symbol_count {
+            let b = 24 + i * 32;
+            let s = str_slice(
+                file,
+                req_i32(file, b, name)?,
+                req_i32(file, b + 4, name)?,
+                blob_start,
+                sym_blob,
+                "symbol str ref",
+            )?;
+            std::str::from_utf8(s).map_err(|_| structural("symbol not utf-8"))?;
+            if let Some(p) = prev {
+                expect(p < s, "symbols not strictly sorted")?;
+            }
+            prev = Some(s);
+            check_ord_opt(
+                req_i32(file, b + 16, name)?,
+                self.ref_group_count as usize,
+                "ref_group_ord",
+            )?;
+            check_ord_opt(
+                req_i32(file, b + 20, name)?,
+                self.rename_group_count as usize,
+                "rename_group_ord",
+            )?;
+            check_ord_opt(
+                req_i32(file, b + 24, name)?,
+                self.target_count,
+                "def_target_ord",
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Every group-postings record's `doc_ord`/`target_ord` in range.
+    fn validate_group_records(&self, idx: usize, recs: usize) -> Result<()> {
+        let file = self.file(idx);
+        let name = format::CHECKSUMMED_FILES[idx];
+        let doc_col = 8;
+        let target_col = 8 + 2 * 4 * recs;
+        for r in 0..recs {
+            check_ord(
+                req_i32(file, doc_col + 4 * r, name)?,
+                self.doc_count as usize,
+                "group doc_ord",
+            )?;
+            check_ord(
+                req_i32(file, target_col + 4 * r, name)?,
+                self.target_count,
+                "group target_ord",
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Every doc-postings record's `symbol_ord` in range.
+    fn validate_doc_records(&self, recs: usize) -> Result<()> {
+        let file = self.file(DOC_POSTINGS);
+        let name = format::DOC_POSTINGS_FILE;
+        for r in 0..recs {
+            check_ord(
+                req_i32(file, 8 + 4 * r, name)?,
+                self.symbol_count,
+                "doc symbol_ord",
+            )?;
+        }
+        Ok(())
+    }
+
+    /// One role's group index: offsets tile `[0, postings_recs)` in order, and
+    /// each non-empty group's blocks partition it into ≤256-record chunks.
+    fn validate_role_groups(
+        &self,
+        gi_idx: usize,
+        group_count: usize,
+        postings_recs: usize,
+        block_cursor: &mut usize,
+        block_count: usize,
+    ) -> Result<()> {
+        let gi = self.file(gi_idx);
+        let name = format::CHECKSUMMED_FILES[gi_idx];
+        let mut acc = 0usize;
+        for g in 0..group_count {
+            let b = 8 + g * 16;
+            let offset = req_i64(gi, b, name)?;
+            expect(
+                offset >= 0 && offset as u64 == acc as u64,
+                "group offset tiling",
+            )?;
+            let count = req_i32(gi, b + 8, name)?;
+            expect(count >= 0, "group count sign")?;
+            let count = count as usize;
+            expect(acc + count <= postings_recs, "group range")?;
+            let block_off = req_i32(gi, b + 12, name)?;
+            if count == 0 {
+                expect(block_off == -1, "empty group block_index_offset")?;
+            } else {
+                expect(
+                    block_off >= 0 && block_off as usize == *block_cursor,
+                    "group block_index_offset",
+                )?;
+                let num_blocks = count.div_ceil(256);
+                for k in 0..num_blocks {
+                    expect(*block_cursor + k < block_count, "block index range")?;
+                    self.validate_block(
+                        *block_cursor + k,
+                        acc + k * 256,
+                        (count - k * 256).min(256),
+                    )?;
+                }
+                *block_cursor += num_blocks;
+            }
+            acc += count;
+        }
+        expect(acc == postings_recs, "group tiling total")?;
+        Ok(())
+    }
+
+    /// One block: `first_record`/`record_count` match the partition, aggregate
+    /// counts are self-consistent, `doc_ord` bounds are in range, and the target
+    /// bitset sets no bit `>= target_count`.
+    fn validate_block(&self, block: usize, want_first: usize, want_count: usize) -> Result<()> {
+        let bi = self.file(BLOCK_INDEX);
+        let name = format::BLOCK_INDEX_FILE;
+        let base = self.block_base(block);
+        expect(
+            req_i64(bi, base, name)? as u64 == want_first as u64,
+            "block first_record",
+        )?;
+        let rc = req_i32(bi, base + 8, name)?;
+        expect(rc >= 0 && rc as usize == want_count, "block record_count")?;
+        let editable = req_i32(bi, base + 12, name)?;
+        let ref_role = req_i32(bi, base + 16, name)?;
+        let def_role = req_i32(bi, base + 20, name)?;
+        expect(editable >= 0 && editable <= rc, "block editable_count")?;
+        expect(
+            ref_role >= 0 && def_role >= 0 && ref_role + def_role == rc,
+            "block role counts",
+        )?;
+        let dmin = req_i32(bi, base + 24, name)?;
+        let dmax = req_i32(bi, base + 28, name)?;
+        expect(
+            dmin >= 0 && dmin <= dmax && (dmax as usize) < self.doc_count as usize,
+            "block doc_ord range",
+        )?;
+        for w in 0..self.words {
+            let word = req_u64(bi, base + 40 + 8 * w, name)?;
+            let valid = self.target_count.saturating_sub(w * 64).min(64);
+            if valid < 64 {
+                let mask = if valid == 0 {
+                    u64::MAX
+                } else {
+                    !((1u64 << valid) - 1)
+                };
+                expect(word & mask == 0, "block target bit out of range")?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Doc entries: uri/target refs valid, doc postings tile `[0, doc_recs)`, and
+    /// each non-empty doc's interval blocks partition its postings.
+    fn validate_doc_index(
+        &self,
+        doc_count: usize,
+        interval_count: usize,
+        uri_blob: usize,
+        doc_recs: usize,
+    ) -> Result<()> {
+        let di = self.file(DOC_INDEX);
+        let name = format::DOC_INDEX_FILE;
+        let interval_base = 24 + doc_count * 48;
+        let uri_blob_start = interval_base + interval_count * 24;
+        let mut post_acc = 0usize;
+        let mut iv_cursor = 0usize;
+        for d in 0..doc_count {
+            let b = 24 + d * 48;
+            let uri = str_slice(
+                di,
+                req_i32(di, b, name)?,
+                req_i32(di, b + 4, name)?,
+                uri_blob_start,
+                uri_blob,
+                "uri str ref",
+            )?;
+            std::str::from_utf8(uri).map_err(|_| structural("uri not utf-8"))?;
+            check_ord(
+                req_i32(di, b + 20, name)?,
+                self.target_count,
+                "doc target_ord",
+            )?;
+            let interval_first = req_i32(di, b + 28, name)?;
+            let post_off = req_i64(di, b + 32, name)?;
+            expect(
+                post_off >= 0 && post_off as u64 == post_acc as u64,
+                "doc postings tiling",
+            )?;
+            let post_count = req_i32(di, b + 40, name)?;
+            expect(post_count >= 0, "doc postings_count sign")?;
+            let post_count = post_count as usize;
+            expect(post_acc + post_count <= doc_recs, "doc postings range")?;
+            let iv_count = req_i32(di, b + 44, name)?;
+            if post_count == 0 {
+                expect(
+                    interval_first == -1 && iv_count == 0,
+                    "empty doc interval ptr",
+                )?;
+            } else {
+                expect(
+                    interval_first >= 0 && interval_first as usize == iv_cursor,
+                    "doc interval_first",
+                )?;
+                let want_iv = post_count.div_ceil(256);
+                expect(
+                    iv_count >= 0 && iv_count as usize == want_iv,
+                    "doc interval_count",
+                )?;
+                for k in 0..want_iv {
+                    expect(iv_cursor + k < interval_count, "interval index range")?;
+                    let ib = interval_base + (iv_cursor + k) * 24;
+                    expect(
+                        req_i64(di, ib + 8, name)? as u64 == (post_acc + k * 256) as u64,
+                        "interval offset",
+                    )?;
+                    expect(
+                        req_i32(di, ib + 16, name)? as usize == (post_count - k * 256).min(256),
+                        "interval count",
+                    )?;
+                }
+                iv_cursor += want_iv;
+            }
+            post_acc += post_count;
+        }
+        expect(post_acc == doc_recs, "doc postings total")?;
+        expect(iv_cursor == interval_count, "interval total")?;
+        Ok(())
+    }
+
+    /// Metadata + search string refs in-bounds, `def_doc_ord`/`symbol_ord` in
+    /// range, and search rows sorted by `normalized_name`.
+    fn validate_meta_and_search(
+        &self,
+        tmc: usize,
+        tmb: usize,
+        smc: usize,
+        smb: usize,
+        src: usize,
+        srb: usize,
+    ) -> Result<()> {
+        let tm = self.file(TARGET_META);
+        let tm_name = format::TARGET_META_FILE;
+        let tblob = 16 + tmc * 48;
+        for i in 0..tmc {
+            let base = 16 + i * 48;
+            for k in 0..4 {
+                str_slice(
+                    tm,
+                    req_i32(tm, base + k * 8, tm_name)?,
+                    req_i32(tm, base + k * 8 + 4, tm_name)?,
+                    tblob,
+                    tmb,
+                    "target-meta str ref",
+                )?;
+            }
+        }
+        let sm = self.file(SYMBOL_META);
+        let sm_name = format::SYMBOL_META_FILE;
+        let sblob = 16 + smc * 48;
+        for i in 0..smc {
+            let base = 16 + i * 48;
+            for k in 0..3 {
+                str_slice(
+                    sm,
+                    req_i32(sm, base + k * 8, sm_name)?,
+                    req_i32(sm, base + k * 8 + 4, sm_name)?,
+                    sblob,
+                    smb,
+                    "symbol-meta str ref",
+                )?;
+            }
+            check_ord_opt(
+                req_i32(sm, base + 40, sm_name)?,
+                self.doc_count as usize,
+                "symbol-meta def_doc_ord",
+            )?;
+        }
+        let se = self.file(SEARCH);
+        let se_name = format::SEARCH_FILE;
+        let seblob = 16 + src * 16;
+        let mut prev: Option<&[u8]> = None;
+        for i in 0..src {
+            let base = 16 + i * 16;
+            let nm = str_slice(
+                se,
+                req_i32(se, base, se_name)?,
+                req_i32(se, base + 4, se_name)?,
+                seblob,
+                srb,
+                "search name ref",
+            )?;
+            if let Some(p) = prev {
+                expect(p <= nm, "search rows not sorted")?;
+            }
+            prev = Some(nm);
+            check_ord(
+                req_i32(se, base + 8, se_name)?,
+                self.symbol_count,
+                "search symbol_ord",
+            )?;
+        }
+        Ok(())
     }
 }
 
@@ -743,14 +1257,67 @@ fn read_str(file: &[u8], ref_off: usize, blob_start: usize) -> String {
         .unwrap_or_default()
 }
 
+fn structural(detail: &str) -> SegmentError {
+    SegmentError::Structural {
+        detail: detail.into(),
+    }
+}
+
 fn expect(cond: bool, detail: &str) -> Result<()> {
     if cond {
         Ok(())
     } else {
-        Err(SegmentError::Structural {
-            detail: detail.into(),
-        })
+        Err(structural(detail))
     }
+}
+
+/// Bound a raw count to `[0, max]` so later size arithmetic cannot overflow or
+/// go negative. `max` is the owning file length (each record is ≥ 1 byte).
+fn bounded(v: i64, max: usize, detail: &str) -> Result<usize> {
+    if v < 0 || v as u64 > max as u64 {
+        Err(structural(detail))
+    } else {
+        Ok(v as usize)
+    }
+}
+
+/// A required ordinal must be in `[0, count)`.
+fn check_ord(v: i32, count: usize, detail: &str) -> Result<()> {
+    if v >= 0 && (v as usize) < count {
+        Ok(())
+    } else {
+        Err(structural(detail))
+    }
+}
+
+/// An optional ordinal is `-1` or in `[0, count)`.
+fn check_ord_opt(v: i32, count: usize, detail: &str) -> Result<()> {
+    if v == -1 || (v >= 0 && (v as usize) < count) {
+        Ok(())
+    } else {
+        Err(structural(detail))
+    }
+}
+
+/// Validate a `(offset, len)` string ref against its blob and return the bytes.
+fn str_slice<'a>(
+    file: &'a [u8],
+    off: i32,
+    len: i32,
+    blob_start: usize,
+    blob_len: usize,
+    detail: &'static str,
+) -> Result<&'a [u8]> {
+    if off < 0 || len < 0 {
+        return Err(structural(detail));
+    }
+    let (off, len) = (off as usize, len as usize);
+    if off + len > blob_len {
+        return Err(structural(detail));
+    }
+    let start = blob_start + off;
+    file.get(start..start + len)
+        .ok_or_else(|| structural(detail))
 }
 
 fn req_i64(b: &[u8], off: usize, file: &str) -> Result<i64> {

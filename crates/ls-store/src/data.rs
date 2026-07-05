@@ -91,8 +91,9 @@ pub struct SymbolMeta {
     pub def_doc_ord: i32,
 }
 
-/// One `search.bin` row (task6 fills the ranking; task4 only plumbs the
-/// section). Rows are written sorted by `normalized_name`.
+/// One `search.bin` row. The segment layer only plumbs the section (write +
+/// validate + expose); the search-ranking layer fills the scoring. Rows are
+/// written sorted by `normalized_name`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SearchRow {
     pub normalized_name: String,
