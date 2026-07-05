@@ -16,7 +16,7 @@
 //! Every vtable status is surfaced; all response memory is Rust-owned and freed.
 
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -219,13 +219,23 @@ struct ControlJob {
     reply: Sender<OpOutcome>,
 }
 
+/// The `busy_generation` sentinel meaning no dispatch op is executing.
+const IDLE_GENERATION: u64 = u64::MAX;
+
 /// Owns the registered vtable and the dispatch/control channels. Constructed at
 /// registration; the loaned threads enter it through `enter_*_worker`.
 pub struct IslandRuntime {
     pc: PcHandle,
     dispatch_tx: Mutex<Sender<DispatchJob>>,
-    staged_dispatch_rx: Mutex<Option<Receiver<DispatchJob>>>,
-    dispatch_busy: AtomicBool,
+    /// The next dispatch receiver + its generation, for the loaned worker that
+    /// enters `enter_dispatch_worker`.
+    staged_dispatch: Mutex<Option<(u64, Receiver<DispatchJob>)>>,
+    /// The newest dispatch generation the backend routes to.
+    active_generation: AtomicU64,
+    /// The generation currently executing a dispatch op, or `IDLE_GENERATION`.
+    /// A worker clears it only via a CAS on its own generation, so an abandoned
+    /// (wedged) worker can never clear a newer active generation's busy state.
+    busy_generation: AtomicU64,
     dispatch_attached: AtomicU64,
     attach_cv: Condvar,
     attach_lock: Mutex<()>,
@@ -243,8 +253,9 @@ impl IslandRuntime {
         Arc::new(IslandRuntime {
             pc: PcHandle(pc),
             dispatch_tx: Mutex::new(dispatch_tx),
-            staged_dispatch_rx: Mutex::new(Some(dispatch_rx)),
-            dispatch_busy: AtomicBool::new(false),
+            staged_dispatch: Mutex::new(Some((0, dispatch_rx))),
+            active_generation: AtomicU64::new(0),
+            busy_generation: AtomicU64::new(IDLE_GENERATION),
             dispatch_attached: AtomicU64::new(0),
             attach_cv: Condvar::new(),
             attach_lock: Mutex::new(()),
@@ -258,20 +269,28 @@ impl IslandRuntime {
     /// serializes PC ops until the channel closes (a superseded generation) or
     /// it wedges (an abandoned generation).
     pub fn enter_dispatch_worker(self: &Arc<IslandRuntime>) {
-        let rx = self
-            .staged_dispatch_rx
+        let (generation, rx) = self
+            .staged_dispatch
             .lock()
-            .expect("staged dispatch rx lock")
+            .expect("staged dispatch lock")
             .take()
             .expect("no staged dispatch receiver");
         self.signal_attached();
         while let Ok(job) = rx.recv() {
-            self.dispatch_busy.store(true, Ordering::SeqCst);
+            self.busy_generation.store(generation, Ordering::SeqCst);
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 invoke_dispatch(self.pc.get(), &job.op)
             }))
             .unwrap_or_else(|_| OpOutcome::panicked());
-            self.dispatch_busy.store(false, Ordering::SeqCst);
+            // Only mark idle if we still own the busy marker for our own
+            // generation — an abandoned worker's late return must not clear a
+            // newer active generation's busy state.
+            let _ = self.busy_generation.compare_exchange(
+                generation,
+                IDLE_GENERATION,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            );
             let _ = job.reply.send(outcome);
         }
     }
@@ -323,13 +342,17 @@ impl IslandRuntime {
         true
     }
 
-    fn stage_new_dispatch_channel(&self) {
+    fn stage_new_dispatch_channel(&self, generation: u64) {
         let (tx, rx) = channel();
         *self.dispatch_tx.lock().expect("dispatch tx lock") = tx;
-        *self
-            .staged_dispatch_rx
-            .lock()
-            .expect("staged dispatch rx lock") = Some(rx);
+        *self.staged_dispatch.lock().expect("staged dispatch lock") = Some((generation, rx));
+        // The backend now routes to this generation; `lane_idle` answers for it.
+        self.active_generation.store(generation, Ordering::SeqCst);
+    }
+
+    /// Is the current active dispatch generation idle (not executing an op)?
+    fn lane_idle(&self) -> bool {
+        self.busy_generation.load(Ordering::SeqCst) != self.active_generation.load(Ordering::SeqCst)
     }
 
     fn dispatch_sender(&self) -> Sender<DispatchJob> {
@@ -459,13 +482,13 @@ impl PcBackend for VtableBackend {
     }
 
     fn lane_idle(&mut self) -> bool {
-        !self.rt.dispatch_busy.load(Ordering::SeqCst)
+        self.rt.lane_idle()
     }
 
     fn spawn_generation(&mut self, generation: u32, replay: &ReplayPlan) -> i32 {
         // Stage the next generation's channel before asking the island to loan a
         // thread, so the fresh worker picks up the right receiver.
-        self.rt.stage_new_dispatch_channel();
+        self.rt.stage_new_dispatch_channel(u64::from(generation));
         let before = self.rt.attach_count();
 
         // The real spawn_dispatch slot (over the control lane, so it runs while
@@ -537,6 +560,11 @@ mod tests {
         restart_unwedges: bool,
         restart_status: i32,
         spawn_status: i32,
+        /// How many completions have wedged so far. The first wedge (the
+        /// abandoned generation) is released on a short cap; later wedges hold,
+        /// so an abandoned worker's return overlaps a later active-gen wedge.
+        wedge_seen: u32,
+        first_wedge_short: bool,
     }
 
     impl StubState {
@@ -550,6 +578,8 @@ mod tests {
                 restart_unwedges: false,
                 restart_status: STATUS_OK,
                 spawn_status: STATUS_OK,
+                wedge_seen: 0,
+                first_wedge_short: false,
             }
         }
     }
@@ -572,6 +602,17 @@ mod tests {
 
     fn record(name: &'static str) {
         guard().calls.push(name);
+    }
+
+    /// Counts wedges and reports whether this one should use the short cap (only
+    /// the first wedge, when `first_wedge_short` is set — the abandoned
+    /// generation that returns while a later generation is still wedged).
+    fn wedge_cap_is_short(s: &mut StubState) -> bool {
+        if !s.wedge_completion {
+            return false;
+        }
+        s.wedge_seen += 1;
+        s.first_wedge_short && s.wedge_seen == 1
     }
 
     fn write_out(out: *mut LsBuf, bytes: &[u8]) {
@@ -612,21 +653,25 @@ mod tests {
         STATUS_OK
     }
     unsafe extern "C" fn s_completion(_u: LsStr, _l: u32, _c: u32, out: *mut LsBuf) -> i32 {
-        let (wedge, response, status) = {
+        let (wedge, response, status, cap) = {
             let mut s = guard();
             s.calls.push("completion");
+            let cap = if wedge_cap_is_short(&mut s) {
+                Duration::from_millis(250)
+            } else {
+                Duration::from_secs(3)
+            };
             (
                 s.wedge_completion,
                 s.completion_response.clone(),
                 s.completion_status,
+                cap,
             )
         };
         if wedge {
-            // Block until a cooperative restart unwedges us, or a safety cap. A
-            // non-cooperative wedge stays abandoned well past the recovery
-            // window (the request deadline + cancel grace).
+            // Block until a cooperative restart unwedges us, or the safety cap.
             let start = Instant::now();
-            while start.elapsed() < Duration::from_secs(3) {
+            while start.elapsed() < cap {
                 if guard().unwedged {
                     break;
                 }
@@ -865,5 +910,46 @@ mod tests {
         assert_eq!(sup.request(query()), Err(PcError::RequestTimeout));
         // spawn_dispatch returned nonzero → island-fatal.
         assert!(sup.is_fatal());
+    }
+
+    #[test]
+    fn abandoned_generation_return_does_not_mask_a_later_wedge() {
+        let _serial = serial_guard();
+        {
+            let mut s = guard();
+            *s = StubState::reset();
+            // Every completion wedges; generation 0's wedge is released on a
+            // short cap so its abandoned worker returns while generation 1 is
+            // still wedged.
+            s.wedge_completion = true;
+            s.first_wedge_short = true;
+        }
+
+        // A generous cancel grace so the ~250ms generation-0 release overlaps the
+        // generation-1 recovery window; generation 0 still stays wedged through
+        // its own recovery window (60+120ms), so it advances non-cooperatively.
+        let hook: SpawnHook = Box::new(|rt: &Arc<IslandRuntime>| {
+            let w = Arc::clone(rt);
+            std::thread::spawn(move || w.enter_dispatch_worker());
+        });
+        let backend = VtableBackend::with_spawn_hook(start_runtime(), test_timeouts(), hook);
+        let mut sup = Supervisor::new(
+            backend,
+            4,
+            Duration::from_millis(60),
+            Duration::from_millis(120),
+        );
+
+        // Generation 0 wedges non-cooperatively → recovery spawns generation 1.
+        assert_eq!(sup.request(query()), Err(PcError::RequestTimeout));
+        assert_eq!(sup.generation(), 1);
+
+        // Generation 1 wedges (held). Generation 0's abandoned worker returns
+        // mid-recovery; its late CAS must not clear generation 1's busy state, so
+        // this wedge is NOT classified cooperative — recovery must spawn
+        // generation 2.
+        assert_eq!(sup.request(query()), Err(PcError::RequestTimeout));
+        assert_eq!(sup.generation(), 2);
+        assert!(!sup.is_fatal());
     }
 }

@@ -159,15 +159,23 @@ impl<B: PcBackend> Supervisor<B> {
         self.generations.current()
     }
 
-    /// Route a request: mirror its lifecycle effect, then dispatch under the
-    /// deadline. A nonzero status is a normal typed error; a wedge fails the
+    /// Route a request: dispatch under the deadline, then mirror its lifecycle
+    /// effect only if the backend accepted it. A nonzero status is a normal
+    /// typed error and must NOT poison the replay mirror; a wedge fails the
     /// request typed and triggers recovery so subsequent requests succeed.
     pub fn request(&mut self, request: PcRequest) -> Result<Vec<u8>, PcError> {
-        self.observe(&request);
         match self.backend.dispatch(&request, self.request_deadline) {
-            DispatchOutcome::Done(reply) => Ok(reply),
+            DispatchOutcome::Done(reply) => {
+                // Apply the lifecycle effect only after a successful status.
+                self.observe(&request);
+                Ok(reply)
+            }
+            // A normal PC error must not mutate the replay mirror.
             DispatchOutcome::Status(code) => Err(PcError::Backend(code)),
             DispatchOutcome::Wedged => {
+                // The editor's notification is a fact regardless of the wedge, so
+                // mirror it before recovery replays state into the new generation.
+                self.observe(&request);
                 self.recover();
                 Err(PcError::RequestTimeout)
             }
@@ -427,5 +435,44 @@ mod tests {
         assert_eq!(sup.request(query()), Err(PcError::RequestTimeout));
         assert_eq!(sup.request(query()), Ok(Vec::new()));
         assert_eq!(sup.generation(), 1);
+    }
+
+    #[test]
+    fn a_failed_lifecycle_op_is_not_replayed_into_a_new_generation() {
+        // register_target succeeds, did_open returns a normal error, then a
+        // query wedges non-cooperatively.
+        let backend = FakeBackend::new(
+            vec![
+                DispatchOutcome::Done(Vec::new()),
+                DispatchOutcome::Status(-5),
+                DispatchOutcome::Wedged,
+            ],
+            false,
+        );
+        let mut sup = supervisor(backend, 4);
+        sup.request(PcRequest::RegisterTarget {
+            id: "a".to_string(),
+            config: config("a"),
+        })
+        .unwrap();
+        assert_eq!(
+            sup.request(PcRequest::DidOpen {
+                target_id: "a".to_string(),
+                uri: "file:///a.scala".to_string(),
+                text: "package a".to_string(),
+            }),
+            Err(PcError::Backend(-5))
+        );
+
+        assert_eq!(sup.request(query()), Err(PcError::RequestTimeout));
+        assert_eq!(sup.generation(), 1);
+
+        // The replay carries the successful target but NOT the failed did_open.
+        let (_, replay) = &sup.backend.spawns[0];
+        assert_eq!(replay.targets.len(), 1);
+        assert!(
+            replay.buffers.is_empty(),
+            "a did_open that returned a nonzero status must not be replayed"
+        );
     }
 }
