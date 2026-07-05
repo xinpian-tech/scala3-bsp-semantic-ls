@@ -1,0 +1,15 @@
+[package]
+name = "ls-jvm"
+description = "Rust side of the embedded-JVM presentation-compiler island lifecycle: dlopen/JNI_CreateJavaVM boot (single boot symbol, zero JNIEnv) with the ls-pc-abi Rust vtable handed to the FFM premain, rendezvous-with-deadline, the loaned dispatch-generation channel + watchdog recovery ladder (cancel/restart/new-generation + replay), and the stdout fd guard that keeps island output off the LSP protocol stream."
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+ls-pc-abi = { path = "../ls-pc-abi" }
+libloading = "0.8"
+libc = "0.2"

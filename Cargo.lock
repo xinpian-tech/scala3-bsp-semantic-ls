@@ -154,6 +154,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ls-jvm"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "libloading",
+ "ls-pc-abi",
+]
+
+[[package]]
 name = "ls-jvm-spike"
 version = "0.1.0"
 dependencies = [
