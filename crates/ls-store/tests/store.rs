@@ -288,3 +288,51 @@ fn corrupt_state_header_rejected_without_panic() {
     let e = corrupt_state_and_reopen(|b| b[PAYLOAD_OFF] ^= 0xff);
     assert!(matches!(e, StoreError::StateCorrupt { .. }), "got {e:?}");
 }
+
+// ---- negative: manifest <-> segment pairing ----
+
+/// Replace `from` with `to` in `manifest.json` and return the reopen error.
+fn tamper_manifest_and_reopen(root: &Path, from: &str, to: &str) -> StoreError {
+    let path = root.join("manifest.json");
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains(from), "manifest missing {from:?}");
+    std::fs::write(&path, text.replace(from, to)).unwrap();
+    match Store::open(root) {
+        Err(e) => e,
+        Ok(_) => panic!("tampered manifest must be rejected"),
+    }
+}
+
+#[test]
+fn manifest_segment_id_mismatch_rejected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    // Two generations with identical doc/symbol counts so the count check can't
+    // distinguish them.
+    store.publish(&data(1, 1), b"g1", 0).unwrap();
+    store.publish(&data(1, 1), b"g2", 0).unwrap();
+    drop(store);
+
+    // Point the (gen2) manifest's segment_dir at gen1 while it still claims
+    // segment_id 2 / state_generation 2 -> a mixed pair the segment-id check
+    // must reject.
+    let e = tamper_manifest_and_reopen(
+        tmp.path(),
+        "segments/segment-000002",
+        "segments/segment-000001",
+    );
+    assert!(matches!(e, StoreError::PairMismatch { .. }), "got {e:?}");
+}
+
+#[test]
+fn manifest_traversal_segment_dir_rejected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    store.publish(&data(1, 1), b"g1", 0).unwrap();
+    drop(store);
+
+    // A non-canonical / traversal segment_dir must be refused before any open.
+    let e =
+        tamper_manifest_and_reopen(tmp.path(), "segments/segment-000001", "../../../etc/passwd");
+    assert!(matches!(e, StoreError::ManifestCorrupt { .. }), "got {e:?}");
+}

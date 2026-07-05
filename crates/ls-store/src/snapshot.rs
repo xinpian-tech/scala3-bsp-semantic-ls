@@ -207,10 +207,29 @@ impl Store {
     }
 
     /// Open the (segment, state) pair named by `manifest` and cross-check they
-    /// are paired (generation, checksum, record counts).
+    /// are paired (segment id, generation, checksum, record counts).
     fn open_snapshot(&self, manifest: &Manifest) -> StoreResult<Snapshot> {
+        // The manifest must name a safe relative `segments/segment-<digits>`
+        // path — never an absolute path or one escaping the store root.
+        if !is_canonical_segment_dir(&manifest.segment_dir) {
+            return Err(StoreError::ManifestCorrupt {
+                detail: format!("non-canonical segment_dir {:?}", manifest.segment_dir),
+            });
+        }
         let segment_dir = self.root.join(&manifest.segment_dir);
         let segment = SegmentReader::open(&segment_dir)?;
+        // Prove the opened segment IS the manifest's segment. Without this a
+        // rewritten manifest could point segment_dir at another generation with
+        // the same counts and serve a mixed (segment, state) pair.
+        if segment.segment_id() != manifest.segment_id {
+            return Err(StoreError::PairMismatch {
+                detail: format!(
+                    "segment header id {} != manifest segment_id {}",
+                    segment.segment_id(),
+                    manifest.segment_id
+                ),
+            });
+        }
         if segment.doc_count() != manifest.doc_count
             || segment.symbol_count() as u32 != manifest.symbol_count
         {
@@ -245,6 +264,16 @@ impl Store {
             .lock()
             .unwrap()
             .push(Retired { snapshot, paths });
+    }
+}
+
+/// Accept only a relative `segments/segment-<digits>` path — no absolute paths,
+/// no `..` traversal, no arbitrary names — so a corrupt manifest cannot make the
+/// store read outside its own segments directory.
+fn is_canonical_segment_dir(dir: &str) -> bool {
+    match dir.strip_prefix("segments/segment-") {
+        Some(rest) => !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()),
+        None => false,
     }
 }
 
