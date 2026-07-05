@@ -1,0 +1,20 @@
+[package]
+name = "ls-server"
+description = "The LSP server: the advertised capability surface, the BSP diagnostics router (per-URI merge with per-target reset and clear-once suppression), and the dirty-buffer document store. A behavior-preserving port of the ls.core server layer."
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+ls-index-model = { path = "../ls-index-model" }
+ls-bsp = { path = "../ls-bsp" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+serde_json = "1"
+tempfile = "3"

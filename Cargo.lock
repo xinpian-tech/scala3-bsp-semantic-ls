@@ -188,6 +188,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ls-server"
+version = "0.1.0"
+dependencies = [
+ "ls-bsp",
+ "ls-index-model",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "ls-store"
 version = "0.1.0"
 dependencies = [
