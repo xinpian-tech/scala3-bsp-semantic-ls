@@ -103,7 +103,7 @@ unsafe extern "C" fn stub_completion(
     out: *mut LsBuf,
 ) -> i32 {
     let label = format!("{}:{line}:{character}", unsafe { read_ls_str(uri) });
-    let payload = single_item_list(label).encode();
+    let payload = single_item_list(label).encode().unwrap();
     if unsafe { memory::write_response(&payload, out) } {
         STATUS_OK
     } else {
@@ -117,7 +117,7 @@ unsafe extern "C" fn stub_hover_null(
     _character: u32,
     out: *mut LsBuf,
 ) -> i32 {
-    let payload = HoverResult(None).encode();
+    let payload = HoverResult(None).encode().unwrap();
     if unsafe { memory::write_response(&payload, out) } {
         STATUS_OK
     } else {
@@ -141,7 +141,8 @@ unsafe extern "C" fn stub_signature_help(
         active_signature: Some(0),
         active_parameter: Some(0),
     }
-    .encode();
+    .encode()
+    .unwrap();
     if unsafe { memory::write_response(&payload, out) } {
         STATUS_OK
     } else {
@@ -168,7 +169,8 @@ unsafe extern "C" fn stub_definition(
             origin: origin::WORKSPACE,
         }],
     }
-    .encode();
+    .encode()
+    .unwrap();
     if unsafe { memory::write_response(&payload, out) } {
         STATUS_OK
     } else {
@@ -182,7 +184,7 @@ unsafe extern "C" fn stub_prepare_rename_null(
     _character: u32,
     out: *mut LsBuf,
 ) -> i32 {
-    let payload = PrepareRenameResult(None).encode();
+    let payload = PrepareRenameResult(None).encode().unwrap();
     if unsafe { memory::write_response(&payload, out) } {
         STATUS_OK
     } else {
@@ -208,7 +210,7 @@ unsafe extern "C" fn stub_resolve(
     };
     // Enrich the item, as a real resolve would.
     item.documentation = Some(Documentation::Plain("resolved".to_string()));
-    let payload = item.encode();
+    let payload = item.encode().unwrap();
     if unsafe { memory::write_response(&payload, out) } {
         STATUS_OK
     } else {
@@ -236,7 +238,8 @@ unsafe extern "C" fn stub_plugin_status(out: *mut LsBuf) -> i32 {
             reason: "superseded".to_string(),
         }],
     }
-    .encode();
+    .encode()
+    .unwrap();
     if unsafe { memory::write_response(&payload, out) } {
         STATUS_OK
     } else {
@@ -295,7 +298,8 @@ unsafe extern "C" fn stub_symbol_definition(
             origin: origin::WORKSPACE,
         }],
     }
-    .encode();
+    .encode()
+    .unwrap();
     if unsafe { memory::write_response(&payload, out) } {
         STATUS_OK
     } else {
@@ -409,7 +413,11 @@ fn boundary_calls_round_trip_and_free_without_leaking() {
         unsafe { (rust.free)(out.ptr, out.len) };
 
         // completion_resolve — the encoded item argument decodes and re-encodes.
-        let item_buf = single_item_list("m".to_string()).items.remove(0).encode();
+        let item_buf = single_item_list("m".to_string())
+            .items
+            .remove(0)
+            .encode()
+            .unwrap();
         let mut out = empty_buf();
         assert_eq!(
             unsafe {
@@ -463,7 +471,7 @@ fn boundary_calls_round_trip_and_free_without_leaking() {
         symbol: "s".to_string(),
         item: single_item_list("x".to_string()).items.remove(0),
     };
-    let item_buf = params.item.encode();
+    let item_buf = params.item.encode().unwrap();
     assert_eq!(
         unsafe {
             (pc.completion_resolve)(

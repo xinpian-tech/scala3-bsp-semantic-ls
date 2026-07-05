@@ -210,7 +210,7 @@ impl LiveIsland {
             .request(PcRequest::Resolve {
                 target_id: TARGET_ID.to_string(),
                 symbol: symbol.to_string(),
-                item: item.encode(),
+                item: item.encode().unwrap(),
             })
             .expect("completion_resolve");
         CompletionItem::decode(&bytes).expect("decode resolved item")

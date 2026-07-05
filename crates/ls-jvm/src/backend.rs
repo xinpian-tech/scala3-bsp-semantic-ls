@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 use ls_pc_abi::abi::{LsBuf, LsStr, PcVtable};
 use ls_pc_abi::memory::abi_free;
 use ls_pc_abi::payloads::{DidChangeParams, DidOpenParams};
-use ls_pc_abi::{STATUS_INTERNAL, STATUS_OK, STATUS_PANIC};
+use ls_pc_abi::{abi_len, AbiError, STATUS_INTERNAL, STATUS_OK, STATUS_PANIC};
 
 use crate::mirror::ReplayPlan;
 use crate::watchdog::{DispatchOutcome, PcBackend, PcRequest, QueryKind};
@@ -77,11 +77,22 @@ enum ControlOp {
     PluginStatus,
 }
 
-fn lsstr(s: &str) -> LsStr {
-    LsStr {
+/// Borrows `s` as an `LsStr`, or returns an error status if its length does not
+/// fit the ABI `u32` (never truncating a length handed to the island).
+fn lsstr(s: &str) -> Result<LsStr, i32> {
+    Ok(LsStr {
         ptr: s.as_ptr(),
-        len: s.len() as u32,
-    }
+        len: abi_len(s.len()).map_err(|_| STATUS_INTERNAL)?,
+    })
+}
+
+/// Encodes a request payload and narrows its length to the ABI `u32`, mapping an
+/// encode failure or an oversized length to an error status — so an oversized
+/// request never reaches the slot with a truncated length.
+fn encoded_request(payload: Result<Vec<u8>, AbiError>) -> Result<(Vec<u8>, u32), i32> {
+    let bytes = payload.map_err(|_| STATUS_INTERNAL)?;
+    let len = abi_len(bytes.len()).map_err(|_| STATUS_INTERNAL)?;
+    Ok((bytes, len))
 }
 
 fn empty_buf() -> LsBuf {
@@ -106,38 +117,51 @@ fn take_response(out: LsBuf) -> Vec<u8> {
 }
 
 fn invoke_dispatch(pc: &PcVtable, request: &PcRequest) -> OpOutcome {
-    match request {
+    // An encode failure or an oversized argument/payload length maps to an error
+    // status WITHOUT invoking the slot with a truncated length.
+    match invoke_dispatch_inner(pc, request) {
+        Ok(outcome) => outcome,
+        Err(status) => OpOutcome::status(status),
+    }
+}
+
+fn invoke_dispatch_inner(pc: &PcVtable, request: &PcRequest) -> Result<OpOutcome, i32> {
+    Ok(match request {
         PcRequest::RegisterTarget { config, .. } => {
-            let bytes = config.encode();
-            // SAFETY: `bytes` is a valid buffer for the call.
-            OpOutcome::status(unsafe { (pc.register_target)(bytes.as_ptr(), bytes.len() as u32) })
+            let (bytes, len) = encoded_request(config.encode())?;
+            // SAFETY: `bytes` is a valid buffer of `len` for the call.
+            OpOutcome::status(unsafe { (pc.register_target)(bytes.as_ptr(), len) })
         }
         PcRequest::DidOpen {
             target_id,
             uri,
             text,
         } => {
-            let bytes = DidOpenParams {
-                target_id: target_id.clone(),
-                uri: uri.clone(),
-                text: text.clone(),
-            }
-            .encode();
-            // SAFETY: `bytes` is a valid buffer for the call.
-            OpOutcome::status(unsafe { (pc.did_open)(bytes.as_ptr(), bytes.len() as u32) })
+            let (bytes, len) = encoded_request(
+                DidOpenParams {
+                    target_id: target_id.clone(),
+                    uri: uri.clone(),
+                    text: text.clone(),
+                }
+                .encode(),
+            )?;
+            // SAFETY: `bytes` is a valid buffer of `len` for the call.
+            OpOutcome::status(unsafe { (pc.did_open)(bytes.as_ptr(), len) })
         }
         PcRequest::DidChange { uri, text } => {
-            let bytes = DidChangeParams {
-                uri: uri.clone(),
-                text: text.clone(),
-            }
-            .encode();
-            // SAFETY: `bytes` is a valid buffer for the call.
-            OpOutcome::status(unsafe { (pc.did_change)(bytes.as_ptr(), bytes.len() as u32) })
+            let (bytes, len) = encoded_request(
+                DidChangeParams {
+                    uri: uri.clone(),
+                    text: text.clone(),
+                }
+                .encode(),
+            )?;
+            // SAFETY: `bytes` is a valid buffer of `len` for the call.
+            OpOutcome::status(unsafe { (pc.did_change)(bytes.as_ptr(), len) })
         }
         PcRequest::DidClose { uri } => {
             // SAFETY: `uri` outlives the call via `request`.
-            OpOutcome::status(unsafe { (pc.did_close)(lsstr(uri)) })
+            OpOutcome::status(unsafe { (pc.did_close)(lsstr(uri)?) })
         }
         PcRequest::Query {
             kind,
@@ -153,9 +177,10 @@ fn invoke_dispatch(pc: &PcVtable, request: &PcRequest) -> OpOutcome {
                 QueryKind::TypeDefinition => pc.type_definition,
                 QueryKind::PrepareRename => pc.prepare_rename,
             };
+            let arg = lsstr(uri)?;
             let mut out = empty_buf();
             // SAFETY: `uri` outlives the call; `out` is a valid out-param.
-            let status = unsafe { slot(lsstr(uri), *line, *character, &mut out) };
+            let status = unsafe { slot(arg, *line, *character, &mut out) };
             OpOutcome {
                 status,
                 out: take_response(out),
@@ -166,23 +191,19 @@ fn invoke_dispatch(pc: &PcVtable, request: &PcRequest) -> OpOutcome {
             symbol,
             item,
         } => {
+            let item_len = abi_len(item.len()).map_err(|_| STATUS_INTERNAL)?;
+            let target = lsstr(target_id)?;
+            let sym = lsstr(symbol)?;
             let mut out = empty_buf();
             // SAFETY: args outlive the call; `out` is a valid out-param.
-            let status = unsafe {
-                (pc.completion_resolve)(
-                    lsstr(target_id),
-                    lsstr(symbol),
-                    item.as_ptr(),
-                    item.len() as u32,
-                    &mut out,
-                )
-            };
+            let status =
+                unsafe { (pc.completion_resolve)(target, sym, item.as_ptr(), item_len, &mut out) };
             OpOutcome {
                 status,
                 out: take_response(out),
             }
         }
-    }
+    })
 }
 
 fn invoke_control(pc: &PcVtable, op: &ControlOp) -> OpOutcome {
@@ -547,6 +568,21 @@ mod tests {
     use crate::watchdog::{PcError, Supervisor};
     use ls_pc_abi::memory::abi_alloc;
     use ls_pc_abi::payloads::TargetConfig;
+
+    #[test]
+    fn an_encode_failure_becomes_an_error_status_before_the_slot() {
+        // A request that fails to encode (or an oversized payload) maps to an
+        // error status, so `invoke_dispatch` never calls the slot with a
+        // truncated length. (A multi-GiB payload can't be allocated in a test;
+        // the encode-error arm exercises the same early-return path, and
+        // `abi_len`'s oversize rejection is covered in ls-pc-abi.)
+        assert_eq!(
+            encoded_request(Err(AbiError("payload too large".to_string()))),
+            Err(STATUS_INTERNAL)
+        );
+        let (bytes, len) = encoded_request(Ok(vec![1u8, 2, 3])).expect("small payload narrows");
+        assert_eq!((bytes.len(), len), (3, 3));
+    }
     use std::sync::OnceLock;
 
     // A single global stub PC vtable + recorder. One integration test uses it,
@@ -627,12 +663,13 @@ mod tests {
             }
             return;
         }
-        // SAFETY: `abi_alloc` returns a buffer of `bytes.len()` we own and copy into.
-        let ptr = unsafe { abi_alloc(bytes.len() as u32) };
+        let len = abi_len(bytes.len()).expect("test response fits the u32 ABI limit");
+        // SAFETY: `abi_alloc` returns a buffer of `len` we own and copy into.
+        let ptr = unsafe { abi_alloc(len) };
         unsafe {
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
             (*out).ptr = ptr;
-            (*out).len = bytes.len() as u32;
+            (*out).len = len;
         }
     }
 

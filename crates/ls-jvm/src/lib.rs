@@ -37,7 +37,7 @@ use ls_pc_abi::memory::{abi_alloc, abi_free, write_response};
 use ls_pc_abi::payloads::LocationsResult;
 use ls_pc_abi::{
     PcVtable, RustVtable, ABI_VERSION, LAYOUT_CANARY, STATUS_ABI_MISMATCH, STATUS_ALLOC,
-    STATUS_BAD_ARG, STATUS_OK, STATUS_PANIC,
+    STATUS_BAD_ARG, STATUS_INTERNAL, STATUS_OK, STATUS_PANIC,
 };
 
 use backend::{IslandRuntime, VtableBackend};
@@ -264,7 +264,12 @@ fn run_resolver(
             }
         }
     };
-    let payload = result.encode();
+    let payload = match result.encode() {
+        Ok(bytes) => bytes,
+        // A response too large to represent in the ABI is an internal failure,
+        // not a truncated buffer handed across the boundary.
+        Err(_) => return STATUS_INTERNAL,
+    };
     // SAFETY: `out` is a valid writable `LsBuf` for the call (checked non-null).
     if unsafe { write_response(&payload, out) } {
         STATUS_OK

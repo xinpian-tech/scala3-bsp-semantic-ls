@@ -27,11 +27,23 @@ impl std::fmt::Display for AbiError {
 
 impl std::error::Error for AbiError {}
 
+/// Narrows a `usize` length to the ABI `u32`, returning a typed [`AbiError`]
+/// (never truncating) when it does not fit. Used at every boundary where a
+/// buffer length is handed across the flat ABI as a `uint32_t`, so an oversized
+/// payload fails with an error instead of a truncated length.
+pub fn abi_len(n: usize) -> Result<u32, AbiError> {
+    u32::try_from(n).map_err(|_| AbiError::new("length exceeds the u32 ABI limit"))
+}
+
 /// Builds a payload buffer: fixed records into `body`, strings/opaque bytes into
 /// `blob`, then `finish` prepends the envelope.
 pub struct Writer {
     body: Vec<u8>,
     blob: Vec<u8>,
+    /// Set when a blob offset, field length, or list count did not fit `u32`;
+    /// [`finish`](Writer::finish) then fails instead of emitting a truncated
+    /// length.
+    overflow: bool,
 }
 
 impl Writer {
@@ -39,11 +51,28 @@ impl Writer {
         Writer {
             body: Vec::new(),
             blob: Vec::new(),
+            overflow: false,
         }
     }
 
     pub fn u32(&mut self, v: u32) {
         self.body.extend_from_slice(&v.to_le_bytes());
+    }
+
+    /// Narrows a `usize` to `u32`, flagging overflow (so [`finish`](Writer::finish)
+    /// fails) instead of truncating. Returns `0` on overflow — a harmless
+    /// placeholder, since the buffer is never produced once flagged.
+    fn narrow(&mut self, n: usize) -> u32 {
+        abi_len(n).unwrap_or_else(|_| {
+            self.overflow = true;
+            0
+        })
+    }
+
+    /// A list count: the element count as a checked `u32`.
+    pub fn count(&mut self, n: usize) {
+        let c = self.narrow(n);
+        self.u32(c);
     }
 
     pub fn i32(&mut self, v: i32) {
@@ -139,21 +168,32 @@ impl Writer {
     }
 
     fn intern(&mut self, bytes: &[u8]) -> (u32, u32) {
-        let offset = self.blob.len() as u32;
+        let offset = self.narrow(self.blob.len());
         self.blob.extend_from_slice(bytes);
-        (offset, bytes.len() as u32)
+        let len = self.narrow(bytes.len());
+        (offset, len)
     }
 
-    /// Concatenates the envelope, body, and blob into the final buffer.
-    pub fn finish(self, kind: u32) -> Vec<u8> {
+    /// Concatenates the envelope, body, and blob into the final buffer, or fails
+    /// with a typed error if any blob offset / field length / list count did not
+    /// fit `u32` (the `overflow` flag) or the body/blob length itself exceeds
+    /// `u32` — never emitting a truncated length across the boundary.
+    pub fn finish(self, kind: u32) -> Result<Vec<u8>, AbiError> {
+        if self.overflow {
+            return Err(AbiError::new(
+                "payload blob offset, field length, or count exceeds the u32 ABI limit",
+            ));
+        }
+        let body_len = abi_len(self.body.len())?;
+        let blob_len = abi_len(self.blob.len())?;
         let mut out = Vec::with_capacity(16 + self.body.len() + self.blob.len());
         out.extend_from_slice(&MAGIC.to_le_bytes());
         out.extend_from_slice(&kind.to_le_bytes());
-        out.extend_from_slice(&(self.body.len() as u32).to_le_bytes());
-        out.extend_from_slice(&(self.blob.len() as u32).to_le_bytes());
+        out.extend_from_slice(&body_len.to_le_bytes());
+        out.extend_from_slice(&blob_len.to_le_bytes());
         out.extend_from_slice(&self.body);
         out.extend_from_slice(&self.blob);
-        out
+        Ok(out)
     }
 }
 
@@ -313,5 +353,43 @@ impl<'a> Reader<'a> {
             )));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn abi_len_narrows_and_rejects_oversized() {
+        assert_eq!(abi_len(0), Ok(0));
+        assert_eq!(abi_len(u32::MAX as usize), Ok(u32::MAX));
+        // A length one past the u32 ceiling is a typed error, never a truncation.
+        assert!(abi_len(u32::MAX as usize + 1).is_err());
+    }
+
+    #[test]
+    fn finish_fails_when_a_count_exceeds_u32() {
+        // A list count above u32::MAX flags overflow, so `finish` fails with a
+        // typed error instead of emitting a truncated count. No allocation:
+        // `count` narrows the value, not an actual list of that many elements.
+        let mut w = Writer::new();
+        w.count(u32::MAX as usize + 1);
+        assert!(w.finish(0).is_err());
+    }
+
+    #[test]
+    fn finish_writes_the_envelope_for_a_normal_payload() {
+        let mut w = Writer::new();
+        w.u32(7);
+        w.str("hi");
+        let buf = w
+            .finish(42)
+            .expect("a small payload fits the u32 ABI limit");
+        assert_eq!(&buf[0..4], &MAGIC.to_le_bytes());
+        assert_eq!(&buf[4..8], &42u32.to_le_bytes());
+        // body_len = 12 (one u32 + a BlobStr's offset,len), blob_len = 2 ("hi").
+        assert_eq!(&buf[8..12], &12u32.to_le_bytes());
+        assert_eq!(&buf[12..16], &2u32.to_le_bytes());
     }
 }

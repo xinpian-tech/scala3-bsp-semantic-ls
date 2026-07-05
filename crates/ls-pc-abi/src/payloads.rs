@@ -39,7 +39,7 @@ fn bad_tag(what: &str, tag: u32) -> AbiError {
 }
 
 fn write_str_list(w: &mut Writer, list: &[String]) {
-    w.u32(list.len() as u32);
+    w.count(list.len());
     for s in list {
         w.str(s);
     }
@@ -286,7 +286,7 @@ pub struct TargetConfig {
 }
 
 impl TargetConfig {
-    pub fn encode(&self) -> Vec<u8> {
+    pub fn encode(&self) -> Result<Vec<u8>, AbiError> {
         let mut w = Writer::new();
         w.str(&self.bsp_id);
         w.str(&self.scala_version);
@@ -323,7 +323,7 @@ pub struct DidOpenParams {
 }
 
 impl DidOpenParams {
-    pub fn encode(&self) -> Vec<u8> {
+    pub fn encode(&self) -> Result<Vec<u8>, AbiError> {
         let mut w = Writer::new();
         w.str(&self.target_id);
         w.str(&self.uri);
@@ -353,7 +353,7 @@ pub struct DidChangeParams {
 }
 
 impl DidChangeParams {
-    pub fn encode(&self) -> Vec<u8> {
+    pub fn encode(&self) -> Result<Vec<u8>, AbiError> {
         let mut w = Writer::new();
         w.str(&self.uri);
         w.str(&self.text);
@@ -379,7 +379,7 @@ pub struct PositionParams {
 }
 
 impl PositionParams {
-    pub fn encode(&self) -> Vec<u8> {
+    pub fn encode(&self) -> Result<Vec<u8>, AbiError> {
         let mut w = Writer::new();
         w.str(&self.uri);
         w.u32(self.line);
@@ -410,7 +410,7 @@ pub struct ResolveParams {
 }
 
 impl ResolveParams {
-    pub fn encode(&self) -> Vec<u8> {
+    pub fn encode(&self) -> Result<Vec<u8>, AbiError> {
         let mut w = Writer::new();
         w.str(&self.target_id);
         w.str(&self.symbol);
@@ -492,7 +492,7 @@ impl CompletionItem {
         match &self.tags {
             Some(tags) => {
                 w.u32(1);
-                w.u32(tags.len() as u32);
+                w.count(tags.len());
                 for tag in tags {
                     w.i32(*tag);
                 }
@@ -519,7 +519,7 @@ impl CompletionItem {
         match &self.additional_text_edits {
             Some(edits) => {
                 w.u32(1);
-                w.u32(edits.len() as u32);
+                w.count(edits.len());
                 for edit in edits {
                     edit.write(w);
                 }
@@ -628,7 +628,7 @@ impl CompletionItem {
     }
 
     /// `completion_resolve` response (a single enriched item).
-    pub fn encode(&self) -> Vec<u8> {
+    pub fn encode(&self) -> Result<Vec<u8>, AbiError> {
         let mut w = Writer::new();
         self.write(&mut w);
         w.finish(KIND_COMPLETION_ITEM)
@@ -762,7 +762,7 @@ pub struct CompletionList {
 }
 
 impl CompletionList {
-    pub fn encode(&self) -> Vec<u8> {
+    pub fn encode(&self) -> Result<Vec<u8>, AbiError> {
         let mut w = Writer::new();
         w.bool32(self.is_incomplete);
         match &self.item_defaults {
@@ -773,7 +773,7 @@ impl CompletionList {
             None => w.u32(0),
         }
         CompletionApplyKind::write_opt(&mut w, &self.apply_kind);
-        w.u32(self.items.len() as u32);
+        w.count(self.items.len());
         for item in &self.items {
             item.write(&mut w);
         }
@@ -831,7 +831,7 @@ impl HoverContents {
             }
             HoverContents::Marked(items) => {
                 w.u32(1);
-                w.u32(items.len() as u32);
+                w.count(items.len());
                 for item in items {
                     match item {
                         MarkedStringItem::Plain(s) => {
@@ -887,7 +887,7 @@ pub struct Hover {
 pub struct HoverResult(pub Option<Hover>);
 
 impl HoverResult {
-    pub fn encode(&self) -> Vec<u8> {
+    pub fn encode(&self) -> Result<Vec<u8>, AbiError> {
         let mut w = Writer::new();
         match &self.0 {
             Some(hover) => {
@@ -979,16 +979,16 @@ pub struct SignatureHelp {
 }
 
 impl SignatureHelp {
-    pub fn encode(&self) -> Vec<u8> {
+    pub fn encode(&self) -> Result<Vec<u8>, AbiError> {
         let mut w = Writer::new();
-        w.u32(self.signatures.len() as u32);
+        w.count(self.signatures.len());
         for sig in &self.signatures {
             w.str(&sig.label);
             Documentation::write_opt(&mut w, &sig.documentation);
             match &sig.parameters {
                 Some(params) => {
                     w.u32(1);
-                    w.u32(params.len() as u32);
+                    w.count(params.len());
                     for param in params {
                         param.label.write(&mut w);
                         Documentation::write_opt(&mut w, &param.documentation);
@@ -1057,10 +1057,10 @@ pub struct DefinitionResult {
 }
 
 impl DefinitionResult {
-    pub fn encode(&self) -> Vec<u8> {
+    pub fn encode(&self) -> Result<Vec<u8>, AbiError> {
         let mut w = Writer::new();
         w.str(&self.symbol);
-        w.u32(self.locations.len() as u32);
+        w.count(self.locations.len());
         for loc in &self.locations {
             loc.write(&mut w);
         }
@@ -1087,9 +1087,9 @@ pub struct LocationsResult {
 }
 
 impl LocationsResult {
-    pub fn encode(&self) -> Vec<u8> {
+    pub fn encode(&self) -> Result<Vec<u8>, AbiError> {
         let mut w = Writer::new();
-        w.u32(self.locations.len() as u32);
+        w.count(self.locations.len());
         for loc in &self.locations {
             loc.write(&mut w);
         }
@@ -1117,7 +1117,7 @@ impl LocationsResult {
 pub struct PrepareRenameResult(pub Option<Rng>);
 
 impl PrepareRenameResult {
-    pub fn encode(&self) -> Vec<u8> {
+    pub fn encode(&self) -> Result<Vec<u8>, AbiError> {
         let mut w = Writer::new();
         Rng::write_opt(&mut w, &self.0);
         w.finish(KIND_PREPARE_RENAME)
@@ -1170,16 +1170,16 @@ pub struct PluginStatus {
 }
 
 impl PluginStatus {
-    pub fn encode(&self) -> Vec<u8> {
+    pub fn encode(&self) -> Result<Vec<u8>, AbiError> {
         let mut w = Writer::new();
-        w.u32(self.compiler_plugins.len() as u32);
+        w.count(self.compiler_plugins.len());
         for plugin in &self.compiler_plugins {
             write_str_list(&mut w, &plugin.jars);
             write_str_list(&mut w, &plugin.options);
             w.bool32(plugin.loaded);
             w.str(&plugin.detail);
         }
-        w.u32(self.service_plugins.len() as u32);
+        w.count(self.service_plugins.len());
         for plugin in &self.service_plugins {
             w.str(&plugin.id);
             w.str(&plugin.source);
@@ -1187,7 +1187,7 @@ impl PluginStatus {
             w.bool32(plugin.self_test_ok);
             w.str(&plugin.self_test_detail);
         }
-        w.u32(self.disabled.len() as u32);
+        w.count(self.disabled.len());
         for plugin in &self.disabled {
             w.str(&plugin.id);
             w.str(&plugin.reason);

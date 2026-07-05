@@ -62,6 +62,7 @@ fn sample_completion_list() -> Vec<u8> {
         items: vec![bare_item("hello")],
     }
     .encode()
+    .unwrap()
 }
 
 #[test]
@@ -118,7 +119,7 @@ fn out_of_range_blob_offset_is_rejected() {
     w.u32(0); // zero locations
               // Kind 10 == KIND_DEFINITION (see payloads.rs); build it directly so we can
               // then corrupt the offset.
-    let mut buf = w.finish(10);
+    let mut buf = w.finish(10).unwrap();
     // The symbol's offset field is the first body u32 (buffer offset 16).
     buf[16..20].copy_from_slice(&0xffff_ffffu32.to_le_bytes());
     assert!(DefinitionResult::decode(&buf).is_err());
@@ -130,8 +131,8 @@ fn invalid_utf8_in_blob_is_rejected() {
     let mut w = Writer::new();
     w.str("\u{0}"); // uri: offset 0, len 1 — will be overwritten below
     w.str(""); // text
-    let mut buf = w.finish(3); // KIND_DID_CHANGE
-                               // The blob is the trailing region; overwrite its first byte with 0xff.
+    let mut buf = w.finish(3).unwrap(); // KIND_DID_CHANGE
+                                        // The blob is the trailing region; overwrite its first byte with 0xff.
     let blob_start = buf.len() - 1;
     buf[blob_start] = 0xff;
     assert!(DidChangeParams::decode(&buf).is_err());
@@ -148,7 +149,8 @@ fn invalid_enum_variant_tag_is_rejected() {
         }),
         range: None,
     }))
-    .encode();
+    .encode()
+    .unwrap();
     let mut buf = buf;
     let tag_at = 16 + 4;
     buf[tag_at..tag_at + 4].copy_from_slice(&99u32.to_le_bytes());
@@ -161,7 +163,7 @@ fn reader_rejects_trailing_body_bytes() {
     let mut w = Writer::new();
     w.u32(7);
     w.u32(9);
-    let buf = w.finish(4); // KIND_POSITION expects uri + line + character
+    let buf = w.finish(4).unwrap(); // KIND_POSITION expects uri + line + character
     assert!(PositionParams::decode(&buf).is_err());
     // And a reader constructed directly rejects the leftover tail.
     let mut reader = Reader::new(&buf, 4).unwrap();
@@ -202,7 +204,7 @@ proptest! {
             apply_kind: None,
             items: labels.iter().map(|l| bare_item(l)).collect(),
         };
-        let mut buf = list.encode();
+        let mut buf = list.encode().unwrap();
         if !buf.is_empty() {
             let i = index.index(buf.len());
             buf[i] ^= xor;

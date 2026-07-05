@@ -93,7 +93,10 @@ fn completion_item_full_lsp4j_surface_round_trips() {
         }),
         data: Some(br#"{"symbol":"scala/collection/List#map()."}"#.to_vec()),
     };
-    assert_eq!(CompletionItem::decode(&item.encode()).unwrap(), item);
+    assert_eq!(
+        CompletionItem::decode(&item.encode().unwrap()).unwrap(),
+        item
+    );
 }
 
 #[test]
@@ -109,7 +112,10 @@ fn runtime_lsp4j_1_0_0_fields_round_trip() {
         command: "run".to_string(),
         arguments: None,
     });
-    assert_eq!(CompletionItem::decode(&item.encode()).unwrap(), item);
+    assert_eq!(
+        CompletionItem::decode(&item.encode().unwrap()).unwrap(),
+        item
+    );
 
     let list = CompletionList {
         is_incomplete: false,
@@ -120,7 +126,10 @@ fn runtime_lsp4j_1_0_0_fields_round_trip() {
         }),
         items: vec![item],
     };
-    assert_eq!(CompletionList::decode(&list.encode()).unwrap(), list);
+    assert_eq!(
+        CompletionList::decode(&list.encode().unwrap()).unwrap(),
+        list
+    );
 
     // applyKind present-but-empty (both merge modes null) is distinct from a
     // null applyKind, and a null command tooltip is distinct from Some("").
@@ -136,10 +145,10 @@ fn runtime_lsp4j_1_0_0_fields_round_trip() {
         ..list
     };
     assert_eq!(
-        CompletionList::decode(&empty_kind.encode()).unwrap(),
+        CompletionList::decode(&empty_kind.encode().unwrap()).unwrap(),
         empty_kind
     );
-    assert_ne!(empty_kind.encode(), no_kind.encode());
+    assert_ne!(empty_kind.encode().unwrap(), no_kind.encode().unwrap());
 }
 
 #[test]
@@ -149,7 +158,10 @@ fn completion_edit_plain_variant_round_trips() {
         range: range(0, 0, 0, 1),
         new_text: "f()".to_string(),
     }));
-    assert_eq!(CompletionItem::decode(&item.encode()).unwrap(), item);
+    assert_eq!(
+        CompletionItem::decode(&item.encode().unwrap()).unwrap(),
+        item
+    );
 }
 
 #[test]
@@ -169,12 +181,18 @@ fn completion_list_item_defaults_round_trip() {
         apply_kind: None,
         items: vec![bare_item("a")],
     };
-    assert_eq!(CompletionList::decode(&list.encode()).unwrap(), list);
+    assert_eq!(
+        CompletionList::decode(&list.encode().unwrap()).unwrap(),
+        list
+    );
 
     // editRange as a plain Range is a distinct variant.
     let mut plain = list.clone();
     plain.item_defaults.as_mut().unwrap().edit_range = Some(EditRange::Range(range(0, 0, 0, 3)));
-    assert_eq!(CompletionList::decode(&plain.encode()).unwrap(), plain);
+    assert_eq!(
+        CompletionList::decode(&plain.encode().unwrap()).unwrap(),
+        plain
+    );
 }
 
 #[test]
@@ -190,7 +208,10 @@ fn hover_marked_string_contents_round_trips() {
         ]),
         range: Some(range(2, 1, 2, 4)),
     }));
-    assert_eq!(HoverResult::decode(&hover.encode()).unwrap(), hover);
+    assert_eq!(
+        HoverResult::decode(&hover.encode().unwrap()).unwrap(),
+        hover
+    );
 }
 
 #[test]
@@ -217,7 +238,10 @@ fn signature_parameter_label_offsets_round_trip() {
         active_signature: Some(0),
         active_parameter: Some(1),
     };
-    assert_eq!(SignatureHelp::decode(&help.encode()).unwrap(), help);
+    assert_eq!(
+        SignatureHelp::decode(&help.encode().unwrap()).unwrap(),
+        help
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -227,7 +251,7 @@ fn signature_parameter_label_offsets_round_trip() {
 #[test]
 fn hover_null_is_distinct_from_present_empty() {
     let null = HoverResult(None);
-    assert_eq!(HoverResult::decode(&null.encode()).unwrap(), null);
+    assert_eq!(HoverResult::decode(&null.encode().unwrap()).unwrap(), null);
 
     let present_empty = HoverResult(Some(Hover {
         contents: HoverContents::Markup(MarkupContent {
@@ -237,19 +261,25 @@ fn hover_null_is_distinct_from_present_empty() {
         range: None,
     }));
     assert_eq!(
-        HoverResult::decode(&present_empty.encode()).unwrap(),
+        HoverResult::decode(&present_empty.encode().unwrap()).unwrap(),
         present_empty
     );
-    assert_ne!(null.encode(), present_empty.encode());
+    assert_ne!(null.encode().unwrap(), present_empty.encode().unwrap());
 }
 
 #[test]
 fn prepare_rename_null_is_distinct_from_zero_range() {
     let null = PrepareRenameResult(None);
     let zero = PrepareRenameResult(Some(Rng::default()));
-    assert_eq!(PrepareRenameResult::decode(&null.encode()).unwrap(), null);
-    assert_eq!(PrepareRenameResult::decode(&zero.encode()).unwrap(), zero);
-    assert_ne!(null.encode(), zero.encode());
+    assert_eq!(
+        PrepareRenameResult::decode(&null.encode().unwrap()).unwrap(),
+        null
+    );
+    assert_eq!(
+        PrepareRenameResult::decode(&zero.encode().unwrap()).unwrap(),
+        zero
+    );
+    assert_ne!(null.encode().unwrap(), zero.encode().unwrap());
 }
 
 #[test]
@@ -259,9 +289,15 @@ fn optional_scalars_distinguish_none_from_zero_and_false() {
     some.deprecated = Some(false);
     some.preselect = Some(false);
     let none = bare_item("x");
-    assert_eq!(CompletionItem::decode(&some.encode()).unwrap(), some);
-    assert_eq!(CompletionItem::decode(&none.encode()).unwrap(), none);
-    assert_ne!(some.encode(), none.encode());
+    assert_eq!(
+        CompletionItem::decode(&some.encode().unwrap()).unwrap(),
+        some
+    );
+    assert_eq!(
+        CompletionItem::decode(&none.encode().unwrap()).unwrap(),
+        none
+    );
+    assert_ne!(some.encode().unwrap(), none.encode().unwrap());
 }
 
 #[test]
@@ -272,9 +308,15 @@ fn nullable_list_distinguishes_none_from_empty() {
     let mut empty = bare_item("x");
     empty.commit_characters = Some(vec![]);
     empty.tags = Some(vec![]);
-    assert_eq!(CompletionItem::decode(&none.encode()).unwrap(), none);
-    assert_eq!(CompletionItem::decode(&empty.encode()).unwrap(), empty);
-    assert_ne!(none.encode(), empty.encode());
+    assert_eq!(
+        CompletionItem::decode(&none.encode().unwrap()).unwrap(),
+        none
+    );
+    assert_eq!(
+        CompletionItem::decode(&empty.encode().unwrap()).unwrap(),
+        empty
+    );
+    assert_ne!(none.encode().unwrap(), empty.encode().unwrap());
 }
 
 #[test]
@@ -285,7 +327,7 @@ fn empty_completion_list_round_trips() {
         apply_kind: None,
         items: vec![],
     };
-    let decoded = CompletionList::decode(&empty.encode()).unwrap();
+    let decoded = CompletionList::decode(&empty.encode().unwrap()).unwrap();
     assert_eq!(decoded, empty);
     assert!(decoded.items.is_empty());
 }
@@ -312,7 +354,7 @@ fn definition_preserves_per_location_origin_tags() {
             },
         ],
     };
-    let decoded = DefinitionResult::decode(&result.encode()).unwrap();
+    let decoded = DefinitionResult::decode(&result.encode().unwrap()).unwrap();
     assert_eq!(decoded, result);
     let origins: Vec<u32> = decoded.locations.iter().map(|l| l.origin).collect();
     assert_eq!(
@@ -325,16 +367,19 @@ fn definition_preserves_per_location_origin_tags() {
 fn opaque_data_bytes_survive_and_empty_is_distinct_from_none() {
     let mut item = bare_item("x");
     item.data = Some(vec![0u8, 1, 2, 0, 255]);
-    assert_eq!(CompletionItem::decode(&item.encode()).unwrap(), item);
+    assert_eq!(
+        CompletionItem::decode(&item.encode().unwrap()).unwrap(),
+        item
+    );
 
     let mut empty_data = bare_item("x");
     empty_data.data = Some(vec![]);
     let no_data = bare_item("x");
     assert_eq!(
-        CompletionItem::decode(&empty_data.encode()).unwrap(),
+        CompletionItem::decode(&empty_data.encode().unwrap()).unwrap(),
         empty_data
     );
-    assert_ne!(empty_data.encode(), no_data.encode());
+    assert_ne!(empty_data.encode().unwrap(), no_data.encode().unwrap());
 }
 
 #[test]
@@ -344,7 +389,10 @@ fn unicode_strings_round_trip() {
         uri: "file:///café/★.scala".to_string(),
         text: "val 名前 = \"🎉\"\n".to_string(),
     };
-    assert_eq!(DidOpenParams::decode(&params.encode()).unwrap(), params);
+    assert_eq!(
+        DidOpenParams::decode(&params.encode().unwrap()).unwrap(),
+        params
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -583,24 +631,24 @@ proptest! {
         source_dirs in proptest::collection::vec(".*", 0..5),
     ) {
         let cfg = TargetConfig { bsp_id, scala_version, classpath, scalac_options, source_dirs };
-        prop_assert_eq!(TargetConfig::decode(&cfg.encode()).unwrap(), cfg);
+        prop_assert_eq!(TargetConfig::decode(&cfg.encode().unwrap()).unwrap(), cfg);
     }
 
     #[test]
     fn did_change_round_trips(uri in ".*", text in ".*") {
         let params = DidChangeParams { uri, text };
-        prop_assert_eq!(DidChangeParams::decode(&params.encode()).unwrap(), params);
+        prop_assert_eq!(DidChangeParams::decode(&params.encode().unwrap()).unwrap(), params);
     }
 
     #[test]
     fn position_params_round_trip(uri in ".*", line in any::<u32>(), character in any::<u32>()) {
         let params = PositionParams { uri, line, character };
-        prop_assert_eq!(PositionParams::decode(&params.encode()).unwrap(), params);
+        prop_assert_eq!(PositionParams::decode(&params.encode().unwrap()).unwrap(), params);
     }
 
     #[test]
     fn completion_item_round_trips(item in completion_item_strat()) {
-        prop_assert_eq!(CompletionItem::decode(&item.encode()).unwrap(), item);
+        prop_assert_eq!(CompletionItem::decode(&item.encode().unwrap()).unwrap(), item);
     }
 
     #[test]
@@ -614,7 +662,7 @@ proptest! {
         items in proptest::collection::vec(completion_item_strat(), 0..5),
     ) {
         let list = CompletionList { is_incomplete, item_defaults, apply_kind, items };
-        prop_assert_eq!(CompletionList::decode(&list.encode()).unwrap(), list);
+        prop_assert_eq!(CompletionList::decode(&list.encode().unwrap()).unwrap(), list);
     }
 
     #[test]
@@ -624,7 +672,7 @@ proptest! {
         item in completion_item_strat(),
     ) {
         let params = ResolveParams { target_id, symbol, item };
-        prop_assert_eq!(ResolveParams::decode(&params.encode()).unwrap(), params);
+        prop_assert_eq!(ResolveParams::decode(&params.encode().unwrap()).unwrap(), params);
     }
 
     #[test]
@@ -635,7 +683,7 @@ proptest! {
     ) {
         let hover = present.then_some(Hover { contents, range });
         let result = HoverResult(hover);
-        prop_assert_eq!(HoverResult::decode(&result.encode()).unwrap(), result);
+        prop_assert_eq!(HoverResult::decode(&result.encode().unwrap()).unwrap(), result);
     }
 
     #[test]
@@ -645,7 +693,7 @@ proptest! {
         active_parameter in proptest::option::of(any::<i32>()),
     ) {
         let help = SignatureHelp { signatures, active_signature, active_parameter };
-        prop_assert_eq!(SignatureHelp::decode(&help.encode()).unwrap(), help);
+        prop_assert_eq!(SignatureHelp::decode(&help.encode().unwrap()).unwrap(), help);
     }
 
     #[test]
@@ -654,19 +702,19 @@ proptest! {
         locations in proptest::collection::vec(location_strat(), 0..6),
     ) {
         let result = DefinitionResult { symbol, locations };
-        prop_assert_eq!(DefinitionResult::decode(&result.encode()).unwrap(), result);
+        prop_assert_eq!(DefinitionResult::decode(&result.encode().unwrap()).unwrap(), result);
     }
 
     #[test]
     fn locations_round_trip(locations in proptest::collection::vec(location_strat(), 0..6)) {
         let result = LocationsResult { locations };
-        prop_assert_eq!(LocationsResult::decode(&result.encode()).unwrap(), result);
+        prop_assert_eq!(LocationsResult::decode(&result.encode().unwrap()).unwrap(), result);
     }
 
     #[test]
     fn prepare_rename_round_trips(range in proptest::option::of(rng_strat())) {
         let result = PrepareRenameResult(range);
-        prop_assert_eq!(PrepareRenameResult::decode(&result.encode()).unwrap(), result);
+        prop_assert_eq!(PrepareRenameResult::decode(&result.encode().unwrap()).unwrap(), result);
     }
 
     #[test]
@@ -679,6 +727,6 @@ proptest! {
         ),
     ) {
         let status = PluginStatus { compiler_plugins, service_plugins, disabled };
-        prop_assert_eq!(PluginStatus::decode(&status.encode()).unwrap(), status);
+        prop_assert_eq!(PluginStatus::decode(&status.encode().unwrap()).unwrap(), status);
     }
 }

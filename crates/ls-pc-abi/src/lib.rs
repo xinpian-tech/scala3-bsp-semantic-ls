@@ -27,4 +27,4 @@ pub use abi::{
     STATUS_OK, STATUS_PANIC,
 };
 pub use canary::{compute_layout_canary, LAYOUT_CANARY};
-pub use codec::{AbiError, Reader, Writer};
+pub use codec::{abi_len, AbiError, Reader, Writer};
