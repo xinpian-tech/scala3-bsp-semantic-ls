@@ -448,6 +448,7 @@ pub struct LabelDetails {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Command {
     pub title: String,
+    pub tooltip: Option<String>,
     pub command: String,
     pub arguments: Option<Vec<u8>>,
 }
@@ -469,6 +470,7 @@ pub struct CompletionItem {
     pub insert_text_format: Option<i32>,
     pub insert_text_mode: Option<i32>,
     pub text_edit: Option<CompletionEdit>,
+    pub text_edit_text: Option<String>,
     pub additional_text_edits: Option<Vec<TextEdit>>,
     pub commit_characters: Option<Vec<String>>,
     pub command: Option<Command>,
@@ -513,6 +515,7 @@ impl CompletionItem {
             }
             None => w.u32(0),
         }
+        w.opt_str(self.text_edit_text.as_deref());
         match &self.additional_text_edits {
             Some(edits) => {
                 w.u32(1);
@@ -528,6 +531,7 @@ impl CompletionItem {
             Some(command) => {
                 w.u32(1);
                 w.str(&command.title);
+                w.opt_str(command.tooltip.as_deref());
                 w.str(&command.command);
                 w.opt_bytes(command.arguments.as_deref());
             }
@@ -573,6 +577,7 @@ impl CompletionItem {
         } else {
             None
         };
+        let text_edit_text = r.opt_str()?;
         let additional_text_edits = if r.u32()? != 0 {
             let n = r.count()?;
             let mut edits = Vec::with_capacity(n);
@@ -586,10 +591,12 @@ impl CompletionItem {
         let commit_characters = read_opt_str_list(r)?;
         let command = if r.u32()? != 0 {
             let title = r.str()?;
+            let tooltip = r.opt_str()?;
             let command = r.str()?;
             let arguments = r.opt_bytes()?;
             Some(Command {
                 title,
+                tooltip,
                 command,
                 arguments,
             })
@@ -612,6 +619,7 @@ impl CompletionItem {
             insert_text_format,
             insert_text_mode,
             text_edit,
+            text_edit_text,
             additional_text_edits,
             commit_characters,
             command,
@@ -707,12 +715,49 @@ impl CompletionItemDefaults {
     }
 }
 
+/// How a `CompletionList` applies its `itemDefaults` to items (LSP4J
+/// `CompletionApplyKind`): the per-field merge mode for `commitCharacters` and
+/// `data`. Each is an `ApplyKind` ordinal (`Replace`/`Merge`), carried as its
+/// int value like the other LSP enums.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompletionApplyKind {
+    pub commit_characters: Option<i32>,
+    pub data: Option<i32>,
+}
+
+impl CompletionApplyKind {
+    fn write_opt(w: &mut Writer, apply_kind: &Option<CompletionApplyKind>) {
+        match apply_kind {
+            Some(kind) => {
+                w.u32(1);
+                w.opt_i32(kind.commit_characters);
+                w.opt_i32(kind.data);
+            }
+            None => w.u32(0),
+        }
+    }
+
+    fn read_opt(r: &mut Reader) -> Result<Option<CompletionApplyKind>, AbiError> {
+        if r.u32()? == 0 {
+            Ok(None)
+        } else {
+            let commit_characters = r.opt_i32()?;
+            let data = r.opt_i32()?;
+            Ok(Some(CompletionApplyKind {
+                commit_characters,
+                data,
+            }))
+        }
+    }
+}
+
 /// A completion response list (LSP4J `CompletionList`). An empty `items` is a
 /// real empty list (distinct from a null hover / prepare-rename).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CompletionList {
     pub is_incomplete: bool,
     pub item_defaults: Option<CompletionItemDefaults>,
+    pub apply_kind: Option<CompletionApplyKind>,
     pub items: Vec<CompletionItem>,
 }
 
@@ -727,6 +772,7 @@ impl CompletionList {
             }
             None => w.u32(0),
         }
+        CompletionApplyKind::write_opt(&mut w, &self.apply_kind);
         w.u32(self.items.len() as u32);
         for item in &self.items {
             item.write(&mut w);
@@ -742,6 +788,7 @@ impl CompletionList {
         } else {
             None
         };
+        let apply_kind = CompletionApplyKind::read_opt(&mut r)?;
         let count = r.count()?;
         let mut items = Vec::with_capacity(count);
         for _ in 0..count {
@@ -751,6 +798,7 @@ impl CompletionList {
         Ok(CompletionList {
             is_incomplete,
             item_defaults,
+            apply_kind,
             items,
         })
     }

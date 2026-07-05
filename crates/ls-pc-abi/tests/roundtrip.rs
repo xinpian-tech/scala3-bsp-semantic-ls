@@ -5,12 +5,12 @@
 //! nullable-vs-empty distinctions, and the definition origin tags.
 
 use ls_pc_abi::payloads::{
-    origin, Command, CompilerPlugin, CompletionEdit, CompletionItem, CompletionItemDefaults,
-    CompletionList, DefinitionResult, DidChangeParams, DidOpenParams, DisabledPlugin,
-    Documentation, EditRange, Hover, HoverContents, HoverResult, InsertReplaceEdit, LabelDetails,
-    Location, LocationsResult, MarkedStringItem, MarkupContent, ParameterInfo, ParameterLabel,
-    PluginStatus, PositionParams, PrepareRenameResult, ResolveParams, Rng, ServicePlugin,
-    SignatureHelp, SignatureInfo, TargetConfig, TextEdit,
+    origin, Command, CompilerPlugin, CompletionApplyKind, CompletionEdit, CompletionItem,
+    CompletionItemDefaults, CompletionList, DefinitionResult, DidChangeParams, DidOpenParams,
+    DisabledPlugin, Documentation, EditRange, Hover, HoverContents, HoverResult, InsertReplaceEdit,
+    LabelDetails, Location, LocationsResult, MarkedStringItem, MarkupContent, ParameterInfo,
+    ParameterLabel, PluginStatus, PositionParams, PrepareRenameResult, ResolveParams, Rng,
+    ServicePlugin, SignatureHelp, SignatureInfo, TargetConfig, TextEdit,
 };
 use proptest::prelude::*;
 
@@ -31,6 +31,7 @@ fn bare_item(label: &str) -> CompletionItem {
         insert_text_format: None,
         insert_text_mode: None,
         text_edit: None,
+        text_edit_text: None,
         additional_text_edits: None,
         commit_characters: None,
         command: None,
@@ -78,6 +79,7 @@ fn completion_item_full_lsp4j_surface_round_trips() {
             insert: range(0, 0, 0, 3),
             replace: range(0, 0, 0, 5),
         })),
+        text_edit_text: Some("map".to_string()),
         additional_text_edits: Some(vec![TextEdit {
             range: range(1, 0, 1, 0),
             new_text: "import scala.collection\n".to_string(),
@@ -85,12 +87,59 @@ fn completion_item_full_lsp4j_surface_round_trips() {
         commit_characters: Some(vec![".".to_string()]),
         command: Some(Command {
             title: "trigger".to_string(),
+            tooltip: Some("re-trigger suggestions".to_string()),
             command: "editor.action.triggerSuggest".to_string(),
             arguments: Some(br#"[{"uri":"file:///a"}]"#.to_vec()),
         }),
         data: Some(br#"{"symbol":"scala/collection/List#map()."}"#.to_vec()),
     };
     assert_eq!(CompletionItem::decode(&item.encode()).unwrap(), item);
+}
+
+#[test]
+fn runtime_lsp4j_1_0_0_fields_round_trip() {
+    // Fields present on the evicted runtime lsp4j 1.0.0 carriers but absent
+    // from the declared 0.24.0 surface: CompletionItem.textEditText,
+    // Command.tooltip, and CompletionList.applyKind.
+    let mut item = bare_item("f");
+    item.text_edit_text = Some("insert-as-snippet".to_string());
+    item.command = Some(Command {
+        title: "cmd".to_string(),
+        tooltip: Some("hover tip".to_string()),
+        command: "run".to_string(),
+        arguments: None,
+    });
+    assert_eq!(CompletionItem::decode(&item.encode()).unwrap(), item);
+
+    let list = CompletionList {
+        is_incomplete: false,
+        item_defaults: None,
+        apply_kind: Some(CompletionApplyKind {
+            commit_characters: Some(1), // Replace
+            data: Some(2),              // Merge
+        }),
+        items: vec![item],
+    };
+    assert_eq!(CompletionList::decode(&list.encode()).unwrap(), list);
+
+    // applyKind present-but-empty (both merge modes null) is distinct from a
+    // null applyKind, and a null command tooltip is distinct from Some("").
+    let empty_kind = CompletionList {
+        apply_kind: Some(CompletionApplyKind {
+            commit_characters: None,
+            data: None,
+        }),
+        ..list.clone()
+    };
+    let no_kind = CompletionList {
+        apply_kind: None,
+        ..list
+    };
+    assert_eq!(
+        CompletionList::decode(&empty_kind.encode()).unwrap(),
+        empty_kind
+    );
+    assert_ne!(empty_kind.encode(), no_kind.encode());
 }
 
 #[test]
@@ -117,6 +166,7 @@ fn completion_list_item_defaults_round_trip() {
             insert_text_mode: None,
             data: Some(b"defaults".to_vec()),
         }),
+        apply_kind: None,
         items: vec![bare_item("a")],
     };
     assert_eq!(CompletionList::decode(&list.encode()).unwrap(), list);
@@ -232,6 +282,7 @@ fn empty_completion_list_round_trips() {
     let empty = CompletionList {
         is_incomplete: false,
         item_defaults: None,
+        apply_kind: None,
         items: vec![],
     };
     let decoded = CompletionList::decode(&empty.encode()).unwrap();
@@ -338,11 +389,14 @@ fn completion_edit_strat() -> impl Strategy<Value = CompletionEdit> {
 }
 
 fn command_strat() -> impl Strategy<Value = Command> {
-    (".*", ".*", opt_bytes()).prop_map(|(title, command, arguments)| Command {
-        title,
-        command,
-        arguments,
-    })
+    (".*", proptest::option::of(".*"), ".*", opt_bytes()).prop_map(
+        |(title, tooltip, command, arguments)| Command {
+            title,
+            tooltip,
+            command,
+            arguments,
+        },
+    )
 }
 
 fn label_details_strat() -> impl Strategy<Value = LabelDetails> {
@@ -372,6 +426,7 @@ fn completion_item_strat() -> impl Strategy<Value = CompletionItem> {
         proptest::option::of(any::<i32>()),
         proptest::option::of(any::<i32>()),
         proptest::option::of(completion_edit_strat()),
+        proptest::option::of(".*"),
         proptest::option::of(proptest::collection::vec(text_edit_strat(), 0..3)),
         proptest::option::of(proptest::collection::vec(".*", 0..3)),
         proptest::option::of(command_strat()),
@@ -396,6 +451,7 @@ fn completion_item_strat() -> impl Strategy<Value = CompletionItem> {
                 insert_text_format,
                 insert_text_mode,
                 text_edit,
+                text_edit_text,
                 additional_text_edits,
                 commit_characters,
                 command,
@@ -416,6 +472,7 @@ fn completion_item_strat() -> impl Strategy<Value = CompletionItem> {
             insert_text_format,
             insert_text_mode,
             text_edit,
+            text_edit_text,
             additional_text_edits,
             commit_characters,
             command,
@@ -550,9 +607,13 @@ proptest! {
     fn completion_list_round_trips(
         is_incomplete in any::<bool>(),
         item_defaults in proptest::option::of(item_defaults_strat()),
+        apply_kind in proptest::option::of(
+            (proptest::option::of(any::<i32>()), proptest::option::of(any::<i32>()))
+                .prop_map(|(commit_characters, data)| CompletionApplyKind { commit_characters, data }),
+        ),
         items in proptest::collection::vec(completion_item_strat(), 0..5),
     ) {
-        let list = CompletionList { is_incomplete, item_defaults, items };
+        let list = CompletionList { is_incomplete, item_defaults, apply_kind, items };
         prop_assert_eq!(CompletionList::decode(&list.encode()).unwrap(), list);
     }
 

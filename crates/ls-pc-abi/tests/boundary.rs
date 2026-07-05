@@ -69,6 +69,7 @@ fn bare_item(label: String) -> CompletionItem {
         insert_text_format: Some(1),
         insert_text_mode: None,
         text_edit: None,
+        text_edit_text: None,
         additional_text_edits: None,
         commit_characters: None,
         command: None,
@@ -80,6 +81,7 @@ fn single_item_list(label: String) -> CompletionList {
     CompletionList {
         is_incomplete: false,
         item_defaults: None,
+        apply_kind: None,
         items: vec![bare_item(label)],
     }
 }

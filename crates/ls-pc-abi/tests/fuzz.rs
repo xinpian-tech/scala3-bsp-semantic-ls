@@ -46,6 +46,7 @@ fn bare_item(label: &str) -> CompletionItem {
         insert_text_format: None,
         insert_text_mode: None,
         text_edit: None,
+        text_edit_text: None,
         additional_text_edits: None,
         commit_characters: None,
         command: None,
@@ -57,6 +58,7 @@ fn sample_completion_list() -> Vec<u8> {
     CompletionList {
         is_incomplete: true,
         item_defaults: None,
+        apply_kind: None,
         items: vec![bare_item("hello")],
     }
     .encode()
@@ -100,9 +102,10 @@ fn length_mismatch_is_rejected() {
 fn fabricated_huge_count_is_rejected_without_allocating() {
     // Patch the item-count field to u32::MAX. The reader must reject it against
     // the remaining body rather than attempt a gigantic allocation. The count
-    // follows the is_incomplete flag (4) and the null itemDefaults flag (4).
+    // follows the is_incomplete flag (4), the null itemDefaults flag (4), and
+    // the null applyKind flag (4).
     let mut buf = sample_completion_list();
-    let count_at = 16 + 8;
+    let count_at = 16 + 12;
     buf[count_at..count_at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
     assert!(CompletionList::decode(&buf).is_err());
 }
@@ -196,6 +199,7 @@ proptest! {
         let list = CompletionList {
             is_incomplete: true,
             item_defaults: None,
+            apply_kind: None,
             items: labels.iter().map(|l| bare_item(l)).collect(),
         };
         let mut buf = list.encode();
