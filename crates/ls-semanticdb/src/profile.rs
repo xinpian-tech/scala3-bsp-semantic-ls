@@ -1,4 +1,4 @@
-//! Per-rename-group rename-safety profiles (plan 13.2).
+//! Per-rename-group rename-safety profiles.
 //!
 //! Semantics:
 //!   - `is_local`: every member is a local symbol;

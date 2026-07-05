@@ -1,0 +1,18 @@
+[package]
+name = "ls-engine"
+description = "Ingest pipeline, query orchestrator (index/raw-semanticdb/pc paths with three consistency levels), and the references + rename engines for the Rust language server."
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+ls-index-model = { path = "../ls-index-model" }
+ls-semanticdb = { path = "../ls-semanticdb" }
+ls-store = { path = "../ls-store" }
+
+[dev-dependencies]
+tempfile = "3"
