@@ -2,16 +2,15 @@ package ls.pc.host.codec
 
 import ls.pc.host.codec.Codec.{Reader, Writer}
 
-/** Island-side owned mirrors of the carrier-free op payloads, with lossless
-  * flat encode/decode over the [[Codec]] buffer format — the byte-for-byte
-  * counterpart of the Rust `ls-pc-abi` `payloads` module for the requests the
-  * island consumes (`register_target`/`did_open`/`did_change`/position) and the
-  * carrier-free responses it produces (`hover`/`definition`/`type_definition`/
-  * `prepare_rename`/`plugin_status` and the `symbol_definition` callback).
-  *
-  * The completion/resolve/signature-help carriers (which model the full
-  * resolved-LSP4J-1.0.0 field surface) land with the facade wiring in a later
-  * slice; their payload kinds are reserved here for reference.
+/** Island-side owned mirrors of every op payload, with lossless flat
+  * encode/decode over the [[Codec]] buffer format — the byte-for-byte
+  * counterpart of the Rust `ls-pc-abi` `payloads` module. Covers the requests
+  * the island consumes (`register_target`/`did_open`/`did_change`/position/
+  * resolve), the carrier-free responses it produces (`hover`/`definition`/
+  * `type_definition`/`prepare_rename`/`plugin_status` and the
+  * `symbol_definition` callback), and the LSP4J-carrier responses
+  * (`completion`/`completion_resolve`/`signature_help`) at the resolved LSP4J
+  * 1.0.0 field surface. All 13 payload kinds are implemented below.
   */
 object Payloads:
   // Payload kinds (the envelope tag; a decode against the wrong kind is rejected).

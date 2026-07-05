@@ -40,6 +40,10 @@ object PcHostAgent:
   private val AbiVersion: Long = boundary_h.ABI_VERSION().toLong
   private var arena: Arena = null
   private var vtable: MemorySegment = null
+  // The boundary-marshalling runtime, built from the registered vtable's `alloc`
+  // slot. Held for the op wiring (a later slice) that routes each request/
+  // response through it.
+  private var runtime: PcHostRuntime = null
 
   def premain(args: String, inst: Instrumentation): Unit =
     try
@@ -160,6 +164,10 @@ object PcHostAgent:
     val rc = RegisterPcVtableFn.invoke(RustVtable.register_pc_vtable(vtable), pc)
     log(s"premain: register_pc_vtable rc=$rc")
     if rc != 0 then return
+
+    // Build the boundary-marshalling runtime from the registered vtable's
+    // `alloc` slot, ready for the op wiring to move payloads across the boundary.
+    runtime = PcHostRuntime.fromVtable(vtable)
 
     startLoanedThread("pc-dispatch", 0)
     startLoanedThread("pc-control", 1)

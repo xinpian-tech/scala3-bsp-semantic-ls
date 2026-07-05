@@ -4,13 +4,14 @@ import scala.io.Source
 
 import ls.pc.host.codec.Payloads.*
 
-/** Cross-language parity for the flat codec. For each carrier-free payload the
-  * suite (a) decodes the Rust-produced golden vector and asserts the fields,
-  * (b) re-encodes the equivalent Java instance and asserts the bytes are
-  * identical to the golden, and (c) checks that malformed buffers decode to a
-  * typed [[CodecException]] rather than crashing. The goldens are produced by
-  * the Rust `ls-pc-abi` encoder (see `test/resources/codec-vectors.txt`), so a
-  * byte mismatch means the two sides disagree on the wire format.
+/** Cross-language parity for the flat codec. For each payload (carrier-free and
+  * LSP4J-carrier alike) the suite (a) decodes the Rust-produced golden vector
+  * and asserts the fields, (b) re-encodes the equivalent Java instance and
+  * asserts the bytes are identical to the golden, and (c) checks that malformed
+  * buffers decode to a typed [[CodecException]] rather than crashing. The
+  * goldens are produced by the Rust `ls-pc-abi` encoder (see
+  * `test/resources/codec-vectors.txt`), so a byte mismatch means the two sides
+  * disagree on the wire format.
   */
 class CodecSuite extends munit.FunSuite:
 
