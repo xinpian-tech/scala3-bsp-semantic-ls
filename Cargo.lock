@@ -159,7 +159,11 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "libloading",
+ "ls-engine",
+ "ls-index-model",
  "ls-pc-abi",
+ "ls-semanticdb",
+ "ls-store",
 ]
 
 [[package]]

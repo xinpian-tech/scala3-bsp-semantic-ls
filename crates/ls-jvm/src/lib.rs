@@ -33,10 +33,11 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use ls_pc_abi::abi::{LsBuf, LsStr};
-use ls_pc_abi::memory::{abi_alloc, abi_free};
+use ls_pc_abi::memory::{abi_alloc, abi_free, write_response};
+use ls_pc_abi::payloads::LocationsResult;
 use ls_pc_abi::{
-    PcVtable, RustVtable, ABI_VERSION, LAYOUT_CANARY, STATUS_ABI_MISMATCH, STATUS_BAD_ARG,
-    STATUS_OK,
+    PcVtable, RustVtable, ABI_VERSION, LAYOUT_CANARY, STATUS_ABI_MISMATCH, STATUS_ALLOC,
+    STATUS_BAD_ARG, STATUS_OK, STATUS_PANIC,
 };
 
 use backend::{IslandRuntime, VtableBackend};
@@ -67,6 +68,22 @@ struct Rendezvous {
 
 static RENDEZVOUS: OnceLock<Rendezvous> = OnceLock::new();
 static ISLAND_RUNTIME: OnceLock<Arc<IslandRuntime>> = OnceLock::new();
+
+/// The island's cross-file go-to-definition resolver: `(semanticdb_symbol,
+/// requesting_file_uri) -> definition locations`. This is the read-only,
+/// snapshot-backed callback behind the PC `SymbolSearch.definition` seam; the
+/// server installs one over the immutable index snapshot before boot.
+pub type SymbolDefinitionResolver = dyn Fn(&str, &str) -> LocationsResult + Send + Sync;
+
+static SYMBOL_DEFINITION_RESOLVER: OnceLock<Box<SymbolDefinitionResolver>> = OnceLock::new();
+
+/// Install the resolver the island downcalls for cross-file go-to-definition.
+/// Idempotent per process: call once before [`boot_island`]; a later call is
+/// ignored (only one JVM/island boots per process). Without one, the callback
+/// answers an empty locations buffer.
+pub fn install_symbol_definition_resolver(resolver: Box<SymbolDefinitionResolver>) {
+    let _ = SYMBOL_DEFINITION_RESOLVER.set(resolver);
+}
 
 fn rendezvous() -> &'static Rendezvous {
     RENDEZVOUS.get_or_init(|| Rendezvous {
@@ -123,16 +140,24 @@ unsafe extern "C" fn vt_pc_dispatch_loop(worker_index: i32) {
     let _ = std::panic::catch_unwind(|| dispatch_loop_inner(worker_index));
 }
 
-/// Index-backed cross-file go-to-definition callback. Without a resolver wired
-/// the response is an empty locations buffer (no cross-file definition).
-unsafe extern "C" fn vt_symbol_definition(
-    _symbol: LsStr,
-    _from_uri: LsStr,
-    out: *mut LsBuf,
-) -> i32 {
-    match std::panic::catch_unwind(|| symbol_definition_inner(out)) {
+/// Index-backed cross-file go-to-definition callback. Decodes the incoming
+/// SemanticDB symbol + requesting `file://` uri, runs the installed resolver
+/// (an empty response when none is wired), and writes an encoded
+/// `LocationsResult` into `out`. Rust owns the response buffer; the island frees
+/// it through the `free` slot.
+unsafe extern "C" fn vt_symbol_definition(symbol: LsStr, from_uri: LsStr, out: *mut LsBuf) -> i32 {
+    match std::panic::catch_unwind(|| {
+        let symbol = read_utf8(symbol.ptr, symbol.len);
+        let from_uri = read_utf8(from_uri.ptr, from_uri.len);
+        run_resolver(
+            SYMBOL_DEFINITION_RESOLVER.get().map(|r| r.as_ref()),
+            &symbol,
+            &from_uri,
+            out,
+        )
+    }) {
         Ok(status) => status,
-        Err(_) => ls_pc_abi::STATUS_PANIC,
+        Err(_) => STATUS_PANIC,
     }
 }
 
@@ -185,17 +210,40 @@ fn dispatch_loop_inner(worker_index: i32) {
     }
 }
 
-fn symbol_definition_inner(out: *mut LsBuf) -> i32 {
+/// Runs the resolver (if any) and writes an encoded `LocationsResult` into
+/// `out`: a missing resolver answers empty locations, a panicking resolver is
+/// contained to `STATUS_PANIC`, a null `out` is `STATUS_BAD_ARG`, and an
+/// allocation failure is `STATUS_ALLOC`. Split out so the containment contract
+/// is unit-tested without booting a JVM.
+fn run_resolver(
+    resolver: Option<&SymbolDefinitionResolver>,
+    symbol: &str,
+    from_uri: &str,
+    out: *mut LsBuf,
+) -> i32 {
     if out.is_null() {
         return STATUS_BAD_ARG;
     }
-    // SAFETY: `out` is a valid `LsBuf` out-param for the call; an empty buffer
-    // (null ptr, zero len) is the "no cross-file definition" response.
-    unsafe {
-        (*out).ptr = std::ptr::null_mut();
-        (*out).len = 0;
+    let result = match resolver {
+        None => LocationsResult {
+            locations: Vec::new(),
+        },
+        Some(resolve) => {
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                resolve(symbol, from_uri)
+            })) {
+                Ok(result) => result,
+                Err(_) => return STATUS_PANIC,
+            }
+        }
+    };
+    let payload = result.encode();
+    // SAFETY: `out` is a valid writable `LsBuf` for the call (checked non-null).
+    if unsafe { write_response(&payload, out) } {
+        STATUS_OK
+    } else {
+        STATUS_ALLOC
     }
-    STATUS_OK
 }
 
 fn read_utf8(ptr: *const u8, len: u32) -> String {
@@ -364,22 +412,116 @@ mod tests {
         assert_eq!(RUST_VTABLE.layout_canary, LAYOUT_CANARY);
     }
 
+    fn decode_out(out: &LsBuf) -> LocationsResult {
+        let bytes = if out.ptr.is_null() || out.len == 0 {
+            Vec::new()
+        } else {
+            // SAFETY: a successful `write_response` left `ptr`/`len` valid.
+            unsafe { std::slice::from_raw_parts(out.ptr, out.len as usize).to_vec() }
+        };
+        LocationsResult::decode(&bytes).expect("decode locations")
+    }
+
+    fn free_out(out: &mut LsBuf) {
+        if !out.ptr.is_null() && out.len > 0 {
+            // SAFETY: `ptr`/`len` came from `abi_alloc` via `write_response`.
+            unsafe { abi_free(out.ptr, out.len) };
+            out.ptr = std::ptr::null_mut();
+            out.len = 0;
+        }
+    }
+
     #[test]
-    fn symbol_definition_writes_an_empty_buffer_without_a_resolver() {
+    fn run_resolver_rejects_null_out_and_answers_empty_without_a_resolver() {
+        assert_eq!(
+            run_resolver(None, "sym", "uri", std::ptr::null_mut()),
+            STATUS_BAD_ARG
+        );
         let mut out = LsBuf {
             ptr: std::ptr::dangling_mut::<u8>(),
             len: 7,
         };
         assert_eq!(
-            symbol_definition_inner(std::ptr::null_mut()),
-            STATUS_BAD_ARG
-        );
-        assert_eq!(
-            symbol_definition_inner(std::ptr::addr_of_mut!(out)),
+            run_resolver(None, "sym", "uri", std::ptr::addr_of_mut!(out)),
             STATUS_OK
         );
-        assert!(out.ptr.is_null());
-        assert_eq!(out.len, 0);
+        // With no resolver the response is a decodable empty locations buffer.
+        assert!(decode_out(&out).locations.is_empty());
+        free_out(&mut out);
+    }
+
+    #[test]
+    fn run_resolver_writes_the_resolved_locations_and_frees_clean() {
+        use ls_pc_abi::payloads::{origin, Location, Rng};
+
+        let seen = Arc::new(Mutex::new(None));
+        let captured = seen.clone();
+        let resolver: Box<SymbolDefinitionResolver> =
+            Box::new(move |symbol: &str, from_uri: &str| {
+                *captured.lock().unwrap() = Some((symbol.to_string(), from_uri.to_string()));
+                LocationsResult {
+                    locations: vec![Location {
+                        uri: "file:///w/A.scala".to_string(),
+                        range: Rng {
+                            start_line: 1,
+                            start_character: 2,
+                            end_line: 1,
+                            end_character: 5,
+                        },
+                        origin: origin::WORKSPACE,
+                    }],
+                }
+            });
+
+        let before = ls_pc_abi::memory::live_allocations();
+        let mut out = LsBuf {
+            ptr: std::ptr::null_mut(),
+            len: 0,
+        };
+        assert_eq!(
+            run_resolver(
+                Some(resolver.as_ref()),
+                "pkg/A#",
+                "file:///w/B.scala",
+                std::ptr::addr_of_mut!(out),
+            ),
+            STATUS_OK
+        );
+        // The resolver saw exactly the decoded arguments.
+        assert_eq!(
+            *seen.lock().unwrap(),
+            Some(("pkg/A#".to_string(), "file:///w/B.scala".to_string()))
+        );
+        let decoded = decode_out(&out);
+        assert_eq!(decoded.locations.len(), 1);
+        assert_eq!(decoded.locations[0].uri, "file:///w/A.scala");
+        assert_eq!(decoded.locations[0].range.start_line, 1);
+        assert_eq!(decoded.locations[0].origin, origin::WORKSPACE);
+        free_out(&mut out);
+        assert_eq!(
+            ls_pc_abi::memory::live_allocations(),
+            before,
+            "the response buffer is freed"
+        );
+    }
+
+    #[test]
+    fn run_resolver_contains_a_panicking_resolver() {
+        let resolver: Box<SymbolDefinitionResolver> =
+            Box::new(|_: &str, _: &str| panic!("boom in the resolver"));
+        let mut out = LsBuf {
+            ptr: std::ptr::dangling_mut::<u8>(),
+            len: 9,
+        };
+        assert_eq!(
+            run_resolver(
+                Some(resolver.as_ref()),
+                "sym",
+                "uri",
+                std::ptr::addr_of_mut!(out),
+            ),
+            STATUS_PANIC
+        );
     }
 
     /// A minimal valid `PcVtable` for registration-contract tests: correct ABI

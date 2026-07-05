@@ -377,6 +377,106 @@ fn build_prune_workspace(dir: &TempDir) -> Arc<WorkspaceTargets> {
     ]))
 }
 
+/// `core` defines `pkg/S#`; `app` depends on `core` and references it; `dup` is
+/// disconnected and ALSO defines `pkg/S#` (the same symbol string, a different
+/// module) — the go-to-definition forward-closure pruning fixture.
+fn build_def_workspace(dir: &TempDir) -> (Arc<WorkspaceTargets>, PathBuf, PathBuf, PathBuf) {
+    let core_t = dir.sub("coretarget");
+    let core_s = dir.sub("coresrc");
+    let app_t = dir.sub("apptarget");
+    let app_s = dir.sub("appsrc");
+    let dup_t = dir.sub("duptarget");
+    let dup_s = dir.sub("dupsrc");
+    write_doc(
+        &core_t,
+        &core_s,
+        &DocFixture::new("c/S.scala", "class S\n")
+            .symbol(sym("pkg/S#", KIND_CLASS, 0, "S"))
+            .occurrence(occ(rng(0, 6, 0, 7), "pkg/S#", DEFINITION)),
+    );
+    write_doc(
+        &app_t,
+        &app_s,
+        &DocFixture::new("a/A.scala", "val a = new S\n").occurrence(occ(
+            rng(0, 12, 0, 13),
+            "pkg/S#",
+            REFERENCE,
+        )),
+    );
+    write_doc(
+        &dup_t,
+        &dup_s,
+        &DocFixture::new("d/S.scala", "class S\n")
+            .symbol(sym("pkg/S#", KIND_CLASS, 0, "S"))
+            .occurrence(occ(rng(0, 6, 0, 7), "pkg/S#", DEFINITION)),
+    );
+    let ws = WorkspaceTargets::new(vec![
+        TargetSpec::new("core", core_t, core_s.clone()),
+        TargetSpec::new("app", app_t, app_s.clone()).with_deps(vec!["core".to_string()]),
+        TargetSpec::new("dup", dup_t, dup_s.clone()),
+    ]);
+    (Arc::new(ws), core_s, app_s, dup_s)
+}
+
+/// The `file://` uri of `rel` under `sourceroot`, matching the resolver's
+/// absolutization.
+fn file_uri(sourceroot: &std::path::Path, rel: &str) -> String {
+    format!(
+        "file://{}/{}",
+        sourceroot.to_str().unwrap().trim_end_matches('/'),
+        rel
+    )
+}
+
+#[test]
+fn symbol_definition_reaches_visible_target_and_prunes_disconnected_duplicate() {
+    let dir = TempDir::new("symdef");
+    let (ws, core_s, app_s, _dup_s) = build_def_workspace(&dir);
+    let orch = orchestrator(&dir, ws);
+    // From `app` (which depends on `core`), go-to-definition of `pkg/S#`
+    // resolves to core's definition only — never the disconnected `dup`
+    // target's duplicate of the same symbol string.
+    let locs = orch.symbol_definition("pkg/S#", &file_uri(&app_s, "a/A.scala"));
+    assert_eq!(locs.len(), 1, "exactly the visible (core) definition");
+    assert_eq!(locs[0].uri, file_uri(&core_s, "c/S.scala"));
+    assert_eq!(locs[0].span, Span::new(0, 6, 0, 7));
+}
+
+#[test]
+fn symbol_definition_disconnected_buffer_sees_only_its_own_definition() {
+    let dir = TempDir::new("symdefdup");
+    let (ws, _core_s, _app_s, dup_s) = build_def_workspace(&dir);
+    let orch = orchestrator(&dir, ws);
+    // `dup` depends on nothing, so its forward closure is just itself.
+    let locs = orch.symbol_definition("pkg/S#", &file_uri(&dup_s, "d/S.scala"));
+    assert_eq!(locs.len(), 1);
+    assert_eq!(locs[0].uri, file_uri(&dup_s, "d/S.scala"));
+}
+
+#[test]
+fn symbol_definition_unscoped_buffer_sees_all_definitions() {
+    let dir = TempDir::new("symdefunscoped");
+    let (ws, core_s, _app_s, dup_s) = build_def_workspace(&dir);
+    let orch = orchestrator(&dir, ws);
+    // A buffer outside every sourceroot is unscoped: the closure gate is what
+    // prunes, so with no owning target BOTH duplicate definitions surface.
+    let locs = orch.symbol_definition("pkg/S#", "file:///nowhere/X.scala");
+    assert_eq!(locs.len(), 2, "unscoped sees both duplicate definitions");
+    let uris: Vec<&str> = locs.iter().map(|l| l.uri.as_str()).collect();
+    assert!(uris.contains(&file_uri(&core_s, "c/S.scala").as_str()));
+    assert!(uris.contains(&file_uri(&dup_s, "d/S.scala").as_str()));
+}
+
+#[test]
+fn symbol_definition_unknown_and_empty_symbols_answer_empty() {
+    let dir = TempDir::new("symdefunknown");
+    let (ws, _core_s, app_s, _dup_s) = build_def_workspace(&dir);
+    let orch = orchestrator(&dir, ws);
+    let from = file_uri(&app_s, "a/A.scala");
+    assert!(orch.symbol_definition("pkg/Nope#", &from).is_empty());
+    assert!(orch.symbol_definition("", &from).is_empty());
+}
+
 #[test]
 fn no_semanticdb_source_returns_hard_error() {
     let dir = TempDir::new("nosdb");

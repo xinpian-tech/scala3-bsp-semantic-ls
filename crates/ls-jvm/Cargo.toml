@@ -18,3 +18,10 @@ libc = "0.2"
 # The live-boundary integration test names flat payload types directly to
 # decode real compiler responses; integration tests only see dev-dependencies.
 ls-pc-abi = { path = "../ls-pc-abi" }
+# The live-definition test installs a real snapshot-backed resolver: it builds a
+# two-target index (ingest a synthetic SemanticDB fixture) and drives
+# `QueryOrchestrator::symbol_definition` over the boundary.
+ls-engine = { path = "../ls-engine" }
+ls-store = { path = "../ls-store" }
+ls-index-model = { path = "../ls-index-model" }
+ls-semanticdb = { path = "../ls-semanticdb" }

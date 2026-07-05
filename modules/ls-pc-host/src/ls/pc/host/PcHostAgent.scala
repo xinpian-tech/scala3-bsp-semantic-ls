@@ -197,7 +197,10 @@ object PcHostAgent:
     // plugins) into the manager before the facade reads it, matching the
     // retained worker; a bad config is logged, not fatal.
     settings.workspaceRoot.foreach(root => PcHostConfig.applyWorkspacePlugins(pluginManager, root, log))
-    PcFacade(pluginManager, settings)
+    // Wire the index-backed cross-file go-to-definition seam to the Rust
+    // `symbol_definition` vtable slot, so a definition the buffer's compiler
+    // cannot see is answered from the immutable snapshot over the boundary.
+    PcFacade(pluginManager, settings, PcHostDefinitionResolver(vtable, log))
 
   /** Runs an upcall body, containing any Java `Throwable` to a status code so it
     * never escapes across the native boundary and unwinds into Rust.

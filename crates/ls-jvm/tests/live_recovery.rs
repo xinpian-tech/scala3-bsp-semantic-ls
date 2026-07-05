@@ -83,9 +83,11 @@ fn live_dispatch_wedge_recovers_via_a_fresh_generation_and_caps_at_fatal() {
     let workspace = std::env::temp_dir().join(format!("ls-live-recovery-{}", std::process::id()));
     std::fs::create_dir_all(&workspace).expect("create workspace root");
 
-    // Boot with the fault hook armed, a short per-request deadline (so a wedge
-    // times out promptly), and a cap of 1 abandoned generation (so the second
-    // non-cooperative wedge is fatal).
+    // Boot with the fault hook armed and a cap of 1 abandoned generation (so the
+    // second non-cooperative wedge is fatal). The per-request deadline sits well
+    // below the 60s wedge busy-loop (so a wedge still times out) yet high enough
+    // that a cold first completion has slack when several live JVM checks build
+    // in parallel under CI load.
     let fault = ["-Dls.pc.host.testFault=busyCompletion".to_string()];
     let config = IslandConfig {
         libjvm: &env.libjvm,
@@ -95,7 +97,7 @@ fn live_dispatch_wedge_recovers_via_a_fresh_generation_and_caps_at_fatal() {
         extra_jvm_options: &fault,
         rendezvous_timeout: Duration::from_secs(30),
         max_abandoned_generations: 1,
-        request_deadline: Duration::from_secs(6),
+        request_deadline: Duration::from_secs(20),
         cancel_grace: Duration::from_millis(500),
     };
     let mut sup = boot_island(&config).expect("the production island boots");

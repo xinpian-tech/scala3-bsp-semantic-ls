@@ -11,13 +11,13 @@
 //!      from it, and flag `needs_reindex` (best-effort synchronous write-through
 //!      republishes the segment so the next query resolves from the snapshot).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use ls_index_model::{LsError, NormalizedDocument, Occurrence, Role, Span, TargetBitset};
+use ls_index_model::{Loc, LsError, NormalizedDocument, Occurrence, Role, Span, TargetBitset};
 use ls_semanticdb::{md5, normalize, parse_file, SemanticdbLocator};
-use ls_store::{SearchIndex, Snapshot, Store, StoreResult, WorkspaceSymbolHit};
+use ls_store::{GroupRecord, SearchIndex, Snapshot, Store, StoreResult, WorkspaceSymbolHit};
 
 use crate::hash::doc_id_for;
 use crate::ingest::{self, IngestReport};
@@ -456,6 +456,112 @@ impl QueryOrchestrator {
             Some(seg.target_meta(def_ord as u32).bsp_id)
         }
     }
+
+    /// Index-backed cross-file go-to-definition for the presentation compiler
+    /// (the callback behind `SymbolSearch.definition`): a SemanticDB symbol to
+    /// its workspace definition `file://` locations.
+    ///
+    /// The same SemanticDB string can be DEFINED in more than one disconnected
+    /// target (two modules reusing a package/class name). A buffer in target T
+    /// must only reach a definition T can SEE — a target in T's forward
+    /// dependency closure — otherwise editors jump to an unrelated duplicate.
+    /// `from_uri` (a `file://` uri) locates the requesting target by its deepest
+    /// containing sourceroot; when no target owns it, results are unscoped.
+    ///
+    /// Never panics; unknown/local symbols answer empty. Reads only the immutable
+    /// snapshot and the workspace graph, so it is safe on PC callback threads.
+    pub fn symbol_definition(&self, semantic_symbol: &str, from_uri: &str) -> Vec<Loc> {
+        if semantic_symbol.is_empty() {
+            return Vec::new();
+        }
+        let Some(snap) = self.current_snapshot() else {
+            return Vec::new();
+        };
+        let seg = snap.segment();
+        let Some(ord) = seg.find_symbol_ord(&symbol_encoding::encode(semantic_symbol, None)) else {
+            return Vec::new();
+        };
+        let ref_group = seg.symbol_view(ord).ref_group_ord;
+        if ref_group < 0 {
+            return Vec::new();
+        }
+        // The bsp ids the requesting buffer's target can see, or None (unscoped).
+        let allowed = self.requesting_forward_closure(from_uri);
+        let mut out: Vec<Loc> = Vec::new();
+        seg.scan_def_group(ref_group as u32, &mut |rec: GroupRecord| {
+            if rec.target_ord < 0 {
+                return;
+            }
+            let ps = rec.packed_start as u32;
+            let pe = rec.packed_end as u32;
+            let sl = Span::unpack_line(ps);
+            let sc = Span::unpack_char(ps);
+            let doc_ord = rec.doc_ord as u32;
+            // Keep only occurrences that define EXACTLY `ord`, not the other
+            // members of its ref group (a class + its companion object, a
+            // getter/setter pair, ...).
+            if seg.symbol_at(doc_ord, sl, sc).map(|h| h.symbol_ord) != Some(ord as i32) {
+                return;
+            }
+            let meta = seg.target_meta(rec.target_ord as u32);
+            let visible = allowed
+                .as_ref()
+                .map(|ids| ids.contains(&meta.bsp_id))
+                .unwrap_or(true);
+            if !visible {
+                return;
+            }
+            let span = Span::new(sl, sc, Span::unpack_line(pe), Span::unpack_char(pe));
+            out.push(Loc::new(
+                sdb_uri_to_file_uri(&meta.sourceroot, seg.uri_of(doc_ord)),
+                span,
+            ));
+        });
+        dedupe_and_sort_locs(out)
+    }
+
+    /// Forward dependency closure (bsp ids) of the target owning `from_uri`,
+    /// found by its deepest containing sourceroot, or `None` when no target owns
+    /// the buffer (definitions are then unscoped). Reads only the immutable
+    /// workspace graph.
+    fn requesting_forward_closure(&self, from_uri: &str) -> Option<HashSet<String>> {
+        let ws = self.workspace()?;
+        let path = file_uri_to_path(from_uri)?;
+        let spec = ws
+            .targets
+            .iter()
+            .filter(|t| path.starts_with(&t.sourceroot))
+            .max_by_key(|t| t.sourceroot.components().count())?;
+        Some(ws.forward_dependency_closure(&spec.bsp_id))
+    }
+}
+
+/// `file://` uri -> absolute path. Linux-first: strips the scheme + empty
+/// authority; percent-decoding is not needed for the paths the PC passes.
+fn file_uri_to_path(uri: &str) -> Option<PathBuf> {
+    uri.strip_prefix("file://").map(PathBuf::from)
+}
+
+/// Absolute source path of a sourceroot-relative SemanticDB uri, as a `file://`
+/// uri (the LSP form editors expect). Mirrors `Uris.fromSdbUri` + `toUri`.
+fn sdb_uri_to_file_uri(sourceroot: &str, sdb_uri: &str) -> String {
+    let root = sourceroot.trim_end_matches('/');
+    format!("file://{root}/{sdb_uri}")
+}
+
+/// Dedupe by (uri, span) and sort by (uri, start, end) — a stable order for
+/// editors and tests.
+fn dedupe_and_sort_locs(mut locs: Vec<Loc>) -> Vec<Loc> {
+    locs.sort_by(|a, b| {
+        a.uri
+            .cmp(&b.uri)
+            .then(a.span.start_line.cmp(&b.span.start_line))
+            .then(a.span.start_char.cmp(&b.span.start_char))
+            .then(a.span.end_line.cmp(&b.span.end_line))
+            .then(a.span.end_char.cmp(&b.span.end_char))
+    });
+    locs.dedup_by(|a, b| a.uri == b.uri && a.span == b.span);
+    locs
 }
 
 /// Exact occurrence covering the position: smallest packed span wins, then

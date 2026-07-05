@@ -104,6 +104,20 @@
           PC_HOST_AGENT_JAR = "${pcHostAgentJar}/pc-host-agent.jar";
           LS_PC_TARGET_CLASSPATH = "${scalaLibraryJar}:${scala3LibraryJar}";
         });
+
+        # The live cross-file go-to-definition check: same real JVM + assembly +
+        # classpath, with a real snapshot-backed resolver installed. It proves
+        # forward-closure pruning on the snapshot and the full FFM round-trip —
+        # live PC → SymbolSearch.definition → the Scala downcall → the Rust
+        # symbol_definition slot → the resolver → back into the PC result.
+        pc-definition-check = craneLib.cargoTest (rust.commonArgs // {
+          inherit (rust) cargoArtifacts;
+          cargoTestExtraArgs = "-p ls-jvm --test live_definition";
+          nativeBuildInputs = [ jdk ];
+          LS_LIBJVM = "${jdk.home}/lib/server/libjvm.so";
+          PC_HOST_AGENT_JAR = "${pcHostAgentJar}/pc-host-agent.jar";
+          LS_PC_TARGET_CLASSPATH = "${scalaLibraryJar}:${scala3LibraryJar}";
+        });
         pc-host-agent-check = pkgs.runCommand "check-pc-host-agent"
           { nativeBuildInputs = [ jdk ]; } ''
           jar="${pcHostAgentJar}/pc-host-agent.jar"
@@ -139,6 +153,7 @@
           pc-host-agent = pc-host-agent-check;
           pc-boundary = pc-boundary-check;
           pc-recovery = pc-recovery-check;
+          pc-definition = pc-definition-check;
         };
 
         packages = {
