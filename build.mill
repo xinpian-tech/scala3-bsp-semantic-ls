@@ -218,6 +218,20 @@ object pcHost extends ScalaModule {
   override def moduleDir = super.moduleDir / os.up / "modules" / "ls-pc-host"
   def scalaVersion = Deps.scalaVer
 
+  // Depends on the retained presentation-compiler island for the live facade and
+  // its result types, and transitively for the resolved LSP4J carrier surface
+  // the boundary translates to/from the flat wire form.
+  def moduleDeps = Seq(pc)
+
+  // lsp4j declares gson as the range [2.9.1,3.0); range resolution needs remote
+  // maven-metadata and breaks the offline Nix build, so pin it (as LsModule does).
+  override def mapDependencies = Task.Anon { (d: coursier.Dependency) =>
+    if d.module.organization.value == "com.google.code.gson"
+      && d.module.name.value == "gson"
+    then d.withVersion("2.13.2")
+    else d
+  }
+
   override def javaHome = Task {
     Task.env.get("JAVA_HOME").map(p => PathRef(os.Path(p), quick = true))
   }

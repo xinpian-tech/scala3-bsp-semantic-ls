@@ -94,3 +94,45 @@ class BoundarySuite extends munit.FunSuite:
       MemorySegment.copy(payload, 0, buf, ValueLayout.JAVA_BYTE, 0L, payload.length)
       assertEquals(PcHostRuntime.readRequest(buf, payload.length).toList, payload.toList)
     finally arena.close()
+
+  test("a signed-negative LsStr length is a typed decode error (not empty)"):
+    val arena = Arena.ofConfined()
+    try
+      val rt = PcHostRuntime(arenaAllocator(arena))
+      // A high-bit u32 length surfaces as a negative Int through jextract.
+      val struct = LsStr.allocate(arena)
+      LsStr.len(struct, -1)
+      assertEquals(rt.runStatus { PcHostRuntime.readLsStr(struct); () }, boundary_h.STATUS_DECODE())
+    finally arena.close()
+
+  test("a null LsStr pointer with a positive length is a typed decode error"):
+    val arena = Arena.ofConfined()
+    try
+      val rt = PcHostRuntime(arenaAllocator(arena))
+      val struct = LsStr.allocate(arena)
+      LsStr.len(struct, 5)
+      LsStr.ptr(struct, MemorySegment.NULL)
+      assertEquals(rt.runStatus { PcHostRuntime.readLsStr(struct); () }, boundary_h.STATUS_DECODE())
+    finally arena.close()
+
+  test("a negative request length is a typed decode error"):
+    val arena = Arena.ofConfined()
+    try
+      val rt = PcHostRuntime(arenaAllocator(arena))
+      assertEquals(
+        rt.runStatus { PcHostRuntime.readRequest(MemorySegment.NULL, -1); () },
+        boundary_h.STATUS_DECODE()
+      )
+    finally arena.close()
+
+  test("a null request pointer with a positive length maps to STATUS_DECODE via runResponse"):
+    val arena = Arena.ofConfined()
+    try
+      val rt = PcHostRuntime(arenaAllocator(arena))
+      val out = LsBuf.allocate(arena)
+      val status = rt.runResponse(out) {
+        PcHostRuntime.readRequest(MemorySegment.NULL, 8)
+        Array.emptyByteArray
+      }
+      assertEquals(status, boundary_h.STATUS_DECODE())
+    finally arena.close()

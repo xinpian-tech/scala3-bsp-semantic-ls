@@ -53,18 +53,31 @@ object PcHostRuntime:
     val allocFn = RustVtable.alloc(vtable)
     PcHostRuntime(size => AllocFn.invoke(allocFn, size))
 
-  /** Reads a borrowed `LsStr` argument (UTF-8, no NUL) into a Scala string. */
+  /** Reads a borrowed `LsStr` argument (UTF-8, no NUL) into a Scala string. The
+    * ABI `len` is a `u32` that jextract surfaces as a signed `Int`, so a
+    * high-bit length arrives negative: reject it (and a null pointer with a
+    * positive length) as a typed decode error rather than accessing foreign
+    * memory. A zero length is a valid empty string.
+    */
   def readLsStr(struct: MemorySegment): String =
     val len = LsStr.len(struct)
-    if len <= 0 then ""
+    if len < 0 then throw CodecException(s"negative LsStr length $len")
+    if len == 0 then ""
     else
-      val bytes = LsStr.ptr(struct).reinterpret(len.toLong).toArray(ValueLayout.JAVA_BYTE)
-      String(bytes, UTF_8)
+      val ptr = LsStr.ptr(struct)
+      if ptr.address() == 0 then throw CodecException("null LsStr pointer with positive length")
+      String(ptr.reinterpret(len.toLong).toArray(ValueLayout.JAVA_BYTE), UTF_8)
 
-  /** Reads a borrowed request-payload buffer (`ptr`, `len`) into a byte array. */
+  /** Reads a borrowed request-payload buffer (`ptr`, `len`) into a byte array,
+    * rejecting a signed-negative length or a null pointer with a positive
+    * length (see [[readLsStr]]). A zero length is a valid empty payload.
+    */
   def readRequest(ptr: MemorySegment, len: Int): Array[Byte] =
-    if len <= 0 then Array.emptyByteArray
-    else ptr.reinterpret(len.toLong).toArray(ValueLayout.JAVA_BYTE)
+    if len < 0 then throw CodecException(s"negative request length $len")
+    if len == 0 then Array.emptyByteArray
+    else
+      if ptr.address() == 0 then throw CodecException("null request pointer with positive length")
+      ptr.reinterpret(len.toLong).toArray(ValueLayout.JAVA_BYTE)
 
   /** Writes `bytes` into a freshly `alloc`-ed Rust-owned buffer and points the
     * caller's `out` `LsBuf` at it, following the boundary memory protocol:
