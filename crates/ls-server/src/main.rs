@@ -13,9 +13,9 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use ls_server::{
-    dump_report, parse_args, resolve_doctor_dir, serve, CliAction, CoreHandlers, IndexBootstrap,
-    LiveBspModelSource, PublishDiagnosticsParams, ServerCore, ServerHooks, SERVER_NAME,
-    SERVER_VERSION,
+    dump_report, parse_args, resolve_doctor_dir, serve, store_section, CliAction, CoreHandlers,
+    IndexBootstrap, LiveBspModelSource, PublishDiagnosticsParams, ServerCore, ServerHooks,
+    SERVER_NAME, SERVER_VERSION,
 };
 
 fn main() -> ExitCode {
@@ -52,15 +52,20 @@ fn version_line() -> String {
     format!("{SERVER_NAME} {SERVER_VERSION}")
 }
 
-/// `--doctor [dir]`: a minimal offline report. Pre-bootstrap the build server,
-/// index store, and presentation compiler are not connected; the full Store/
-/// Runtime section contract renders once the doctor module lands.
+/// `--doctor [dir]`: the offline report. Pre-bootstrap the build server and
+/// presentation compiler are not connected, but the on-disk index store under the
+/// workspace root is inspected directly, so the `Store` section renders the same
+/// manifest/segment/state facts the live doctor shows. The remaining
+/// `DoctorCommand` sections (Runtime host facts + live island status,
+/// BSP/SemanticDB/PC/Nix) are gathered as they are ported.
 fn offline_doctor_report(root: &Path) -> String {
     format!(
         "{SERVER_NAME} {SERVER_VERSION}\n\
-         workspace: {}\n\
-         state: offline (--doctor): build server, index store, and presentation compiler not connected\n",
-        root.display()
+         state: offline (--doctor): build server and presentation compiler not connected\n\
+         workspace: {}\n\n\
+         {}",
+        root.display(),
+        store_section(Some(root)),
     )
 }
 
@@ -108,10 +113,16 @@ mod tests {
     }
 
     #[test]
-    fn offline_doctor_report_names_the_workspace_and_state() {
+    fn offline_doctor_report_names_the_workspace_state_and_store() {
         let report = offline_doctor_report(Path::new("/ws/x"));
         assert!(report.contains("scala3-bsp-semantic-ls"));
         assert!(report.contains("workspace: /ws/x"));
         assert!(report.contains("offline"));
+        // The Store section renders offline (here /ws/x has no store).
+        assert!(report.contains("Store:"), "{report}");
+        assert!(
+            report.contains("no store at this workspace root"),
+            "{report}"
+        );
     }
 }

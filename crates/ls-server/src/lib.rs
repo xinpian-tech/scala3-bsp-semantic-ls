@@ -51,5 +51,5 @@ pub use services::{
     highlights_to_lsp, pc_locations_to_lsp, references_locations, workspace_symbol_of,
     BuildCompiler, CoreHandlers, CoreServices,
 };
-pub use store_dump::dump_report;
+pub use store_dump::{dump_report, store_section};
 pub use workspace_uris::WorkspaceUris;

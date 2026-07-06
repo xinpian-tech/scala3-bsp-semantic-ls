@@ -405,12 +405,19 @@ fn execute_command<S>(
     }
 }
 
-/// The `scala3SemanticLs.doctor` result. Renders the `state:` header from the
-/// current context in every state, matching `DoctorCommand.report`. The
-/// runtime/store/semanticdb/postings/pc report sections are gathered by the
-/// doctor module.
+/// The `scala3SemanticLs.doctor` result. Renders the `state:` header plus the
+/// `Store` section (manifest/segment/state facts from the on-disk store under the
+/// workspace root) in every state, matching `DoctorCommand.report`'s
+/// always-available sections. The store facts come from the same boot-recovery
+/// read the server uses, so the report renders offline and pre-bootstrap and
+/// boots no JVM. The remaining `DoctorCommand` sections (Runtime host facts +
+/// live island status, BSP/SemanticDB/PC/Nix) are gathered as they are ported.
 fn doctor_report<S>(core: &ServerCore<S>) -> String {
-    format!("state: {}\n\n", core.state.status_line())
+    format!(
+        "state: {}\n\n{}",
+        core.state.status_line(),
+        crate::store_dump::store_section(core.workspace_root.as_deref()),
+    )
 }
 
 fn dispatch_notification<S>(
@@ -821,9 +828,11 @@ mod tests {
         assert_eq!(down.state.ready().unwrap().tag, "initial");
     }
 
-    // Doctor renders the state header from the context in every state.
+    // Doctor renders the state header plus the Store section in every state.
+    // With no `rootUri` the workspace root is unset, so the Store section reports
+    // that; the store-fact rendering itself is covered by the store_dump tests.
     #[test]
-    fn doctor_renders_the_state_header_in_every_state() {
+    fn doctor_renders_the_state_header_and_store_section_in_every_state() {
         let doctor = |state: WorkspaceState<FakeServices>, send_initialized: bool| {
             let mut input = vec![frame(request(1, "initialize", json!({})))];
             if send_initialized {
@@ -838,13 +847,17 @@ mod tests {
             let (_core, out) = run(input, state);
             out[1]["result"].as_str().unwrap().to_string()
         };
+        let store = "Store:\n  workspace root not set\n";
         // Not ready (no initialized): the pre-ready state header.
         assert_eq!(
             doctor(ready("unused"), false),
-            "state: not ready: waiting for the initialized notification\n\n"
+            format!("state: not ready: waiting for the initialized notification\n\n{store}")
         );
         // Ready.
-        assert_eq!(doctor(ready("svc"), true), "state: ready\n\n");
+        assert_eq!(
+            doctor(ready("svc"), true),
+            format!("state: ready\n\n{store}")
+        );
         // Failed.
         assert_eq!(
             doctor(
@@ -853,7 +866,7 @@ mod tests {
                 },
                 true
             ),
-            "state: bootstrap failed: no build server\n\n"
+            format!("state: bootstrap failed: no build server\n\n{store}")
         );
     }
 

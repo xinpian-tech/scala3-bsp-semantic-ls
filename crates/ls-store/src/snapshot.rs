@@ -100,6 +100,28 @@ impl Store {
         Ok(store)
     }
 
+    /// Open the store at `root` STRICTLY READ-ONLY: recover the active (segment,
+    /// state) pair named by `manifest.json` (if any) without creating the root or
+    /// touching tmp debris. Unlike [`Store::open`], this never writes, so an
+    /// offline inspector (the doctor `Store` section, `ls dump`) can read a store
+    /// that a live server owns without racing its in-flight publish. A missing
+    /// root or manifest opens empty; publishing is not supported on a read-only
+    /// handle (nothing recovers superseded generations, so `run_janitor` is a
+    /// no-op over the empty retired set).
+    pub fn open_readonly(root: &Path) -> StoreResult<Store> {
+        let store = Store {
+            root: root.to_path_buf(),
+            current: ArcSwapOption::empty(),
+            retired: Mutex::new(Vec::new()),
+            publish_lock: Mutex::new(()),
+        };
+        if let Some(manifest) = Manifest::load(root)? {
+            let snap = Arc::new(store.open_snapshot(&manifest)?);
+            store.current.store(Some(snap));
+        }
+        Ok(store)
+    }
+
     /// The store root directory.
     pub fn root(&self) -> &Path {
         &self.root

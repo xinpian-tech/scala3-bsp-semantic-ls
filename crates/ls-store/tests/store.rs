@@ -106,6 +106,28 @@ fn second_publish_increments_generation() {
     assert_eq!(snap.state().payload, b"g2");
 }
 
+#[test]
+fn open_readonly_recovers_without_creating_or_cleaning() {
+    let tmp = tempfile::tempdir().unwrap();
+    Store::open(tmp.path())
+        .unwrap()
+        .publish(&data(2, 1), b"g1", 0)
+        .unwrap();
+    // Debris a live server's in-flight publish would leave behind.
+    let debris = tmp.path().join("tmp-inflight");
+    std::fs::create_dir_all(&debris).unwrap();
+
+    // A read-only open recovers the active pair but touches nothing.
+    let ro = Store::open_readonly(tmp.path()).unwrap();
+    assert_eq!(ro.current().unwrap().generation(), 1);
+    assert!(debris.exists(), "open_readonly removed tmp debris");
+
+    // A missing root opens empty without being created.
+    let missing = tmp.path().join("does-not-exist");
+    assert!(Store::open_readonly(&missing).unwrap().current().is_none());
+    assert!(!missing.exists(), "open_readonly created a missing root");
+}
+
 // ---- retention + janitor (ArcSwap semantics) ----
 
 #[test]

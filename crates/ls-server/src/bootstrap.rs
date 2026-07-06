@@ -40,7 +40,9 @@ use crate::workspace_uris::WorkspaceUris;
 /// The directory under the workspace root that holds the index store — the
 /// manifest, immutable segments, and generational state files that replaced
 /// SQLite. Matches the Scala `settings` `workspaceRoot.resolve(".scala3-bsp-semantic-ls")`.
-const STORE_DIR: &str = ".scala3-bsp-semantic-ls";
+/// Public so the doctor `Store` section derives the same store path from a
+/// workspace root.
+pub const STORE_DIR: &str = ".scala3-bsp-semantic-ls";
 
 /// Per-document generated/readonly/dependency-source knowledge keyed by
 /// `(bspId, sdbUri)` — the ingest's `contributesOccurrences` profile input.

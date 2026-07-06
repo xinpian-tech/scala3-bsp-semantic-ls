@@ -18,7 +18,7 @@ pub enum CliAction {
     /// Print an offline dump of the on-disk index store at `dir` (manifest,
     /// workspace-state, and segment-header facts), then exit. Like `--doctor`,
     /// `dir` is the raw argument (or `.`) resolved with [`resolve_doctor_dir`];
-    /// the dump opens the store read-only and boots no JVM.
+    /// the dump reads the store strictly read-only and boots no JVM.
     Dump { dir: PathBuf },
     /// Start the LSP server over stdio.
     Serve,
