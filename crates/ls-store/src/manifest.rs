@@ -60,8 +60,10 @@ impl Manifest {
     }
 
     /// Load `root/manifest.json`. Returns `Ok(None)` when absent (a fresh store),
-    /// a typed error when present but unparseable or from a future schema.
-    pub(crate) fn load(root: &Path) -> StoreResult<Option<Manifest>> {
+    /// a typed error when present but unparseable or from a future schema. Public
+    /// so offline inspectors (the `ls dump` store report) can read the commit
+    /// point without opening a full snapshot.
+    pub fn load(root: &Path) -> StoreResult<Option<Manifest>> {
         let path = root.join(MANIFEST_FILE);
         let bytes = match std::fs::read(&path) {
             Ok(b) => b,

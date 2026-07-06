@@ -17,6 +17,7 @@ mod pc_convert;
 pub mod protocol;
 pub mod server;
 pub mod services;
+pub mod store_dump;
 pub mod workspace_uris;
 
 pub use bootstrap::{
@@ -50,4 +51,5 @@ pub use services::{
     highlights_to_lsp, pc_locations_to_lsp, references_locations, workspace_symbol_of,
     BuildCompiler, CoreHandlers, CoreServices,
 };
+pub use store_dump::dump_report;
 pub use workspace_uris::WorkspaceUris;

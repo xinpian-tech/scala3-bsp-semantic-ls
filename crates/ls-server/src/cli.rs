@@ -15,6 +15,11 @@ pub enum CliAction {
     /// argument (or `.`); the entry point resolves it to an absolute, normalized
     /// path with [`resolve_doctor_dir`] before rendering the report.
     Doctor { dir: PathBuf },
+    /// Print an offline dump of the on-disk index store at `dir` (manifest,
+    /// workspace-state, and segment-header facts), then exit. Like `--doctor`,
+    /// `dir` is the raw argument (or `.`) resolved with [`resolve_doctor_dir`];
+    /// the dump opens the store read-only and boots no JVM.
+    Dump { dir: PathBuf },
     /// Start the LSP server over stdio.
     Serve,
     /// Print a usage error and exit non-zero.
@@ -51,6 +56,12 @@ pub fn parse_args(args: &[String]) -> CliAction {
             dir: PathBuf::from("."),
         },
         [flag, dir] if flag == "--doctor" && !is_flag(dir) => CliAction::Doctor {
+            dir: PathBuf::from(dir),
+        },
+        [cmd] if cmd == "dump" => CliAction::Dump {
+            dir: PathBuf::from("."),
+        },
+        [cmd, dir] if cmd == "dump" && !is_flag(dir) => CliAction::Dump {
             dir: PathBuf::from(dir),
         },
         _ => CliAction::Usage {
@@ -113,6 +124,48 @@ mod tests {
     #[test]
     fn no_arguments_starts_the_server() {
         assert_eq!(parse_args(&[]), CliAction::Serve);
+    }
+
+    #[test]
+    fn dump_without_a_dir_defaults_to_the_current_directory() {
+        assert_eq!(
+            parse_args(&args(&["dump"])),
+            CliAction::Dump {
+                dir: PathBuf::from(".")
+            }
+        );
+    }
+
+    #[test]
+    fn dump_takes_the_following_directory_argument() {
+        assert_eq!(
+            parse_args(&args(&["dump", "/tmp/ws"])),
+            CliAction::Dump {
+                dir: PathBuf::from("/tmp/ws")
+            }
+        );
+    }
+
+    #[test]
+    fn version_wins_over_dump() {
+        assert_eq!(
+            parse_args(&args(&["dump", "--version"])),
+            CliAction::Version
+        );
+    }
+
+    #[test]
+    fn extra_or_flag_arguments_around_dump_are_rejected() {
+        for invocation in [
+            &["dump", ".", "extra"][..],
+            &["dump", "--bogus"][..],
+            &["--bogus", "dump"][..],
+        ] {
+            assert!(
+                matches!(parse_args(&args(invocation)), CliAction::Usage { .. }),
+                "expected usage error for {invocation:?}"
+            );
+        }
     }
 
     #[test]

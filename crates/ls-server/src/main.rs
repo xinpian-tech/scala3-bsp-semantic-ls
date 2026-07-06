@@ -13,7 +13,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use ls_server::{
-    parse_args, resolve_doctor_dir, serve, CliAction, CoreHandlers, IndexBootstrap,
+    dump_report, parse_args, resolve_doctor_dir, serve, CliAction, CoreHandlers, IndexBootstrap,
     LiveBspModelSource, PublishDiagnosticsParams, ServerCore, ServerHooks, SERVER_NAME,
     SERVER_VERSION,
 };
@@ -28,6 +28,11 @@ fn main() -> ExitCode {
         CliAction::Doctor { dir } => {
             let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
             println!("{}", offline_doctor_report(&resolve_doctor_dir(&dir, &cwd)));
+            ExitCode::SUCCESS
+        }
+        CliAction::Dump { dir } => {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            print!("{}", dump_report(&resolve_doctor_dir(&dir, &cwd)));
             ExitCode::SUCCESS
         }
         CliAction::Serve => {
