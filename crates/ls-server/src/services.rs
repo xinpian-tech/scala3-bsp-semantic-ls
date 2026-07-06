@@ -2,15 +2,18 @@
 //! wired over the Rust engine.
 //!
 //! [`CoreServices`] is the `S` the ready state owns (the Scala `CoreServices`
-//! equivalent): the query orchestrator, the workspace URI mapping, and the
-//! workspace root. [`CoreHandlers`] is the production [`Handlers`] impl. It
-//! wires the index-backed, PC-free query methods — `references`,
-//! `documentHighlight`, and `workspace/symbol` — over the engine's
+//! equivalent): the query orchestrator, the workspace URI mapping, the workspace
+//! root, and the build model's URI ownership (`uri_to_target`, backing the
+//! `requireSemanticdb` gate). [`CoreHandlers`] is the production [`Handlers`]
+//! impl. It wires the index-backed, PC-free ready methods — `references`,
+//! `documentHighlight`, `workspace/symbol`, `prepareRename`, and the
+//! `scala3SemanticLs.reindex` executeCommand — over the engine's
 //! [`ReferencesEngine`] / [`DocumentHighlightService`] / workspace-symbol
-//! resolver, converting SemanticDB coordinates and URIs to the LSP result
-//! shapes. The remaining ready methods (the PC-backed queries, rename, and the
-//! `executeCommand` actions) attach as their subsystems are wired; until then
-//! they answer a typed placeholder error.
+//! resolver / [`RenameEngine`], each gated (where the source applies it) by
+//! `requireSemanticdb`, converting SemanticDB coordinates and URIs to the LSP
+//! result shapes. The remaining ready methods (the PC-backed queries, full
+//! rename, and the `compile`/`pcPluginStatus` executeCommand actions) attach as
+//! their subsystems are wired; until then they answer a typed placeholder error.
 
 use std::collections::HashMap;
 use std::path::PathBuf;

@@ -257,3 +257,143 @@ fn production_bootstrap_ingests_the_model_and_serves_real_queries() {
         "expected highlights for Core, got none"
     );
 }
+
+/// The indexable corpus plus one target that OWNS a source but produces no
+/// SemanticDB (`semanticdb_root: None` → excluded from `indexable_targets()` and
+/// so from the ingested workspace), whose source URI is still in `uri_to_target`.
+/// Returns the model and the non-indexable-owned source URI.
+fn model_with_non_indexable_owner() -> (BspProjectModel, String) {
+    let fx = fixtures_root();
+    let unindexed_uri = path_to_uri(&fx.join("noindex/pkgc/Widget.scala"));
+    let mut model = fixture_model();
+    model.targets.push(BspTarget {
+        bsp_id: "fixture-c-noindex".to_string(),
+        display_name: "fixture-c-noindex".to_string(),
+        scala_version: "3".to_string(),
+        scalac_options: Vec::new(),
+        class_directory: fx.join("noindex-out"),
+        // No SemanticDB output: owns sources but is not indexable.
+        semanticdb_root: None,
+        sourceroot: Some(fx.join("noindex")),
+        sources: Vec::new(),
+        direct_deps: Vec::new(),
+    });
+    model
+        .uri_to_target
+        .insert(unindexed_uri.clone(), "fixture-c-noindex".to_string());
+    (model, unindexed_uri)
+}
+
+/// A source the live model owns through a target that produces no SemanticDB is
+/// a hard `NoSemanticdb`/`RequestFailed` error on every gated method — never
+/// `NotIndexed`, an empty result, or `null` — proving the gate consults the live
+/// model's ownership, not just index/sourceroot mappability. Rust equivalent of
+/// the retained `LsEndToEndTest`/`RealBspCoreTest` no-SemanticDB module-`c`
+/// cases. Exercises the `uri_to_target.get(uri) == Some(non-indexable)` branch,
+/// distinct from the unowned-URI case (`get` → `None`).
+#[test]
+fn a_source_owned_by_a_non_indexable_target_is_no_semanticdb() {
+    let store_root = tempfile::tempdir().unwrap();
+    let (model, unindexed_uri) = model_with_non_indexable_owner();
+
+    // Pin the scenario so a silent break of the ownership setup fails loudly
+    // rather than passing via the unowned-URI branch: the source is owned in the
+    // model by a target that produces no SemanticDB.
+    let owner = model
+        .uri_to_target
+        .get(&unindexed_uri)
+        .expect("the source is owned in the model");
+    let owner_target = model
+        .targets
+        .iter()
+        .find(|t| &t.bsp_id == owner)
+        .expect("the owning target is in the model");
+    assert!(
+        !owner_target.indexable(),
+        "the owning target must be non-indexable (no SemanticDB output)"
+    );
+
+    let input = [
+        frame(request(
+            1,
+            "initialize",
+            json!({ "rootUri": path_to_uri(store_root.path()) }),
+        )),
+        frame(notification("initialized", json!({}))),
+        frame(request(
+            2,
+            "textDocument/references",
+            json!({
+                "textDocument": { "uri": unindexed_uri },
+                "position": { "line": 0, "character": 0 },
+                "context": { "includeDeclaration": true }
+            }),
+        )),
+        frame(request(
+            3,
+            "textDocument/documentHighlight",
+            json!({
+                "textDocument": { "uri": unindexed_uri },
+                "position": { "line": 0, "character": 0 }
+            }),
+        )),
+        frame(request(
+            4,
+            "textDocument/prepareRename",
+            json!({
+                "textDocument": { "uri": unindexed_uri },
+                "position": { "line": 0, "character": 0 }
+            }),
+        )),
+        frame(notification("exit", json!({}))),
+    ]
+    .concat();
+
+    let mut reader = Cursor::new(input);
+    let mut writer = Vec::new();
+    let mut core = ServerCore::new();
+    let bootstrap = IndexBootstrap::new(|_root: &Path| Ok(model_with_non_indexable_owner().0));
+    let publish = |_p: PublishDiagnosticsParams| {};
+    let on_changed = || {};
+    let hooks = ServerHooks {
+        publish_diagnostics: &publish,
+        on_build_targets_changed: &on_changed,
+    };
+    serve(
+        &mut reader,
+        &mut writer,
+        &mut core,
+        &CoreHandlers,
+        &bootstrap,
+        &hooks,
+    )
+    .unwrap();
+
+    assert!(core.state.is_ready(), "workspace did not reach ready");
+    let out = responses(writer);
+    let by_id = |id: i64| {
+        out.iter()
+            .find(|r| r["id"] == id)
+            .unwrap_or_else(|| panic!("no response for id {id} in {out:?}"))
+    };
+
+    // references / documentHighlight / prepareRename all hard-error with the
+    // NoSemanticdb message; none falls through to NotIndexed, [], or null.
+    for id in [2, 3, 4] {
+        let response = by_id(id);
+        let error = &response["error"];
+        assert_eq!(
+            error["code"], -32803,
+            "method id {id} should RequestFailed, got {response}"
+        );
+        let message = error["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("has no SemanticDB output"),
+            "id {id}: expected the NoSemanticdb message, got {response}"
+        );
+        assert!(
+            !message.contains("not part of any indexed build target"),
+            "id {id}: must be NoSemanticdb, not NotIndexed, got {response}"
+        );
+    }
+}
