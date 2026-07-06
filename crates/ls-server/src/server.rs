@@ -256,6 +256,7 @@ where
     // does not consume it (the index bootstrap emits no diagnostics), and BSP
     // diagnostics routing to it is wired with the diagnostics router.
     let bootstrap = Arc::new(bootstrap);
+    let mut exiting = false;
     while let Some(body) = read_frame(reader)? {
         // At the top of each turn, adopt a completed async bootstrap and then drain
         // a build-target reload, so the message just read sees the freshest state.
@@ -268,15 +269,24 @@ where
             }
             Ok(Incoming::Notification(note)) => {
                 if let Flow::Stop = dispatch_notification(core, handlers, &bootstrap, note) {
+                    exiting = true;
                     break;
                 }
             }
             Err(error) => write_null_id_error(writer, &error)?,
         }
     }
-    // The input ended (clean EOF or `exit`): adopt an in-flight bootstrap result so
-    // the workspace reaches Ready before `serve` returns.
-    drain_bootstrap(core, &*bootstrap);
+    if exiting || core.shutting_down {
+        // `exit`, or a shutting-down server: detach any in-flight worker and return
+        // promptly — a late result must neither resurrect the shut-down state nor
+        // block the client's teardown on bootstrap.
+        detach_bootstrap(core);
+    } else {
+        // A clean EOF with no shutdown/exit: adopt an in-flight bootstrap result so a
+        // `serve` call that stops right after `initialized` still reaches Ready
+        // (pump-until-ready).
+        drain_bootstrap(core, &*bootstrap);
+    }
     Ok(())
 }
 
@@ -333,11 +343,19 @@ fn drain_bootstrap<S, B: Bootstrap<S>>(core: &mut ServerCore<S>, bootstrap: &B) 
 /// Installs a bootstrap result: joins the worker, replays the open buffers into a
 /// freshly-ready bundle on the loop (ports `ScalaLs.replayOpenBuffers`), and swaps
 /// the state. `None` (a dropped/panicked worker) becomes a typed failure.
+///
+/// A result delivered after `shutdown` is DISCARDED: it must not resurrect a
+/// shut-down server. The worker is detached (its handle dropped, not joined) so a
+/// late result cannot delay teardown, and the shut-down `NotReady` state is kept.
 fn adopt_bootstrap<S, B: Bootstrap<S>>(
     core: &mut ServerCore<S>,
     bootstrap: &B,
     result: Option<WorkspaceState<S>>,
 ) {
+    if core.shutting_down {
+        detach_bootstrap(core);
+        return;
+    }
     core.bootstrap_rx = None;
     if let Some(handle) = core.bootstrap_handle.take() {
         let _ = handle.join();
@@ -352,6 +370,16 @@ fn adopt_bootstrap<S, B: Bootstrap<S>>(
             detail: "bootstrap worker terminated without a result".to_string(),
         },
     };
+}
+
+/// Stops tracking the in-flight bootstrap worker WITHOUT blocking on it: drops the
+/// result channel and detaches the worker thread (it owns its data, and its `send`
+/// fails harmlessly once the receiver is gone). Used when the server is shutting
+/// down or exiting, so a late result neither resurrects the shut-down state nor
+/// delays `serve` from returning.
+fn detach_bootstrap<S>(core: &mut ServerCore<S>) {
+    core.bootstrap_rx = None;
+    core.bootstrap_handle = None;
 }
 
 /// Drains the build-targets-changed flag: when the build server has reported a
@@ -879,7 +907,8 @@ mod tests {
                     json!({ "textDocument": { "uri": "file:///ws/a.scala", "text": "x" } }),
                 )),
                 frame(notification("initialized", json!({}))),
-                frame(notification("exit", json!({}))),
+                // A clean EOF (no `exit`) block-drains the worker to Ready, so replay
+                // runs; an `exit` would instead detach the worker without adopting.
             ]
             .concat(),
         );
@@ -1016,6 +1045,203 @@ mod tests {
         poll_bootstrap(&mut core, &bootstrap);
         assert!(matches!(core.state, WorkspaceState::Failed { .. }));
         assert!(core.bootstrap_rx.is_none());
+    }
+
+    // A bootstrap result delivered AFTER shutdown must not resurrect the server: the
+    // workspace stays shut down and the worker is detached. Deterministic — the
+    // channel is fed by hand.
+    #[test]
+    fn poll_bootstrap_discards_a_late_ready_after_shutdown() {
+        let bootstrap = FixedBootstrap(ready("svc"));
+        let mut core: ServerCore<FakeServices> = ServerCore::new();
+        core.initialize(&json!({ "rootUri": "file:///ws" }));
+        let (tx, rx) = mpsc::channel();
+        core.bootstrap_rx = Some(rx);
+
+        // Shutdown arrives while the worker is in flight.
+        core.shutdown();
+        assert!(core.shutting_down);
+        // The worker then delivers Ready — it must NOT overwrite the shutdown state.
+        tx.send(ready("svc")).unwrap();
+        poll_bootstrap(&mut core, &bootstrap);
+
+        assert!(
+            !core.state.is_ready(),
+            "a late Ready must not resurrect shutdown"
+        );
+        match &core.state {
+            WorkspaceState::NotReady { detail } => assert_eq!(detail, "server is shut down"),
+            other => panic!("expected shut-down NotReady, got {:?}", other.status_line()),
+        }
+        assert!(
+            core.bootstrap_rx.is_none(),
+            "the worker is detached after shutdown"
+        );
+    }
+
+    // `shutdown` then `exit` while the bootstrap worker is still in flight: `serve`
+    // must return WITHOUT blocking on the worker and must NOT install Ready over the
+    // shut-down state. The worker is gated so it is genuinely in flight at exit — if
+    // `serve` block-drained, this test would deadlock (only the test releases the
+    // gate, after `serve` returns).
+    #[test]
+    fn serve_neither_resurrects_nor_blocks_on_shutdown_then_exit_during_bootstrap() {
+        struct GatedBootstrap {
+            gate: Arc<std::sync::Barrier>,
+            outcome: WorkspaceState<FakeServices>,
+        }
+        impl Bootstrap<FakeServices> for GatedBootstrap {
+            fn build(&self, _workspace_root: Option<PathBuf>) -> WorkspaceState<FakeServices> {
+                self.gate.wait();
+                self.outcome.clone()
+            }
+        }
+
+        let gate = Arc::new(std::sync::Barrier::new(2));
+        let bootstrap = GatedBootstrap {
+            gate: Arc::clone(&gate),
+            outcome: ready("svc"),
+        };
+        let mut reader = Cursor::new(
+            [
+                frame(request(1, "initialize", json!({ "rootUri": "file:///ws" }))),
+                frame(notification("initialized", json!({}))),
+                frame(request(2, "shutdown", json!({}))),
+                frame(notification("exit", json!({}))),
+            ]
+            .concat(),
+        );
+        let mut writer = Vec::new();
+        let mut core = ServerCore::new();
+        let publish = |_p: PublishDiagnosticsParams| {};
+        let hooks = ServerHooks {
+            publish_diagnostics: &publish,
+        };
+        // Returns promptly (no block on the gated worker).
+        serve(
+            &mut reader,
+            &mut writer,
+            &mut core,
+            &EchoHandlers,
+            bootstrap,
+            &hooks,
+        )
+        .unwrap();
+
+        assert!(
+            !core.state.is_ready(),
+            "a late Ready must not resurrect shutdown"
+        );
+        match &core.state {
+            WorkspaceState::NotReady { detail } => assert_eq!(detail, "server is shut down"),
+            other => panic!("expected shut-down NotReady, got {:?}", other.status_line()),
+        }
+        // The shutdown response was served; no request was answered as ready.
+        let out = responses(writer);
+        assert!(out
+            .iter()
+            .any(|r| r["id"] == 2 && r["result"] == Value::Null));
+        // Release the worker so its thread finishes (its send fails harmlessly).
+        gate.wait();
+    }
+
+    // A clean EOF with no shutdown/exit still block-drains the worker to Ready, so
+    // the pump-until-ready path is preserved.
+    #[test]
+    fn serve_reaches_ready_on_clean_eof_without_shutdown_or_exit() {
+        let mut reader = Cursor::new(
+            [
+                frame(request(1, "initialize", json!({ "rootUri": "file:///ws" }))),
+                frame(notification("initialized", json!({}))),
+            ]
+            .concat(),
+        );
+        let mut writer = Vec::new();
+        let mut core = ServerCore::new();
+        let publish = |_p: PublishDiagnosticsParams| {};
+        let hooks = ServerHooks {
+            publish_diagnostics: &publish,
+        };
+        serve(
+            &mut reader,
+            &mut writer,
+            &mut core,
+            &EchoHandlers,
+            FixedBootstrap(ready("svc")),
+            &hooks,
+        )
+        .unwrap();
+        assert!(
+            core.state.is_ready(),
+            "a clean EOF after initialized must drain to Ready"
+        );
+        assert_eq!(core.state.ready().unwrap().tag, "svc");
+    }
+
+    // While the bootstrap worker is in flight (bootstrap_rx present but empty), the
+    // workspace is NotReady, so every readiness-sensitive request returns its exact
+    // per-method pre-ready fallback. Pins the whole surface so a future change
+    // cannot silently regress one method's fallback.
+    #[test]
+    fn pre_ready_in_flight_bootstrap_serves_every_method_fallback() {
+        #[derive(Debug)]
+        enum Shape {
+            Error,
+            Null,
+            Empty(Value),
+        }
+        let cases = [
+            ("textDocument/references", Shape::Error),
+            ("textDocument/rename", Shape::Error),
+            ("textDocument/documentHighlight", Shape::Empty(json!([]))),
+            ("workspace/symbol", Shape::Empty(json!([]))),
+            ("textDocument/definition", Shape::Empty(json!([]))),
+            ("textDocument/typeDefinition", Shape::Empty(json!([]))),
+            (
+                "textDocument/completion",
+                Shape::Empty(json!({ "isIncomplete": false, "items": [] })),
+            ),
+            ("textDocument/prepareRename", Shape::Null),
+            ("textDocument/hover", Shape::Null),
+            ("textDocument/signatureHelp", Shape::Null),
+        ];
+        for (method, expected) in cases {
+            let bootstrap = FixedBootstrap(ready("svc"));
+            let mut core: ServerCore<FakeServices> = ServerCore::new();
+            core.initialize(&json!({ "rootUri": "file:///ws" }));
+            // Worker in flight: the sender is held (channel stays connected, empty).
+            let (_tx, rx) = mpsc::channel::<WorkspaceState<FakeServices>>();
+            core.bootstrap_rx = Some(rx);
+            poll_bootstrap(&mut core, &bootstrap);
+            assert!(
+                !core.state.is_ready(),
+                "{method}: worker in flight is not ready"
+            );
+
+            let resp = dispatch_request(
+                &mut core,
+                &EchoHandlers,
+                Request {
+                    id: RequestId::Number(1),
+                    method: method.to_string(),
+                    params: json!({}),
+                },
+            );
+            match expected {
+                Shape::Error => assert!(
+                    resp.error.is_some(),
+                    "{method}: expected a not-ready error, got {resp:?}"
+                ),
+                Shape::Null => {
+                    assert!(resp.error.is_none(), "{method}: unexpected error {resp:?}");
+                    assert_eq!(resp.result, Some(Value::Null), "{method}: expected null");
+                }
+                Shape::Empty(value) => {
+                    assert!(resp.error.is_none(), "{method}: unexpected error {resp:?}");
+                    assert_eq!(resp.result, Some(value), "{method}: wrong empty shape");
+                }
+            }
+        }
     }
 
     // Doctor renders the state header plus the Store section in every state.
