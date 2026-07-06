@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use ls_bsp::model::BspProjectModel;
+use ls_bsp::{BspClientHandlers, BspDiscovery, BspSession, BspSessionConfig, ProjectModelLoader};
 use ls_engine::{DocFacts, QueryOrchestrator, TargetSpec, WorkspaceTargets};
 use ls_store::Store;
 
@@ -142,6 +143,51 @@ impl<M: ModelSource> Bootstrap<CoreServices> for IndexBootstrap<M> {
             Err(detail) => WorkspaceState::Failed { detail },
         }
     }
+}
+
+/// The production [`ModelSource`]: discover the workspace's build server, launch
+/// and initialize a session, and load the project model. Ports the model-load
+/// prefix of `WorkspaceState.loadModel` (`build/initialize` then
+/// `ProjectModelLoader.load`). Every `BspError` becomes the failed-bootstrap
+/// detail string.
+///
+/// The session is shut down once the model is loaded: the index-backed query
+/// path answers from the ingested store and does not retain it. When compile /
+/// reload land, the session moves into the services bundle instead of closing.
+#[derive(Clone, Copy, Default)]
+pub struct LiveBspModelSource;
+
+impl LiveBspModelSource {
+    pub fn new() -> Self {
+        LiveBspModelSource
+    }
+}
+
+impl ModelSource for LiveBspModelSource {
+    fn load(&self, workspace_root: &Path) -> Result<BspProjectModel, String> {
+        let connection = BspDiscovery::required(workspace_root).map_err(|e| e.to_string())?;
+        let session = BspSession::launch(
+            workspace_root.to_path_buf(),
+            &connection.details,
+            BspClientHandlers::new(),
+            BspSessionConfig::default(),
+        )
+        .map_err(|e| e.to_string())?;
+        // Load, then close the session cleanly whether or not the load
+        // succeeded — a launched build server must not be left running.
+        let model = load_project_model(&session);
+        session.shutdown();
+        session.close();
+        model
+    }
+}
+
+/// Initializes the session and loads the project model, mapping any `BspError`
+/// to a detail string. Separated so the caller closes the session on either
+/// outcome.
+fn load_project_model(session: &BspSession) -> Result<BspProjectModel, String> {
+    session.initialize().map_err(|e| e.to_string())?;
+    ProjectModelLoader::load(session).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -272,6 +318,17 @@ mod tests {
             .orchestrator
             .workspace_symbols("Anything", 10)
             .is_empty());
+    }
+
+    // The live model source fails cleanly (not a panic) when the workspace has
+    // no BSP connection file, surfacing the discovery error as the detail.
+    #[test]
+    fn live_model_source_without_a_connection_file_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = LiveBspModelSource::new()
+            .load(dir.path())
+            .expect_err("no .bsp connection file should fail");
+        assert!(err.contains(".bsp"), "{err}");
     }
 
     #[test]

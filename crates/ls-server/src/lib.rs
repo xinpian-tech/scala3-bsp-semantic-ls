@@ -17,9 +17,12 @@ pub mod server;
 pub mod services;
 pub mod workspace_uris;
 
-pub use bootstrap::{from_bsp, workspace_source_facts, BspDocFacts, IndexBootstrap, ModelSource};
+pub use bootstrap::{
+    from_bsp, workspace_source_facts, BspDocFacts, IndexBootstrap, LiveBspModelSource, ModelSource,
+};
 pub use capabilities::{
-    initialize_result, server_capabilities, InitializeResult, ServerCapabilities,
+    initialize_result, server_capabilities, InitializeResult, ServerCapabilities, SERVER_NAME,
+    SERVER_VERSION,
 };
 pub use cli::{parse_args, resolve_doctor_dir, CliAction};
 pub use convert::{
