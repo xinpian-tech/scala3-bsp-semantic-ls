@@ -302,7 +302,7 @@ pub struct ShowMessageParams {
     pub message: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct DidChangeBuildTarget {
     #[serde(default)]
     pub changes: Vec<BuildTargetEvent>,

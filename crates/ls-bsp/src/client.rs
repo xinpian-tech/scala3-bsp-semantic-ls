@@ -98,11 +98,51 @@ pub(crate) fn dispatch_notification(handlers: &BspClientHandlers, note: Notifica
         }
         "buildTarget/didChange" => {
             if let Some(h) = &handlers.on_did_change_build_target {
-                if let Ok(p) = serde_json::from_value(note.params) {
-                    h(p);
-                }
+                // The build server signals "targets changed" here; lsp4j/Gson fires
+                // the handler regardless of the params shape (missing/null fields
+                // tolerated). A change payload serde would reject (an event missing
+                // `target`, or null/absent params) is still a valid reload signal,
+                // so fall back to an empty event rather than dropping the reload.
+                let event = serde_json::from_value(note.params).unwrap_or_default();
+                h(event);
             }
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn didchange(params: serde_json::Value) -> Notification {
+        Notification {
+            method: "buildTarget/didChange".to_string(),
+            params,
+        }
+    }
+
+    // The build server's `buildTarget/didChange` fires the reload handler no matter
+    // the params shape (lsp4j/Gson tolerance parity): a change event missing
+    // `target`, an empty object, or null/absent params are all still a valid
+    // "targets changed" signal, not a dropped notification.
+    #[test]
+    fn buildtarget_didchange_fires_the_handler_even_on_a_malformed_payload() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let seen = count.clone();
+        let handlers = BspClientHandlers::new().on_did_change_build_target(move |_| {
+            seen.fetch_add(1, Ordering::SeqCst);
+        });
+
+        dispatch_notification(&handlers, didchange(json!({"changes": [{}]})));
+        dispatch_notification(&handlers, didchange(json!({})));
+        dispatch_notification(&handlers, didchange(serde_json::Value::Null));
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            3,
+            "every didChange must fire the reload handler, even a malformed one"
+        );
     }
 }

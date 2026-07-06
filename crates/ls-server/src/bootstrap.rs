@@ -34,7 +34,7 @@ use crate::documents::DocumentStore;
 use crate::lifecycle::WorkspaceState;
 use crate::pc::{pc_options, IslandPcService, SymbolResolver};
 use crate::server::{Bootstrap, BootstrapContext};
-use crate::services::{CoreServices, UnavailableCompiler};
+use crate::services::{BuildCompiler, CoreServices, UnavailableCompiler};
 use crate::workspace_uris::WorkspaceUris;
 
 /// The directory under the workspace root that holds the index store — the
@@ -150,7 +150,7 @@ fn path_string(path: &Path) -> String {
 /// injections carry the disconnected stub.
 pub struct ReadyModel {
     pub model: BspProjectModel,
-    pub compiler: Box<dyn CompileService>,
+    pub compiler: Box<dyn BuildCompiler>,
 }
 
 /// The outcome of asking a [`ModelSource`] for a workspace's build model.
@@ -293,6 +293,72 @@ impl<M: ModelSource> Bootstrap<CoreServices> for IndexBootstrap<M> {
             Err(detail) => WorkspaceState::Failed { detail },
         }
     }
+
+    fn reload(&self, old: CoreServices, documents: &DocumentStore) -> WorkspaceState<CoreServices> {
+        reload_build_model(old, documents)
+    }
+}
+
+/// Reload the build project model after a `buildTarget/didChange`, reusing the
+/// ready bundle's durable handles. Refetches the model over the retained session
+/// (`BuildCompiler::refetch_model` — no rediscovery, no relaunch), re-ingests into
+/// the reused orchestrator (same store), rebuilds the URI ownership and sourceroot
+/// mapping from the new model, re-registers the new PC target set into the reused
+/// island, and replays the open buffers. A refetch or reingest failure keeps
+/// serving the previous ready snapshot (never a spurious `Failed`). A
+/// behavior-preserving port of `ScalaLs.reloadBuildModel`.
+pub fn reload_build_model(
+    old: CoreServices,
+    documents: &DocumentStore,
+) -> WorkspaceState<CoreServices> {
+    let model = match old.compiler.refetch_model() {
+        Ok(model) => model,
+        Err(detail) => {
+            eprintln!("scala3-bsp-semantic-ls: build target model reload failed: {detail}");
+            return WorkspaceState::Ready(old);
+        }
+    };
+    let workspace = from_bsp(&model, workspace_source_facts());
+    // The sourceroots, PC target registrations, and URI ownership are read from
+    // the new model before the workspace moves into the reingest (mirrors `build`).
+    let sourceroots: Vec<PathBuf> = workspace
+        .targets
+        .iter()
+        .map(|t| t.sourceroot.clone())
+        .collect();
+    let pc_targets = pc_target_configs(&model);
+    let uri_to_target = model
+        .uri_to_target
+        .iter()
+        .map(|(uri, bsp_id)| (normalize_uri(uri), bsp_id.clone()))
+        .collect();
+    // Reingest only when the refetched model still has indexable targets — the
+    // Scala `reloadBuildModel` gates its build job on `workspaceTargets.targets
+    // .nonEmpty` (ScalaLs.scala). An all-targets-removed change must NOT commit an
+    // empty segment that supersedes the prior index; the old segment is kept and
+    // still answers the un-gated `workspace/symbol` (only the model-authoritative
+    // `uri_to_target` ownership drops to the new empty set).
+    if !workspace.targets.is_empty() {
+        if let Err(error) = old.orchestrator.ingest(Arc::new(workspace)) {
+            eprintln!("scala3-bsp-semantic-ls: build target model reingest failed: {error}");
+            return WorkspaceState::Ready(old);
+        }
+    }
+    // Reuse the same island (buffers + JVM intact), updating its registered target
+    // set to the refetched model — the Scala `reloadBuildModel` reuse of `s.pc`.
+    old.pc.reconfigure_targets(pc_targets);
+    let uris = WorkspaceUris::new(&sourceroots);
+    let updated = CoreServices::new(
+        old.orchestrator, // reused: same store, just reingested
+        uris,
+        old.workspace_root,
+        uri_to_target,
+        old.compiler, // reused: same retained session
+        old.pc,       // reused: same island
+        true,
+    );
+    replay_open_buffers(&updated, documents);
+    WorkspaceState::Ready(updated)
 }
 
 /// Seeds the presentation compiler's open-buffer mirror from the buffers already
@@ -321,12 +387,19 @@ fn replay_open_buffers(services: &CoreServices, documents: &DocumentStore) {
 /// server; it is torn down from the ready-state teardown ([`BspCompileService`]'s
 /// `Drop`), not here. On a load failure the launched server is shut down before
 /// returning, so it is never left running.
-#[derive(Clone, Copy, Default)]
-pub struct LiveBspModelSource;
+#[derive(Clone)]
+pub struct LiveBspModelSource {
+    /// Called (on the BSP reader thread) when the build server reports a
+    /// `buildTarget/didChange`, so the server schedules a model reload. The
+    /// production hook sets the message loop's reload flag.
+    on_build_targets_changed: Arc<dyn Fn() + Send + Sync>,
+}
 
 impl LiveBspModelSource {
-    pub fn new() -> Self {
-        LiveBspModelSource
+    pub fn new(on_build_targets_changed: Arc<dyn Fn() + Send + Sync>) -> Self {
+        LiveBspModelSource {
+            on_build_targets_changed,
+        }
     }
 }
 
@@ -339,10 +412,14 @@ impl ModelSource for LiveBspModelSource {
         let Some(connection) = BspDiscovery::pick(workspace_root) else {
             return Ok(LoadOutcome::NoBsp);
         };
+        // The build server drives reloads: a `buildTarget/didChange` notification
+        // (delivered on the session's reader thread) fires the reload hook.
+        let on_changed = self.on_build_targets_changed.clone();
+        let handlers = BspClientHandlers::new().on_did_change_build_target(move |_| on_changed());
         let session = BspSession::launch(
             workspace_root.to_path_buf(),
             &connection.details,
-            BspClientHandlers::new(),
+            handlers,
             BspSessionConfig::default(),
         )
         .map_err(|e| e.to_string())?;
@@ -397,6 +474,16 @@ impl CompileService for BspCompileService {
     }
 }
 
+impl BuildCompiler for BspCompileService {
+    /// Refetch the model over the already-launched, already-initialized session
+    /// (`ProjectModelLoader::load` without a second `initialize` — the Scala
+    /// `Bootstrap.loadModel(session, …, initialize = false)`); no rediscovery, no
+    /// relaunch.
+    fn refetch_model(&self) -> Result<BspProjectModel, String> {
+        ProjectModelLoader::load(&self.session).map_err(|e| e.to_string())
+    }
+}
+
 impl Drop for BspCompileService {
     fn drop(&mut self) {
         // Best-effort teardown of the retained build server on ready-state drop.
@@ -444,13 +531,11 @@ mod tests {
         root: Option<&'a Path>,
         documents: &'a DocumentStore,
         publish: &'a dyn Fn(PublishDiagnosticsParams),
-        changed: &'a dyn Fn(),
     ) -> BootstrapContext<'a> {
         BootstrapContext {
             workspace_root: root,
             documents,
             publish_diagnostics: publish,
-            on_build_targets_changed: changed,
         }
     }
 
@@ -536,8 +621,7 @@ mod tests {
         });
         let documents = DocumentStore::new();
         let publish = |_p: PublishDiagnosticsParams| {};
-        let changed = || {};
-        let state = bootstrap.run(bootstrap_context(None, &documents, &publish, &changed));
+        let state = bootstrap.run(bootstrap_context(None, &documents, &publish));
         assert!(matches!(state, WorkspaceState::Failed { .. }));
     }
 
@@ -549,13 +633,7 @@ mod tests {
         });
         let documents = DocumentStore::new();
         let publish = |_p: PublishDiagnosticsParams| {};
-        let changed = || {};
-        let state = bootstrap.run(bootstrap_context(
-            Some(dir.path()),
-            &documents,
-            &publish,
-            &changed,
-        ));
+        let state = bootstrap.run(bootstrap_context(Some(dir.path()), &documents, &publish));
         let services = match state {
             WorkspaceState::Ready(s) => s,
             other => panic!("expected Ready, got {:?}", other.status_line()),
@@ -577,7 +655,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // No `.bsp` connection file: the live source reports the no-BSP case
         // (ports `defaultConnect` -> None), not an error.
-        let outcome = LiveBspModelSource::new()
+        let outcome = LiveBspModelSource::new(Arc::new(|| {}))
             .load(dir.path())
             .expect("no .bsp connection reports the no-BSP case, not an error");
         assert!(matches!(outcome, LoadOutcome::NoBsp));
@@ -590,13 +668,7 @@ mod tests {
             IndexBootstrap::new(|_root: &Path| Err("no build server found".to_string()));
         let documents = DocumentStore::new();
         let publish = |_p: PublishDiagnosticsParams| {};
-        let changed = || {};
-        let state = bootstrap.run(bootstrap_context(
-            Some(dir.path()),
-            &documents,
-            &publish,
-            &changed,
-        ));
+        let state = bootstrap.run(bootstrap_context(Some(dir.path()), &documents, &publish));
         match state {
             WorkspaceState::Failed { detail } => assert!(detail.contains("no build server")),
             other => panic!("expected Failed, got {:?}", other.status_line()),

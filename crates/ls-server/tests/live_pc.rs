@@ -96,12 +96,10 @@ fn live_definition_over_an_open_buffer_routes_through_the_pc_island() {
 
     let documents = DocumentStore::new();
     let publish = |_p: PublishDiagnosticsParams| {};
-    let on_changed = || {};
     let services = match IndexBootstrap::new(model_source).run(BootstrapContext {
         workspace_root: Some(&workspace),
         documents: &documents,
         publish_diagnostics: &publish,
-        on_build_targets_changed: &on_changed,
     }) {
         WorkspaceState::Ready(services) => services,
         other => panic!("bootstrap not ready: {}", other.status_line()),

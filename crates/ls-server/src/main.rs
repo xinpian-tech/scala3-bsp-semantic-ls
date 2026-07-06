@@ -9,6 +9,8 @@
 use std::io::{self, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 use ls_server::{
     parse_args, resolve_doctor_dir, serve, CliAction, CoreHandlers, IndexBootstrap,
@@ -66,14 +68,17 @@ fn serve_stdio() {
     let mut reader = BufReader::new(stdin.lock());
     let mut writer = stdout.lock();
     let mut core = ServerCore::new();
-    let bootstrap = IndexBootstrap::new(LiveBspModelSource::new());
-    // Diagnostics publishing and build-target-change draining attach with the
-    // async lifecycle; the index bootstrap emits neither, so both are no-ops.
+    // The build server's `buildTarget/didChange` (delivered on the session reader
+    // thread) sets the loop's reload flag; the loop drains it and reloads the model.
+    let reload_flag = core.reload_flag();
+    let on_build_targets_changed: Arc<dyn Fn() + Send + Sync> =
+        Arc::new(move || reload_flag.store(true, Ordering::SeqCst));
+    let bootstrap = IndexBootstrap::new(LiveBspModelSource::new(on_build_targets_changed));
+    // Diagnostics publishing attaches with the diagnostics router; the index
+    // bootstrap emits none, so it is a no-op.
     let publish = |_p: PublishDiagnosticsParams| {};
-    let on_changed = || {};
     let hooks = ServerHooks {
         publish_diagnostics: &publish,
-        on_build_targets_changed: &on_changed,
     };
     if let Err(error) = serve(
         &mut reader,

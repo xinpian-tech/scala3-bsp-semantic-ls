@@ -100,6 +100,14 @@ pub trait PcQueryService: Send + Sync {
     /// fallback: a resolve that cannot enrich returns the item the client already
     /// has, never an error).
     fn resolve_completion_item(&self, target_id: &str, symbol: &str, item: &Value) -> Value;
+
+    /// Replace the registered PC target set with `targets` after a build-target
+    /// change, reusing the same island. Updates the `is_registered` gate and the
+    /// boot-replay source immediately; when the island has already booted, the
+    /// new targets are (re-)registered into the running island. The Scala
+    /// `reloadBuildModel` reuse of `s.pc` with the refetched `pcConfigs`. Default
+    /// no-op: a services bundle with no PC island keeps its (empty) target set.
+    fn reconfigure_targets(&self, _targets: Vec<TargetConfig>) {}
 }
 
 /// The `symbol_definition` resolver the island calls when the presentation
@@ -437,6 +445,43 @@ impl PcQueryService for IslandPcService {
         .map(|resolved| crate::pc_convert::completion_item(&resolved))
         .unwrap_or_else(|| item.clone())
     }
+
+    fn reconfigure_targets(&self, targets: Vec<TargetConfig>) {
+        let mut guard = self.state.lock().expect("pc island state mutex");
+        let state = &mut *guard;
+        // The new set is the gate + the boot-replay source immediately; a still-
+        // cold island simply registers it on its eventual boot (no re-boot of the
+        // one-per-process JVM). A dropped target falls out of `is_registered`, so a
+        // `did_open` against it is rejected even if its island-side registration
+        // lingers inertly.
+        state.targets = targets;
+        // If the island has already booted, (re-)register the new targets into the
+        // running island so a query against a newly added target's buffer resolves.
+        // A rejected registration is recorded like a boot failure would be, but the
+        // mirror still reflects the intended set (the gate stays authoritative). The
+        // failure is recorded after the driver borrow ends, so `state` is not
+        // aliased (mirrors `install_driver`'s snapshot discipline).
+        let registrations = state.targets.clone();
+        let mut rejected = None;
+        if let Some(driver) = state.driver.as_mut() {
+            for target in &registrations {
+                let outcome = driver.request(PcRequest::RegisterTarget {
+                    id: target.bsp_id.clone(),
+                    config: target.clone(),
+                });
+                if !accepted(&outcome) {
+                    rejected = Some(format!(
+                        "PC target '{}' re-registration rejected by the island",
+                        target.bsp_id
+                    ));
+                    break;
+                }
+            }
+        }
+        if let Some(detail) = rejected {
+            state.boot_error = Some(detail);
+        }
+    }
 }
 
 /// Boots the island: installs the resolver (once), reads the JVM environment,
@@ -670,6 +715,34 @@ mod tests {
         assert!(
             !pc.is_booted(),
             "a document notification must never boot the embedded JVM island"
+        );
+    }
+
+    // A build-target change reconfigures the registered set on the SAME island
+    // (the Scala `reloadBuildModel` reuse of `s.pc`): the `is_registered` gate
+    // reflects the new set, a still-cold island does not boot, and a booted island
+    // (re-)registers the new targets into the running island.
+    #[test]
+    fn reconfigure_targets_updates_the_gate_and_registers_into_a_booted_island() {
+        // Cold: the mirror (the gate + boot-replay source) updates without booting.
+        let cold = IslandPcService::new(
+            PathBuf::from("/ws"),
+            vec![target_config("old")],
+            empty_resolver(),
+        );
+        cold.reconfigure_targets(vec![target_config("new")]);
+        assert!(cold.is_registered("new"));
+        assert!(!cold.is_registered("old"));
+        assert!(!cold.is_booted(), "reconfigure must not boot the island");
+
+        // Booted: the new targets are (re-)registered into the running island.
+        let (booted_pc, calls) = booted("old", vec![Ok(Vec::new()), Ok(Vec::new())]);
+        booted_pc.reconfigure_targets(vec![target_config("new"), target_config("old")]);
+        assert!(booted_pc.is_registered("new"));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "both targets re-registered into the booted island"
         );
     }
 

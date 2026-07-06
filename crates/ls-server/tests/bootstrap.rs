@@ -21,9 +21,10 @@ use ls_engine::{CompileOutcome, CompileService};
 use ls_index_model::uri::{normalize_uri, path_to_uri};
 use ls_index_model::LsError;
 use ls_server::{
-    serve, Bootstrap, BootstrapContext, CoreHandlers, CoreServices, DocumentStore, Handlers,
-    IndexBootstrap, LoadOutcome, ModelSource, PcLocation, PcQueryService, PublishDiagnosticsParams,
-    ReadyModel, Request, RequestContext, RequestId, ServerCore, ServerHooks, WorkspaceState,
+    reload_build_model, serve, Bootstrap, BootstrapContext, BuildCompiler, CoreHandlers,
+    CoreServices, DocumentStore, Handlers, IndexBootstrap, LoadOutcome, ModelSource, PcLocation,
+    PcQueryService, PublishDiagnosticsParams, ReadyModel, Request, RequestContext, RequestId,
+    ServerCore, ServerHooks, WorkspaceState,
 };
 
 fn fixtures_root() -> PathBuf {
@@ -181,10 +182,8 @@ fn production_bootstrap_ingests_the_model_and_serves_real_queries() {
     let mut core = ServerCore::new();
     let bootstrap = IndexBootstrap::new(|_root: &Path| Ok(fixture_model()));
     let publish = |_p: PublishDiagnosticsParams| {};
-    let on_changed = || {};
     let hooks = ServerHooks {
         publish_diagnostics: &publish,
-        on_build_targets_changed: &on_changed,
     };
     serve(
         &mut reader,
@@ -370,10 +369,8 @@ fn a_source_owned_by_a_non_indexable_target_is_no_semanticdb() {
     let mut core = ServerCore::new();
     let bootstrap = IndexBootstrap::new(|_root: &Path| Ok(model_with_non_indexable_owner().0));
     let publish = |_p: PublishDiagnosticsParams| {};
-    let on_changed = || {};
     let hooks = ServerHooks {
         publish_diagnostics: &publish,
-        on_build_targets_changed: &on_changed,
     };
     serve(
         &mut reader,
@@ -436,6 +433,12 @@ impl CompileService for RecordingCompiler {
     }
 }
 
+impl BuildCompiler for RecordingCompiler {
+    fn refetch_model(&self) -> Result<BspProjectModel, String> {
+        Err("recording compiler does not refetch".to_string())
+    }
+}
+
 /// Injects the real fixture model plus a recording compiler into the bootstrap.
 struct CompilingModelSource {
     succeed: bool,
@@ -464,6 +467,221 @@ impl ModelSource for NoBspSource {
     fn load(&self, _root: &Path) -> Result<LoadOutcome, String> {
         Ok(LoadOutcome::NoBsp)
     }
+}
+
+/// The fixture model with `fixture-c` removed (its target and its URI ownership),
+/// so a reload back to the full model is observable: `fixture-c` becomes
+/// registered, owns its sources, and its SemanticDB (the `CopyCore` `Core`) is
+/// reingested.
+fn fixture_model_ab_only() -> BspProjectModel {
+    let full = fixture_model();
+    let targets = full
+        .targets
+        .into_iter()
+        .filter(|t| t.bsp_id != "fixture-c")
+        .collect();
+    let uri_to_target = full
+        .uri_to_target
+        .into_iter()
+        .filter(|(_, t)| t != "fixture-c")
+        .collect();
+    BspProjectModel::new(targets, uri_to_target)
+}
+
+/// A compile capability whose model refetch returns a scripted model, so a
+/// build-target-change reload runs over a retained session without a live server.
+struct ReloadingCompiler {
+    reload_model: BspProjectModel,
+}
+
+impl CompileService for ReloadingCompiler {
+    fn compile(&self, _targets: &[String]) -> CompileOutcome {
+        CompileOutcome::Ok
+    }
+}
+
+impl BuildCompiler for ReloadingCompiler {
+    fn refetch_model(&self) -> Result<BspProjectModel, String> {
+        Ok(self.reload_model.clone())
+    }
+}
+
+/// A model source that loads `initial` and whose retained compiler refetches
+/// `reload` — the model the build server reports after a `buildTarget/didChange`.
+struct ReloadingModelSource {
+    initial: BspProjectModel,
+    reload: BspProjectModel,
+}
+
+impl ModelSource for ReloadingModelSource {
+    fn load(&self, _root: &Path) -> Result<LoadOutcome, String> {
+        Ok(LoadOutcome::Model(ReadyModel {
+            model: self.initial.clone(),
+            compiler: Box::new(ReloadingCompiler {
+                reload_model: self.reload.clone(),
+            }),
+        }))
+    }
+}
+
+fn ready_over<M: ModelSource>(
+    bootstrap: &IndexBootstrap<M>,
+    root: &Path,
+    documents: &DocumentStore,
+) -> CoreServices {
+    let publish = |_p: PublishDiagnosticsParams| {};
+    let cx = BootstrapContext {
+        workspace_root: Some(root),
+        documents,
+        publish_diagnostics: &publish,
+    };
+    match bootstrap.run(cx) {
+        WorkspaceState::Ready(services) => services,
+        other => panic!("expected Ready, got {:?}", other.status_line()),
+    }
+}
+
+// Ports ScalaLs.reloadBuildModel: a build-target change refetches the model over
+// the retained session, reingests into the reused store, rebuilds the URI
+// ownership, and re-registers the PC target set into the reused island.
+#[test]
+fn a_build_target_change_reload_refetches_reingests_and_reconfigures() {
+    let dir = tempfile::tempdir().unwrap();
+    let documents = DocumentStore::new();
+    let bootstrap = IndexBootstrap::new(ReloadingModelSource {
+        initial: fixture_model_ab_only(),
+        reload: fixture_model(),
+    });
+    let before = ready_over(&bootstrap, dir.path(), &documents);
+    // Before the reload the c target is unknown: unregistered, unowned, and its
+    // `CopyCore` `Core` is not indexed.
+    assert!(!before.pc.is_registered("fixture-c"));
+    assert!(!before.uri_to_target.values().any(|t| t == "fixture-c"));
+    let core_hits_before = before.orchestrator.workspace_symbols("Core", 100).len();
+
+    let after = match reload_build_model(before, &documents) {
+        WorkspaceState::Ready(services) => services,
+        other => panic!("expected Ready after reload, got {:?}", other.status_line()),
+    };
+    // After the reload the refetched model's c target is registered, owns its
+    // sources, and its symbols were reingested into the reused store.
+    assert!(after.pc.is_registered("fixture-c"));
+    assert!(after.uri_to_target.values().any(|t| t == "fixture-c"));
+    assert!(
+        after.orchestrator.workspace_symbols("Core", 100).len() > core_hits_before,
+        "reingest did not add the c target's Core symbol"
+    );
+}
+
+// A transient refetch failure keeps serving the previous ready snapshot rather
+// than dropping the workspace to a failed state (the Scala `catch NonFatal`).
+#[test]
+fn a_build_target_change_reload_keeps_the_snapshot_on_a_refetch_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let documents = DocumentStore::new();
+    // The closure blanket source gives an `UnavailableCompiler`, whose
+    // `refetch_model` fails, so the reload must keep the loaded snapshot.
+    let bootstrap = IndexBootstrap::new(|_root: &Path| Ok(fixture_model_ab_only()));
+    let before = ready_over(&bootstrap, dir.path(), &documents);
+    let owned_before = before.uri_to_target.len();
+
+    let after = match reload_build_model(before, &documents) {
+        WorkspaceState::Ready(services) => services,
+        other => panic!(
+            "a failed refetch must keep the ready snapshot, got {:?}",
+            other.status_line()
+        ),
+    };
+    assert_eq!(after.uri_to_target.len(), owned_before);
+    assert!(!after.pc.is_registered("fixture-c"));
+}
+
+// A build-target change to a model with NO indexable targets must NOT wipe the
+// index: Scala gates its reingest on `workspaceTargets.targets.nonEmpty`, so the
+// prior segment is kept and the un-gated workspace/symbol still answers the old
+// symbols even though the new (empty) model owns no URIs.
+#[test]
+fn a_build_target_change_reload_to_an_empty_model_keeps_the_prior_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let documents = DocumentStore::new();
+    let bootstrap = IndexBootstrap::new(ReloadingModelSource {
+        initial: fixture_model(),
+        reload: BspProjectModel::new(Vec::new(), HashMap::new()),
+    });
+    let before = ready_over(&bootstrap, dir.path(), &documents);
+    let hits_before = before.orchestrator.workspace_symbols("Core", 100).len();
+    assert!(
+        hits_before > 0,
+        "the fixture should index some Core symbols"
+    );
+
+    let after = match reload_build_model(before, &documents) {
+        WorkspaceState::Ready(services) => services,
+        other => panic!("expected Ready, got {:?}", other.status_line()),
+    };
+    // The empty model owns no URIs, but the prior segment is retained, so the
+    // un-gated workspace/symbol still answers the old symbols (not an empty index).
+    assert!(after.uri_to_target.is_empty());
+    assert_eq!(
+        after.orchestrator.workspace_symbols("Core", 100).len(),
+        hits_before,
+        "an empty-model reload must keep the prior index, not wipe it"
+    );
+}
+
+// End-to-end over the serve loop: a build-target change flagged during startup is
+// drained on the first ready turn, so the following workspace/symbol reflects the
+// reloaded model (the c target's CopyCore.scala hit appears).
+#[test]
+fn a_build_target_change_reloads_the_model_over_the_serve_loop() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = ReloadingModelSource {
+        initial: fixture_model_ab_only(),
+        reload: fixture_model(),
+    };
+    let input = [
+        frame(request(
+            1,
+            "initialize",
+            json!({ "rootUri": path_to_uri(dir.path()) }),
+        )),
+        frame(notification("initialized", json!({}))),
+        frame(request(2, "workspace/symbol", json!({ "query": "Core" }))),
+        frame(notification("exit", json!({}))),
+    ]
+    .concat();
+    let mut reader = Cursor::new(input);
+    let mut writer = Vec::new();
+    let mut core = ServerCore::new();
+    // The build server reports a target change during startup: the flag is set and
+    // drained on the first ready turn (before the workspace/symbol query).
+    core.reload_flag()
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let publish = |_p: PublishDiagnosticsParams| {};
+    let hooks = ServerHooks {
+        publish_diagnostics: &publish,
+    };
+    serve(
+        &mut reader,
+        &mut writer,
+        &mut core,
+        &CoreHandlers,
+        &IndexBootstrap::new(source),
+        &hooks,
+    )
+    .unwrap();
+    let out = responses(writer);
+    let symbols = out[1]["result"]
+        .as_array()
+        .expect("workspace/symbol returns an array");
+    assert!(
+        symbols.iter().any(|s| s["location"]["uri"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("CopyCore.scala")),
+        "reload did not reingest the c target: {:?}",
+        out[1]["result"]
+    );
 }
 
 /// Bootstrap over the fixture model with a recording compiler, run the `compile`
@@ -498,10 +716,8 @@ fn run_compile(succeed: bool, fail_reason: &str) -> (Value, Vec<Vec<String>>) {
     let mut core = ServerCore::new();
     let bootstrap = IndexBootstrap::new(source);
     let publish = |_p: PublishDiagnosticsParams| {};
-    let on_changed = || {};
     let hooks = ServerHooks {
         publish_diagnostics: &publish,
-        on_build_targets_changed: &on_changed,
     };
     serve(
         &mut reader,
@@ -583,10 +799,8 @@ fn run_rename(succeed: bool, new_name: &str) -> (Value, Vec<Vec<String>>) {
     let mut core = ServerCore::new();
     let bootstrap = IndexBootstrap::new(source);
     let publish = |_p: PublishDiagnosticsParams| {};
-    let on_changed = || {};
     let hooks = ServerHooks {
         publish_diagnostics: &publish,
-        on_build_targets_changed: &on_changed,
     };
     serve(
         &mut reader,
@@ -657,12 +871,10 @@ fn ready_fixture_services() -> (CoreServices, tempfile::TempDir) {
     let bootstrap = IndexBootstrap::new(|_root: &Path| Ok(fixture_model()));
     let documents = DocumentStore::new();
     let publish = |_p: PublishDiagnosticsParams| {};
-    let on_changed = || {};
     let cx = BootstrapContext {
         workspace_root: Some(store_root.path()),
         documents: &documents,
         publish_diagnostics: &publish,
-        on_build_targets_changed: &on_changed,
     };
     match bootstrap.run(cx) {
         WorkspaceState::Ready(services) => (services, store_root),
@@ -981,13 +1193,11 @@ fn ready_replays_pre_opened_buffers_into_the_pc_mirror() {
     // Opened during the pre-ready window.
     documents.open(&core_uri, "class Core\n");
     let publish = |_p: PublishDiagnosticsParams| {};
-    let on_changed = || {};
     let services =
         match IndexBootstrap::new(|_root: &Path| Ok(fixture_model())).run(BootstrapContext {
             workspace_root: Some(store_root.path()),
             documents: &documents,
             publish_diagnostics: &publish,
-            on_build_targets_changed: &on_changed,
         }) {
             WorkspaceState::Ready(services) => services,
             other => panic!("bootstrap not ready: {}", other.status_line()),
@@ -1086,10 +1296,8 @@ fn no_bsp_connection_is_a_deferred_failed_bootstrap() {
     let mut core = ServerCore::new();
     let bootstrap = IndexBootstrap::new(NoBspSource);
     let publish = |_p: PublishDiagnosticsParams| {};
-    let on_changed = || {};
     let hooks = ServerHooks {
         publish_diagnostics: &publish,
-        on_build_targets_changed: &on_changed,
     };
     serve(
         &mut reader,

@@ -20,8 +20,8 @@ pub mod services;
 pub mod workspace_uris;
 
 pub use bootstrap::{
-    from_bsp, workspace_source_facts, BspDocFacts, IndexBootstrap, LiveBspModelSource, LoadOutcome,
-    ModelSource, ReadyModel,
+    from_bsp, reload_build_model, workspace_source_facts, BspDocFacts, IndexBootstrap,
+    LiveBspModelSource, LoadOutcome, ModelSource, ReadyModel,
 };
 pub use capabilities::{
     initialize_result, server_capabilities, InitializeResult, ServerCapabilities, SERVER_NAME,
@@ -48,6 +48,6 @@ pub use server::{
 };
 pub use services::{
     highlights_to_lsp, pc_locations_to_lsp, references_locations, workspace_symbol_of,
-    CoreHandlers, CoreServices,
+    BuildCompiler, CoreHandlers, CoreServices,
 };
 pub use workspace_uris::WorkspaceUris;

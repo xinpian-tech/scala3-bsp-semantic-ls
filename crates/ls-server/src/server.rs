@@ -19,6 +19,8 @@
 
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use serde_json::{json, Value};
 
@@ -34,20 +36,27 @@ use crate::lifecycle::{pre_ready_outcome, require_ready, Method, PreReadyOutcome
 use crate::protocol::PublishDiagnosticsParams;
 
 /// The inputs and callbacks the bootstrap needs: the normalized workspace root,
-/// the open-buffer document store, a hook to publish build diagnostics to the
-/// client, and a hook the build server calls when its target set changes.
+/// the open-buffer document store, and a hook to publish build diagnostics to the
+/// client.
 pub struct BootstrapContext<'a> {
     pub workspace_root: Option<&'a Path>,
     pub documents: &'a DocumentStore,
     pub publish_diagnostics: &'a dyn Fn(PublishDiagnosticsParams),
-    pub on_build_targets_changed: &'a dyn Fn(),
 }
 
 /// The workspace bootstrap, run on `initialized`. It discovers the build server,
 /// boots the JVM, and ingests, producing either the ready services or a failure;
-/// tests inject a fixed transition.
+/// tests inject a fixed transition. It also reloads the ready services after a
+/// build-target change, refetching over the retained session (default: keep the
+/// current services — a fixed/fake bootstrap has nothing to refetch).
 pub trait Bootstrap<S> {
     fn run(&self, cx: BootstrapContext<'_>) -> WorkspaceState<S>;
+
+    /// Reload the ready services after the build server reports its targets
+    /// changed, reusing the durable handles. `old` is the current ready bundle.
+    fn reload(&self, old: S, _documents: &DocumentStore) -> WorkspaceState<S> {
+        WorkspaceState::Ready(old)
+    }
 }
 
 /// The context a ready-path handler receives: the request plus everything the
@@ -91,10 +100,11 @@ pub trait Handlers<S> {
 }
 
 /// The client-facing callbacks the server is wired with: publishing diagnostics
-/// and reacting to build-target changes.
+/// to the editor. (The build server's target-change notification is wired
+/// directly into the live model source's session, which sets the loop's reload
+/// flag; it does not flow through here.)
 pub struct ServerHooks<'a> {
     pub publish_diagnostics: &'a dyn Fn(PublishDiagnosticsParams),
-    pub on_build_targets_changed: &'a dyn Fn(),
 }
 
 /// The mutable server state driven by the message loop.
@@ -104,6 +114,11 @@ pub struct ServerCore<S> {
     pub workspace_root: Option<PathBuf>,
     pub shutting_down: bool,
     initialized: bool,
+    /// Set (from the build server's reader thread) when the build targets change;
+    /// drained on the message loop, which reloads the ready model. An `AtomicBool`
+    /// is the only state shared with the reader thread — the reload itself runs on
+    /// the loop, so the ready services stay single-threaded.
+    reload_requested: Arc<AtomicBool>,
 }
 
 impl<S> ServerCore<S> {
@@ -116,7 +131,14 @@ impl<S> ServerCore<S> {
             workspace_root: None,
             shutting_down: false,
             initialized: false,
+            reload_requested: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// A handle to the build-targets-changed flag, for the live model source to
+    /// set from the BSP reader thread when the server reports a target change.
+    pub fn reload_flag(&self) -> Arc<AtomicBool> {
+        self.reload_requested.clone()
     }
 
     /// Handles `initialize`: records the workspace root and, unless the workspace
@@ -141,7 +163,6 @@ impl<S> ServerCore<S> {
                 workspace_root: self.workspace_root.as_deref(),
                 documents: &self.docs,
                 publish_diagnostics: hooks.publish_diagnostics,
-                on_build_targets_changed: hooks.on_build_targets_changed,
             };
             bootstrap.run(cx)
         };
@@ -230,6 +251,7 @@ pub fn serve<S>(
     hooks: &ServerHooks<'_>,
 ) -> io::Result<()> {
     while let Some(body) = read_frame(reader)? {
+        poll_reload(core, bootstrap);
         match parse_incoming(&body) {
             Ok(Incoming::Request(request)) => {
                 let response = dispatch_request(core, handlers, request);
@@ -244,6 +266,31 @@ pub fn serve<S>(
         }
     }
     Ok(())
+}
+
+/// Drains the build-targets-changed flag: when the build server has reported a
+/// target change and the workspace is ready (and not shutting down), reload the
+/// model on the message loop, reusing the durable handles. The flag is left set
+/// while the workspace is not yet ready, so a change during bootstrap reloads on
+/// the first ready turn (ports `ScalaLs.onBuildTargetsChanged`). The reload runs
+/// here on the loop thread, so the ready services stay single-threaded.
+fn poll_reload<S>(core: &mut ServerCore<S>, bootstrap: &impl Bootstrap<S>) {
+    if core.shutting_down || !core.state.is_ready() {
+        return;
+    }
+    if !core.reload_requested.swap(false, Ordering::SeqCst) {
+        return;
+    }
+    let taken = std::mem::replace(
+        &mut core.state,
+        WorkspaceState::NotReady {
+            detail: "reloading the build model".to_string(),
+        },
+    );
+    core.state = match taken {
+        WorkspaceState::Ready(old) => bootstrap.reload(old, &core.docs),
+        other => other,
+    };
 }
 
 fn dispatch_request<S>(
@@ -546,10 +593,8 @@ mod tests {
         let mut writer = Vec::new();
         let mut core = ServerCore::new();
         let publish = |_p: PublishDiagnosticsParams| {};
-        let on_changed = || {};
         let hooks = ServerHooks {
             publish_diagnostics: &publish,
-            on_build_targets_changed: &on_changed,
         };
         serve(
             &mut reader,
@@ -676,13 +721,13 @@ mod tests {
         }
     }
 
-    // Bootstrap receives the workspace root, the open documents, and both hooks.
+    // Bootstrap receives the workspace root, the open documents, and the
+    // diagnostics-publishing hook.
     #[test]
-    fn bootstrap_receives_root_documents_and_hooks() {
+    fn bootstrap_receives_root_documents_and_publish() {
         struct RecordingBootstrap;
         impl Bootstrap<FakeServices> for RecordingBootstrap {
             fn run(&self, cx: BootstrapContext<'_>) -> WorkspaceState<FakeServices> {
-                (cx.on_build_targets_changed)();
                 (cx.publish_diagnostics)(PublishDiagnosticsParams {
                     uri: "file:///ws/a.scala".to_string(),
                     diagnostics: Vec::new(),
@@ -713,13 +758,10 @@ mod tests {
         );
         let mut writer = Vec::new();
         let mut core = ServerCore::new();
-        let changed = Cell::new(0);
         let published = Cell::new(0);
-        let on_changed = || changed.set(changed.get() + 1);
         let publish = |_p: PublishDiagnosticsParams| published.set(published.get() + 1);
         let hooks = ServerHooks {
             publish_diagnostics: &publish,
-            on_build_targets_changed: &on_changed,
         };
         serve(
             &mut reader,
@@ -731,13 +773,52 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(
-            changed.get(),
-            1,
-            "on_build_targets_changed hook not received"
-        );
         assert_eq!(published.get(), 1, "publish_diagnostics hook not received");
         assert_eq!(core.state.ready().unwrap().tag, "root=/ws docs=1");
+    }
+
+    // poll_reload reloads only when the workspace is ready, not shutting down, and
+    // a build-target change was flagged; a change flagged before ready stays
+    // pending (drained on the first ready turn), and a shutting-down server never
+    // reloads. Ports ScalaLs.onBuildTargetsChanged's gating.
+    #[test]
+    fn poll_reload_reloads_only_when_ready_and_requested() {
+        struct ReloadingBootstrap;
+        impl Bootstrap<FakeServices> for ReloadingBootstrap {
+            fn run(&self, _cx: BootstrapContext<'_>) -> WorkspaceState<FakeServices> {
+                ready("initial")
+            }
+            fn reload(
+                &self,
+                _old: FakeServices,
+                _documents: &DocumentStore,
+            ) -> WorkspaceState<FakeServices> {
+                ready("reloaded")
+            }
+        }
+
+        // Ready + flagged -> reload runs and clears the flag.
+        let mut core: ServerCore<FakeServices> = ServerCore::new();
+        core.state = ready("initial");
+        core.reload_flag().store(true, Ordering::SeqCst);
+        poll_reload(&mut core, &ReloadingBootstrap);
+        assert_eq!(core.state.ready().unwrap().tag, "reloaded");
+        assert!(!core.reload_requested.load(Ordering::SeqCst));
+
+        // Not ready + flagged -> no reload; the flag stays set for the ready turn.
+        let mut pending: ServerCore<FakeServices> = ServerCore::new();
+        pending.reload_flag().store(true, Ordering::SeqCst);
+        poll_reload(&mut pending, &ReloadingBootstrap);
+        assert!(!pending.state.is_ready());
+        assert!(pending.reload_requested.load(Ordering::SeqCst));
+
+        // Shutting down + ready + flagged -> no reload.
+        let mut down: ServerCore<FakeServices> = ServerCore::new();
+        down.state = ready("initial");
+        down.shutting_down = true;
+        down.reload_flag().store(true, Ordering::SeqCst);
+        poll_reload(&mut down, &ReloadingBootstrap);
+        assert_eq!(down.state.ready().unwrap().tag, "initial");
     }
 
     // Doctor renders the state header from the context in every state.
@@ -977,10 +1058,8 @@ mod tests {
             let mut core = ServerCore::new();
             let handlers = RecordingHandlers::default();
             let publish = |_p: PublishDiagnosticsParams| {};
-            let on_changed = || {};
             let hooks = ServerHooks {
                 publish_diagnostics: &publish,
-                on_build_targets_changed: &on_changed,
             };
             let bootstrap = if ready_state {
                 FixedBootstrap(ready("svc"))

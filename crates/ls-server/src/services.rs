@@ -17,8 +17,10 @@
 //! `definition`/`typeDefinition` (the location family) and the
 //! `completion`/`hover`/`signatureHelp` queries (decoding the island's flat
 //! `#[repr(C)]` result carriers to the LSP result shapes). `completionItem/
-//! resolve` echoes the item back unchanged (the Scala `case _ => item` fallback)
-//! until its presentation-compiler enrichment path attaches.
+//! resolve` enriches the item through the presentation compiler when it carries a
+//! SemanticDB symbol and the last completion's target is still registered,
+//! echoing the item back unchanged otherwise (the Scala `case _ => item`
+//! fallback).
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -26,6 +28,7 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Value};
 
+use ls_bsp::model::BspProjectModel;
 use ls_engine::{
     CompileOutcome, CompileService, DocHighlight, DocumentHighlightService, IngestReport,
     QueryOrchestrator, ReferencesEngine, ReferencesResult, RenameEngine, WorkspaceSymbolEntry,
@@ -55,10 +58,11 @@ pub struct CoreServices {
     /// names the PC target a buffer's PC request runs against.
     pub uri_to_target: HashMap<String, String>,
     /// The live build compile capability (the Scala `CoreServices.compiler`):
-    /// the `compile` executeCommand and the rename compile ladder run through it.
-    /// In production it retains the BSP session; index-only injections get the
-    /// disconnected stub.
-    pub compiler: Box<dyn CompileService>,
+    /// the `compile` executeCommand and the rename compile ladder run through it,
+    /// and the build-target-change reload refetches the project model over its
+    /// retained session. In production it retains the BSP session; index-only
+    /// injections get the disconnected stub.
+    pub compiler: Box<dyn BuildCompiler>,
     /// The presentation-compiler query capability (the Scala `CoreServices.pc`):
     /// the definition-family PC methods run through it. In production it lazily
     /// boots the embedded JVM island on the first PC request.
@@ -74,6 +78,19 @@ pub struct CoreServices {
     last_completion_target: Mutex<Option<String>>,
 }
 
+/// The retained build capability: a [`CompileService`] that can also refetch the
+/// project model over its live session. The build-target-change reload uses
+/// `refetch_model` to reload the model without relaunching or re-initializing the
+/// server (the Scala `Bootstrap.loadModel(session, …, initialize = false)`), while
+/// `compile`/rename keep using the [`CompileService`] surface. The disconnected
+/// stub reports no session for both.
+pub trait BuildCompiler: CompileService {
+    /// Refetch the build project model over the retained session, or a
+    /// human-readable detail on failure (a transient refetch error keeps the
+    /// previous ready snapshot rather than dropping the workspace).
+    fn refetch_model(&self) -> Result<BspProjectModel, String>;
+}
+
 impl CoreServices {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -81,7 +98,7 @@ impl CoreServices {
         uris: WorkspaceUris,
         workspace_root: Option<PathBuf>,
         uri_to_target: HashMap<String, String>,
-        compiler: Box<dyn CompileService>,
+        compiler: Box<dyn BuildCompiler>,
         pc: Box<dyn PcQueryService>,
         bsp_connected: bool,
     ) -> CoreServices {
@@ -601,7 +618,8 @@ fn ingest_summary(report: &IngestReport) -> String {
 
 /// The disconnected compile capability: the default for index-only bundles that
 /// carry no live build server (test injections, and the `prepareRename` engine,
-/// which never compiles). A compile request reports no build server is connected.
+/// which never compiles). A compile request reports no build server is connected,
+/// and a model refetch reports there is no session to refetch over.
 pub(crate) struct UnavailableCompiler;
 
 impl CompileService for UnavailableCompiler {
@@ -609,6 +627,12 @@ impl CompileService for UnavailableCompiler {
         CompileOutcome::Failed {
             reason: "no build server connected".to_string(),
         }
+    }
+}
+
+impl BuildCompiler for UnavailableCompiler {
+    fn refetch_model(&self) -> Result<BspProjectModel, String> {
+        Err("no build server connected".to_string())
     }
 }
 
