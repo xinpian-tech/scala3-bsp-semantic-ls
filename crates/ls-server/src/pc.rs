@@ -26,7 +26,10 @@ use std::time::Duration;
 use ls_jvm::backend::VtableBackend;
 use ls_jvm::watchdog::{PcError, PcRequest, QueryKind, Supervisor};
 use ls_jvm::{boot_island, install_symbol_definition_resolver, IslandConfig};
-use ls_pc_abi::payloads::{DefinitionResult, LocationsResult, TargetConfig};
+use ls_pc_abi::payloads::{
+    CompletionList, DefinitionResult, HoverResult, LocationsResult, SignatureHelp, TargetConfig,
+};
+use serde_json::Value;
 
 /// A resolved definition location, in the LSP coordinate system (zero-based
 /// lines, UTF-16 characters, end-exclusive). The seam's own type so the trait
@@ -70,6 +73,19 @@ pub trait PcQueryService: Send + Sync {
 
     /// Go-to-type-definition, otherwise identical to [`PcQueryService::definition`].
     fn type_definition(&self, uri: &str, line: u32, character: u32) -> Vec<PcLocation>;
+
+    /// Completion at `(line, character)` in the mirrored buffer `uri`, as an LSP
+    /// `CompletionList` JSON value. An empty, complete list when the presentation
+    /// compiler yields nothing (the Scala `emptyCompletions()` fallback).
+    fn completion(&self, uri: &str, line: u32, character: u32) -> Value;
+
+    /// Hover at `(line, character)`, as an LSP `Hover` JSON value, or `null` when
+    /// the presentation compiler has nothing at the point.
+    fn hover(&self, uri: &str, line: u32, character: u32) -> Value;
+
+    /// Signature help at `(line, character)`, as an LSP `SignatureHelp` JSON value,
+    /// or `null` when the presentation compiler has nothing at the point.
+    fn signature_help(&self, uri: &str, line: u32, character: u32) -> Value;
 }
 
 /// The `symbol_definition` resolver the island calls when the presentation
@@ -224,10 +240,17 @@ impl IslandPcService {
 
     /// Ensures the island is booted (booting + replaying the mirrored buffers on
     /// the first query), dispatches the query against the already-mirrored buffer,
-    /// and decodes the locations. Any boundary/decode failure degrades to an empty
-    /// result, matching the Scala PC methods' empty/null fallback when the
-    /// compiler yields nothing.
-    fn query(&self, kind: QueryKind, uri: &str, line: u32, character: u32) -> Vec<PcLocation> {
+    /// and returns the raw reply bytes. `None` on a boot failure or any boundary
+    /// error, so each query method degrades to its own empty/null fallback —
+    /// matching the Scala PC methods' empty/null result when the compiler yields
+    /// nothing. The per-query carrier is decoded by the caller.
+    fn query_reply(
+        &self,
+        kind: QueryKind,
+        uri: &str,
+        line: u32,
+        character: u32,
+    ) -> Option<Vec<u8>> {
         let mut guard = self.state.lock().expect("pc island state mutex");
         let state = &mut *guard;
 
@@ -235,24 +258,32 @@ impl IslandPcService {
         // is the first thing that boots the island (so an index-only session that
         // only opens buffers keeps a zero-JVM process).
         if state.driver.is_none() && !boot(state) {
-            return Vec::new();
+            return None;
         }
-        let Some(driver) = state.driver.as_mut() else {
-            return Vec::new();
-        };
-        let reply = match driver.request(PcRequest::Query {
-            kind,
-            uri: uri.to_string(),
-            line,
-            character,
-        }) {
-            Ok(reply) => reply,
-            Err(_) => return Vec::new(),
-        };
-        match DefinitionResult::decode(&reply) {
-            Ok(result) => result.locations.into_iter().map(pc_location_of).collect(),
-            Err(_) => Vec::new(),
-        }
+        let driver = state.driver.as_mut()?;
+        driver
+            .request(PcRequest::Query {
+                kind,
+                uri: uri.to_string(),
+                line,
+                character,
+            })
+            .ok()
+    }
+
+    /// Dispatches a definition-family query and decodes the `DefinitionResult`
+    /// carrier to seam locations, degrading to empty on any boundary/decode failure.
+    fn definition_query(
+        &self,
+        kind: QueryKind,
+        uri: &str,
+        line: u32,
+        character: u32,
+    ) -> Vec<PcLocation> {
+        self.query_reply(kind, uri, line, character)
+            .and_then(|reply| DefinitionResult::decode(&reply).ok())
+            .map(|result| result.locations.into_iter().map(pc_location_of).collect())
+            .unwrap_or_default()
     }
 }
 
@@ -341,11 +372,32 @@ impl PcQueryService for IslandPcService {
     }
 
     fn definition(&self, uri: &str, line: u32, character: u32) -> Vec<PcLocation> {
-        self.query(QueryKind::Definition, uri, line, character)
+        self.definition_query(QueryKind::Definition, uri, line, character)
     }
 
     fn type_definition(&self, uri: &str, line: u32, character: u32) -> Vec<PcLocation> {
-        self.query(QueryKind::TypeDefinition, uri, line, character)
+        self.definition_query(QueryKind::TypeDefinition, uri, line, character)
+    }
+
+    fn completion(&self, uri: &str, line: u32, character: u32) -> Value {
+        self.query_reply(QueryKind::Completion, uri, line, character)
+            .and_then(|reply| CompletionList::decode(&reply).ok())
+            .map(|list| crate::pc_convert::completion_list(&list))
+            .unwrap_or_else(crate::pc_convert::empty_completions)
+    }
+
+    fn hover(&self, uri: &str, line: u32, character: u32) -> Value {
+        self.query_reply(QueryKind::Hover, uri, line, character)
+            .and_then(|reply| HoverResult::decode(&reply).ok())
+            .map(|result| crate::pc_convert::hover_result(&result))
+            .unwrap_or(Value::Null)
+    }
+
+    fn signature_help(&self, uri: &str, line: u32, character: u32) -> Value {
+        self.query_reply(QueryKind::SignatureHelp, uri, line, character)
+            .and_then(|reply| SignatureHelp::decode(&reply).ok())
+            .map(|help| crate::pc_convert::signature_help(&help))
+            .unwrap_or(Value::Null)
     }
 }
 
@@ -752,5 +804,56 @@ mod tests {
         let (pc, _calls) = booted("t", vec![Ok(Vec::new()), Err(PcError::Backend(-1))]);
         pc.did_open("t", a, "object A");
         assert!(pc.definition(a, 0, 0).is_empty());
+    }
+
+    // A booted completion decodes the `CompletionList` carrier and renders it as
+    // LSP JSON; a backend error degrades to an empty, complete completion list.
+    #[test]
+    fn a_booted_completion_decodes_the_list_and_degrades_to_empty() {
+        let a = "file:///ws/a.scala";
+        let reply = CompletionList {
+            is_incomplete: false,
+            item_defaults: None,
+            apply_kind: None,
+            items: vec![ls_pc_abi::payloads::CompletionItem {
+                label: "foo".to_string(),
+                label_details: None,
+                kind: Some(2),
+                tags: None,
+                detail: None,
+                documentation: None,
+                deprecated: None,
+                preselect: None,
+                sort_text: None,
+                filter_text: None,
+                insert_text: None,
+                insert_text_format: None,
+                insert_text_mode: None,
+                text_edit: None,
+                text_edit_text: None,
+                additional_text_edits: None,
+                commit_characters: None,
+                command: None,
+                data: None,
+            }],
+        }
+        .encode()
+        .expect("encode completion list");
+
+        // did_open consumes the first Ok; the completion query consumes the list.
+        let (pc, _calls) = booted("t", vec![Ok(Vec::new()), Ok(reply)]);
+        pc.did_open("t", a, "object A");
+        let value = pc.completion(a, 0, 0);
+        assert_eq!(value["isIncomplete"], false);
+        assert_eq!(value["items"][0]["label"], "foo");
+        assert_eq!(value["items"][0]["kind"], 2);
+
+        // A backend error on the query degrades to an empty, complete list.
+        let (pc, _calls) = booted("t", vec![Ok(Vec::new()), Err(PcError::Backend(-1))]);
+        pc.did_open("t", a, "object A");
+        assert_eq!(
+            pc.completion(a, 0, 0),
+            crate::pc_convert::empty_completions()
+        );
     }
 }

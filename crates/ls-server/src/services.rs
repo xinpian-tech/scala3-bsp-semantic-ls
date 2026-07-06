@@ -13,10 +13,12 @@
 //! [`DocumentHighlightService`] / workspace-symbol resolver / [`RenameEngine`]
 //! and the retained build compiler, each gated (where the source applies it) by
 //! `requireSemanticdb`, converting SemanticDB coordinates and URIs to the LSP
-//! result shapes. It also wires `definition`/`typeDefinition` over the embedded
-//! PC island (`CoreServices.pc`). The remaining PC-backed ready methods
-//! (completion/resolve/hover/signatureHelp) attach as their result carriers are
-//! wired; until then they answer a typed placeholder error.
+//! result shapes. It also wires the PC-island methods over `CoreServices.pc`:
+//! `definition`/`typeDefinition` (the location family) and the
+//! `completion`/`hover`/`signatureHelp` queries (decoding the island's flat
+//! `#[repr(C)]` result carriers to the LSP result shapes). `completionItem/
+//! resolve` echoes the item back unchanged (the Scala `case _ => item` fallback)
+//! until its presentation-compiler enrichment path attaches.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -154,6 +156,14 @@ impl Handlers<CoreServices> for CoreHandlers {
             "textDocument/rename" => rename(id, cx.services, &cx.request.params),
             "textDocument/definition" => definition(id, cx.services, &cx.request.params),
             "textDocument/typeDefinition" => type_definition(id, cx.services, &cx.request.params),
+            "textDocument/completion" => completion(id, cx.services, &cx.request.params),
+            "textDocument/hover" => hover(id, cx.services, &cx.request.params),
+            "textDocument/signatureHelp" => signature_help(id, cx.services, &cx.request.params),
+            // Advertised as `resolveProvider`; the presentation-compiler enrichment
+            // path is not yet attached, so — like the pre-ready dispatch and the
+            // Scala `case _ => item` fallback — echo the item back unchanged rather
+            // than answer a typed error.
+            "completionItem/resolve" => Response::success(id, cx.request.params.clone()),
             "workspace/executeCommand" => execute_command(id, cx.services, &cx.request.params),
             other => not_implemented(id, other),
         }
@@ -387,6 +397,77 @@ fn pc_locations(
     ok_json(id, &pc_locations_to_lsp(&locations))
 }
 
+/// `textDocument/completion`: presentation-compiler completion over the open
+/// (dirty) buffer, as an LSP `CompletionList`. Ports `ScalaLs.completion` — the
+/// `withPcBuffer` fallback is an empty, complete completion list. Records the
+/// buffer's target as `lastCompletionTarget` is deferred with the resolve
+/// enrichment; the list itself is complete.
+fn completion(id: RequestId, services: &CoreServices, params: &Value) -> Response {
+    pc_value(
+        id,
+        services,
+        params,
+        crate::pc_convert::empty_completions(),
+        |pc, uri, line, character| pc.completion(uri, line, character),
+    )
+}
+
+/// `textDocument/hover`: presentation-compiler hover over the open buffer, as an
+/// LSP `Hover` or `null`. Ports `ScalaLs.hover` — the `withPcBuffer` fallback and
+/// a null hover are both JSON `null`.
+fn hover(id: RequestId, services: &CoreServices, params: &Value) -> Response {
+    pc_value(
+        id,
+        services,
+        params,
+        Value::Null,
+        |pc, uri, line, character| pc.hover(uri, line, character),
+    )
+}
+
+/// `textDocument/signatureHelp`: presentation-compiler signature help over the
+/// open buffer, as an LSP `SignatureHelp` or `null`. Ports `ScalaLs.signatureHelp`
+/// — the `withPcBuffer` fallback is JSON `null`.
+fn signature_help(id: RequestId, services: &CoreServices, params: &Value) -> Response {
+    pc_value(
+        id,
+        services,
+        params,
+        Value::Null,
+        |pc, uri, line, character| pc.signature_help(uri, line, character),
+    )
+}
+
+/// The shared body of the JSON-valued PC query methods (completion/hover/
+/// signatureHelp). Mirrors [`pc_locations`]: `requireSemanticdb` runs FIRST and
+/// *outside* the buffer fallback (a URI the model does not own via an indexable
+/// target is a hard `NoSemanticdb`/`RequestFailed`, never the fallback), then the
+/// `withPcBuffer` gate (`is_open`) answers `fallback` for a buffer the PC mirror
+/// does not hold. The PC method itself degrades a boundary/decode failure to the
+/// same fallback, so the compiler yielding nothing is never an error.
+fn pc_value(
+    id: RequestId,
+    services: &CoreServices,
+    params: &Value,
+    fallback: Value,
+    run: impl Fn(&dyn PcQueryService, &str, u32, u32) -> Value,
+) -> Response {
+    let Some(raw) = text_document_uri(params) else {
+        return Response::success(id, fallback);
+    };
+    if let Err(error) = services.require_semanticdb(&raw) {
+        return request_failed(id, &error);
+    }
+    let Some(pos) = position(params) else {
+        return Response::success(id, fallback);
+    };
+    let uri = normalize_uri(&raw);
+    if !services.pc.is_open(&uri) {
+        return Response::success(id, fallback);
+    }
+    Response::success(id, run(services.pc.as_ref(), &uri, pos.line, pos.character))
+}
+
 /// PC definition locations (already `file://` URIs) -> LSP locations.
 pub fn pc_locations_to_lsp(locations: &[PcLocation]) -> Vec<Location> {
     locations
@@ -585,6 +666,9 @@ mod tests {
     struct FakePc {
         definition: Vec<PcLocation>,
         type_definition: Vec<PcLocation>,
+        completion: Value,
+        hover: Value,
+        signature_help: Value,
     }
 
     impl PcQueryService for FakePc {
@@ -599,6 +683,15 @@ mod tests {
         }
         fn type_definition(&self, _u: &str, _l: u32, _c: u32) -> Vec<PcLocation> {
             self.type_definition.clone()
+        }
+        fn completion(&self, _u: &str, _l: u32, _c: u32) -> Value {
+            self.completion.clone()
+        }
+        fn hover(&self, _u: &str, _l: u32, _c: u32) -> Value {
+            self.hover.clone()
+        }
+        fn signature_help(&self, _u: &str, _l: u32, _c: u32) -> Value {
+            self.signature_help.clone()
         }
     }
 
@@ -712,7 +805,7 @@ mod tests {
             .contains("has no SemanticDB output"));
     }
 
-    // A ready method that is not yet wired answers a typed error through the
+    // A ready method with no handler branch answers a typed error through the
     // production handler dispatch — never a silent empty result.
     #[test]
     fn an_unwired_ready_method_answers_a_typed_placeholder_error() {
@@ -721,7 +814,7 @@ mod tests {
         let documents = DocumentStore::new();
         let request = Request {
             id: RequestId::Number(1),
-            method: "textDocument/hover".to_string(),
+            method: "textDocument/foldingRange".to_string(),
             params: json!({}),
         };
         let response = CoreHandlers.handle(RequestContext {
@@ -737,6 +830,53 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("not yet available"));
+    }
+
+    // A ready `completionItem/resolve` echoes the item back unchanged (the Scala
+    // `case _ => item` fallback), never a typed error, while its presentation-
+    // compiler enrichment path is unattached.
+    #[test]
+    fn completion_item_resolve_echoes_the_item_when_ready() {
+        let dir = tempfile::tempdir().unwrap();
+        let services = unindexed_services(dir.path());
+        let documents = DocumentStore::new();
+        let item = json!({ "label": "foo", "kind": 2, "data": { "symbol": "x" } });
+        let request = Request {
+            id: RequestId::Number(1),
+            method: "completionItem/resolve".to_string(),
+            params: item.clone(),
+        };
+        let response = CoreHandlers.handle(RequestContext {
+            request: &request,
+            services: &services,
+            workspace_root: None,
+            documents: &documents,
+            shutting_down: false,
+        });
+        assert_eq!(serde_json::to_value(&response).unwrap()["result"], item);
+    }
+
+    // `requireSemanticdb` runs first and *outside* the buffer fallback for the PC
+    // query methods too, so completion/hover/signatureHelp over a URI the model
+    // does not own are hard NoSemanticdb errors, not the empty/null fallback.
+    #[test]
+    fn pc_query_methods_over_an_unowned_uri_are_hard_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("A.scala"), "object A").unwrap();
+        let services = unindexed_services(dir.path());
+        for handler in [completion, hover, signature_help] {
+            let value = serde_json::to_value(handler(
+                RequestId::Number(1),
+                &services,
+                &position_params(dir.path()),
+            ))
+            .unwrap();
+            assert_eq!(value["error"]["code"], error_codes::REQUEST_FAILED);
+            assert!(value["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("has no SemanticDB output"));
+        }
     }
 
     #[test]

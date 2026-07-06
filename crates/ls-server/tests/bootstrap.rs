@@ -680,6 +680,9 @@ fn ready_fixture_services() -> (CoreServices, tempfile::TempDir) {
 struct FakePc {
     definition: Vec<PcLocation>,
     type_definition: Vec<PcLocation>,
+    completion: Value,
+    hover: Value,
+    signature_help: Value,
     events: Arc<Mutex<Vec<String>>>,
     open: Arc<Mutex<Vec<String>>>,
 }
@@ -710,6 +713,15 @@ impl PcQueryService for FakePc {
     }
     fn type_definition(&self, _u: &str, _l: u32, _c: u32) -> Vec<PcLocation> {
         self.type_definition.clone()
+    }
+    fn completion(&self, _u: &str, _l: u32, _c: u32) -> Value {
+        self.completion.clone()
+    }
+    fn hover(&self, _u: &str, _l: u32, _c: u32) -> Value {
+        self.hover.clone()
+    }
+    fn signature_help(&self, _u: &str, _l: u32, _c: u32) -> Value {
+        self.signature_help.clone()
     }
 }
 
@@ -815,6 +827,76 @@ fn definition_over_an_owned_but_unopened_buffer_is_an_empty_list() {
     });
     let def = drive(&services, "textDocument/definition", params);
     assert_eq!(def["result"], json!([]));
+}
+
+/// completion/hover/signatureHelp each route to their own PC op over an open,
+/// owned buffer that passes `requireSemanticdb`, and the PC's JSON result reaches
+/// the client verbatim. The buffer reaches the PC mirror through the
+/// document-notification hook (the `withPcBuffer` precondition).
+#[test]
+fn completion_hover_and_signature_help_route_to_the_pc_over_an_open_owned_buffer() {
+    let (mut services, _root) = ready_fixture_services();
+    let core_uri = core_uri();
+    let completion = json!({ "isIncomplete": false, "items": [ { "label": "foo", "kind": 2 } ] });
+    let hover = json!({ "contents": { "kind": "markdown", "value": "T" } });
+    let signature = json!({ "signatures": [ { "label": "f(a: Int)" } ], "activeSignature": 0 });
+    services.pc = Box::new(FakePc {
+        completion: completion.clone(),
+        hover: hover.clone(),
+        signature_help: signature.clone(),
+        ..Default::default()
+    });
+    CoreHandlers.on_did_open(&services, &core_uri, "class Core\n");
+    let pos = json!({
+        "textDocument": { "uri": core_uri },
+        "position": { "line": 2, "character": 6 }
+    });
+
+    assert_eq!(
+        drive(&services, "textDocument/completion", pos.clone())["result"],
+        completion
+    );
+    assert_eq!(
+        drive(&services, "textDocument/hover", pos.clone())["result"],
+        hover
+    );
+    assert_eq!(
+        drive(&services, "textDocument/signatureHelp", pos)["result"],
+        signature
+    );
+}
+
+/// `withPcBuffer`: an owned URI that passes `requireSemanticdb` but is NOT an open
+/// buffer answers each method's fallback — an empty completion list for
+/// completion, `null` for hover/signatureHelp — and the PC is never consulted
+/// (the fake would return a populated result, yet the fallback is served).
+#[test]
+fn pc_query_methods_over_an_owned_but_unopened_buffer_answer_the_fallback() {
+    let (mut services, _root) = ready_fixture_services();
+    let core_uri = core_uri();
+    services.pc = Box::new(FakePc {
+        completion: json!({ "isIncomplete": true, "items": [ { "label": "x" } ] }),
+        hover: json!({ "contents": "present" }),
+        signature_help: json!({ "signatures": [ { "label": "g()" } ] }),
+        ..Default::default()
+    });
+    // The buffer is never opened, so the PC mirror does not hold it.
+    let pos = json!({
+        "textDocument": { "uri": core_uri },
+        "position": { "line": 2, "character": 6 }
+    });
+    assert_eq!(
+        drive(&services, "textDocument/completion", pos.clone())["result"],
+        json!({ "isIncomplete": false, "items": [] })
+    );
+    assert_eq!(
+        drive(&services, "textDocument/hover", pos.clone())["result"],
+        Value::Null
+    );
+    assert_eq!(
+        drive(&services, "textDocument/signatureHelp", pos)["result"],
+        Value::Null
+    );
 }
 
 /// `TextDocs.didChange` parity: a change for a buffer the PC does not yet hold

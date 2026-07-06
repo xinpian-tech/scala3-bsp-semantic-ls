@@ -13,6 +13,7 @@ pub mod documents;
 pub mod jsonrpc;
 pub mod lifecycle;
 pub mod pc;
+mod pc_convert;
 pub mod protocol;
 pub mod server;
 pub mod services;

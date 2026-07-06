@@ -113,12 +113,13 @@ fn live_definition_over_an_open_buffer_routes_through_the_pc_island() {
     documents.open(&file_uri, SOURCE);
     CoreHandlers.on_did_open(&services, &file_uri, SOURCE);
     // `  val x = foo` is line 2; `foo` starts at column 10.
+    let position = json!({ "line": 2, "character": 10 });
     let request = Request {
         id: RequestId::Number(1),
         method: "textDocument/definition".to_string(),
         params: json!({
-            "textDocument": { "uri": file_uri },
-            "position": { "line": 2, "character": 10 }
+            "textDocument": { "uri": file_uri.clone() },
+            "position": position.clone()
         }),
     };
     let response = CoreHandlers.handle(RequestContext {
@@ -139,5 +140,31 @@ fn live_definition_over_an_open_buffer_routes_through_the_pc_island() {
             .iter()
             .any(|loc| loc["range"]["start"]["line"] == 1),
         "definition must land on the in-buffer declaration line: {value:?}"
+    );
+
+    // Drive hover over the SAME open buffer through the real island (one JVM per
+    // process): the presentation compiler types the in-buffer `foo` reference and
+    // returns a Hover, decoded from the flat `#[repr(C)]` carrier and rendered to
+    // LSP JSON — proving the completion/hover/signatureHelp decode+convert seam
+    // over the real boundary, not just a fake.
+    let hover_request = Request {
+        id: RequestId::Number(2),
+        method: "textDocument/hover".to_string(),
+        params: json!({
+            "textDocument": { "uri": file_uri },
+            "position": position
+        }),
+    };
+    let hover = serde_json::to_value(CoreHandlers.handle(RequestContext {
+        request: &hover_request,
+        services: &services,
+        workspace_root: Some(&workspace),
+        documents: &documents,
+        shutting_down: false,
+    }))
+    .expect("serialize hover response");
+    assert!(
+        hover["result"].get("contents").is_some(),
+        "hover over the in-buffer `foo` must return a present Hover with contents: {hover:?}"
     );
 }
