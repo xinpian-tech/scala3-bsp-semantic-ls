@@ -473,6 +473,25 @@ fn workspace_symbol_prefix_query() {
         .is_empty());
 }
 
+#[test]
+fn workspace_symbols_resolve_display_and_defining_location() {
+    let stack = new_stack();
+    let entries = stack.orch.workspace_symbols("Cor", 50);
+    let core = entries
+        .iter()
+        .find(|e| e.display == "Core")
+        .unwrap_or_else(|| panic!("no Core entry in {entries:?}"));
+    assert!(
+        core.location.uri.starts_with("file://")
+            && core.location.uri.ends_with("a/src/pkga/Core.scala"),
+        "unexpected uri {}",
+        core.location.uri
+    );
+    // `class Core` is on the third source line (zero-based line 2); the def span
+    // comes from the symbol's def metadata, not a fallback zero span.
+    assert_eq!(core.location.span.start_line, 2, "{:?}", core.location.span);
+}
+
 // ------------------------------------------------------------ document highlight
 
 #[test]

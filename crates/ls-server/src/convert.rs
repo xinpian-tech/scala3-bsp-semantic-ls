@@ -25,6 +25,17 @@ pub struct Location {
     pub range: Range,
 }
 
+/// LSP `WorkspaceSymbol`: a name + kind + defining location + optional container.
+/// A `null`/absent container is omitted (matching lsp4j + gson null elision).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct WorkspaceSymbol {
+    pub name: String,
+    pub kind: SymbolKind,
+    pub location: Location,
+    #[serde(rename = "containerName", skip_serializing_if = "Option::is_none")]
+    pub container_name: Option<String>,
+}
+
 /// LSP `DocumentHighlight`: a range plus its read/write [`DocumentHighlightKind`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct DocumentHighlight {

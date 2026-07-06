@@ -193,6 +193,15 @@ mod tests {
         assert!(uris.candidates("untitled:Untitled-1").is_empty());
     }
 
+    // A non-empty-authority `file://host/...` URI is unmappable: `uri_to_path`
+    // rejects the authority (Java `Path.of(URI)` parity), so it yields no
+    // sourceroot-relative candidate rather than mapping to the local `/...` path.
+    #[test]
+    fn candidates_reject_a_non_empty_authority_uri() {
+        let uris = WorkspaceUris::new(&[PathBuf::from("/ws")]);
+        assert!(uris.candidates("file://host/ws/A.scala").is_empty());
+    }
+
     #[test]
     fn pick_sdb_uri_prefers_a_known_candidate_else_the_deepest() {
         let uris = WorkspaceUris::new(&[PathBuf::from("/ws"), PathBuf::from("/ws/mod")]);

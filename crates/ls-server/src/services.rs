@@ -17,11 +17,12 @@ use serde_json::{json, Value};
 
 use ls_engine::{
     DocHighlight, DocumentHighlightService, QueryOrchestrator, ReferencesEngine, ReferencesResult,
+    WorkspaceSymbolEntry,
 };
 use ls_index_model::uri::normalize_uri;
 use ls_index_model::LsError;
 
-use crate::convert::{self, DocumentHighlight, Location};
+use crate::convert::{self, DocumentHighlight, Location, WorkspaceSymbol};
 use crate::jsonrpc::{error_codes, RequestId, Response, ResponseError};
 use crate::protocol::Position;
 use crate::server::{Handlers, RequestContext};
@@ -70,6 +71,7 @@ impl Handlers<CoreServices> for CoreHandlers {
             "textDocument/documentHighlight" => {
                 document_highlight(id, cx.services, &cx.request.params)
             }
+            "workspace/symbol" => workspace_symbol(id, cx.services, &cx.request.params),
             other => not_implemented(id, other),
         }
     }
@@ -131,6 +133,26 @@ fn document_highlight(id: RequestId, services: &CoreServices, params: &Value) ->
     }
 }
 
+/// The default workspace-symbol candidate cap (Scala `workspaceSymbol`'s
+/// `limit = 200`).
+const WORKSPACE_SYMBOL_LIMIT: usize = 200;
+
+/// `workspace/symbol`: resolve the query over the index and return matching
+/// symbols with their defining locations. Ports `ScalaLs.symbol` for the
+/// index-backed hits; the PC-only unsaved-buffer augmentation
+/// (`overlay.pcOnlySymbols`) attaches with the PcOverlay. Ready-only — the
+/// pre-ready fallback (an empty list) is served before the workspace is ready.
+fn workspace_symbol(id: RequestId, services: &CoreServices, params: &Value) -> Response {
+    let query = params.get("query").and_then(Value::as_str).unwrap_or("");
+    let symbols: Vec<WorkspaceSymbol> = services
+        .orchestrator
+        .workspace_symbols(query, WORKSPACE_SYMBOL_LIMIT)
+        .iter()
+        .map(workspace_symbol_of)
+        .collect();
+    ok_json(id, &symbols)
+}
+
 /// Reference hits -> LSP locations, dropping any hit whose SemanticDB URI does
 /// not resolve to a `file://` URI (mirroring the Scala `foreach`/`flatMap` that
 /// only emits resolvable locations).
@@ -156,6 +178,16 @@ pub fn highlights_to_lsp(highlights: &[DocHighlight]) -> Vec<DocumentHighlight> 
             kind: convert::highlight_kind(highlight.kind),
         })
         .collect()
+}
+
+/// A resolved workspace-symbol entry -> LSP `WorkspaceSymbol`.
+pub fn workspace_symbol_of(entry: &WorkspaceSymbolEntry) -> WorkspaceSymbol {
+    WorkspaceSymbol {
+        name: entry.display.clone(),
+        kind: convert::symbol_kind(entry.kind),
+        location: convert::location(&entry.location.uri, entry.location.span),
+        container_name: entry.container.clone(),
+    }
 }
 
 fn text_document_uri(params: &Value) -> Option<String> {
@@ -209,9 +241,11 @@ mod tests {
     use super::*;
     use std::path::Path;
 
-    use ls_engine::{DocHighlight, HighlightKind, QueryOrchestrator, ReferenceHit};
+    use ls_engine::{
+        DocHighlight, HighlightKind, QueryOrchestrator, ReferenceHit, WorkspaceSymbolEntry,
+    };
     use ls_index_model::uri::path_to_uri;
-    use ls_index_model::{Loc, Role, Span};
+    use ls_index_model::{Loc, Role, Span, SymKind};
     use ls_store::Store;
 
     use crate::documents::DocumentStore;
@@ -338,5 +372,83 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("not yet available"));
+    }
+
+    #[test]
+    fn workspace_symbol_of_maps_entry_with_its_container() {
+        let entry = WorkspaceSymbolEntry {
+            display: "Foo".to_string(),
+            kind: SymKind::Class,
+            container: Some("pkg".to_string()),
+            location: Loc::new("file:///ws/a/Foo.scala", Span::new(1, 2, 1, 5)),
+        };
+        assert_eq!(
+            serde_json::to_value(workspace_symbol_of(&entry)).unwrap(),
+            json!({
+                "name": "Foo",
+                "kind": 5,
+                "location": {
+                    "uri": "file:///ws/a/Foo.scala",
+                    "range": { "start": { "line": 1, "character": 2 }, "end": { "line": 1, "character": 5 } }
+                },
+                "containerName": "pkg"
+            })
+        );
+    }
+
+    // An absent container is omitted, not serialized as null/empty.
+    #[test]
+    fn workspace_symbol_of_omits_an_absent_container() {
+        let entry = WorkspaceSymbolEntry {
+            display: "bar".to_string(),
+            kind: SymKind::Method,
+            container: None,
+            location: Loc::new("file:///ws/a/A.scala", Span::new(0, 0, 0, 3)),
+        };
+        let value = serde_json::to_value(workspace_symbol_of(&entry)).unwrap();
+        assert_eq!(value["name"], "bar");
+        assert_eq!(value["kind"], 6);
+        assert!(value.get("containerName").is_none());
+    }
+
+    #[test]
+    fn workspace_symbol_over_an_unindexed_workspace_is_an_empty_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let services = unindexed_services(dir.path());
+        let response =
+            workspace_symbol(RequestId::Number(1), &services, &json!({ "query": "Foo" }));
+        let value = serde_json::to_value(&response).unwrap();
+        assert_eq!(value["result"], json!([]));
+    }
+
+    // A non-empty-authority `file://host/...` URI must be unmappable: the shared
+    // `uri_to_path` rejects the authority (Java `Path.of(URI)` parity), so it can
+    // never be answered as the bare local `/...` path.
+    #[test]
+    fn references_over_a_non_empty_authority_uri_is_not_indexed() {
+        let dir = tempfile::tempdir().unwrap();
+        let services = unindexed_services(dir.path());
+        let params = json!({
+            "textDocument": { "uri": "file://host/ws/A.scala" },
+            "position": { "line": 0, "character": 0 }
+        });
+        let value =
+            serde_json::to_value(references(RequestId::Number(1), &services, &params)).unwrap();
+        assert_eq!(value["error"]["code"], error_codes::REQUEST_FAILED);
+        assert!(value["error"]["message"].as_str().unwrap().contains("host"));
+    }
+
+    #[test]
+    fn document_highlight_over_a_non_empty_authority_uri_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let services = unindexed_services(dir.path());
+        let params = json!({
+            "textDocument": { "uri": "file://host/ws/A.scala" },
+            "position": { "line": 0, "character": 0 }
+        });
+        let value =
+            serde_json::to_value(document_highlight(RequestId::Number(1), &services, &params))
+                .unwrap();
+        assert_eq!(value["result"], json!([]));
     }
 }

@@ -22,7 +22,7 @@ pub use capabilities::{
 pub use cli::{parse_args, resolve_doctor_dir, CliAction};
 pub use convert::{
     highlight_kind, location, range, symbol_kind, workspace_edit, DocumentHighlight,
-    DocumentHighlightKind, Location, SymbolKind, TextEdit, WorkspaceEdit,
+    DocumentHighlightKind, Location, SymbolKind, TextEdit, WorkspaceEdit, WorkspaceSymbol,
 };
 pub use diagnostics::{to_lsp_diagnostic, DiagnosticRouter};
 pub use documents::DocumentStore;
@@ -37,5 +37,7 @@ pub use protocol::{Diagnostic, DiagnosticCode, Position, PublishDiagnosticsParam
 pub use server::{
     serve, Bootstrap, BootstrapContext, Handlers, RequestContext, ServerCore, ServerHooks,
 };
-pub use services::{highlights_to_lsp, references_locations, CoreHandlers, CoreServices};
+pub use services::{
+    highlights_to_lsp, references_locations, workspace_symbol_of, CoreHandlers, CoreServices,
+};
 pub use workspace_uris::WorkspaceUris;

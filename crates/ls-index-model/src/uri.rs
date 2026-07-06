@@ -32,18 +32,23 @@ pub fn path_to_uri(path: &Path) -> String {
 }
 
 /// Inverse of [`path_to_uri`], accepting the spellings `Path.of(URI.create(…))`
-/// does: the authority forms `file:///abs` and `file://host/abs` (the authority
-/// is dropped), and the single-slash `file:/abs` (no authority). Non-file
-/// schemes and pathless file URIs are rejected.
+/// does: the empty-authority form `file:///abs` and the single-slash `file:/abs`
+/// (no authority). A NON-empty authority (`file://host/abs`) is rejected, because
+/// `Path.of(URI)` — which the retained `Uris.toPath`/`WorkspaceUris.toSdbUri`
+/// call — throws on an authority component; dropping the host instead would let a
+/// `file://host/…` URI be answered as if it named the local `/…` path. Non-file
+/// schemes and pathless file URIs are also rejected.
 pub fn uri_to_path(uri: &str) -> Result<PathBuf, String> {
     let rest = uri
         .strip_prefix("file:")
         .ok_or_else(|| format!("not a file uri: {uri}"))?;
     let path_part = if let Some(after_authority) = rest.strip_prefix("//") {
-        // Authority form: the path starts at the first `/` after `file://`
-        // (an empty authority for `file:///…`), and the authority is dropped.
+        // Authority form. The authority is the text before the first `/`; only an
+        // EMPTY authority (`file:///…`, first `/` at index 0) is accepted, and the
+        // path is the remainder from that `/`. A non-empty authority is rejected.
         match after_authority.find('/') {
-            Some(i) => &after_authority[i..],
+            Some(0) => after_authority,
+            Some(_) => return Err(format!("file uri has a non-empty authority: {uri}")),
             None => return Err(format!("file uri has no path: {uri}")),
         }
     } else if rest.starts_with('/') {
@@ -144,16 +149,14 @@ mod tests {
     }
 
     #[test]
-    fn decodes_percent_escapes_and_drops_authority() {
+    fn decodes_percent_escapes_and_rejects_a_non_empty_authority() {
         assert_eq!(
             uri_to_path("file:///a/b%20c.scala").unwrap(),
             PathBuf::from("/a/b c.scala")
         );
-        // an authority component is dropped; the path starts at its first `/`.
-        assert_eq!(
-            uri_to_path("file://host/a/b.scala").unwrap(),
-            PathBuf::from("/a/b.scala")
-        );
+        // A non-empty authority is rejected: `Path.of(URI)` throws on it, so the
+        // retained `Uris.toPath` never maps `file://host/...` to a local path.
+        assert!(uri_to_path("file://host/a/b.scala").is_err());
     }
 
     #[test]

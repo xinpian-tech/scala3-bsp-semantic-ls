@@ -19,7 +19,9 @@ pub mod targets;
 
 pub use highlight::{DocHighlight, DocumentHighlightService, HighlightKind};
 pub use ingest::{ingest, IngestReport, SemanticdbFileError};
-pub use orchestrator::{current_thread_label, CursorSymbol, QueryOrchestrator, ResolutionSource};
+pub use orchestrator::{
+    current_thread_label, CursorSymbol, QueryOrchestrator, ResolutionSource, WorkspaceSymbolEntry,
+};
 pub use overlay::{DirtyBufferOverlay, NoopOverlay, OverlayHit};
 pub use references::{ReferenceHit, ReferencesEngine, ReferencesResult};
 pub use rename::{CompileOutcome, CompileService, RenameEngine, TextEditSpan, WorkspaceEditPlan};

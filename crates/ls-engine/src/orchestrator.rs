@@ -16,7 +16,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use ls_index_model::uri;
-use ls_index_model::{Loc, LsError, NormalizedDocument, Occurrence, Role, Span, TargetBitset};
+use ls_index_model::{
+    Loc, LsError, NormalizedDocument, Occurrence, Role, Span, SymKind, TargetBitset,
+};
 use ls_semanticdb::{md5, normalize, parse_file, SemanticdbLocator};
 use ls_store::{GroupRecord, SearchIndex, Snapshot, Store, StoreResult, WorkspaceSymbolHit};
 
@@ -26,6 +28,17 @@ use crate::overlay::{DirtyBufferOverlay, NoopOverlay};
 use crate::state::IngestState;
 use crate::symbol_encoding;
 use crate::targets::{TargetSpec, WorkspaceTargets};
+
+/// A workspace-symbol search hit resolved to what a `WorkspaceSymbol` needs: the
+/// display name, kind, optional container (owner, else package), and defining
+/// `file://` location. Mirrors what `ScalaLs.workspaceSymbolOf` builds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkspaceSymbolEntry {
+    pub display: String,
+    pub kind: SymKind,
+    pub container: Option<String>,
+    pub location: Loc,
+}
 
 /// Where a cursor resolution came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -128,6 +141,62 @@ impl QueryOrchestrator {
             Some(snap) => SearchIndex::build(snap.segment()).workspace_symbol_name_exists(name),
             None => false,
         }
+    }
+
+    /// Workspace-symbol search resolved to [`WorkspaceSymbolEntry`]s: the index
+    /// hits with their defining location built from the segment (def span from
+    /// `symbol_meta`, doc URI from `uri_of`, sourceroot from `target_meta`), as
+    /// `ScalaLs.workspaceSymbolOf` does. A hit whose defining doc/target/symbol
+    /// is unknown or out of range is dropped, matching the Scala
+    /// for-comprehension that yields `None`. Search + resolution run against one
+    /// snapshot so the hit ordinals stay valid.
+    pub fn workspace_symbols(&self, query: &str, limit: usize) -> Vec<WorkspaceSymbolEntry> {
+        let Some(snap) = self.store.current() else {
+            return Vec::new();
+        };
+        let seg = snap.segment();
+        let doc_count = seg.doc_count();
+        let target_count = seg.target_count();
+        let symbol_count = seg.symbol_count();
+        SearchIndex::build(seg)
+            .workspace_symbol_search(query, limit)
+            .iter()
+            .filter_map(|hit| {
+                if hit.def_doc_ord < 0 || hit.def_target_ord < 0 {
+                    return None;
+                }
+                let doc_ord = hit.def_doc_ord as u32;
+                let target_ord = hit.def_target_ord as u32;
+                if doc_ord >= doc_count
+                    || target_ord as usize >= target_count
+                    || hit.symbol_ord as usize >= symbol_count
+                {
+                    return None;
+                }
+                let meta = seg.symbol_meta(hit.symbol_ord);
+                let span = Span::new(
+                    Span::unpack_line(meta.def_packed_start as u32),
+                    Span::unpack_char(meta.def_packed_start as u32),
+                    Span::unpack_line(meta.def_packed_end as u32),
+                    Span::unpack_char(meta.def_packed_end as u32),
+                );
+                let sourceroot = seg.target_meta(target_ord).sourceroot;
+                let abs = uri::normalize(&Path::new(&sourceroot).join(seg.uri_of(doc_ord)));
+                let container = if !hit.owner.is_empty() {
+                    Some(hit.owner.clone())
+                } else if !hit.package_name.is_empty() {
+                    Some(hit.package_name.clone())
+                } else {
+                    None
+                };
+                Some(WorkspaceSymbolEntry {
+                    display: hit.display.clone(),
+                    kind: SymKind::from_code(hit.kind),
+                    container,
+                    location: Loc::new(uri::path_to_uri(&abs), span),
+                })
+            })
+            .collect()
     }
 
     // --- symbol at cursor ---
