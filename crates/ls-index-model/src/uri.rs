@@ -74,6 +74,33 @@ pub fn normalize(path: &Path) -> PathBuf {
     out
 }
 
+/// Canonicalizes a `file://` URI string the way `ls.core.Uris.normalize` does:
+/// URI -> path -> lexical [`normalize`] -> URI, so equivalent spellings key the
+/// same document. A URI that does not parse as a file URI is returned unchanged
+/// (mirroring the Scala `catch` that falls back to the raw input).
+///
+/// A `file://host/…` URI with a non-empty authority is left unchanged: Java's
+/// `Path.of(URI)` (which `Uris.normalize` calls) rejects an authority component,
+/// so the Scala normalizer returns the input verbatim rather than silently
+/// dropping the host. Keying the document under the raw spelling keeps it
+/// distinct from the authority-less form, as it is in the Scala server.
+pub fn normalize_uri(uri: &str) -> String {
+    if has_nonempty_authority(uri) {
+        return uri.to_string();
+    }
+    match uri_to_path(uri) {
+        Ok(path) => path_to_uri(&normalize(&path)),
+        Err(_) => uri.to_string(),
+    }
+}
+
+/// Whether `uri` is a `file://<authority>/…` URI with a non-empty authority.
+fn has_nonempty_authority(uri: &str) -> bool {
+    uri.strip_prefix("file://")
+        .and_then(|rest| rest.split('/').next())
+        .is_some_and(|authority| !authority.is_empty())
+}
+
 fn percent_decode(s: &str) -> Result<Vec<u8>, String> {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
@@ -162,5 +189,26 @@ mod tests {
             PathBuf::from("/tmp/a/c")
         );
         assert_eq!(normalize(Path::new("/tmp/a/b")), PathBuf::from("/tmp/a/b"));
+    }
+
+    // Mirrors ls.core.Uris.normalize: canonicalize a file uri, pass a
+    // non-file uri through unchanged.
+    #[test]
+    fn normalize_uri_canonicalizes_a_file_uri_and_passes_others_through() {
+        assert_eq!(
+            normalize_uri("file:///ws/a/../b/c.scala"),
+            "file:///ws/b/c.scala"
+        );
+        assert_eq!(normalize_uri("untitled:Untitled-1"), "untitled:Untitled-1");
+    }
+
+    // Java Path.of(URI) rejects an authority, so Uris.normalize leaves a
+    // file://host/... uri unchanged rather than dropping the host.
+    #[test]
+    fn normalize_uri_leaves_a_non_empty_authority_unchanged() {
+        assert_eq!(
+            normalize_uri("file://host/ws/a.scala"),
+            "file://host/ws/a.scala"
+        );
     }
 }

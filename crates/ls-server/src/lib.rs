@@ -8,8 +8,10 @@ pub mod capabilities;
 pub mod cli;
 pub mod diagnostics;
 pub mod documents;
+pub mod jsonrpc;
 pub mod lifecycle;
 pub mod protocol;
+pub mod server;
 
 pub use capabilities::{
     initialize_result, server_capabilities, InitializeResult, ServerCapabilities,
@@ -17,7 +19,12 @@ pub use capabilities::{
 pub use cli::{parse_args, resolve_doctor_dir, CliAction};
 pub use diagnostics::{to_lsp_diagnostic, DiagnosticRouter};
 pub use documents::DocumentStore;
+pub use jsonrpc::{
+    parse_incoming, read_frame, write_frame, Incoming, Notification, Request, RequestId, Response,
+    ResponseError,
+};
 pub use lifecycle::{
     pre_ready_outcome, require_ready, Method, NotReadyError, PreReadyOutcome, WorkspaceState,
 };
 pub use protocol::{Diagnostic, DiagnosticCode, Position, PublishDiagnosticsParams, Range};
+pub use server::{serve, Bootstrap, Handlers, ServerCore};

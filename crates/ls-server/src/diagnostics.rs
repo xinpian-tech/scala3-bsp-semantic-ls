@@ -9,13 +9,14 @@ use ls_bsp::protocol as bsp;
 
 use crate::protocol::{Diagnostic, DiagnosticCode, Position, PublishDiagnosticsParams, Range};
 
-/// Converts a BSP diagnostic to its LSP shape. BSP and LSP share the same
-/// severity integers (1 Error, 2 Warning, 3 Information, 4 Hint) and the same
-/// `integer | string` code, so the conversion is a faithful copy.
+/// Converts a BSP diagnostic to its LSP shape. BSP and LSP share the severity
+/// integers (1 Error, 2 Warning, 3 Information, 4 Hint) and the same
+/// `integer | string` code, so the code copies through and severity maps via
+/// [`to_lsp_severity`].
 pub fn to_lsp_diagnostic(d: &bsp::Diagnostic) -> Diagnostic {
     Diagnostic {
         range: d.range.as_ref().map(to_lsp_range).unwrap_or(ORIGIN_RANGE),
-        severity: d.severity.and_then(to_lsp_severity),
+        severity: d.severity.map(to_lsp_severity),
         code: d.code.as_ref().map(to_lsp_code),
         source: d.source.clone(),
         message: d.message.clone(),
@@ -23,12 +24,13 @@ pub fn to_lsp_diagnostic(d: &bsp::Diagnostic) -> Diagnostic {
 }
 
 /// BSP and LSP share the severity integers 1..=4 (Error/Warning/Information/
-/// Hint). Any other value is not a valid severity — a build server's enum has no
-/// such member — so it maps to unset rather than being forwarded verbatim.
-fn to_lsp_severity(bsp: i32) -> Option<u32> {
+/// Hint). A present-but-unexpected value maps to Information (3), matching the
+/// Scala converter's explicit default branch; a missing severity stays unset
+/// (the `map` in [`to_lsp_diagnostic`] keeps `None`).
+fn to_lsp_severity(bsp: i32) -> u32 {
     match bsp {
-        1..=4 => Some(bsp as u32),
-        _ => None,
+        1..=4 => bsp as u32,
+        _ => 3,
     }
 }
 
@@ -399,7 +401,7 @@ mod tests {
     }
 
     #[test]
-    fn valid_severities_pass_through_and_out_of_range_maps_to_none() {
+    fn valid_severities_pass_through_and_out_of_range_maps_to_information() {
         let base = bsp::Range {
             start: bsp::Position {
                 line: 0,
@@ -423,9 +425,11 @@ mod tests {
                 Some(sev as u32)
             );
         }
-        // A value outside the 1..=4 enum is unset, not forwarded raw.
-        assert_eq!(to_lsp_diagnostic(&with_sev(Some(0))).severity, None);
-        assert_eq!(to_lsp_diagnostic(&with_sev(Some(5))).severity, None);
-        assert_eq!(to_lsp_diagnostic(&with_sev(Some(-1))).severity, None);
+        // A present value outside the 1..=4 enum falls to Information (3), like
+        // the Scala converter's default branch; a missing severity stays unset.
+        assert_eq!(to_lsp_diagnostic(&with_sev(Some(0))).severity, Some(3));
+        assert_eq!(to_lsp_diagnostic(&with_sev(Some(5))).severity, Some(3));
+        assert_eq!(to_lsp_diagnostic(&with_sev(Some(-1))).severity, Some(3));
+        assert_eq!(to_lsp_diagnostic(&with_sev(None)).severity, None);
     }
 }

@@ -40,24 +40,27 @@ pub fn parse_args(args: &[String]) -> CliAction {
     if args.iter().any(|a| a == "--version") {
         return CliAction::Version;
     }
-    // `--doctor` optionally takes the workspace directory as the next argument,
-    // defaulting to the current directory.
-    if let Some(i) = args.iter().position(|a| a == "--doctor") {
-        let dir = args
-            .get(i + 1)
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("."));
-        return CliAction::Doctor { dir };
+    // Every other invocation is matched exactly: no action flag with no extra
+    // arguments starts the server; `--doctor` optionally takes one non-flag
+    // directory argument; anything else (extra tokens, a flag where the doctor
+    // directory belongs, or a removed/unknown flag) is a usage error, never a
+    // silent start.
+    match args {
+        [] => CliAction::Serve,
+        [flag] if flag == "--doctor" => CliAction::Doctor {
+            dir: PathBuf::from("."),
+        },
+        [flag, dir] if flag == "--doctor" && !is_flag(dir) => CliAction::Doctor {
+            dir: PathBuf::from(dir),
+        },
+        _ => CliAction::Usage {
+            message: format!("unknown or unexpected arguments: {}", args.join(" ")),
+        },
     }
-    // With no action flag, only an empty argument list starts the server; any
-    // leftover argument is unrecognized and rejected (never a silent start).
-    if args.is_empty() {
-        CliAction::Serve
-    } else {
-        CliAction::Usage {
-            message: format!("unknown arguments: {}", args.join(" ")),
-        }
-    }
+}
+
+fn is_flag(arg: &str) -> bool {
+    arg.starts_with("--")
 }
 
 #[cfg(test)]
@@ -133,6 +136,20 @@ mod tests {
         match parse_args(&args(&["--bogus"])) {
             CliAction::Usage { message } => assert!(message.contains("--bogus"), "{message}"),
             other => panic!("expected a usage error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn extra_or_flag_arguments_around_doctor_are_rejected() {
+        for invocation in [
+            &["--doctor", ".", "--bogus"][..],
+            &["--bogus", "--doctor"][..],
+            &["--doctor", "--bogus"][..],
+        ] {
+            assert!(
+                matches!(parse_args(&args(invocation)), CliAction::Usage { .. }),
+                "expected usage error for {invocation:?}"
+            );
         }
     }
 
