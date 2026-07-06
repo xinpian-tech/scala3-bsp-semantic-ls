@@ -24,7 +24,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use ls_jvm::backend::VtableBackend;
-use ls_jvm::watchdog::{PcRequest, QueryKind, Supervisor};
+use ls_jvm::watchdog::{PcError, PcRequest, QueryKind, Supervisor};
 use ls_jvm::{boot_island, install_symbol_definition_resolver, IslandConfig};
 use ls_pc_abi::payloads::{DefinitionResult, LocationsResult, TargetConfig};
 
@@ -103,6 +103,31 @@ pub fn pc_options(scalac_options: &[String]) -> Vec<String> {
     out
 }
 
+/// The booted-island dispatch seam: the one operation the outer mirror needs
+/// from the `ls-jvm` [`Supervisor`]. A trait so the status-aware mirror logic is
+/// testable with a fake that returns `Ok`/`RequestTimeout`/`Backend` outcomes
+/// without a live JVM.
+trait PcDriver: Send {
+    fn request(&mut self, request: PcRequest) -> Result<Vec<u8>, PcError>;
+}
+
+impl PcDriver for Supervisor<VtableBackend> {
+    fn request(&mut self, request: PcRequest) -> Result<Vec<u8>, PcError> {
+        Supervisor::request(self, request)
+    }
+}
+
+/// Whether a lifecycle forward's outcome should be reflected in the outer mirror.
+/// A success (`Ok`) or a timeout-recovery (`RequestTimeout` — the editor's
+/// notification is a fact the generation replay honors) mutates the mirror; a
+/// clean nonzero backend status (`PcError::Backend`, e.g. an open for an
+/// unregistered target) must NOT — the island did not apply it, so the outer
+/// mirror must not claim it. This mirrors `Supervisor::observe`, which updates
+/// its inner recovery mirror on `Done`/`Wedged` but never on `Status`.
+fn accepted(outcome: &Result<Vec<u8>, PcError>) -> bool {
+    !matches!(outcome, Err(PcError::Backend(_)))
+}
+
 /// The lazily-booted embedded PC island. Constructed with the workspace's PC
 /// target registrations and the index-backed `symbol_definition` resolver, but
 /// the JVM is not started until the first PC request.
@@ -112,21 +137,34 @@ pub struct IslandPcService {
 
 struct IslandState {
     workspace_root: PathBuf,
-    /// The PC target registrations, replayed into the island on boot.
+    /// The PC target registrations, replayed into the island on boot; also the
+    /// registered-target lookup that gates `did_open` (the Scala `PcFacade`
+    /// `require(targets.contains(targetId), …)`).
     targets: Vec<TargetConfig>,
     /// The `symbol_definition` resolver, installed into the island's global slot
     /// once, at boot; taken then.
     resolver: Option<Box<SymbolResolver>>,
     /// The mirrored open buffers (`uri -> (owning target, text)`), replayed into
-    /// the island on boot and kept in sync on every query.
+    /// the island on boot and the source of the `is_open`/`withPcBuffer` gate.
+    /// Kept status-aware: a buffer is recorded only after the island has actually
+    /// accepted the corresponding lifecycle request (or while still cold).
     buffers: BTreeMap<String, Buffered>,
-    /// `None` until the first PC request boots the island.
-    supervisor: Option<Supervisor<VtableBackend>>,
+    /// `None` until the first PC query boots the island.
+    driver: Option<Box<dyn PcDriver>>,
     /// A recorded boot failure, so a broken environment is reported once and the
     /// service then degrades to empty rather than re-attempting a boot per request.
     boot_error: Option<String>,
 }
 
+impl IslandState {
+    /// Whether a target id was registered — the `PcFacade` `require` precondition
+    /// for `did_open`.
+    fn is_registered(&self, target_id: &str) -> bool {
+        self.targets.iter().any(|t| t.bsp_id == target_id)
+    }
+}
+
+#[derive(Clone)]
 struct Buffered {
     target_id: String,
     text: String,
@@ -155,7 +193,7 @@ impl IslandPcService {
                 targets,
                 resolver: Some(resolver),
                 buffers: BTreeMap::new(),
-                supervisor: None,
+                driver: None,
                 boot_error: None,
             }),
         }
@@ -168,8 +206,20 @@ impl IslandPcService {
         self.state
             .lock()
             .expect("pc island state mutex")
-            .supervisor
+            .driver
             .is_some()
+    }
+
+    /// The mirrored text of an open buffer, or `None` if the mirror does not hold
+    /// it — the replay source the boot would feed the island.
+    #[cfg(test)]
+    fn buffer_text(&self, uri: &str) -> Option<String> {
+        self.state
+            .lock()
+            .expect("pc island state mutex")
+            .buffers
+            .get(uri)
+            .map(|b| b.text.clone())
     }
 
     /// Ensures the island is booted (booting + replaying the mirrored buffers on
@@ -184,13 +234,13 @@ impl IslandPcService {
         // The buffer is already mirrored by the document notifications; the query
         // is the first thing that boots the island (so an index-only session that
         // only opens buffers keeps a zero-JVM process).
-        if state.supervisor.is_none() && !boot(state) {
+        if state.driver.is_none() && !boot(state) {
             return Vec::new();
         }
-        let Some(sup) = state.supervisor.as_mut() else {
+        let Some(driver) = state.driver.as_mut() else {
             return Vec::new();
         };
-        let reply = match sup.request(PcRequest::Query {
+        let reply = match driver.request(PcRequest::Query {
             kind,
             uri: uri.to_string(),
             line,
@@ -210,6 +260,25 @@ impl PcQueryService for IslandPcService {
     fn did_open(&self, target_id: &str, uri: &str, text: &str) {
         let mut guard = self.state.lock().expect("pc island state mutex");
         let state = &mut *guard;
+        // The Scala `PcFacade.didOpen` requires the target registered *before*
+        // adding the buffer; an open for an unknown target is never mirrored.
+        if !state.is_registered(target_id) {
+            return;
+        }
+        // A booted island is forwarded to first; the outer mirror records the
+        // buffer only if the island accepted it (or a timeout recovery replays
+        // it) — never on a clean backend rejection. A not-yet-booted island stays
+        // cold and picks the buffer up from the mirror on its boot replay.
+        if let Some(driver) = state.driver.as_mut() {
+            let outcome = driver.request(PcRequest::DidOpen {
+                target_id: target_id.to_string(),
+                uri: uri.to_string(),
+                text: text.to_string(),
+            });
+            if !accepted(&outcome) {
+                return;
+            }
+        }
         state.buffers.insert(
             uri.to_string(),
             Buffered {
@@ -217,46 +286,50 @@ impl PcQueryService for IslandPcService {
                 text: text.to_string(),
             },
         );
-        // Forward to a running island; a not-yet-booted island stays cold and
-        // picks the buffer up from the mirror on its boot replay.
-        if let Some(sup) = state.supervisor.as_mut() {
-            let _ = sup.request(PcRequest::DidOpen {
-                target_id: target_id.to_string(),
-                uri: uri.to_string(),
-                text: text.to_string(),
-            });
-        }
     }
 
     fn did_change(&self, uri: &str, text: &str) {
         let mut guard = self.state.lock().expect("pc island state mutex");
         let state = &mut *guard;
-        // Update the mirror in place (keeping the owning target); the handler only
-        // calls `did_change` for a buffer the mirror already holds.
-        let Some(buffered) = state.buffers.get_mut(uri) else {
+        // The handler only calls `did_change` for a buffer the mirror already
+        // holds; a change for an unheld buffer is a no-op.
+        if !state.buffers.contains_key(uri) {
             return;
-        };
-        buffered.text = text.to_string();
-        if let Some(sup) = state.supervisor.as_mut() {
-            let _ = sup.request(PcRequest::DidChange {
+        }
+        // Forward first; update the mirror text only if the island accepted the
+        // change (or a timeout recovery). On a clean backend rejection the old
+        // replayable text is preserved, so a later boot replay feeds the island
+        // the last text it actually accepted.
+        if let Some(driver) = state.driver.as_mut() {
+            let outcome = driver.request(PcRequest::DidChange {
                 uri: uri.to_string(),
                 text: text.to_string(),
             });
+            if !accepted(&outcome) {
+                return;
+            }
+        }
+        if let Some(buffered) = state.buffers.get_mut(uri) {
+            buffered.text = text.to_string();
         }
     }
 
     fn did_close(&self, uri: &str) {
         let mut guard = self.state.lock().expect("pc island state mutex");
         let state = &mut *guard;
-        state.buffers.remove(uri);
-        // Forwarding a close for an unknown buffer is harmless (the island ignores
-        // it), matching the Scala `s.pc.didClose(uri)` unconditional forward; a
-        // cold island simply drops it from the mirror.
-        if let Some(sup) = state.supervisor.as_mut() {
-            let _ = sup.request(PcRequest::DidClose {
+        // Forward first; drop the buffer from the mirror only if the island
+        // accepted the close (or a timeout recovery). On a clean backend rejection
+        // the island still holds the buffer, so keeping it in the mirror avoids an
+        // outer/inner replay divergence. A cold island simply drops it.
+        if let Some(driver) = state.driver.as_mut() {
+            let outcome = driver.request(PcRequest::DidClose {
                 uri: uri.to_string(),
             });
+            if !accepted(&outcome) {
+                return;
+            }
         }
+        state.buffers.remove(uri);
     }
 
     fn is_open(&self, uri: &str) -> bool {
@@ -309,27 +382,57 @@ fn boot(state: &mut IslandState) -> bool {
         request_deadline: REQUEST_DEADLINE,
         cancel_grace: Duration::from_millis(500),
     };
-    let mut sup = match boot_island(&config) {
+    let sup = match boot_island(&config) {
         Ok(sup) => sup,
         Err(error) => {
             state.boot_error = Some(error.to_string());
             return false;
         }
     };
-    for target in &state.targets {
-        let _ = sup.request(PcRequest::RegisterTarget {
+    install_driver(state, Box::new(sup))
+}
+
+/// Registers the workspace targets and replays the mirrored open buffers into a
+/// freshly booted `driver`, then installs it — but only if the island accepted
+/// every registration and buffer. A clean backend status on any `RegisterTarget`
+/// or replayed `DidOpen` means the island missed part of the state, so the driver
+/// is NOT installed (a half-populated island is never served) and the failure is
+/// recorded. Split from [`boot`] so the register/replay discipline is testable
+/// with a fake driver, without a live JVM.
+fn install_driver(state: &mut IslandState, mut driver: Box<dyn PcDriver>) -> bool {
+    // Snapshot the desired state so the register/replay loop does not alias the
+    // `state` it may record a `boot_error` into.
+    let targets = state.targets.clone();
+    let buffers: Vec<(String, Buffered)> = state
+        .buffers
+        .iter()
+        .map(|(uri, buffered)| (uri.clone(), buffered.clone()))
+        .collect();
+    for target in &targets {
+        let outcome = driver.request(PcRequest::RegisterTarget {
             id: target.bsp_id.clone(),
             config: target.clone(),
         });
+        if !accepted(&outcome) {
+            state.boot_error = Some(format!(
+                "PC target '{}' registration rejected by the island",
+                target.bsp_id
+            ));
+            return false;
+        }
     }
-    for (uri, buffered) in &state.buffers {
-        let _ = sup.request(PcRequest::DidOpen {
+    for (uri, buffered) in &buffers {
+        let outcome = driver.request(PcRequest::DidOpen {
             target_id: buffered.target_id.clone(),
             uri: uri.clone(),
             text: buffered.text.clone(),
         });
+        if !accepted(&outcome) {
+            state.boot_error = Some(format!("PC buffer '{uri}' replay rejected by the island"));
+            return false;
+        }
     }
-    state.supervisor = Some(sup);
+    state.driver = Some(driver);
     true
 }
 
@@ -384,10 +487,68 @@ mod tests {
         assert_eq!(pc_options(&options), options);
     }
 
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
     fn empty_resolver() -> Box<SymbolResolver> {
         Box::new(|_symbol, _from_uri| LocationsResult {
             locations: Vec::new(),
         })
+    }
+
+    fn target_config(id: &str) -> TargetConfig {
+        TargetConfig {
+            bsp_id: id.to_string(),
+            scala_version: "3".to_string(),
+            classpath: Vec::new(),
+            scalac_options: Vec::new(),
+            source_dirs: Vec::new(),
+        }
+    }
+
+    /// A fake booted-island driver that returns queued lifecycle outcomes and
+    /// counts the forwards it received, so the status-aware mirror discipline is
+    /// exercised without a live JVM.
+    struct FakeDriver {
+        outcomes: VecDeque<Result<Vec<u8>, PcError>>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl FakeDriver {
+        fn new(outcomes: Vec<Result<Vec<u8>, PcError>>) -> (FakeDriver, Arc<AtomicUsize>) {
+            let calls = Arc::new(AtomicUsize::new(0));
+            (
+                FakeDriver {
+                    outcomes: outcomes.into(),
+                    calls: calls.clone(),
+                },
+                calls,
+            )
+        }
+    }
+
+    impl PcDriver for FakeDriver {
+        fn request(&mut self, _request: PcRequest) -> Result<Vec<u8>, PcError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.outcomes.pop_front().unwrap_or(Ok(Vec::new()))
+        }
+    }
+
+    /// A service with `target` registered and a fake driver installed (as if the
+    /// island had already booted), returning the queued lifecycle outcomes.
+    fn booted(
+        target: &str,
+        outcomes: Vec<Result<Vec<u8>, PcError>>,
+    ) -> (IslandPcService, Arc<AtomicUsize>) {
+        let pc = IslandPcService::new(
+            PathBuf::from("/ws"),
+            vec![target_config(target)],
+            empty_resolver(),
+        );
+        let (driver, calls) = FakeDriver::new(outcomes);
+        pc.state.lock().unwrap().driver = Some(Box::new(driver));
+        (pc, calls)
     }
 
     // The document notifications keep the open-buffer mirror in sync WITHOUT
@@ -396,14 +557,18 @@ mod tests {
     // for a buffer the mirror never held is a no-op, not a panic (replay-safe).
     #[test]
     fn document_notifications_mirror_without_booting_the_island() {
-        let pc = IslandPcService::new(PathBuf::from("/ws"), Vec::new(), empty_resolver());
+        let pc = IslandPcService::new(
+            PathBuf::from("/ws"),
+            vec![target_config("t")],
+            empty_resolver(),
+        );
         let a = "file:///ws/a.scala";
 
         assert!(!pc.is_open(a));
         pc.did_open("t", a, "v1");
         assert!(pc.is_open(a));
         pc.did_change(a, "v2");
-        assert!(pc.is_open(a));
+        assert_eq!(pc.buffer_text(a).as_deref(), Some("v2"));
         pc.did_close(a);
         assert!(!pc.is_open(a));
 
@@ -416,5 +581,176 @@ mod tests {
             !pc.is_booted(),
             "a document notification must never boot the embedded JVM island"
         );
+    }
+
+    // `PcFacade.didOpen` requires the target registered before adding the buffer;
+    // an open for an unregistered target is never mirrored (and never boots).
+    #[test]
+    fn did_open_for_an_unregistered_target_is_ignored() {
+        let pc = IslandPcService::new(
+            PathBuf::from("/ws"),
+            vec![target_config("known")],
+            empty_resolver(),
+        );
+        pc.did_open("unknown", "file:///ws/a.scala", "v1");
+        assert!(!pc.is_open("file:///ws/a.scala"));
+        assert!(!pc.is_booted());
+    }
+
+    // A booted `did_open` whose live forward returns a clean backend status must
+    // NOT mirror the buffer — the island rejected it, so `is_open`/`withPcBuffer`
+    // must not claim it. The island is forwarded to first.
+    #[test]
+    fn failed_live_did_open_leaves_the_buffer_unmirrored() {
+        let (pc, calls) = booted("t", vec![Err(PcError::Backend(-7))]);
+        let a = "file:///ws/a.scala";
+        pc.did_open("t", a, "v1");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the island must be forwarded the open first"
+        );
+        assert!(
+            !pc.is_open(a),
+            "a rejected didOpen must not mark the buffer open"
+        );
+    }
+
+    // A booted `did_open` the island accepts mirrors the buffer; a timeout
+    // recovery also mirrors (the editor's notification is a fact the replay honors).
+    #[test]
+    fn accepted_and_timeout_live_did_open_mirror_the_buffer() {
+        let (pc, _calls) = booted("t", vec![Ok(Vec::new())]);
+        pc.did_open("t", "file:///ws/ok.scala", "v1");
+        assert_eq!(pc.buffer_text("file:///ws/ok.scala").as_deref(), Some("v1"));
+
+        let (pc, _calls) = booted("t", vec![Err(PcError::RequestTimeout)]);
+        pc.did_open("t", "file:///ws/recovered.scala", "v1");
+        assert!(pc.is_open("file:///ws/recovered.scala"));
+    }
+
+    // A booted `did_change` the island rejects preserves the last accepted text,
+    // so a later boot replay feeds the island what it actually holds.
+    #[test]
+    fn failed_live_did_change_preserves_the_replayable_text() {
+        let (pc, _calls) = booted("t", vec![Ok(Vec::new()), Err(PcError::Backend(-3))]);
+        let a = "file:///ws/a.scala";
+        pc.did_open("t", a, "v1");
+        pc.did_change(a, "v2");
+        assert_eq!(
+            pc.buffer_text(a).as_deref(),
+            Some("v1"),
+            "a rejected didChange must keep the last accepted text"
+        );
+    }
+
+    // A booted `did_close` the island rejects keeps the buffer (the island still
+    // holds it), avoiding an outer/inner replay divergence.
+    #[test]
+    fn failed_live_did_close_keeps_the_buffer() {
+        let (pc, _calls) = booted("t", vec![Ok(Vec::new()), Err(PcError::Backend(-9))]);
+        let a = "file:///ws/a.scala";
+        pc.did_open("t", a, "v1");
+        pc.did_close(a);
+        assert!(
+            pc.is_open(a),
+            "a rejected didClose must keep the buffer to avoid a replay divergence"
+        );
+    }
+
+    // A backend status on a boot replay (the target registers, then a replayed
+    // DidOpen is rejected) fails the boot: the driver is NOT installed and the
+    // failure is recorded, so a half-populated island is never served.
+    #[test]
+    fn failed_boot_replay_does_not_install_a_driver() {
+        let pc = IslandPcService::new(
+            PathBuf::from("/ws"),
+            vec![target_config("t")],
+            empty_resolver(),
+        );
+        // A buffer is pending replay (opened while cold).
+        pc.did_open("t", "file:///ws/a.scala", "v1");
+        // RegisterTarget succeeds; the replayed DidOpen is rejected.
+        let (driver, _calls) = FakeDriver::new(vec![Ok(Vec::new()), Err(PcError::Backend(-4))]);
+        let installed = {
+            let mut guard = pc.state.lock().unwrap();
+            install_driver(&mut guard, Box::new(driver))
+        };
+        assert!(
+            !installed,
+            "a rejected boot replay must not install a driver"
+        );
+        assert!(
+            !pc.is_booted(),
+            "no driver is installed after a failed replay"
+        );
+        assert!(
+            pc.state.lock().unwrap().boot_error.is_some(),
+            "the boot failure is recorded"
+        );
+    }
+
+    // A boot that registers the target and replays the buffer cleanly installs the
+    // driver.
+    #[test]
+    fn clean_boot_replay_installs_the_driver() {
+        let pc = IslandPcService::new(
+            PathBuf::from("/ws"),
+            vec![target_config("t")],
+            empty_resolver(),
+        );
+        pc.did_open("t", "file:///ws/a.scala", "v1");
+        let (driver, _calls) = FakeDriver::new(vec![Ok(Vec::new()), Ok(Vec::new())]);
+        let installed = {
+            let mut guard = pc.state.lock().unwrap();
+            install_driver(&mut guard, Box::new(driver))
+        };
+        assert!(installed);
+        assert!(pc.is_booted());
+    }
+
+    // A booted query dispatches `PcRequest::Query` through the driver and decodes
+    // the `DefinitionResult` reply to LSP-coordinate locations; a backend error on
+    // the query degrades to an empty result (no panic across the seam).
+    #[test]
+    fn a_booted_query_dispatches_through_the_driver_and_decodes_locations() {
+        use ls_pc_abi::payloads::{origin, Location, Rng};
+
+        let a = "file:///ws/a.scala";
+        let reply = DefinitionResult {
+            symbol: "foo".to_string(),
+            locations: vec![Location {
+                uri: a.to_string(),
+                range: Rng {
+                    start_line: 1,
+                    start_character: 2,
+                    end_line: 1,
+                    end_character: 5,
+                },
+                origin: origin::WORKSPACE,
+            }],
+        }
+        .encode()
+        .expect("encode definition result");
+
+        // The first Ok is consumed by `did_open` (mirrors the buffer); the query
+        // consumes the encoded reply.
+        let (pc, _calls) = booted("t", vec![Ok(Vec::new()), Ok(reply)]);
+        pc.did_open("t", a, "object A");
+        assert_eq!(
+            pc.definition(a, 0, 0),
+            vec![PcLocation {
+                uri: a.to_string(),
+                start_line: 1,
+                start_character: 2,
+                end_line: 1,
+                end_character: 5,
+            }]
+        );
+
+        // A backend error on the query degrades to empty.
+        let (pc, _calls) = booted("t", vec![Ok(Vec::new()), Err(PcError::Backend(-1))]);
+        pc.did_open("t", a, "object A");
+        assert!(pc.definition(a, 0, 0).is_empty());
     }
 }
