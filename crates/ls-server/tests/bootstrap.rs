@@ -96,6 +96,19 @@ fn production_bootstrap_ingests_the_model_and_serves_real_queries() {
                 "context": { "includeDeclaration": true }
             }),
         )),
+        frame(request(
+            4,
+            "textDocument/prepareRename",
+            json!({
+                "textDocument": { "uri": core_uri },
+                "position": { "line": 2, "character": 6 }
+            }),
+        )),
+        frame(request(
+            5,
+            "workspace/executeCommand",
+            json!({ "command": "scala3SemanticLs.reindex" }),
+        )),
         frame(notification("exit", json!({}))),
     ]
     .concat();
@@ -145,4 +158,20 @@ fn production_bootstrap_ingests_the_model_and_serves_real_queries() {
         .as_array()
         .expect("references result array");
     assert!(!refs.is_empty(), "expected references for Core, got none");
+
+    // prepareRename returns the span of the `Core` occurrence under the cursor.
+    let prepare = &by_id(4)["result"];
+    assert_eq!(
+        prepare["start"]["line"], 2,
+        "prepareRename range: {prepare}"
+    );
+    assert_eq!(prepare["start"]["character"], 6);
+    assert_eq!(prepare["end"]["character"], 10);
+
+    // reindex re-ingests the retained workspace and returns the ingest summary.
+    let summary = by_id(5)["result"].as_str().expect("reindex string result");
+    assert!(
+        summary.starts_with("ingest: segment ") && summary.contains(" docs "),
+        "unexpected reindex summary: {summary}"
+    );
 }

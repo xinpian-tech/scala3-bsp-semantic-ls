@@ -17,12 +17,13 @@ use std::path::PathBuf;
 use serde_json::{json, Value};
 
 use ls_engine::{
-    DocHighlight, DocumentHighlightService, QueryOrchestrator, ReferencesEngine, ReferencesResult,
-    WorkspaceSymbolEntry,
+    CompileOutcome, CompileService, DocHighlight, DocumentHighlightService, IngestReport,
+    QueryOrchestrator, ReferencesEngine, ReferencesResult, RenameEngine, WorkspaceSymbolEntry,
 };
 use ls_index_model::uri::normalize_uri;
 use ls_index_model::LsError;
 
+use crate::capabilities::commands;
 use crate::convert::{self, DocumentHighlight, Location, WorkspaceSymbol};
 use crate::jsonrpc::{error_codes, RequestId, Response, ResponseError};
 use crate::protocol::Position;
@@ -73,6 +74,8 @@ impl Handlers<CoreServices> for CoreHandlers {
                 document_highlight(id, cx.services, &cx.request.params)
             }
             "workspace/symbol" => workspace_symbol(id, cx.services, &cx.request.params),
+            "textDocument/prepareRename" => prepare_rename(id, cx.services, &cx.request.params),
+            "workspace/executeCommand" => execute_command(id, cx.services, &cx.request.params),
             other => not_implemented(id, other),
         }
     }
@@ -152,6 +155,86 @@ fn workspace_symbol(id: RequestId, services: &CoreServices, params: &Value) -> R
         .map(workspace_symbol_of)
         .collect();
     ok_json(id, &symbols)
+}
+
+/// `textDocument/prepareRename`: validate that a rename can start under the
+/// cursor and return the symbol occurrence's span as an LSP range. Any failure
+/// (an unmappable URI, a missing position, a non-renameable/unresolved cursor)
+/// answers `null`, matching `ScalaLs.prepareRename`'s `catch => null` and its
+/// non-ready `_ => null`. Ports `ScalaLs.prepareRename` (the index path); the
+/// `requireSemanticdb` prefix is observably equivalent here — an unmapped or
+/// unindexed URI yields `null` either way — and attaches with the live model.
+fn prepare_rename(id: RequestId, services: &CoreServices, params: &Value) -> Response {
+    let (Some(raw), Some(pos)) = (text_document_uri(params), position(params)) else {
+        return Response::success(id, Value::Null);
+    };
+    let Some(sdb_uri) = services.to_sdb_uri(&normalize_uri(&raw)) else {
+        return Response::success(id, Value::Null);
+    };
+    // `prepare_rename` resolves the span only; it never compiles, so the compile
+    // hook is a placeholder the FreshRequired `rename` ladder will supply for real.
+    let engine = RenameEngine::new(&services.orchestrator, &UnavailableCompiler);
+    match engine.prepare_rename(&sdb_uri, pos.line, pos.character) {
+        Ok(span) => ok_json(id, &convert::range(span)),
+        Err(_) => Response::success(id, Value::Null),
+    }
+}
+
+/// `workspace/executeCommand` for the ready-path commands the message loop
+/// routes here. `reindex` re-ingests over the retained workspace; `compile` and
+/// `pcPluginStatus` need the live build compiler / PC island and stay a typed
+/// placeholder. (`doctor` and unknown commands are handled before this point.)
+fn execute_command(id: RequestId, services: &CoreServices, params: &Value) -> Response {
+    match params.get("command").and_then(Value::as_str) {
+        Some(commands::REINDEX) => Response::success(id, Value::String(reindex(services))),
+        Some(other) => not_implemented(id, other),
+        None => not_implemented(id, "workspace/executeCommand"),
+    }
+}
+
+/// `scala3SemanticLs.reindex`: re-run a full ingest over the workspace the
+/// orchestrator already holds, returning the ingest summary. With no indexable
+/// target it is a no-op with the Scala skip message. Ports the `Reindex`
+/// executeCommand branch.
+fn reindex(services: &CoreServices) -> String {
+    let orchestrator = &services.orchestrator;
+    match orchestrator.workspace() {
+        Some(workspace) if !workspace.targets.is_empty() => match orchestrator.ingest(workspace) {
+            Ok(report) => ingest_summary(&report),
+            Err(error) => format!("reindex failed: {error}"),
+        },
+        _ => "reindex skipped: no target produces SemanticDB".to_string(),
+    }
+}
+
+/// One-line ingest summary. Ports `Bootstrap.ingestSummary` byte-for-byte.
+fn ingest_summary(report: &IngestReport) -> String {
+    format!(
+        "ingest: segment {}, {} docs ({} shared, {} stale, {} skipped), \
+         {} symbols, {} ref groups, {} rename groups in {}ms",
+        report.segment_id,
+        report.docs_indexed,
+        report.docs_shared,
+        report.docs_stale,
+        report.docs_skipped,
+        report.symbol_count,
+        report.ref_group_count,
+        report.rename_group_count,
+        report.duration_ms,
+    )
+}
+
+/// The compile hook used to build a [`RenameEngine`] for `prepareRename`, which
+/// never compiles. The FreshRequired `rename` ladder supplies the live build
+/// compiler instead; until then a compile request reports it is unavailable.
+struct UnavailableCompiler;
+
+impl CompileService for UnavailableCompiler {
+    fn compile(&self, _targets: &[String]) -> CompileOutcome {
+        CompileOutcome::Failed {
+            reason: "no build server connected".to_string(),
+        }
+    }
 }
 
 /// Reference hits -> LSP locations, dropping any hit whose SemanticDB URI does
@@ -451,5 +534,73 @@ mod tests {
             serde_json::to_value(document_highlight(RequestId::Number(1), &services, &params))
                 .unwrap();
         assert_eq!(value["result"], json!([]));
+    }
+
+    // prepareRename over an unindexed workspace resolves no symbol, so it answers
+    // null (the ScalaLs `catch => null`), never an error.
+    #[test]
+    fn prepare_rename_over_an_unindexed_workspace_is_null() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("A.scala"), "object A").unwrap();
+        let services = unindexed_services(dir.path());
+        let value = serde_json::to_value(prepare_rename(
+            RequestId::Number(1),
+            &services,
+            &position_params(dir.path()),
+        ))
+        .unwrap();
+        assert_eq!(value["result"], Value::Null);
+    }
+
+    #[test]
+    fn prepare_rename_with_an_unmappable_uri_is_null() {
+        let dir = tempfile::tempdir().unwrap();
+        let services = unindexed_services(dir.path());
+        let params = json!({
+            "textDocument": { "uri": "untitled:Untitled-1" },
+            "position": { "line": 0, "character": 0 }
+        });
+        let value =
+            serde_json::to_value(prepare_rename(RequestId::Number(1), &services, &params)).unwrap();
+        assert_eq!(value["result"], Value::Null);
+    }
+
+    // reindex over an orchestrator that never ingested a workspace is the no-op
+    // skip message, not an error.
+    #[test]
+    fn reindex_without_an_ingested_workspace_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let services = unindexed_services(dir.path());
+        let params = json!({ "command": "scala3SemanticLs.reindex" });
+        let value = serde_json::to_value(execute_command(RequestId::Number(1), &services, &params))
+            .unwrap();
+        assert_eq!(
+            value["result"],
+            "reindex skipped: no target produces SemanticDB"
+        );
+    }
+
+    // ingest_summary reproduces Bootstrap.ingestSummary's format byte-for-byte.
+    #[test]
+    fn ingest_summary_matches_the_scala_format() {
+        let report = IngestReport {
+            segment_id: 3,
+            docs_indexed: 25,
+            docs_shared: 1,
+            docs_stale: 0,
+            docs_skipped: 2,
+            symbol_count: 100,
+            ref_group_count: 40,
+            rename_group_count: 30,
+            stale_uris: Vec::new(),
+            skipped_uris: Vec::new(),
+            parse_errors: Vec::new(),
+            duration_ms: 12,
+        };
+        assert_eq!(
+            ingest_summary(&report),
+            "ingest: segment 3, 25 docs (1 shared, 0 stale, 2 skipped), \
+             100 symbols, 40 ref groups, 30 rename groups in 12ms"
+        );
     }
 }
