@@ -12,13 +12,16 @@
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Value};
 
 use ls_bsp::model::{BspProjectModel, BspTarget};
+use ls_engine::{CompileOutcome, CompileService};
 use ls_index_model::uri::path_to_uri;
 use ls_server::{
-    serve, CoreHandlers, IndexBootstrap, PublishDiagnosticsParams, ServerCore, ServerHooks,
+    serve, CoreHandlers, IndexBootstrap, ModelSource, PublishDiagnosticsParams, ReadyModel,
+    ServerCore, ServerHooks,
 };
 
 fn fixtures_root() -> PathBuf {
@@ -396,4 +399,125 @@ fn a_source_owned_by_a_non_indexable_target_is_no_semanticdb() {
             "id {id}: must be NoSemanticdb, not NotIndexed, got {response}"
         );
     }
+}
+
+/// A compile capability that records the target sets it is asked to compile and
+/// returns a fixed outcome, so the `compile` executeCommand is exercised over
+/// the real serve path without a live build server.
+struct RecordingCompiler {
+    succeed: bool,
+    fail_reason: String,
+    calls: Arc<Mutex<Vec<Vec<String>>>>,
+}
+
+impl CompileService for RecordingCompiler {
+    fn compile(&self, targets: &[String]) -> CompileOutcome {
+        self.calls.lock().unwrap().push(targets.to_vec());
+        if self.succeed {
+            CompileOutcome::Ok
+        } else {
+            CompileOutcome::Failed {
+                reason: self.fail_reason.clone(),
+            }
+        }
+    }
+}
+
+/// Injects the real fixture model plus a recording compiler into the bootstrap.
+struct CompilingModelSource {
+    succeed: bool,
+    fail_reason: String,
+    calls: Arc<Mutex<Vec<Vec<String>>>>,
+}
+
+impl ModelSource for CompilingModelSource {
+    fn load(&self, _root: &Path) -> Result<ReadyModel, String> {
+        Ok(ReadyModel {
+            model: fixture_model(),
+            compiler: Box::new(RecordingCompiler {
+                succeed: self.succeed,
+                fail_reason: self.fail_reason.clone(),
+                calls: self.calls.clone(),
+            }),
+        })
+    }
+}
+
+/// Bootstrap over the fixture model with a recording compiler, run the `compile`
+/// executeCommand, and return its result and the recorded compile domains.
+fn run_compile(succeed: bool, fail_reason: &str) -> (Value, Vec<Vec<String>>) {
+    let store_root = tempfile::tempdir().unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let source = CompilingModelSource {
+        succeed,
+        fail_reason: fail_reason.to_string(),
+        calls: calls.clone(),
+    };
+
+    let input = [
+        frame(request(
+            1,
+            "initialize",
+            json!({ "rootUri": path_to_uri(store_root.path()) }),
+        )),
+        frame(notification("initialized", json!({}))),
+        frame(request(
+            2,
+            "workspace/executeCommand",
+            json!({ "command": "scala3SemanticLs.compile" }),
+        )),
+        frame(notification("exit", json!({}))),
+    ]
+    .concat();
+
+    let mut reader = Cursor::new(input);
+    let mut writer = Vec::new();
+    let mut core = ServerCore::new();
+    let bootstrap = IndexBootstrap::new(source);
+    let publish = |_p: PublishDiagnosticsParams| {};
+    let on_changed = || {};
+    let hooks = ServerHooks {
+        publish_diagnostics: &publish,
+        on_build_targets_changed: &on_changed,
+    };
+    serve(
+        &mut reader,
+        &mut writer,
+        &mut core,
+        &CoreHandlers,
+        &bootstrap,
+        &hooks,
+    )
+    .unwrap();
+    assert!(core.state.is_ready(), "workspace did not reach ready");
+
+    let out = responses(writer);
+    let result = out
+        .iter()
+        .find(|r| r["id"] == 2)
+        .expect("compile response")
+        .clone();
+    let recorded = calls.lock().unwrap().clone();
+    (result, recorded)
+}
+
+/// `compile` over the ingested indexable targets reports the ok summary and
+/// compiles exactly the indexable bsp ids. Ports the `Compile` executeCommand
+/// branch (`s.compiler.compile(s.indexableBspIds)` -> "compile ok (N targets)").
+#[test]
+fn compile_reports_ok_over_the_indexable_targets() {
+    let (result, calls) = run_compile(true, "");
+    assert_eq!(result["result"], "compile ok (3 targets)");
+    assert_eq!(calls.len(), 1, "compile invoked once");
+    let mut domain = calls[0].clone();
+    domain.sort();
+    assert_eq!(domain, vec!["fixture-a", "fixture-b", "fixture-c"]);
+}
+
+/// A failed compile surfaces the status in the summary
+/// (`BspCompileOutcome.Failed(code, _)` -> "compile failed: $code").
+#[test]
+fn compile_reports_the_failure_status() {
+    let (result, _calls) = run_compile(false, "ERROR");
+    assert_eq!(result["result"], "compile failed: ERROR");
 }

@@ -19,6 +19,7 @@ pub mod workspace_uris;
 
 pub use bootstrap::{
     from_bsp, workspace_source_facts, BspDocFacts, IndexBootstrap, LiveBspModelSource, ModelSource,
+    ReadyModel,
 };
 pub use capabilities::{
     initialize_result, server_capabilities, InitializeResult, ServerCapabilities, SERVER_NAME,

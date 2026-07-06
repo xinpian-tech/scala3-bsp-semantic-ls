@@ -7,13 +7,14 @@
 //! `requireSemanticdb` gate). [`CoreHandlers`] is the production [`Handlers`]
 //! impl. It wires the index-backed, PC-free ready methods — `references`,
 //! `documentHighlight`, `workspace/symbol`, `prepareRename`, and the
-//! `scala3SemanticLs.reindex` executeCommand — over the engine's
-//! [`ReferencesEngine`] / [`DocumentHighlightService`] / workspace-symbol
-//! resolver / [`RenameEngine`], each gated (where the source applies it) by
-//! `requireSemanticdb`, converting SemanticDB coordinates and URIs to the LSP
-//! result shapes. The remaining ready methods (the PC-backed queries, full
-//! rename, and the `compile`/`pcPluginStatus` executeCommand actions) attach as
-//! their subsystems are wired; until then they answer a typed placeholder error.
+//! `scala3SemanticLs.reindex` and `scala3SemanticLs.compile` executeCommand
+//! actions — over the engine's [`ReferencesEngine`] / [`DocumentHighlightService`]
+//! / workspace-symbol resolver / [`RenameEngine`] and the retained build
+//! compiler, each gated (where the source applies it) by `requireSemanticdb`,
+//! converting SemanticDB coordinates and URIs to the LSP result shapes. The
+//! remaining ready methods (the PC-backed queries and full rename) attach as the
+//! PC island / compile ladder are wired; until then they answer a typed
+//! placeholder error.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -44,6 +45,11 @@ pub struct CoreServices {
     /// Normalized `file://` URI -> owning bspId, from the build project model
     /// (`WorkspaceState`'s `uriToTarget`). Backs the `requireSemanticdb` gate.
     pub uri_to_target: HashMap<String, String>,
+    /// The live build compile capability (the Scala `CoreServices.compiler`):
+    /// the `compile` executeCommand and the rename compile ladder run through it.
+    /// In production it retains the BSP session; index-only injections get the
+    /// disconnected stub.
+    pub compiler: Box<dyn CompileService>,
 }
 
 impl CoreServices {
@@ -52,12 +58,14 @@ impl CoreServices {
         uris: WorkspaceUris,
         workspace_root: Option<PathBuf>,
         uri_to_target: HashMap<String, String>,
+        compiler: Box<dyn CompileService>,
     ) -> CoreServices {
         CoreServices {
             orchestrator,
             uris,
             workspace_root,
             uri_to_target,
+            compiler,
         }
     }
 
@@ -230,14 +238,33 @@ fn prepare_rename(id: RequestId, services: &CoreServices, params: &Value) -> Res
 }
 
 /// `workspace/executeCommand` for the ready-path commands the message loop
-/// routes here. `reindex` re-ingests over the retained workspace; `compile` and
-/// `pcPluginStatus` need the live build compiler / PC island and stay a typed
-/// placeholder. (`doctor` and unknown commands are handled before this point.)
+/// routes here. `reindex` re-ingests over the retained workspace; `compile`
+/// compiles the indexable targets through the retained build compiler.
+/// (`doctor` and unknown / pre-ready commands are handled before this point.)
 fn execute_command(id: RequestId, services: &CoreServices, params: &Value) -> Response {
     match params.get("command").and_then(Value::as_str) {
         Some(commands::REINDEX) => Response::success(id, Value::String(reindex(services))),
+        Some(commands::COMPILE) => Response::success(id, Value::String(compile(services))),
         Some(other) => not_implemented(id, other),
         None => not_implemented(id, "workspace/executeCommand"),
+    }
+}
+
+/// `scala3SemanticLs.compile`: compile the ingested workspace's indexable targets
+/// through the retained build compiler and report the outcome (no reingest — the
+/// didSave build flow handles that). With no indexable target it is a no-op with
+/// the Scala skip message. Ports the `Compile` executeCommand branch.
+fn compile(services: &CoreServices) -> String {
+    let indexable_ids: Vec<String> = match services.orchestrator.workspace() {
+        Some(workspace) => workspace.targets.iter().map(|t| t.bsp_id.clone()).collect(),
+        None => Vec::new(),
+    };
+    if indexable_ids.is_empty() {
+        return "compile skipped: no indexable targets".to_string();
+    }
+    match services.compiler.compile(&indexable_ids) {
+        CompileOutcome::Ok => format!("compile ok ({} targets)", indexable_ids.len()),
+        CompileOutcome::Failed { reason } => format!("compile failed: {reason}"),
     }
 }
 
@@ -273,10 +300,10 @@ fn ingest_summary(report: &IngestReport) -> String {
     )
 }
 
-/// The compile hook used to build a [`RenameEngine`] for `prepareRename`, which
-/// never compiles. The FreshRequired `rename` ladder supplies the live build
-/// compiler instead; until then a compile request reports it is unavailable.
-struct UnavailableCompiler;
+/// The disconnected compile capability: the default for index-only bundles that
+/// carry no live build server (test injections, and the `prepareRename` engine,
+/// which never compiles). A compile request reports no build server is connected.
+pub(crate) struct UnavailableCompiler;
 
 impl CompileService for UnavailableCompiler {
     fn compile(&self, _targets: &[String]) -> CompileOutcome {
@@ -443,7 +470,13 @@ mod tests {
         let store = Store::open(root).unwrap();
         let orchestrator = QueryOrchestrator::with_defaults(store);
         let uris = WorkspaceUris::new(&[root.to_path_buf()]);
-        CoreServices::new(orchestrator, uris, Some(root.to_path_buf()), HashMap::new())
+        CoreServices::new(
+            orchestrator,
+            uris,
+            Some(root.to_path_buf()),
+            HashMap::new(),
+            Box::new(UnavailableCompiler),
+        )
     }
 
     fn position_params(root: &Path) -> Value {
@@ -642,6 +675,18 @@ mod tests {
             value["result"],
             "reindex skipped: no target produces SemanticDB"
         );
+    }
+
+    // compile over an orchestrator that never ingested a workspace has no
+    // indexable target, so it is the skip message, not a compile attempt.
+    #[test]
+    fn compile_without_an_ingested_workspace_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let services = unindexed_services(dir.path());
+        let params = json!({ "command": "scala3SemanticLs.compile" });
+        let value = serde_json::to_value(execute_command(RequestId::Number(1), &services, &params))
+            .unwrap();
+        assert_eq!(value["result"], "compile skipped: no indexable targets");
     }
 
     // A URI the live model does not own via an indexable target is NoSemanticdb,

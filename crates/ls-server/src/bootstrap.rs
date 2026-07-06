@@ -18,14 +18,19 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use ls_bsp::model::BspProjectModel;
-use ls_bsp::{BspClientHandlers, BspDiscovery, BspSession, BspSessionConfig, ProjectModelLoader};
-use ls_engine::{DocFacts, QueryOrchestrator, TargetSpec, WorkspaceTargets};
+use ls_bsp::{
+    BspClientHandlers, BspCompileOutcome, BspDiscovery, BspSession, BspSessionConfig,
+    ProjectModelLoader,
+};
+use ls_engine::{
+    CompileOutcome, CompileService, DocFacts, QueryOrchestrator, TargetSpec, WorkspaceTargets,
+};
 use ls_index_model::uri::normalize_uri;
 use ls_store::Store;
 
 use crate::lifecycle::WorkspaceState;
 use crate::server::{Bootstrap, BootstrapContext};
-use crate::services::CoreServices;
+use crate::services::{CoreServices, UnavailableCompiler};
 use crate::workspace_uris::WorkspaceUris;
 
 /// The directory under the workspace root that holds the index store — the
@@ -72,20 +77,34 @@ pub fn from_bsp(model: &BspProjectModel, doc_facts: BspDocFacts) -> WorkspaceTar
     WorkspaceTargets::new(specs)
 }
 
-/// A source of the build project model for a workspace root. In production it
-/// connects to the build server and loads the model (`BspDiscovery` +
-/// `BspSession` + `ProjectModelLoader`); tests inject a fixture. A load error is
-/// carried as a human-readable detail for the failed-bootstrap state.
-pub trait ModelSource {
-    fn load(&self, workspace_root: &Path) -> Result<BspProjectModel, String>;
+/// The build model plus the live compile capability the ready bundle retains.
+/// In production the `compiler` owns the launched BSP session; index-only
+/// injections carry the disconnected stub.
+pub struct ReadyModel {
+    pub model: BspProjectModel,
+    pub compiler: Box<dyn CompileService>,
 }
 
+/// A source of the build project model for a workspace root. In production it
+/// connects to the build server, loads the model (via `BspDiscovery`,
+/// `BspSession`, and `ProjectModelLoader`), and hands the retained session's
+/// compile capability to the ready bundle; tests inject a fixture. A load error
+/// is carried as a human-readable detail for the failed-bootstrap state.
+pub trait ModelSource {
+    fn load(&self, workspace_root: &Path) -> Result<ReadyModel, String>;
+}
+
+/// A closure that only produces the model gets the disconnected compiler, so an
+/// index-only test/injection needs no build server.
 impl<F> ModelSource for F
 where
     F: Fn(&Path) -> Result<BspProjectModel, String>,
 {
-    fn load(&self, workspace_root: &Path) -> Result<BspProjectModel, String> {
-        self(workspace_root)
+    fn load(&self, workspace_root: &Path) -> Result<ReadyModel, String> {
+        Ok(ReadyModel {
+            model: self(workspace_root)?,
+            compiler: Box::new(UnavailableCompiler),
+        })
     }
 }
 
@@ -109,7 +128,7 @@ impl<M: ModelSource> IndexBootstrap<M> {
     /// Loads the model, ingests it into a fresh store under the root, and returns
     /// the assembled services, or a human-readable detail on the first failure.
     fn build(&self, workspace_root: &Path) -> Result<CoreServices, String> {
-        let model = self.model_source.load(workspace_root)?;
+        let ReadyModel { model, compiler } = self.model_source.load(workspace_root)?;
         let workspace = from_bsp(&model, workspace_source_facts());
         // The model's URI ownership, keyed by normalized `file://` URI (as
         // `WorkspaceState` does with `Uris.normalize`), backs `requireSemanticdb`.
@@ -136,6 +155,7 @@ impl<M: ModelSource> IndexBootstrap<M> {
             uris,
             Some(workspace_root.to_path_buf()),
             uri_to_target,
+            compiler,
         ))
     }
 }
@@ -160,9 +180,11 @@ impl<M: ModelSource> Bootstrap<CoreServices> for IndexBootstrap<M> {
 /// `ProjectModelLoader.load`). Every `BspError` becomes the failed-bootstrap
 /// detail string.
 ///
-/// The session is shut down once the model is loaded: the index-backed query
-/// path answers from the ingested store and does not retain it. When compile /
-/// reload land, the session moves into the services bundle instead of closing.
+/// On success the launched session is RETAINED inside a [`BspCompileService`]
+/// carried in the ready bundle, so `compile` and rename reach the live build
+/// server; it is torn down from the ready-state teardown ([`BspCompileService`]'s
+/// `Drop`), not here. On a load failure the launched server is shut down before
+/// returning, so it is never left running.
 #[derive(Clone, Copy, Default)]
 pub struct LiveBspModelSource;
 
@@ -173,7 +195,7 @@ impl LiveBspModelSource {
 }
 
 impl ModelSource for LiveBspModelSource {
-    fn load(&self, workspace_root: &Path) -> Result<BspProjectModel, String> {
+    fn load(&self, workspace_root: &Path) -> Result<ReadyModel, String> {
         let connection = BspDiscovery::required(workspace_root).map_err(|e| e.to_string())?;
         let session = BspSession::launch(
             workspace_root.to_path_buf(),
@@ -182,21 +204,73 @@ impl ModelSource for LiveBspModelSource {
             BspSessionConfig::default(),
         )
         .map_err(|e| e.to_string())?;
-        // Load, then close the session cleanly whether or not the load
-        // succeeded — a launched build server must not be left running.
-        let model = load_project_model(&session);
-        session.shutdown();
-        session.close();
-        model
+        match load_project_model(&session) {
+            Ok(model) => Ok(ReadyModel {
+                model,
+                compiler: Box::new(BspCompileService::new(session)),
+            }),
+            Err(detail) => {
+                // A launched build server must not be left running past a failed load.
+                session.shutdown();
+                session.close();
+                Err(detail)
+            }
+        }
     }
 }
 
 /// Initializes the session and loads the project model, mapping any `BspError`
-/// to a detail string. Separated so the caller closes the session on either
-/// outcome.
+/// to a detail string. Separated so the caller retains or tears down the session
+/// by the outcome.
 fn load_project_model(session: &BspSession) -> Result<BspProjectModel, String> {
     session.initialize().map_err(|e| e.to_string())?;
     ProjectModelLoader::load(session).map_err(|e| e.to_string())
+}
+
+/// The live build compile capability: it owns the retained BSP session and
+/// compiles through `buildTarget/compile`. Dropped when the ready bundle is torn
+/// down, at which point it shuts the session down (matching the Scala ready-state
+/// shutdown, which closes the session rather than leaving it after model load).
+struct BspCompileService {
+    session: BspSession,
+}
+
+impl BspCompileService {
+    fn new(session: BspSession) -> Self {
+        BspCompileService { session }
+    }
+}
+
+impl CompileService for BspCompileService {
+    fn compile(&self, targets: &[String]) -> CompileOutcome {
+        match self.session.compile(targets, None) {
+            Ok(BspCompileOutcome::Ok { .. }) => CompileOutcome::Ok,
+            Ok(BspCompileOutcome::Failed { status_code, .. }) => CompileOutcome::Failed {
+                reason: bsp_status_name(status_code),
+            },
+            Err(error) => CompileOutcome::Failed {
+                reason: error.to_string(),
+            },
+        }
+    }
+}
+
+impl Drop for BspCompileService {
+    fn drop(&mut self) {
+        // Best-effort teardown of the retained build server on ready-state drop.
+        self.session.shutdown();
+        self.session.close();
+    }
+}
+
+/// The BSP `StatusCode` name a failed compile reports, matching the Scala
+/// `s"compile failed: $code"` rendering (`StatusCode` interpolates its name).
+fn bsp_status_name(status_code: i32) -> String {
+    match status_code {
+        2 => "ERROR".to_string(),
+        3 => "CANCELLED".to_string(),
+        other => other.to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -334,9 +408,12 @@ mod tests {
     #[test]
     fn live_model_source_without_a_connection_file_errors() {
         let dir = tempfile::tempdir().unwrap();
+        // `ReadyModel` holds a boxed compiler and is not `Debug`, so unwrap the
+        // error side directly rather than through `expect_err`.
         let err = LiveBspModelSource::new()
             .load(dir.path())
-            .expect_err("no .bsp connection file should fail");
+            .err()
+            .expect("no .bsp connection file should fail");
         assert!(err.contains(".bsp"), "{err}");
     }
 
