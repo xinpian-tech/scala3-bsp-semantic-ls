@@ -107,8 +107,11 @@ fn live_definition_over_an_open_buffer_routes_through_the_pc_island() {
         other => panic!("bootstrap not ready: {}", other.status_line()),
     };
 
-    // The buffer must be open for the presentation compiler to serve it.
+    // The buffer must be open for the presentation compiler to serve it: the
+    // document-notification hook mirrors it into the PC (the query then boots the
+    // island and replays the mirror), exactly as `didOpen` forwards it.
     documents.open(&file_uri, SOURCE);
+    CoreHandlers.on_did_open(&services, &file_uri, SOURCE);
     // `  val x = foo` is line 2; `foo` starts at column 10.
     let request = Request {
         id: RequestId::Number(1),

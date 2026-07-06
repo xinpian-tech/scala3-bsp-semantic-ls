@@ -67,8 +67,27 @@ pub struct RequestContext<'a, S> {
 /// report is a context built-in ([`doctor_report`]) so it renders in every
 /// state. The production impl is wired over the real subsystems; tests inject a
 /// fake.
+///
+/// The document-lifecycle hooks (`on_did_open`/`on_did_change`/`on_did_close`)
+/// let the ready services react to buffer notifications — the production impl
+/// forwards them to the presentation-compiler buffer mirror so an unsaved open
+/// buffer is visible to a later PC query and a closed buffer is dropped. They are
+/// invoked only when the workspace is ready and default to no-ops, so a services
+/// bundle that needs no buffer mirror (and the test fakes) inherit the empty
+/// behavior. Ports the `TextDocs.didOpen`/`didChange`/`didClose` PC forwarding.
 pub trait Handlers<S> {
     fn handle(&self, cx: RequestContext<'_, S>) -> Response;
+
+    /// A buffer was opened (already synced into the document store). `uri` is
+    /// normalized.
+    fn on_did_open(&self, _services: &S, _uri: &str, _text: &str) {}
+
+    /// An open buffer's text changed (full-text sync). `uri` is normalized.
+    fn on_did_change(&self, _services: &S, _uri: &str, _text: &str) {}
+
+    /// A buffer was closed (already dropped from the document store). `uri` is
+    /// normalized.
+    fn on_did_close(&self, _services: &S, _uri: &str) {}
 }
 
 /// The client-facing callbacks the server is wired with: publishing diagnostics
@@ -141,22 +160,34 @@ impl<S> ServerCore<S> {
         }
     }
 
-    fn did_open(&self, params: &Value) {
-        if let (Some(uri), Some(text)) = (document_uri(params), document_text(params)) {
-            self.docs.open(&uri, &text);
+    fn did_open(&self, handlers: &impl Handlers<S>, params: &Value) {
+        let (Some(uri), Some(text)) = (document_uri(params), document_text(params)) else {
+            return;
+        };
+        self.docs.open(&uri, &text);
+        if let Some(services) = self.state.ready() {
+            handlers.on_did_open(services, &uri, &text);
         }
     }
 
-    fn did_change(&self, params: &Value) {
+    fn did_change(&self, handlers: &impl Handlers<S>, params: &Value) {
         // Full-text sync: the last content change carries the whole document.
-        if let (Some(uri), Some(text)) = (document_uri(params), last_change_text(params)) {
-            self.docs.change(&uri, &text);
+        let (Some(uri), Some(text)) = (document_uri(params), last_change_text(params)) else {
+            return;
+        };
+        self.docs.change(&uri, &text);
+        if let Some(services) = self.state.ready() {
+            handlers.on_did_change(services, &uri, &text);
         }
     }
 
-    fn did_close(&self, params: &Value) {
-        if let Some(uri) = document_uri(params) {
-            self.docs.close(&uri);
+    fn did_close(&self, handlers: &impl Handlers<S>, params: &Value) {
+        let Some(uri) = document_uri(params) else {
+            return;
+        };
+        self.docs.close(&uri);
+        if let Some(services) = self.state.ready() {
+            handlers.on_did_close(services, &uri);
         }
     }
 
@@ -205,7 +236,7 @@ pub fn serve<S>(
                 write_frame(writer, &response)?;
             }
             Ok(Incoming::Notification(note)) => {
-                if let Flow::Stop = dispatch_notification(core, bootstrap, hooks, note) {
+                if let Flow::Stop = dispatch_notification(core, handlers, bootstrap, hooks, note) {
                     break;
                 }
             }
@@ -337,6 +368,7 @@ fn doctor_report<S>(core: &ServerCore<S>) -> String {
 
 fn dispatch_notification<S>(
     core: &mut ServerCore<S>,
+    handlers: &impl Handlers<S>,
     bootstrap: &impl Bootstrap<S>,
     hooks: &ServerHooks<'_>,
     note: Notification,
@@ -344,9 +376,9 @@ fn dispatch_notification<S>(
     match note.method.as_str() {
         "initialized" => core.run_bootstrap(bootstrap, hooks),
         "exit" => return Flow::Stop,
-        "textDocument/didOpen" => core.did_open(&note.params),
-        "textDocument/didChange" => core.did_change(&note.params),
-        "textDocument/didClose" => core.did_close(&note.params),
+        "textDocument/didOpen" => core.did_open(handlers, &note.params),
+        "textDocument/didChange" => core.did_change(handlers, &note.params),
+        "textDocument/didClose" => core.did_close(handlers, &note.params),
         "textDocument/didSave" => core.did_save(&note.params),
         // Any other notification (including `$/setTrace`) is ignored.
         _ => {}
@@ -851,13 +883,22 @@ mod tests {
     #[test]
     fn did_change_full_sync_takes_the_last_change_and_did_close_drops_the_buffer() {
         let core: ServerCore<FakeServices> = ServerCore::new();
-        core.did_open(&json!({ "textDocument": { "uri": "file:///a", "text": "v1" } }));
-        core.did_change(&json!({
-            "textDocument": { "uri": "file:///a" },
-            "contentChanges": [ { "text": "stale" }, { "text": "v2" } ]
-        }));
+        core.did_open(
+            &EchoHandlers,
+            &json!({ "textDocument": { "uri": "file:///a", "text": "v1" } }),
+        );
+        core.did_change(
+            &EchoHandlers,
+            &json!({
+                "textDocument": { "uri": "file:///a" },
+                "contentChanges": [ { "text": "stale" }, { "text": "v2" } ]
+            }),
+        );
         assert_eq!(core.docs.text("file:///a").as_deref(), Some("v2"));
-        core.did_close(&json!({ "textDocument": { "uri": "file:///a" } }));
+        core.did_close(
+            &EchoHandlers,
+            &json!({ "textDocument": { "uri": "file:///a" } }),
+        );
         assert!(!core.docs.is_open("file:///a"));
     }
 
@@ -866,8 +907,111 @@ mod tests {
         let core: ServerCore<FakeServices> = ServerCore::new();
         core.did_save(&json!({ "textDocument": { "uri": "file:///a" }, "text": "saved" }));
         assert!(!core.docs.is_open("file:///a"));
-        core.did_open(&json!({ "textDocument": { "uri": "file:///a", "text": "v1" } }));
+        core.did_open(
+            &EchoHandlers,
+            &json!({ "textDocument": { "uri": "file:///a", "text": "v1" } }),
+        );
         core.did_save(&json!({ "textDocument": { "uri": "file:///a" }, "text": "saved" }));
         assert_eq!(core.docs.text("file:///a").as_deref(), Some("saved"));
+    }
+
+    /// The document-notification seam: when the workspace is ready, `didOpen`/
+    /// `didChange`/`didClose` forward to the handlers' lifecycle hooks with the
+    /// normalized URI (so the PC buffer mirror stays in sync); before ready they
+    /// only sync the document store and the hooks are NOT invoked.
+    #[test]
+    fn document_notifications_forward_to_the_lifecycle_hooks_when_ready() {
+        use std::sync::Mutex;
+
+        #[derive(Default)]
+        struct RecordingHandlers {
+            events: Mutex<Vec<String>>,
+        }
+        impl Handlers<FakeServices> for RecordingHandlers {
+            fn handle(&self, cx: RequestContext<'_, FakeServices>) -> Response {
+                Response::success(cx.request.id.clone(), Value::Null)
+            }
+            fn on_did_open(&self, services: &FakeServices, uri: &str, text: &str) {
+                self.events
+                    .lock()
+                    .unwrap()
+                    .push(format!("open {} {uri} {text}", services.tag));
+            }
+            fn on_did_change(&self, _services: &FakeServices, uri: &str, text: &str) {
+                self.events
+                    .lock()
+                    .unwrap()
+                    .push(format!("change {uri} {text}"));
+            }
+            fn on_did_close(&self, _services: &FakeServices, uri: &str) {
+                self.events.lock().unwrap().push(format!("close {uri}"));
+            }
+        }
+
+        let drive = |ready_state: bool| {
+            let mut reader = Cursor::new(
+                [
+                    frame(request(1, "initialize", json!({ "rootUri": "file:///ws" }))),
+                    frame(notification("initialized", json!({}))),
+                    frame(notification(
+                        "textDocument/didOpen",
+                        // The `..` segment must be normalized away before the hook.
+                        json!({ "textDocument": { "uri": "file:///ws/x/../a.scala", "text": "v1" } }),
+                    )),
+                    frame(notification(
+                        "textDocument/didChange",
+                        json!({
+                            "textDocument": { "uri": "file:///ws/a.scala" },
+                            "contentChanges": [ { "text": "v2" } ]
+                        }),
+                    )),
+                    frame(notification(
+                        "textDocument/didClose",
+                        json!({ "textDocument": { "uri": "file:///ws/a.scala" } }),
+                    )),
+                    frame(notification("exit", json!({}))),
+                ]
+                .concat(),
+            );
+            let mut writer = Vec::new();
+            let mut core = ServerCore::new();
+            let handlers = RecordingHandlers::default();
+            let publish = |_p: PublishDiagnosticsParams| {};
+            let on_changed = || {};
+            let hooks = ServerHooks {
+                publish_diagnostics: &publish,
+                on_build_targets_changed: &on_changed,
+            };
+            let bootstrap = if ready_state {
+                FixedBootstrap(ready("svc"))
+            } else {
+                FixedBootstrap(WorkspaceState::Failed {
+                    detail: "no build server".to_string(),
+                })
+            };
+            serve(
+                &mut reader,
+                &mut writer,
+                &mut core,
+                &handlers,
+                &bootstrap,
+                &hooks,
+            )
+            .unwrap();
+            handlers.events.into_inner().unwrap()
+        };
+
+        // Ready: the hooks fire in order with the normalized URI and the services.
+        assert_eq!(
+            drive(true),
+            vec![
+                "open svc file:///ws/a.scala v1".to_string(),
+                "change file:///ws/a.scala v2".to_string(),
+                "close file:///ws/a.scala".to_string(),
+            ]
+        );
+        // Not ready (failed bootstrap): the document store still syncs, but no
+        // hook is invoked.
+        assert!(drive(false).is_empty());
     }
 }

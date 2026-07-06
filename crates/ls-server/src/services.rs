@@ -33,7 +33,6 @@ use ls_index_model::{LsError, Span};
 
 use crate::capabilities::commands;
 use crate::convert::{self, DocumentHighlight, Location, WorkspaceSymbol};
-use crate::documents::DocumentStore;
 use crate::jsonrpc::{error_codes, RequestId, Response, ResponseError};
 use crate::pc::{PcLocation, PcQueryService};
 use crate::protocol::Position;
@@ -153,15 +152,38 @@ impl Handlers<CoreServices> for CoreHandlers {
             "workspace/symbol" => workspace_symbol(id, cx.services, &cx.request.params),
             "textDocument/prepareRename" => prepare_rename(id, cx.services, &cx.request.params),
             "textDocument/rename" => rename(id, cx.services, &cx.request.params),
-            "textDocument/definition" => {
-                definition(id, cx.services, cx.documents, &cx.request.params)
-            }
-            "textDocument/typeDefinition" => {
-                type_definition(id, cx.services, cx.documents, &cx.request.params)
-            }
+            "textDocument/definition" => definition(id, cx.services, &cx.request.params),
+            "textDocument/typeDefinition" => type_definition(id, cx.services, &cx.request.params),
             "workspace/executeCommand" => execute_command(id, cx.services, &cx.request.params),
             other => not_implemented(id, other),
         }
+    }
+
+    /// A buffer opened: mirror it into the presentation compiler if the live
+    /// model owns it via a target. Ports `TextDocs.didOpen`'s PC forward
+    /// (`s.uriToTarget.get(uri).foreach(bspId => s.pc.didOpen(bspId, uri, text))`).
+    fn on_did_open(&self, services: &CoreServices, uri: &str, text: &str) {
+        if let Some(target_id) = services.uri_to_target.get(uri) {
+            services.pc.did_open(target_id, uri, text);
+        }
+    }
+
+    /// An open buffer changed: update the mirror if the PC already holds the
+    /// buffer, otherwise open it (a change that arrives before the PC has the
+    /// buffer). Ports `TextDocs.didChange`'s `if bufferText(uri).isDefined then
+    /// didChange else uriToTarget.get(uri).foreach(didOpen)`.
+    fn on_did_change(&self, services: &CoreServices, uri: &str, text: &str) {
+        if services.pc.is_open(uri) {
+            services.pc.did_change(uri, text);
+        } else if let Some(target_id) = services.uri_to_target.get(uri) {
+            services.pc.did_open(target_id, uri, text);
+        }
+    }
+
+    /// A buffer closed: drop it from the mirror. Ports `TextDocs.didClose`'s
+    /// unconditional `s.pc.didClose(uri)`.
+    fn on_did_close(&self, services: &CoreServices, uri: &str) {
+        services.pc.did_close(uri);
     }
 }
 
@@ -317,51 +339,34 @@ fn rename(id: RequestId, services: &CoreServices, params: &Value) -> Response {
 
 /// `textDocument/definition`: go-to-definition of the cursor symbol through the
 /// presentation compiler over the open buffer. Ports `ScalaLs.definition`.
-fn definition(
-    id: RequestId,
-    services: &CoreServices,
-    documents: &DocumentStore,
-    params: &Value,
-) -> Response {
-    pc_locations(
-        id,
-        services,
-        documents,
-        params,
-        |pc, target, uri, text, l, c| pc.definition(target, uri, text, l, c),
-    )
+fn definition(id: RequestId, services: &CoreServices, params: &Value) -> Response {
+    pc_locations(id, services, params, |pc, uri, l, c| {
+        pc.definition(uri, l, c)
+    })
 }
 
 /// `textDocument/typeDefinition`: the type-definition variant, otherwise
 /// identical to [`definition`]. Ports `ScalaLs.typeDefinition`.
-fn type_definition(
-    id: RequestId,
-    services: &CoreServices,
-    documents: &DocumentStore,
-    params: &Value,
-) -> Response {
-    pc_locations(
-        id,
-        services,
-        documents,
-        params,
-        |pc, target, uri, text, l, c| pc.type_definition(target, uri, text, l, c),
-    )
+fn type_definition(id: RequestId, services: &CoreServices, params: &Value) -> Response {
+    pc_locations(id, services, params, |pc, uri, l, c| {
+        pc.type_definition(uri, l, c)
+    })
 }
 
 /// The shared body of `definition`/`typeDefinition`. `requireSemanticdb` runs
 /// FIRST and *outside* the buffer fallback (ports the Scala guard preceding
 /// `withPcBuffer`): a URI the model does not own via an indexable target is a
 /// hard `NoSemanticdb`/`RequestFailed`, not an empty result. Only a missing
-/// position, a not-open buffer (the `withPcBuffer` fallback), a URI the model
-/// does not name a target for, or the PC yielding nothing answers the empty
-/// location list.
+/// position, a not-open buffer (the `withPcBuffer` fallback — the presentation
+/// compiler's mirror does not hold the buffer), or the PC yielding nothing
+/// answers the empty location list. The buffer text reaches the presentation
+/// compiler through the document notifications, so the query runs against the
+/// already-mirrored buffer by URI.
 fn pc_locations(
     id: RequestId,
     services: &CoreServices,
-    documents: &DocumentStore,
     params: &Value,
-    run: impl Fn(&dyn PcQueryService, &str, &str, &str, u32, u32) -> Vec<PcLocation>,
+    run: impl Fn(&dyn PcQueryService, &str, u32, u32) -> Vec<PcLocation>,
 ) -> Response {
     let Some(raw) = text_document_uri(params) else {
         return Response::success(id, json!([]));
@@ -374,21 +379,11 @@ fn pc_locations(
     };
     let uri = normalize_uri(&raw);
     // `withPcBuffer`: the presentation compiler serves only an open (dirty)
-    // buffer; a URI with no open buffer answers the empty list.
-    let Some(text) = documents.text(&uri) else {
+    // buffer; a URI the PC mirror does not hold answers the empty list.
+    if !services.pc.is_open(&uri) {
         return Response::success(id, json!([]));
-    };
-    let Some(target_id) = services.uri_to_target.get(&uri) else {
-        return Response::success(id, json!([]));
-    };
-    let locations = run(
-        services.pc.as_ref(),
-        target_id,
-        &uri,
-        &text,
-        pos.line,
-        pos.character,
-    );
+    }
+    let locations = run(services.pc.as_ref(), &uri, pos.line, pos.character);
     ok_json(id, &pc_locations_to_lsp(&locations))
 }
 
@@ -593,17 +588,16 @@ mod tests {
     }
 
     impl PcQueryService for FakePc {
-        fn definition(&self, _t: &str, _u: &str, _x: &str, _l: u32, _c: u32) -> Vec<PcLocation> {
+        fn did_open(&self, _t: &str, _u: &str, _x: &str) {}
+        fn did_change(&self, _u: &str, _x: &str) {}
+        fn did_close(&self, _u: &str) {}
+        fn is_open(&self, _u: &str) -> bool {
+            true
+        }
+        fn definition(&self, _u: &str, _l: u32, _c: u32) -> Vec<PcLocation> {
             self.definition.clone()
         }
-        fn type_definition(
-            &self,
-            _t: &str,
-            _u: &str,
-            _x: &str,
-            _l: u32,
-            _c: u32,
-        ) -> Vec<PcLocation> {
+        fn type_definition(&self, _u: &str, _l: u32, _c: u32) -> Vec<PcLocation> {
             self.type_definition.clone()
         }
     }
@@ -800,11 +794,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("A.scala"), "object A").unwrap();
         let services = unindexed_services(dir.path());
-        let documents = DocumentStore::new();
         let response = definition(
             RequestId::Number(1),
             &services,
-            &documents,
             &position_params(dir.path()),
         );
         let value = serde_json::to_value(&response).unwrap();

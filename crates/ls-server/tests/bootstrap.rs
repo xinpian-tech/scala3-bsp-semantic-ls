@@ -670,25 +670,51 @@ fn ready_fixture_services() -> (CoreServices, tempfile::TempDir) {
     }
 }
 
-/// A fake PC returning canned locations, so the ready definition/typeDefinition
-/// handlers are driven over the real fixture-ingested services (the production
-/// `IslandPcService` would need a live JVM to answer).
+/// A fake PC returning canned locations and recording its document-lifecycle
+/// calls, so the ready definition/typeDefinition handlers and the notification
+/// forwarding are driven over the real fixture-ingested services (the production
+/// `IslandPcService` would need a live JVM to answer). The recorded `events` and
+/// the `open` mirror are behind `Arc<Mutex<_>>` so a test can read them after the
+/// fake is boxed into the services.
 #[derive(Clone, Default)]
 struct FakePc {
     definition: Vec<PcLocation>,
     type_definition: Vec<PcLocation>,
+    events: Arc<Mutex<Vec<String>>>,
+    open: Arc<Mutex<Vec<String>>>,
 }
 
 impl PcQueryService for FakePc {
-    fn definition(&self, _t: &str, _u: &str, _txt: &str, _l: u32, _c: u32) -> Vec<PcLocation> {
+    fn did_open(&self, target_id: &str, uri: &str, text: &str) {
+        self.events
+            .lock()
+            .unwrap()
+            .push(format!("open {target_id} {uri} {text}"));
+        self.open.lock().unwrap().push(uri.to_string());
+    }
+    fn did_change(&self, uri: &str, text: &str) {
+        self.events
+            .lock()
+            .unwrap()
+            .push(format!("change {uri} {text}"));
+    }
+    fn did_close(&self, uri: &str) {
+        self.events.lock().unwrap().push(format!("close {uri}"));
+        self.open.lock().unwrap().retain(|u| u != uri);
+    }
+    fn is_open(&self, uri: &str) -> bool {
+        self.open.lock().unwrap().iter().any(|u| u == uri)
+    }
+    fn definition(&self, _u: &str, _l: u32, _c: u32) -> Vec<PcLocation> {
         self.definition.clone()
     }
-    fn type_definition(&self, _t: &str, _u: &str, _txt: &str, _l: u32, _c: u32) -> Vec<PcLocation> {
+    fn type_definition(&self, _u: &str, _l: u32, _c: u32) -> Vec<PcLocation> {
         self.type_definition.clone()
     }
 }
 
-fn drive(services: &CoreServices, documents: &DocumentStore, method: &str, params: Value) -> Value {
+fn drive(services: &CoreServices, method: &str, params: Value) -> Value {
+    let documents = DocumentStore::new();
     let request = Request {
         id: RequestId::Number(1),
         method: method.to_string(),
@@ -698,24 +724,29 @@ fn drive(services: &CoreServices, documents: &DocumentStore, method: &str, param
         request: &request,
         services,
         workspace_root: None,
-        documents,
+        documents: &documents,
         shutting_down: false,
     });
     serde_json::to_value(&response).unwrap()
 }
 
+/// The normalized `file://` URI of the fixture's `Core.scala` (owned by
+/// `fixture-a`), the buffer the PC-routing tests drive.
+fn core_uri() -> String {
+    normalize_uri(&path_to_uri(
+        &fixtures_root().join("sources/a/src/pkga/Core.scala"),
+    ))
+}
+
 /// definition and typeDefinition each route to their own PC op (proven by
 /// distinct canned locations) over an open, owned buffer that passes
 /// `requireSemanticdb`, and the PC `file://` locations convert to LSP locations.
+/// The buffer reaches the PC mirror through the document-notification hook (the
+/// `withPcBuffer` precondition), exactly as `didOpen` forwards it.
 #[test]
 fn definition_and_type_definition_route_to_the_pc_over_an_open_owned_buffer() {
     let (mut services, _root) = ready_fixture_services();
-    // The document store keys by normalized URI (as `did_open` does), and the
-    // handler looks the open buffer up by the normalized request URI; the fixture
-    // root carries a `..`, so normalize to match.
-    let core_uri = normalize_uri(&path_to_uri(
-        &fixtures_root().join("sources/a/src/pkga/Core.scala"),
-    ));
+    let core_uri = core_uri();
     services.pc = Box::new(FakePc {
         definition: vec![PcLocation {
             uri: core_uri.clone(),
@@ -731,20 +762,16 @@ fn definition_and_type_definition_route_to_the_pc_over_an_open_owned_buffer() {
             end_line: 5,
             end_character: 4,
         }],
+        ..Default::default()
     });
-    let documents = DocumentStore::new();
-    documents.open(&core_uri, "class Core\n");
+    // Open the buffer through the lifecycle hook so the PC mirror holds it.
+    CoreHandlers.on_did_open(&services, &core_uri, "class Core\n");
     let pos = json!({
         "textDocument": { "uri": core_uri.clone() },
         "position": { "line": 2, "character": 6 }
     });
 
-    let def = drive(
-        &services,
-        &documents,
-        "textDocument/definition",
-        pos.clone(),
-    );
+    let def = drive(&services, "textDocument/definition", pos.clone());
     assert_eq!(
         def["result"],
         json!([{
@@ -753,7 +780,7 @@ fn definition_and_type_definition_route_to_the_pc_over_an_open_owned_buffer() {
         }])
     );
 
-    let type_def = drive(&services, &documents, "textDocument/typeDefinition", pos);
+    let type_def = drive(&services, "textDocument/typeDefinition", pos);
     assert_eq!(
         type_def["result"],
         json!([{
@@ -764,14 +791,13 @@ fn definition_and_type_definition_route_to_the_pc_over_an_open_owned_buffer() {
 }
 
 /// `withPcBuffer`: an owned URI that passes `requireSemanticdb` but is NOT an
-/// open buffer answers the empty list — the PC is never consulted (the fake
-/// would return a location, yet the result is empty).
+/// open buffer (the PC mirror does not hold it) answers the empty list — the PC
+/// is never consulted (the fake would return a location, yet the result is
+/// empty).
 #[test]
 fn definition_over_an_owned_but_unopened_buffer_is_an_empty_list() {
     let (mut services, _root) = ready_fixture_services();
-    let core_uri = normalize_uri(&path_to_uri(
-        &fixtures_root().join("sources/a/src/pkga/Core.scala"),
-    ));
+    let core_uri = core_uri();
     services.pc = Box::new(FakePc {
         definition: vec![PcLocation {
             uri: core_uri.clone(),
@@ -782,14 +808,78 @@ fn definition_over_an_owned_but_unopened_buffer_is_an_empty_list() {
         }],
         ..Default::default()
     });
-    // The buffer is not opened, so the PC serves nothing for it.
-    let documents = DocumentStore::new();
+    // The buffer is never opened, so the PC mirror does not hold it.
     let params = json!({
         "textDocument": { "uri": core_uri },
         "position": { "line": 2, "character": 6 }
     });
-    let def = drive(&services, &documents, "textDocument/definition", params);
+    let def = drive(&services, "textDocument/definition", params);
     assert_eq!(def["result"], json!([]));
+}
+
+/// `TextDocs.didChange` parity: a change for a buffer the PC does not yet hold
+/// OPENS it (resolving the owning target), and a subsequent change UPDATES the
+/// now-mirrored buffer — never a second open. A close then drops it.
+#[test]
+fn on_did_change_opens_an_unmirrored_buffer_then_updates_it() {
+    let (mut services, _root) = ready_fixture_services();
+    let core_uri = core_uri();
+    let fake = FakePc::default();
+    let events = fake.events.clone();
+    services.pc = Box::new(fake);
+
+    // First change: the PC has no buffer, so it opens (owner resolved to fixture-a).
+    CoreHandlers.on_did_change(&services, &core_uri, "v1");
+    // Second change: the PC now holds it, so it updates.
+    CoreHandlers.on_did_change(&services, &core_uri, "v2");
+    // Close: dropped from the mirror.
+    CoreHandlers.on_did_close(&services, &core_uri);
+
+    assert_eq!(
+        *events.lock().unwrap(),
+        vec![
+            format!("open fixture-a {core_uri} v1"),
+            format!("change {core_uri} v2"),
+            format!("close {core_uri}"),
+        ]
+    );
+    assert!(!services.pc.is_open(&core_uri));
+}
+
+/// `ScalaLs.replayOpenBuffers`: a buffer already open when the workspace reaches
+/// ready is replayed into the PC mirror (the production `IslandPcService`), so it
+/// is visible to a later PC query — and the replay does NOT boot the JVM (proven
+/// by the real service being usable with no `LS_LIBJVM` in the environment).
+#[test]
+fn ready_replays_pre_opened_buffers_into_the_pc_mirror() {
+    let store_root = tempfile::tempdir().unwrap();
+    let documents = DocumentStore::new();
+    let core_uri = core_uri();
+    // Opened during the pre-ready window.
+    documents.open(&core_uri, "class Core\n");
+    let publish = |_p: PublishDiagnosticsParams| {};
+    let on_changed = || {};
+    let services =
+        match IndexBootstrap::new(|_root: &Path| Ok(fixture_model())).run(BootstrapContext {
+            workspace_root: Some(store_root.path()),
+            documents: &documents,
+            publish_diagnostics: &publish,
+            on_build_targets_changed: &on_changed,
+        }) {
+            WorkspaceState::Ready(services) => services,
+            other => panic!("bootstrap not ready: {}", other.status_line()),
+        };
+
+    // The pre-opened buffer was replayed into the real PC mirror at ready.
+    assert!(
+        services.pc.is_open(&core_uri),
+        "a pre-opened buffer must be replayed into the PC mirror at ready"
+    );
+    // A buffer that was never open is not mirrored.
+    let unopened = normalize_uri(&path_to_uri(
+        &fixtures_root().join("sources/b/src/pkgb/Widget.scala"),
+    ));
+    assert!(!services.pc.is_open(&unopened));
 }
 
 /// The no-BSP recovered-index fallback (`ScalaLs.requireSemanticdb`'s

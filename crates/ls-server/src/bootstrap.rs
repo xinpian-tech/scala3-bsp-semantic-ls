@@ -30,6 +30,7 @@ use ls_index_model::Loc;
 use ls_pc_abi::payloads::{origin, LocationsResult, Rng, TargetConfig};
 use ls_store::Store;
 
+use crate::documents::DocumentStore;
 use crate::lifecycle::WorkspaceState;
 use crate::pc::{pc_options, IslandPcService, SymbolResolver};
 use crate::server::{Bootstrap, BootstrapContext};
@@ -285,8 +286,26 @@ impl<M: ModelSource> Bootstrap<CoreServices> for IndexBootstrap<M> {
             };
         };
         match self.build(root) {
-            Ok(services) => WorkspaceState::Ready(services),
+            Ok(services) => {
+                replay_open_buffers(&services, cx.documents);
+                WorkspaceState::Ready(services)
+            }
             Err(detail) => WorkspaceState::Failed { detail },
+        }
+    }
+}
+
+/// Seeds the presentation compiler's open-buffer mirror from the buffers already
+/// open when the workspace reaches ready (opened during the pre-ready window, so
+/// their `didOpen` notifications were dropped before the ready services existed).
+/// A buffer opened before bootstrap finished is thereby visible to a later PC
+/// query. Ports `ScalaLs.replayOpenBuffers`.
+fn replay_open_buffers(services: &CoreServices, documents: &DocumentStore) {
+    for uri in documents.open_uris() {
+        if let (Some(text), Some(target_id)) =
+            (documents.text(&uri), services.uri_to_target.get(&uri))
+        {
+            services.pc.did_open(target_id, &uri, &text);
         }
     }
 }
