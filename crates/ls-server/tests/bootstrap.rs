@@ -21,10 +21,10 @@ use ls_engine::{CompileOutcome, CompileService};
 use ls_index_model::uri::{normalize_uri, path_to_uri};
 use ls_index_model::LsError;
 use ls_server::{
-    reload_build_model, serve, Bootstrap, BootstrapContext, BuildCompiler, CoreHandlers,
-    CoreServices, DocumentStore, Handlers, IndexBootstrap, LoadOutcome, ModelSource, PcLocation,
-    PcQueryService, PublishDiagnosticsParams, ReadyModel, Request, RequestContext, RequestId,
-    ServerCore, ServerHooks, WorkspaceState,
+    read_frame, reload_build_model, serve, Bootstrap, BuildCompiler, CoreHandlers, CoreServices,
+    DocumentStore, Handlers, IndexBootstrap, LoadOutcome, ModelSource, PcLocation, PcQueryService,
+    PublishDiagnosticsParams, ReadyModel, Request, RequestContext, RequestId, ServerCore,
+    ServerHooks, WorkspaceState,
 };
 
 fn fixtures_root() -> PathBuf {
@@ -177,26 +177,15 @@ fn production_bootstrap_ingests_the_model_and_serves_real_queries() {
     ]
     .concat();
 
-    let mut reader = Cursor::new(input);
-    let mut writer = Vec::new();
     let mut core = ServerCore::new();
-    let bootstrap = IndexBootstrap::new(|_root: &Path| Ok(fixture_model()));
-    let publish = |_p: PublishDiagnosticsParams| {};
-    let hooks = ServerHooks {
-        publish_diagnostics: &publish,
-    };
-    serve(
-        &mut reader,
-        &mut writer,
+    let out = serve_pumped(
         &mut core,
         &CoreHandlers,
-        &bootstrap,
-        &hooks,
-    )
-    .unwrap();
+        || IndexBootstrap::new(|_root: &Path| Ok(fixture_model())),
+        input,
+    );
 
     assert!(core.state.is_ready(), "workspace did not reach ready");
-    let out = responses(writer);
     let by_id = |id: i64| {
         out.iter()
             .find(|r| r["id"] == id)
@@ -364,26 +353,15 @@ fn a_source_owned_by_a_non_indexable_target_is_no_semanticdb() {
     ]
     .concat();
 
-    let mut reader = Cursor::new(input);
-    let mut writer = Vec::new();
     let mut core = ServerCore::new();
-    let bootstrap = IndexBootstrap::new(|_root: &Path| Ok(model_with_non_indexable_owner().0));
-    let publish = |_p: PublishDiagnosticsParams| {};
-    let hooks = ServerHooks {
-        publish_diagnostics: &publish,
-    };
-    serve(
-        &mut reader,
-        &mut writer,
+    let out = serve_pumped(
         &mut core,
         &CoreHandlers,
-        &bootstrap,
-        &hooks,
-    )
-    .unwrap();
+        || IndexBootstrap::new(|_root: &Path| Ok(model_with_non_indexable_owner().0)),
+        input,
+    );
 
     assert!(core.state.is_ready(), "workspace did not reach ready");
-    let out = responses(writer);
     let by_id = |id: i64| {
         out.iter()
             .find(|r| r["id"] == id)
@@ -440,6 +418,7 @@ impl BuildCompiler for RecordingCompiler {
 }
 
 /// Injects the real fixture model plus a recording compiler into the bootstrap.
+#[derive(Clone)]
 struct CompilingModelSource {
     succeed: bool,
     fail_reason: String,
@@ -461,6 +440,7 @@ impl ModelSource for CompilingModelSource {
 
 /// A model source that selects the no-BSP recovered-index mode: no live model,
 /// serve whatever the store recovered.
+#[derive(Clone)]
 struct NoBspSource;
 
 impl ModelSource for NoBspSource {
@@ -508,6 +488,7 @@ impl BuildCompiler for ReloadingCompiler {
 
 /// A model source that loads `initial` and whose retained compiler refetches
 /// `reload` — the model the build server reports after a `buildTarget/didChange`.
+#[derive(Clone)]
 struct ReloadingModelSource {
     initial: BspProjectModel,
     reload: BspProjectModel,
@@ -524,19 +505,78 @@ impl ModelSource for ReloadingModelSource {
     }
 }
 
+/// The byte offset just past the `initialized` notification in a framed input
+/// stream, or the full length if none is present.
+fn split_after_initialized(bytes: &[u8]) -> usize {
+    let mut reader = std::io::Cursor::new(bytes.to_vec());
+    while let Ok(Some(body)) = read_frame(&mut reader) {
+        let is_initialized = serde_json::from_slice::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|v| v.get("method")?.as_str().map(str::to_string))
+            .as_deref()
+            == Some("initialized");
+        if is_initialized {
+            return reader.position() as usize;
+        }
+    }
+    bytes.len()
+}
+
+/// Drives `serve` over the scripted `input` in two passes split just after the
+/// `initialized` notification, on one persistent `core`: the first pass reaches
+/// Ready/Failed (the async bootstrap worker is drained at that pass's loop end),
+/// so the ready-requiring requests in the second pass observe the settled state —
+/// as a real client, which waits between `initialized` and its queries while the
+/// bootstrap runs. `bootstrap` yields a fresh instance per pass (the second pass's
+/// is unused for building, but `serve` consumes one by value). Returns the
+/// responses from both passes, in order.
+fn serve_pumped<S, H, B>(
+    core: &mut ServerCore<S>,
+    handlers: &H,
+    mut bootstrap: impl FnMut() -> B,
+    input: Vec<u8>,
+) -> Vec<serde_json::Value>
+where
+    S: Send + 'static,
+    H: Handlers<S>,
+    B: Bootstrap<S> + Send + Sync + 'static,
+{
+    let split = split_after_initialized(&input);
+    let mut out = Vec::new();
+    for chunk in [input[..split].to_vec(), input[split..].to_vec()] {
+        if chunk.is_empty() {
+            continue;
+        }
+        let mut reader = std::io::Cursor::new(chunk);
+        let mut writer = Vec::new();
+        let publish = |_p: PublishDiagnosticsParams| {};
+        let hooks = ServerHooks {
+            publish_diagnostics: &publish,
+        };
+        serve(
+            &mut reader,
+            &mut writer,
+            core,
+            handlers,
+            bootstrap(),
+            &hooks,
+        )
+        .unwrap();
+        out.extend(responses(writer));
+    }
+    out
+}
+
 fn ready_over<M: ModelSource>(
     bootstrap: &IndexBootstrap<M>,
     root: &Path,
     documents: &DocumentStore,
 ) -> CoreServices {
-    let publish = |_p: PublishDiagnosticsParams| {};
-    let cx = BootstrapContext {
-        workspace_root: Some(root),
-        documents,
-        publish_diagnostics: &publish,
-    };
-    match bootstrap.run(cx) {
-        WorkspaceState::Ready(services) => services,
+    match bootstrap.build(Some(root.to_path_buf())) {
+        WorkspaceState::Ready(services) => {
+            bootstrap.replay(&services, documents);
+            services
+        }
         other => panic!("expected Ready, got {:?}", other.status_line()),
     }
 }
@@ -650,27 +690,18 @@ fn a_build_target_change_reloads_the_model_over_the_serve_loop() {
         frame(notification("exit", json!({}))),
     ]
     .concat();
-    let mut reader = Cursor::new(input);
-    let mut writer = Vec::new();
     let mut core = ServerCore::new();
-    // The build server reports a target change during startup: the flag is set and
-    // drained on the first ready turn (before the workspace/symbol query).
+    // The build server reports a target change during startup: the flag is set
+    // while the async bootstrap runs and is drained on the first ready turn (the
+    // workspace/symbol query), so the query observes the reloaded model.
     core.reload_flag()
         .store(true, std::sync::atomic::Ordering::SeqCst);
-    let publish = |_p: PublishDiagnosticsParams| {};
-    let hooks = ServerHooks {
-        publish_diagnostics: &publish,
-    };
-    serve(
-        &mut reader,
-        &mut writer,
+    let out = serve_pumped(
         &mut core,
         &CoreHandlers,
-        &IndexBootstrap::new(source),
-        &hooks,
-    )
-    .unwrap();
-    let out = responses(writer);
+        || IndexBootstrap::new(source.clone()),
+        input,
+    );
     let symbols = out[1]["result"]
         .as_array()
         .expect("workspace/symbol returns an array");
@@ -711,26 +742,14 @@ fn run_compile(succeed: bool, fail_reason: &str) -> (Value, Vec<Vec<String>>) {
     ]
     .concat();
 
-    let mut reader = Cursor::new(input);
-    let mut writer = Vec::new();
     let mut core = ServerCore::new();
-    let bootstrap = IndexBootstrap::new(source);
-    let publish = |_p: PublishDiagnosticsParams| {};
-    let hooks = ServerHooks {
-        publish_diagnostics: &publish,
-    };
-    serve(
-        &mut reader,
-        &mut writer,
+    let out = serve_pumped(
         &mut core,
         &CoreHandlers,
-        &bootstrap,
-        &hooks,
-    )
-    .unwrap();
+        || IndexBootstrap::new(source.clone()),
+        input,
+    );
     assert!(core.state.is_ready(), "workspace did not reach ready");
-
-    let out = responses(writer);
     let result = out
         .iter()
         .find(|r| r["id"] == 2)
@@ -794,26 +813,14 @@ fn run_rename(succeed: bool, new_name: &str) -> (Value, Vec<Vec<String>>) {
     ]
     .concat();
 
-    let mut reader = Cursor::new(input);
-    let mut writer = Vec::new();
     let mut core = ServerCore::new();
-    let bootstrap = IndexBootstrap::new(source);
-    let publish = |_p: PublishDiagnosticsParams| {};
-    let hooks = ServerHooks {
-        publish_diagnostics: &publish,
-    };
-    serve(
-        &mut reader,
-        &mut writer,
+    let out = serve_pumped(
         &mut core,
         &CoreHandlers,
-        &bootstrap,
-        &hooks,
-    )
-    .unwrap();
+        || IndexBootstrap::new(source.clone()),
+        input,
+    );
     assert!(core.state.is_ready(), "workspace did not reach ready");
-
-    let out = responses(writer);
     let result = out
         .iter()
         .find(|r| r["id"] == 2)
@@ -869,14 +876,7 @@ fn rename_with_a_failing_compile_is_a_request_failed_error() {
 fn ready_fixture_services() -> (CoreServices, tempfile::TempDir) {
     let store_root = tempfile::tempdir().unwrap();
     let bootstrap = IndexBootstrap::new(|_root: &Path| Ok(fixture_model()));
-    let documents = DocumentStore::new();
-    let publish = |_p: PublishDiagnosticsParams| {};
-    let cx = BootstrapContext {
-        workspace_root: Some(store_root.path()),
-        documents: &documents,
-        publish_diagnostics: &publish,
-    };
-    match bootstrap.run(cx) {
+    match bootstrap.build(Some(store_root.path().to_path_buf())) {
         WorkspaceState::Ready(services) => (services, store_root),
         other => panic!("bootstrap not ready: {}", other.status_line()),
     }
@@ -1192,16 +1192,15 @@ fn ready_replays_pre_opened_buffers_into_the_pc_mirror() {
     let core_uri = core_uri();
     // Opened during the pre-ready window.
     documents.open(&core_uri, "class Core\n");
-    let publish = |_p: PublishDiagnosticsParams| {};
-    let services =
-        match IndexBootstrap::new(|_root: &Path| Ok(fixture_model())).run(BootstrapContext {
-            workspace_root: Some(store_root.path()),
-            documents: &documents,
-            publish_diagnostics: &publish,
-        }) {
-            WorkspaceState::Ready(services) => services,
-            other => panic!("bootstrap not ready: {}", other.status_line()),
-        };
+    let bootstrap = IndexBootstrap::new(|_root: &Path| Ok(fixture_model()));
+    let services = match bootstrap.build(Some(store_root.path().to_path_buf())) {
+        WorkspaceState::Ready(services) => {
+            // Replay runs on the loop after Ready; drive it directly here.
+            bootstrap.replay(&services, &documents);
+            services
+        }
+        other => panic!("bootstrap not ready: {}", other.status_line()),
+    };
 
     // The pre-opened buffer was replayed into the real PC mirror at ready.
     assert!(
@@ -1291,23 +1290,13 @@ fn no_bsp_connection_is_a_deferred_failed_bootstrap() {
     ]
     .concat();
 
-    let mut reader = Cursor::new(input);
-    let mut writer = Vec::new();
     let mut core = ServerCore::new();
-    let bootstrap = IndexBootstrap::new(NoBspSource);
-    let publish = |_p: PublishDiagnosticsParams| {};
-    let hooks = ServerHooks {
-        publish_diagnostics: &publish,
-    };
-    serve(
-        &mut reader,
-        &mut writer,
+    let out = serve_pumped(
         &mut core,
         &CoreHandlers,
-        &bootstrap,
-        &hooks,
-    )
-    .unwrap();
+        || IndexBootstrap::new(NoBspSource),
+        input,
+    );
 
     // The no-BSP bootstrap does not reach Ready; it is a clean Failed state.
     assert!(
@@ -1316,7 +1305,6 @@ fn no_bsp_connection_is_a_deferred_failed_bootstrap() {
     );
 
     // references does not serve a recovered index; it answers the not-ready path.
-    let out = responses(writer);
     let refs = out
         .iter()
         .find(|r| r["id"] == 2)

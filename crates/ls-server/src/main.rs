@@ -95,7 +95,7 @@ fn serve_stdio() {
         &mut writer,
         &mut core,
         &CoreHandlers,
-        &bootstrap,
+        bootstrap,
         &hooks,
     ) {
         eprintln!("{SERVER_NAME}: serve loop ended: {error}");

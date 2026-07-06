@@ -9,18 +9,20 @@
 //! `shutdown`/`exit`. A behavior-preserving port of the `ls.core.ScalaLs`
 //! lifecycle.
 //!
-//! The ready services and the request/command handlers are reached through an
-//! explicit context ([`BootstrapContext`], [`RequestContext`]), so a production
-//! [`Bootstrap`]/[`Handlers`] pair — over BSP discovery, the embedded JVM,
-//! ingest, and the engine — attaches to the ready state without a second copy of
-//! server state. Bootstrap runs on the message loop here; running it off the
-//! loop so pre-ready requests are served concurrently is an orthogonal
-//! concurrency change.
+//! The request/command handlers are reached through an explicit
+//! [`RequestContext`], so a production [`Bootstrap`]/[`Handlers`] pair — over BSP
+//! discovery, the embedded JVM, ingest, and the engine — attaches to the ready
+//! state without a second copy of server state. Bootstrap runs OFF the message
+//! loop on a worker thread ([`Bootstrap::build`]): `initialized` spawns it, the
+//! workspace stays `NotReady` (so pre-ready requests are served concurrently with
+//! the per-method fallbacks), and the loop adopts Ready/Failed and replays the
+//! open buffers ([`Bootstrap::replay`]) when the worker completes.
 
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
+use std::thread;
 
 use serde_json::{json, Value};
 
@@ -35,22 +37,23 @@ use crate::jsonrpc::{
 use crate::lifecycle::{pre_ready_outcome, require_ready, Method, PreReadyOutcome, WorkspaceState};
 use crate::protocol::PublishDiagnosticsParams;
 
-/// The inputs and callbacks the bootstrap needs: the normalized workspace root,
-/// the open-buffer document store, and a hook to publish build diagnostics to the
-/// client.
-pub struct BootstrapContext<'a> {
-    pub workspace_root: Option<&'a Path>,
-    pub documents: &'a DocumentStore,
-    pub publish_diagnostics: &'a dyn Fn(PublishDiagnosticsParams),
-}
-
-/// The workspace bootstrap, run on `initialized`. It discovers the build server,
-/// boots the JVM, and ingests, producing either the ready services or a failure;
-/// tests inject a fixed transition. It also reloads the ready services after a
-/// build-target change, refetching over the retained session (default: keep the
-/// current services — a fixed/fake bootstrap has nothing to refetch).
+/// The workspace bootstrap. Its [`build`](Bootstrap::build) discovers the build
+/// server, boots the JVM, and ingests, producing either the ready services or a
+/// failure; it runs on `initialized`, OFF the message loop, on a worker thread,
+/// so it takes an OWNED workspace root and borrows nothing from the server. Open
+/// buffers accumulated during the pre-ready window are replayed by
+/// [`replay`](Bootstrap::replay) on the loop once Ready is installed. It also
+/// reloads the ready services after a build-target change, refetching over the
+/// retained session (default: keep the current services — a fixed/fake bootstrap
+/// has nothing to refetch). Tests inject a fixed transition.
 pub trait Bootstrap<S> {
-    fn run(&self, cx: BootstrapContext<'_>) -> WorkspaceState<S>;
+    /// Build the ready services (or a failure) from an owned workspace root. Runs
+    /// on the bootstrap worker thread; must not borrow server state.
+    fn build(&self, workspace_root: Option<PathBuf>) -> WorkspaceState<S>;
+
+    /// Seed the freshly-ready services from the open buffers, on the message loop
+    /// after Ready is installed. Default no-op (a fake has no buffer mirror).
+    fn replay(&self, _services: &S, _documents: &DocumentStore) {}
 
     /// Reload the ready services after the build server reports its targets
     /// changed, reusing the durable handles. `old` is the current ready bundle.
@@ -119,6 +122,13 @@ pub struct ServerCore<S> {
     /// is the only state shared with the reader thread — the reload itself runs on
     /// the loop, so the ready services stay single-threaded.
     reload_requested: Arc<AtomicBool>,
+    /// The in-flight bootstrap worker's result channel, set when `initialized`
+    /// spawns the worker and cleared when its result is adopted. While it is
+    /// `Some`, the workspace stays `NotReady` and pre-ready fallbacks are served;
+    /// the loop adopts Ready/Failed only when the worker actually sends a result.
+    bootstrap_rx: Option<mpsc::Receiver<WorkspaceState<S>>>,
+    /// The worker thread handle, joined when its result is adopted.
+    bootstrap_handle: Option<thread::JoinHandle<()>>,
 }
 
 impl<S> ServerCore<S> {
@@ -132,6 +142,8 @@ impl<S> ServerCore<S> {
             shutting_down: false,
             initialized: false,
             reload_requested: Arc::new(AtomicBool::new(false)),
+            bootstrap_rx: None,
+            bootstrap_handle: None,
         }
     }
 
@@ -153,20 +165,6 @@ impl<S> ServerCore<S> {
             };
         }
         initialize_result()
-    }
-
-    /// Handles `initialized` by running bootstrap with the context it needs and
-    /// adopting its outcome.
-    pub fn run_bootstrap(&mut self, bootstrap: &impl Bootstrap<S>, hooks: &ServerHooks<'_>) {
-        let next = {
-            let cx = BootstrapContext {
-                workspace_root: self.workspace_root.as_deref(),
-                documents: &self.docs,
-                publish_diagnostics: hooks.publish_diagnostics,
-            };
-            bootstrap.run(cx)
-        };
-        self.state = next;
     }
 
     /// Handles `shutdown`: idempotently marks the server shutting down and moves
@@ -242,30 +240,118 @@ enum Flow {
 }
 
 /// Runs the stdio server loop until `exit` or a clean end of input.
-pub fn serve<S>(
+pub fn serve<S, B>(
     reader: &mut impl BufRead,
     writer: &mut impl Write,
     core: &mut ServerCore<S>,
     handlers: &impl Handlers<S>,
-    bootstrap: &impl Bootstrap<S>,
-    hooks: &ServerHooks<'_>,
-) -> io::Result<()> {
+    bootstrap: B,
+    _hooks: &ServerHooks<'_>,
+) -> io::Result<()>
+where
+    S: Send + 'static,
+    B: Bootstrap<S> + Send + Sync + 'static,
+{
+    // `_hooks` carries the client diagnostics-publish seam; the async bootstrap
+    // does not consume it (the index bootstrap emits no diagnostics), and BSP
+    // diagnostics routing to it is wired with the diagnostics router.
+    let bootstrap = Arc::new(bootstrap);
     while let Some(body) = read_frame(reader)? {
-        poll_reload(core, bootstrap);
+        // At the top of each turn, adopt a completed async bootstrap and then drain
+        // a build-target reload, so the message just read sees the freshest state.
+        poll_bootstrap(core, &*bootstrap);
+        poll_reload(core, &*bootstrap);
         match parse_incoming(&body) {
             Ok(Incoming::Request(request)) => {
                 let response = dispatch_request(core, handlers, request);
                 write_frame(writer, &response)?;
             }
             Ok(Incoming::Notification(note)) => {
-                if let Flow::Stop = dispatch_notification(core, handlers, bootstrap, hooks, note) {
+                if let Flow::Stop = dispatch_notification(core, handlers, &bootstrap, note) {
                     break;
                 }
             }
             Err(error) => write_null_id_error(writer, &error)?,
         }
     }
+    // The input ended (clean EOF or `exit`): adopt an in-flight bootstrap result so
+    // the workspace reaches Ready before `serve` returns.
+    drain_bootstrap(core, &*bootstrap);
     Ok(())
+}
+
+/// Spawns the bootstrap worker on `initialized`: one worker per session (a second
+/// `initialized` is ignored while one is in flight). The worker owns the workspace
+/// root and the shared bootstrap, borrows nothing from the server, and sends its
+/// `WorkspaceState` result over the channel; the workspace stays `NotReady` until
+/// the loop adopts it. Ports `ScalaLs.initialized` submitting the index bootstrap.
+fn spawn_bootstrap<S, B>(core: &mut ServerCore<S>, bootstrap: &Arc<B>)
+where
+    S: Send + 'static,
+    B: Bootstrap<S> + Send + Sync + 'static,
+{
+    if core.bootstrap_rx.is_some() {
+        return;
+    }
+    let (tx, rx) = mpsc::channel();
+    let worker = Arc::clone(bootstrap);
+    let root = core.workspace_root.clone();
+    let handle = thread::spawn(move || {
+        // The receiver may already be gone (loop ended before adoption); dropping
+        // the result is fine.
+        let _ = tx.send(worker.build(root));
+    });
+    core.bootstrap_rx = Some(rx);
+    core.bootstrap_handle = Some(handle);
+}
+
+/// Non-blocking: adopt the bootstrap worker's result if it has arrived, else leave
+/// the workspace `NotReady`. A worker that dropped its sender without a result
+/// (panicked) yields a typed failure rather than a hang.
+fn poll_bootstrap<S, B: Bootstrap<S>>(core: &mut ServerCore<S>, bootstrap: &B) {
+    let Some(rx) = &core.bootstrap_rx else {
+        return;
+    };
+    match rx.try_recv() {
+        Ok(result) => adopt_bootstrap(core, bootstrap, Some(result)),
+        Err(mpsc::TryRecvError::Empty) => {}
+        Err(mpsc::TryRecvError::Disconnected) => adopt_bootstrap(core, bootstrap, None),
+    }
+}
+
+/// Blocking: adopt an in-flight bootstrap result, waiting for the worker if
+/// necessary. Called at loop end so a `serve` call that stops right after
+/// `initialized` still reaches Ready.
+fn drain_bootstrap<S, B: Bootstrap<S>>(core: &mut ServerCore<S>, bootstrap: &B) {
+    let Some(rx) = core.bootstrap_rx.as_ref() else {
+        return;
+    };
+    let result = rx.recv().ok();
+    adopt_bootstrap(core, bootstrap, result);
+}
+
+/// Installs a bootstrap result: joins the worker, replays the open buffers into a
+/// freshly-ready bundle on the loop (ports `ScalaLs.replayOpenBuffers`), and swaps
+/// the state. `None` (a dropped/panicked worker) becomes a typed failure.
+fn adopt_bootstrap<S, B: Bootstrap<S>>(
+    core: &mut ServerCore<S>,
+    bootstrap: &B,
+    result: Option<WorkspaceState<S>>,
+) {
+    core.bootstrap_rx = None;
+    if let Some(handle) = core.bootstrap_handle.take() {
+        let _ = handle.join();
+    }
+    core.state = match result {
+        Some(WorkspaceState::Ready(services)) => {
+            bootstrap.replay(&services, &core.docs);
+            WorkspaceState::Ready(services)
+        }
+        Some(other) => other,
+        None => WorkspaceState::Failed {
+            detail: "bootstrap worker terminated without a result".to_string(),
+        },
+    };
 }
 
 /// Drains the build-targets-changed flag: when the build server has reported a
@@ -420,15 +506,18 @@ fn doctor_report<S>(core: &ServerCore<S>) -> String {
     )
 }
 
-fn dispatch_notification<S>(
+fn dispatch_notification<S, B>(
     core: &mut ServerCore<S>,
     handlers: &impl Handlers<S>,
-    bootstrap: &impl Bootstrap<S>,
-    hooks: &ServerHooks<'_>,
+    bootstrap: &Arc<B>,
     note: Notification,
-) -> Flow {
+) -> Flow
+where
+    S: Send + 'static,
+    B: Bootstrap<S> + Send + Sync + 'static,
+{
     match note.method.as_str() {
-        "initialized" => core.run_bootstrap(bootstrap, hooks),
+        "initialized" => spawn_bootstrap(core, bootstrap),
         "exit" => return Flow::Stop,
         "textDocument/didOpen" => core.did_open(handlers, &note.params),
         "textDocument/didChange" => core.did_change(handlers, &note.params),
@@ -527,7 +616,6 @@ fn last_change_text(params: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::Cell;
     use std::io::Cursor;
 
     /// A fake ready-services bundle carrying a marker the handler echoes, so a
@@ -557,7 +645,7 @@ mod tests {
 
     struct FixedBootstrap(WorkspaceState<FakeServices>);
     impl Bootstrap<FakeServices> for FixedBootstrap {
-        fn run(&self, _cx: BootstrapContext<'_>) -> WorkspaceState<FakeServices> {
+        fn build(&self, _workspace_root: Option<PathBuf>) -> WorkspaceState<FakeServices> {
             self.0.clone()
         }
     }
@@ -590,15 +678,24 @@ mod tests {
         })
     }
 
-    /// Drives `serve` over the scripted input with the echo handlers, a fixed
-    /// bootstrap outcome, and no-op hooks.
-    fn run(
-        input: Vec<Vec<u8>>,
-        bootstrap: WorkspaceState<FakeServices>,
-    ) -> (ServerCore<FakeServices>, Vec<Value>) {
-        let mut reader = Cursor::new(input.concat());
+    /// The method of a single framed message, for splitting scripted input.
+    fn frame_method(frame: &[u8]) -> Option<String> {
+        let mut reader = Cursor::new(frame.to_vec());
+        let body = read_frame(&mut reader).ok()??;
+        let value: Value = serde_json::from_slice(&body).ok()?;
+        value.get("method")?.as_str().map(str::to_string)
+    }
+
+    /// Feeds one group of frames through `serve` on the given persistent `core`
+    /// with the echo handlers, a fixed bootstrap outcome, and no-op hooks, and
+    /// returns the responses written.
+    fn serve_frames(
+        core: &mut ServerCore<FakeServices>,
+        frames: &[Vec<u8>],
+        bootstrap: &WorkspaceState<FakeServices>,
+    ) -> Vec<Value> {
+        let mut reader = Cursor::new(frames.concat());
         let mut writer = Vec::new();
-        let mut core = ServerCore::new();
         let publish = |_p: PublishDiagnosticsParams| {};
         let hooks = ServerHooks {
             publish_diagnostics: &publish,
@@ -606,13 +703,33 @@ mod tests {
         serve(
             &mut reader,
             &mut writer,
-            &mut core,
+            core,
             &EchoHandlers,
-            &FixedBootstrap(bootstrap),
+            FixedBootstrap(bootstrap.clone()),
             &hooks,
         )
         .unwrap();
-        (core, responses(writer))
+        responses(writer)
+    }
+
+    /// Drives `serve` over the scripted input, pumping to ready across the
+    /// `initialized` boundary: a real client waits between `initialized` and its
+    /// first ready-requiring request while the async bootstrap runs, so the input
+    /// is fed in two `serve` passes split just after `initialized` (the first pass
+    /// drains the worker at loop end, installing the ready state before the queries).
+    fn run(
+        input: Vec<Vec<u8>>,
+        bootstrap: WorkspaceState<FakeServices>,
+    ) -> (ServerCore<FakeServices>, Vec<Value>) {
+        let mut core = ServerCore::new();
+        let split = input
+            .iter()
+            .position(|f| frame_method(f).as_deref() == Some("initialized"))
+            .map(|i| i + 1)
+            .unwrap_or(input.len());
+        let mut out = serve_frames(&mut core, &input[..split], &bootstrap);
+        out.extend(serve_frames(&mut core, &input[split..], &bootstrap));
+        (core, out)
     }
 
     // Ports the pre-ready dispatch and lifecycle of ls.core.ScalaLs.
@@ -728,26 +845,29 @@ mod tests {
         }
     }
 
-    // Bootstrap receives the workspace root, the open documents, and the
-    // diagnostics-publishing hook.
+    // The async bootstrap worker receives the owned workspace root (in `build`);
+    // open-buffer replay on the loop receives the documents opened during the
+    // pre-ready window (in `replay`, after Ready is installed).
     #[test]
-    fn bootstrap_receives_root_documents_and_publish() {
-        struct RecordingBootstrap;
+    fn bootstrap_build_receives_root_and_replay_receives_documents() {
+        #[derive(Clone)]
+        struct RecordingBootstrap {
+            replayed_docs: Arc<std::sync::atomic::AtomicUsize>,
+        }
         impl Bootstrap<FakeServices> for RecordingBootstrap {
-            fn run(&self, cx: BootstrapContext<'_>) -> WorkspaceState<FakeServices> {
-                (cx.publish_diagnostics)(PublishDiagnosticsParams {
-                    uri: "file:///ws/a.scala".to_string(),
-                    diagnostics: Vec::new(),
-                });
+            fn build(&self, workspace_root: Option<PathBuf>) -> WorkspaceState<FakeServices> {
                 WorkspaceState::Ready(FakeServices {
                     tag: format!(
-                        "root={} docs={}",
-                        cx.workspace_root
+                        "root={}",
+                        workspace_root
                             .map(|p| p.display().to_string())
-                            .unwrap_or_default(),
-                        cx.documents.open_uris().len()
+                            .unwrap_or_default()
                     ),
                 })
+            }
+            fn replay(&self, _services: &FakeServices, documents: &DocumentStore) {
+                self.replayed_docs
+                    .store(documents.open_uris().len(), Ordering::SeqCst);
             }
         }
 
@@ -765,8 +885,8 @@ mod tests {
         );
         let mut writer = Vec::new();
         let mut core = ServerCore::new();
-        let published = Cell::new(0);
-        let publish = |_p: PublishDiagnosticsParams| published.set(published.get() + 1);
+        let replayed_docs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let publish = |_p: PublishDiagnosticsParams| {};
         let hooks = ServerHooks {
             publish_diagnostics: &publish,
         };
@@ -775,13 +895,19 @@ mod tests {
             &mut writer,
             &mut core,
             &EchoHandlers,
-            &RecordingBootstrap,
+            RecordingBootstrap {
+                replayed_docs: Arc::clone(&replayed_docs),
+            },
             &hooks,
         )
         .unwrap();
 
-        assert_eq!(published.get(), 1, "publish_diagnostics hook not received");
-        assert_eq!(core.state.ready().unwrap().tag, "root=/ws docs=1");
+        assert_eq!(core.state.ready().unwrap().tag, "root=/ws");
+        assert_eq!(
+            replayed_docs.load(Ordering::SeqCst),
+            1,
+            "replay did not observe the pre-ready open buffer"
+        );
     }
 
     // poll_reload reloads only when the workspace is ready, not shutting down, and
@@ -792,7 +918,7 @@ mod tests {
     fn poll_reload_reloads_only_when_ready_and_requested() {
         struct ReloadingBootstrap;
         impl Bootstrap<FakeServices> for ReloadingBootstrap {
-            fn run(&self, _cx: BootstrapContext<'_>) -> WorkspaceState<FakeServices> {
+            fn build(&self, _workspace_root: Option<PathBuf>) -> WorkspaceState<FakeServices> {
                 ready("initial")
             }
             fn reload(
@@ -826,6 +952,70 @@ mod tests {
         down.reload_flag().store(true, Ordering::SeqCst);
         poll_reload(&mut down, &ReloadingBootstrap);
         assert_eq!(down.state.ready().unwrap().tag, "initial");
+    }
+
+    fn references_request(id: i64) -> Request {
+        Request {
+            id: RequestId::Number(id),
+            method: "textDocument/references".to_string(),
+            params: json!({}),
+        }
+    }
+
+    // The async bootstrap is adopted only when the worker actually delivers a
+    // result: while its result channel is empty the workspace stays `NotReady`, so
+    // a readiness-sensitive request gets the typed pre-ready fallback; once the
+    // worker sends `Ready`, `poll_bootstrap` installs it (replaying the open
+    // buffers) and the same request is served. Deterministic — the channel is fed
+    // by hand, with no dependence on worker-thread timing.
+    #[test]
+    fn poll_bootstrap_adopts_the_workspace_only_when_the_worker_result_arrives() {
+        let bootstrap = FixedBootstrap(ready("svc"));
+        let mut core: ServerCore<FakeServices> = ServerCore::new();
+        core.initialize(&json!({ "rootUri": "file:///ws" }));
+        // Model a spawned worker whose result has not arrived yet.
+        let (tx, rx) = mpsc::channel();
+        core.bootstrap_rx = Some(rx);
+
+        // Worker in flight: no result to adopt, so the workspace stays not-ready and
+        // references answers the not-ready contract (an error), not a served result.
+        poll_bootstrap(&mut core, &bootstrap);
+        assert!(!core.state.is_ready(), "an empty channel must not adopt");
+        assert!(core.bootstrap_rx.is_some(), "the channel must be retained");
+        let pre = dispatch_request(&mut core, &EchoHandlers, references_request(1));
+        assert!(
+            pre.error.is_some(),
+            "a pre-ready request must get the not-ready fallback, got {pre:?}"
+        );
+
+        // Worker completes: the result is adopted and the request is now served.
+        tx.send(ready("svc")).unwrap();
+        poll_bootstrap(&mut core, &bootstrap);
+        assert!(
+            core.state.is_ready(),
+            "the delivered result must be adopted"
+        );
+        assert!(core.bootstrap_rx.is_none(), "the channel must be cleared");
+        let post = dispatch_request(&mut core, &EchoHandlers, references_request(2));
+        assert!(
+            post.error.is_none(),
+            "a ready request must be served, got {post:?}"
+        );
+        assert_eq!(post.result.unwrap()["services"], "svc");
+    }
+
+    // A worker that drops its sender without a result (a panicked build) is adopted
+    // as a typed failure rather than leaving the workspace wedged forever.
+    #[test]
+    fn poll_bootstrap_adopts_a_dropped_worker_as_a_failure() {
+        let bootstrap = FixedBootstrap(ready("svc"));
+        let mut core: ServerCore<FakeServices> = ServerCore::new();
+        let (tx, rx) = mpsc::channel::<WorkspaceState<FakeServices>>();
+        core.bootstrap_rx = Some(rx);
+        drop(tx);
+        poll_bootstrap(&mut core, &bootstrap);
+        assert!(matches!(core.state, WorkspaceState::Failed { .. }));
+        assert!(core.bootstrap_rx.is_none());
     }
 
     // Doctor renders the state header plus the Store section in every state.
@@ -1043,53 +1233,60 @@ mod tests {
         }
 
         let drive = |ready_state: bool| {
-            let mut reader = Cursor::new(
-                [
-                    frame(request(1, "initialize", json!({ "rootUri": "file:///ws" }))),
-                    frame(notification("initialized", json!({}))),
-                    frame(notification(
-                        "textDocument/didOpen",
-                        // The `..` segment must be normalized away before the hook.
-                        json!({ "textDocument": { "uri": "file:///ws/x/../a.scala", "text": "v1" } }),
-                    )),
-                    frame(notification(
-                        "textDocument/didChange",
-                        json!({
-                            "textDocument": { "uri": "file:///ws/a.scala" },
-                            "contentChanges": [ { "text": "v2" } ]
-                        }),
-                    )),
-                    frame(notification(
-                        "textDocument/didClose",
-                        json!({ "textDocument": { "uri": "file:///ws/a.scala" } }),
-                    )),
-                    frame(notification("exit", json!({}))),
-                ]
-                .concat(),
-            );
-            let mut writer = Vec::new();
+            let bootstrap_state = if ready_state {
+                ready("svc")
+            } else {
+                WorkspaceState::Failed {
+                    detail: "no build server".to_string(),
+                }
+            };
             let mut core = ServerCore::new();
             let handlers = RecordingHandlers::default();
-            let publish = |_p: PublishDiagnosticsParams| {};
-            let hooks = ServerHooks {
-                publish_diagnostics: &publish,
-            };
-            let bootstrap = if ready_state {
-                FixedBootstrap(ready("svc"))
-            } else {
-                FixedBootstrap(WorkspaceState::Failed {
-                    detail: "no build server".to_string(),
-                })
-            };
-            serve(
-                &mut reader,
-                &mut writer,
-                &mut core,
-                &handlers,
-                &bootstrap,
-                &hooks,
-            )
-            .unwrap();
+            // Pass 1 settles the workspace across the `initialized` boundary; pass 2
+            // runs the document lifecycle once ready/failed is installed (the async
+            // bootstrap makes readiness observable only after the worker is drained).
+            let pre = [
+                frame(request(1, "initialize", json!({ "rootUri": "file:///ws" }))),
+                frame(notification("initialized", json!({}))),
+            ]
+            .concat();
+            let post = [
+                frame(notification(
+                    "textDocument/didOpen",
+                    // The `..` segment must be normalized away before the hook.
+                    json!({ "textDocument": { "uri": "file:///ws/x/../a.scala", "text": "v1" } }),
+                )),
+                frame(notification(
+                    "textDocument/didChange",
+                    json!({
+                        "textDocument": { "uri": "file:///ws/a.scala" },
+                        "contentChanges": [ { "text": "v2" } ]
+                    }),
+                )),
+                frame(notification(
+                    "textDocument/didClose",
+                    json!({ "textDocument": { "uri": "file:///ws/a.scala" } }),
+                )),
+                frame(notification("exit", json!({}))),
+            ]
+            .concat();
+            for group in [pre, post] {
+                let mut reader = Cursor::new(group);
+                let mut writer = Vec::new();
+                let publish = |_p: PublishDiagnosticsParams| {};
+                let hooks = ServerHooks {
+                    publish_diagnostics: &publish,
+                };
+                serve(
+                    &mut reader,
+                    &mut writer,
+                    &mut core,
+                    &handlers,
+                    FixedBootstrap(bootstrap_state.clone()),
+                    &hooks,
+                )
+                .unwrap();
+            }
             handlers.events.into_inner().unwrap()
         };
 

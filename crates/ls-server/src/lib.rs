@@ -44,9 +44,7 @@ pub use lifecycle::{
 };
 pub use pc::{pc_options, IslandPcService, PcLocation, PcQueryService, SymbolResolver};
 pub use protocol::{Diagnostic, DiagnosticCode, Position, PublishDiagnosticsParams, Range};
-pub use server::{
-    serve, Bootstrap, BootstrapContext, Handlers, RequestContext, ServerCore, ServerHooks,
-};
+pub use server::{serve, Bootstrap, Handlers, RequestContext, ServerCore, ServerHooks};
 pub use services::{
     highlights_to_lsp, pc_locations_to_lsp, references_locations, workspace_symbol_of,
     BuildCompiler, CoreHandlers, CoreServices,

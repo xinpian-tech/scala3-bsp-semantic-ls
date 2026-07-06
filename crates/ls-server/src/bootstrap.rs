@@ -33,7 +33,7 @@ use ls_store::Store;
 use crate::documents::DocumentStore;
 use crate::lifecycle::WorkspaceState;
 use crate::pc::{pc_options, IslandPcService, SymbolResolver};
-use crate::server::{Bootstrap, BootstrapContext};
+use crate::server::Bootstrap;
 use crate::services::{BuildCompiler, CoreServices, UnavailableCompiler};
 use crate::workspace_uris::WorkspaceUris;
 
@@ -174,7 +174,9 @@ pub enum LoadOutcome {
 /// yields [`LoadOutcome::NoBsp`] for the recovered-index mode. Tests inject a
 /// fixture. A load error (a connected server that fails to load) is carried as a
 /// human-readable detail for the failed-bootstrap state.
-pub trait ModelSource {
+/// `Send + Sync` so an [`IndexBootstrap`] over the source can run on the bootstrap
+/// worker thread.
+pub trait ModelSource: Send + Sync {
     fn load(&self, workspace_root: &Path) -> Result<LoadOutcome, String>;
 }
 
@@ -183,7 +185,7 @@ pub trait ModelSource {
 /// no-BSP recovered-index mode: it either produces a model or fails.
 impl<F> ModelSource for F
 where
-    F: Fn(&Path) -> Result<BspProjectModel, String>,
+    F: Fn(&Path) -> Result<BspProjectModel, String> + Send + Sync,
 {
     fn load(&self, workspace_root: &Path) -> Result<LoadOutcome, String> {
         Ok(LoadOutcome::Model(ReadyModel {
@@ -212,7 +214,8 @@ impl<M: ModelSource> IndexBootstrap<M> {
 
     /// Loads the model, ingests it into a fresh store under the root, and returns
     /// the assembled services, or a human-readable detail on the first failure.
-    fn build(&self, workspace_root: &Path) -> Result<CoreServices, String> {
+    /// This is the heavy work the bootstrap worker runs off the message loop.
+    fn build_services(&self, workspace_root: &Path) -> Result<CoreServices, String> {
         let ReadyModel { model, compiler } =
             match self.model_source.load(workspace_root)? {
                 LoadOutcome::Model(ready) => ready,
@@ -281,19 +284,20 @@ impl<M: ModelSource> IndexBootstrap<M> {
 }
 
 impl<M: ModelSource> Bootstrap<CoreServices> for IndexBootstrap<M> {
-    fn run(&self, cx: BootstrapContext<'_>) -> WorkspaceState<CoreServices> {
-        let Some(root) = cx.workspace_root else {
+    fn build(&self, workspace_root: Option<PathBuf>) -> WorkspaceState<CoreServices> {
+        let Some(root) = workspace_root else {
             return WorkspaceState::Failed {
                 detail: "no workspace root in the initialize params".to_string(),
             };
         };
-        match self.build(root) {
-            Ok(services) => {
-                replay_open_buffers(&services, cx.documents);
-                WorkspaceState::Ready(services)
-            }
+        match self.build_services(&root) {
+            Ok(services) => WorkspaceState::Ready(services),
             Err(detail) => WorkspaceState::Failed { detail },
         }
+    }
+
+    fn replay(&self, services: &CoreServices, documents: &DocumentStore) {
+        replay_open_buffers(services, documents);
     }
 
     fn reload(&self, old: CoreServices, documents: &DocumentStore) -> WorkspaceState<CoreServices> {
@@ -511,9 +515,6 @@ mod tests {
 
     use ls_bsp::model::BspTarget;
 
-    use crate::documents::DocumentStore;
-    use crate::protocol::PublishDiagnosticsParams;
-
     fn target(bsp_id: &str, semanticdb_root: Option<&str>, sourceroot: Option<&str>) -> BspTarget {
         BspTarget {
             bsp_id: bsp_id.to_string(),
@@ -526,18 +527,6 @@ mod tests {
             sourceroot: sourceroot.map(PathBuf::from),
             sources: Vec::new(),
             direct_deps: Vec::new(),
-        }
-    }
-
-    fn bootstrap_context<'a>(
-        root: Option<&'a Path>,
-        documents: &'a DocumentStore,
-        publish: &'a dyn Fn(PublishDiagnosticsParams),
-    ) -> BootstrapContext<'a> {
-        BootstrapContext {
-            workspace_root: root,
-            documents,
-            publish_diagnostics: publish,
         }
     }
 
@@ -621,9 +610,7 @@ mod tests {
         let bootstrap = IndexBootstrap::new(|_root: &Path| {
             Ok(BspProjectModel::new(Vec::new(), HashMap::new()))
         });
-        let documents = DocumentStore::new();
-        let publish = |_p: PublishDiagnosticsParams| {};
-        let state = bootstrap.run(bootstrap_context(None, &documents, &publish));
+        let state = bootstrap.build(None);
         assert!(matches!(state, WorkspaceState::Failed { .. }));
     }
 
@@ -633,9 +620,7 @@ mod tests {
         let bootstrap = IndexBootstrap::new(|_root: &Path| {
             Ok(BspProjectModel::new(Vec::new(), HashMap::new()))
         });
-        let documents = DocumentStore::new();
-        let publish = |_p: PublishDiagnosticsParams| {};
-        let state = bootstrap.run(bootstrap_context(Some(dir.path()), &documents, &publish));
+        let state = bootstrap.build(Some(dir.path().to_path_buf()));
         let services = match state {
             WorkspaceState::Ready(s) => s,
             other => panic!("expected Ready, got {:?}", other.status_line()),
@@ -668,9 +653,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let bootstrap =
             IndexBootstrap::new(|_root: &Path| Err("no build server found".to_string()));
-        let documents = DocumentStore::new();
-        let publish = |_p: PublishDiagnosticsParams| {};
-        let state = bootstrap.run(bootstrap_context(Some(dir.path()), &documents, &publish));
+        let state = bootstrap.build(Some(dir.path().to_path_buf()));
         match state {
             WorkspaceState::Failed { detail } => assert!(detail.contains("no build server")),
             other => panic!("expected Failed, got {:?}", other.status_line()),

@@ -18,8 +18,8 @@ use serde_json::json;
 use ls_bsp::model::{BspProjectModel, BspTarget};
 use ls_index_model::uri::{normalize_uri, path_to_uri};
 use ls_server::{
-    Bootstrap, BootstrapContext, CoreHandlers, DocumentStore, Handlers, IndexBootstrap,
-    PublishDiagnosticsParams, Request, RequestContext, RequestId, WorkspaceState,
+    Bootstrap, CoreHandlers, DocumentStore, Handlers, IndexBootstrap, Request, RequestContext,
+    RequestId, WorkspaceState,
 };
 
 // `foo` is defined and referenced in the same buffer, so the presentation
@@ -95,12 +95,7 @@ fn live_definition_over_an_open_buffer_routes_through_the_pc_island() {
     };
 
     let documents = DocumentStore::new();
-    let publish = |_p: PublishDiagnosticsParams| {};
-    let services = match IndexBootstrap::new(model_source).run(BootstrapContext {
-        workspace_root: Some(&workspace),
-        documents: &documents,
-        publish_diagnostics: &publish,
-    }) {
+    let services = match IndexBootstrap::new(model_source).build(Some(workspace.to_path_buf())) {
         WorkspaceState::Ready(services) => services,
         other => panic!("bootstrap not ready: {}", other.status_line()),
     };

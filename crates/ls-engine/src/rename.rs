@@ -26,7 +26,9 @@ pub enum CompileOutcome {
     Failed { reason: String },
 }
 
-pub trait CompileService {
+/// `Send + Sync` so a `CoreServices` carrying a boxed compiler can be built on a
+/// bootstrap worker thread and handed back to the message loop.
+pub trait CompileService: Send + Sync {
     fn compile(&self, targets: &[String]) -> CompileOutcome;
 }
 
