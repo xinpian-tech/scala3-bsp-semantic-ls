@@ -156,6 +156,9 @@ impl<M: ModelSource> IndexBootstrap<M> {
             Some(workspace_root.to_path_buf()),
             uri_to_target,
             compiler,
+            // A live build model was loaded, so a BSP session backs this
+            // workspace; the persisted-index fallback stays inert here.
+            true,
         ))
     }
 }

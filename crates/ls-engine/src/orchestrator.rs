@@ -108,6 +108,17 @@ impl QueryOrchestrator {
         self.store.current()
     }
 
+    /// `true` iff the current snapshot holds an active document for `sdb_uri`.
+    /// The mmap store keeps only active (non-superseded) documents in the live
+    /// segment, so any uri the current snapshot resolves is, by construction,
+    /// active. Ports `MetaStore.hasActiveDocument`; read-only against the
+    /// immutable snapshot `Arc` (no writer touched), matching the Scala
+    /// reader-pool read that the gate performs off the writer connection.
+    pub fn has_active_document(&self, sdb_uri: &str) -> bool {
+        self.current_snapshot()
+            .is_some_and(|snap| self.doc_ord_of(&snap, sdb_uri).is_some())
+    }
+
     pub fn workspace(&self) -> Option<Arc<WorkspaceTargets>> {
         self.current_workspace.lock().unwrap().clone()
     }

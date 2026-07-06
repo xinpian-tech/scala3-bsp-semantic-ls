@@ -19,9 +19,10 @@ use serde_json::{json, Value};
 use ls_bsp::model::{BspProjectModel, BspTarget};
 use ls_engine::{CompileOutcome, CompileService};
 use ls_index_model::uri::path_to_uri;
+use ls_index_model::LsError;
 use ls_server::{
-    serve, CoreHandlers, IndexBootstrap, ModelSource, PublishDiagnosticsParams, ReadyModel,
-    ServerCore, ServerHooks,
+    serve, Bootstrap, BootstrapContext, CoreHandlers, CoreServices, DocumentStore, IndexBootstrap,
+    ModelSource, PublishDiagnosticsParams, ReadyModel, ServerCore, ServerHooks, WorkspaceState,
 };
 
 fn fixtures_root() -> PathBuf {
@@ -632,4 +633,71 @@ fn rename_with_a_failing_compile_is_a_request_failed_error() {
         result["error"]["code"], -32803,
         "expected RequestFailed, got {result}"
     );
+}
+
+/// Bootstraps the fixture model and returns the Ready `CoreServices` directly
+/// (not through `serve`), so a test can drive `require_semanticdb` over the
+/// ingested index while flipping the public `bsp_connected` / `uri_to_target`
+/// fields to model the no-BSP recovered-index warm-restart mode.
+fn ready_fixture_services() -> (CoreServices, tempfile::TempDir) {
+    let store_root = tempfile::tempdir().unwrap();
+    let bootstrap = IndexBootstrap::new(|_root: &Path| Ok(fixture_model()));
+    let documents = DocumentStore::new();
+    let publish = |_p: PublishDiagnosticsParams| {};
+    let on_changed = || {};
+    let cx = BootstrapContext {
+        workspace_root: Some(store_root.path()),
+        documents: &documents,
+        publish_diagnostics: &publish,
+        on_build_targets_changed: &on_changed,
+    };
+    match bootstrap.run(cx) {
+        WorkspaceState::Ready(services) => (services, store_root),
+        other => panic!("bootstrap not ready: {}", other.status_line()),
+    }
+}
+
+/// The no-BSP recovered-index fallback (`ScalaLs.requireSemanticdb`'s
+/// `indexedOnDisk` branch): with no live BSP session, a source the recovered
+/// index still holds an active document for is serviceable even though no live
+/// model owns it.
+#[test]
+fn no_bsp_recovered_index_serves_a_persisted_source() {
+    let (mut services, _root) = ready_fixture_services();
+    services.bsp_connected = false;
+    services.uri_to_target = HashMap::new();
+    let core = path_to_uri(&fixtures_root().join("sources/a/src/pkga/Core.scala"));
+    assert!(
+        services.require_semanticdb(&core).is_ok(),
+        "a persisted active source must be serviceable in no-BSP mode"
+    );
+}
+
+/// In no-BSP mode a uri with no active persisted document is still a hard
+/// `NoSemanticdb` — the fallback does not invent coverage for an unindexed file.
+#[test]
+fn no_bsp_recovered_index_rejects_an_unindexed_uri() {
+    let (mut services, _root) = ready_fixture_services();
+    services.bsp_connected = false;
+    services.uri_to_target = HashMap::new();
+    let absent = path_to_uri(&fixtures_root().join("sources/a/src/pkga/Absent.scala"));
+    let err = services
+        .require_semanticdb(&absent)
+        .expect_err("an unindexed uri must be rejected even in no-BSP mode");
+    assert!(matches!(err, LsError::NoSemanticdb { .. }), "got {err:?}");
+}
+
+/// A LIVE BSP session suppresses the persisted-index fallback (the fallback is
+/// restricted to BSP-less mode): a uri the live model no longer owns is a hard
+/// `NoSemanticdb`, never answered from a stale-but-active persisted row.
+#[test]
+fn a_live_session_suppresses_the_persisted_index_fallback() {
+    let (mut services, _root) = ready_fixture_services();
+    services.bsp_connected = true;
+    services.uri_to_target = HashMap::new();
+    let core = path_to_uri(&fixtures_root().join("sources/a/src/pkga/Core.scala"));
+    let err = services
+        .require_semanticdb(&core)
+        .expect_err("a live session must not serve a uri it no longer owns");
+    assert!(matches!(err, LsError::NoSemanticdb { .. }), "got {err:?}");
 }

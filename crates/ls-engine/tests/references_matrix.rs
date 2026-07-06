@@ -686,6 +686,23 @@ fn unknown_uri_errors_not_indexed() {
     assert!(matches!(err, LsError::NotIndexed { .. }), "{err:?}");
 }
 
+// -------------------------------------------------------- has_active_document
+
+#[test]
+fn has_active_document_reflects_the_ingested_docs() {
+    let stack = new_stack();
+    // A source ingested into the current snapshot resolves to an active doc.
+    assert!(
+        stack.orch.has_active_document("a/src/pkga/Item.scala"),
+        "an ingested source must report an active document"
+    );
+    // A uri the snapshot never ingested has no active document.
+    assert!(
+        !stack.orch.has_active_document("nope/Missing.scala"),
+        "an unknown uri must report no active document"
+    );
+}
+
 // ------------------------------------------------------------ re-ingest supersede
 
 #[test]

@@ -50,6 +50,11 @@ pub struct CoreServices {
     /// In production it retains the BSP session; index-only injections get the
     /// disconnected stub.
     pub compiler: Box<dyn CompileService>,
+    /// Whether a live BSP session backs this workspace (the Scala `s.session`
+    /// being non-empty). `false` only in the no-BSP recovered-index warm-restart
+    /// mode; it gates the `require_semanticdb` persisted-index fallback so that
+    /// fallback applies exclusively when no live model is authoritative.
+    pub bsp_connected: bool,
 }
 
 impl CoreServices {
@@ -59,6 +64,7 @@ impl CoreServices {
         workspace_root: Option<PathBuf>,
         uri_to_target: HashMap<String, String>,
         compiler: Box<dyn CompileService>,
+        bsp_connected: bool,
     ) -> CoreServices {
         CoreServices {
             orchestrator,
@@ -66,6 +72,7 @@ impl CoreServices {
             workspace_root,
             uri_to_target,
             compiler,
+            bsp_connected,
         }
     }
 
@@ -79,21 +86,37 @@ impl CoreServices {
         self.uris.to_file_uri(sdb_uri, &self.orchestrator)
     }
 
-    /// SemanticDB is mandatory: a URI is serviceable only when the live model
+    /// SemanticDB is mandatory. A URI is serviceable when EITHER the live model
     /// owns it via an *indexable* target (one that produces SemanticDB, hence
-    /// present in the ingested workspace). Otherwise the gated methods answer
-    /// `NoSemanticdb` rather than a stale/empty result. Ports the model-present
-    /// branch of `ScalaLs.requireSemanticdb`; the persisted-index fallback (the
-    /// no-BSP warm-restart recovery mode) attaches with that mode — a model is
-    /// always present here, so it is authoritative.
+    /// present in the ingested workspace), OR — only with no live BSP session —
+    /// the recovered persisted index still holds an active document for it (the
+    /// no-BSP warm-restart fallback). Otherwise the gated methods answer
+    /// `NoSemanticdb` rather than a stale/empty result. Ports the three-branch
+    /// `ScalaLs.requireSemanticdb`.
     pub fn require_semanticdb(&self, raw_uri: &str) -> Result<(), LsError> {
         let uri = normalize_uri(raw_uri);
-        let owned_by_indexable = self.uri_to_target.get(&uri).is_some_and(|bsp_id| {
+        let owned_by_live_target = self.uri_to_target.get(&uri);
+        let indexable_in_model = owned_by_live_target.is_some_and(|bsp_id| {
             self.orchestrator
                 .workspace()
                 .is_some_and(|workspace| workspace.targets.iter().any(|t| &t.bsp_id == bsp_id))
         });
-        if owned_by_indexable {
+        // The persisted-index fallback serves an already-indexed source in the
+        // no-BSP recovered-index warm-restart mode. It applies ONLY when there
+        // is no live BSP session AND the live model does not own the URI: while
+        // a session exists the live model is authoritative about coverage, so a
+        // URI it no longer owns — e.g. a source/target dropped via
+        // `buildTarget/didChange`, leaving only a stale persisted row — is a
+        // hard `NoSemanticdb`, never answered from that stale-but-active row.
+        // Lazily evaluated, matching Scala's `def indexedOnDisk`.
+        let indexed_on_disk = || {
+            !self.bsp_connected
+                && owned_by_live_target.is_none()
+                && self
+                    .to_sdb_uri(&uri)
+                    .is_some_and(|sdb| self.orchestrator.has_active_document(&sdb))
+        };
+        if indexable_in_model || indexed_on_disk() {
             Ok(())
         } else {
             Err(LsError::NoSemanticdb { uri })
@@ -510,6 +533,7 @@ mod tests {
             Some(root.to_path_buf()),
             HashMap::new(),
             Box::new(UnavailableCompiler),
+            true,
         )
     }
 
