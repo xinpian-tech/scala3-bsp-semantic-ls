@@ -348,6 +348,15 @@ fn a_source_owned_by_a_non_indexable_target_is_no_semanticdb() {
                 "position": { "line": 0, "character": 0 }
             }),
         )),
+        frame(request(
+            5,
+            "textDocument/rename",
+            json!({
+                "textDocument": { "uri": unindexed_uri },
+                "position": { "line": 0, "character": 0 },
+                "newName": "Renamed"
+            }),
+        )),
         frame(notification("exit", json!({}))),
     ]
     .concat();
@@ -380,9 +389,9 @@ fn a_source_owned_by_a_non_indexable_target_is_no_semanticdb() {
             .unwrap_or_else(|| panic!("no response for id {id} in {out:?}"))
     };
 
-    // references / documentHighlight / prepareRename all hard-error with the
-    // NoSemanticdb message; none falls through to NotIndexed, [], or null.
-    for id in [2, 3, 4] {
+    // references / documentHighlight / prepareRename / rename all hard-error with
+    // the NoSemanticdb message; none falls through to NotIndexed, [], or null.
+    for id in [2, 3, 4, 5] {
         let response = by_id(id);
         let error = &response["error"];
         assert_eq!(
@@ -520,4 +529,107 @@ fn compile_reports_ok_over_the_indexable_targets() {
 fn compile_reports_the_failure_status() {
     let (result, _calls) = run_compile(false, "ERROR");
     assert_eq!(result["result"], "compile failed: ERROR");
+}
+
+/// Bootstrap over the fixture model with a recording compiler, run `rename` for
+/// `Core` at its declaration, and return the response and the recorded compile
+/// domains (the FreshRequired ladder compiles before re-resolving).
+fn run_rename(succeed: bool, new_name: &str) -> (Value, Vec<Vec<String>>) {
+    let store_root = tempfile::tempdir().unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let source = CompilingModelSource {
+        succeed,
+        fail_reason: "ERROR".to_string(),
+        calls: calls.clone(),
+    };
+    let core_uri = path_to_uri(&fixtures_root().join("sources/a/src/pkga/Core.scala"));
+
+    let input = [
+        frame(request(
+            1,
+            "initialize",
+            json!({ "rootUri": path_to_uri(store_root.path()) }),
+        )),
+        frame(notification("initialized", json!({}))),
+        frame(request(
+            2,
+            "textDocument/rename",
+            json!({
+                "textDocument": { "uri": core_uri },
+                "position": { "line": 2, "character": 6 },
+                "newName": new_name
+            }),
+        )),
+        frame(notification("exit", json!({}))),
+    ]
+    .concat();
+
+    let mut reader = Cursor::new(input);
+    let mut writer = Vec::new();
+    let mut core = ServerCore::new();
+    let bootstrap = IndexBootstrap::new(source);
+    let publish = |_p: PublishDiagnosticsParams| {};
+    let on_changed = || {};
+    let hooks = ServerHooks {
+        publish_diagnostics: &publish,
+        on_build_targets_changed: &on_changed,
+    };
+    serve(
+        &mut reader,
+        &mut writer,
+        &mut core,
+        &CoreHandlers,
+        &bootstrap,
+        &hooks,
+    )
+    .unwrap();
+    assert!(core.state.is_ready(), "workspace did not reach ready");
+
+    let out = responses(writer);
+    let result = out
+        .iter()
+        .find(|r| r["id"] == 2)
+        .expect("rename response")
+        .clone();
+    let recorded = calls.lock().unwrap().clone();
+    (result, recorded)
+}
+
+/// `rename` renames the class under the cursor across the workspace: the result
+/// is an LSP WorkspaceEdit whose changes include the declaring source with a
+/// TextEdit carrying the new name at the occurrence span, and the FreshRequired
+/// ladder compiled the reverse-dependency closure. Ports `ScalaLs.rename`.
+#[test]
+fn rename_produces_a_workspace_edit_over_the_declaration() {
+    let (result, calls) = run_rename(true, "Renamed");
+    let changes = result["result"]["changes"]
+        .as_object()
+        .unwrap_or_else(|| panic!("expected a WorkspaceEdit, got {result}"));
+    let (_, core_edits) = changes
+        .iter()
+        .find(|(uri, _)| uri.ends_with("a/src/pkga/Core.scala"))
+        .unwrap_or_else(|| panic!("Core.scala not in the edit: {result}"));
+    let edits = core_edits.as_array().expect("edit list");
+    assert!(
+        edits.iter().any(|e| {
+            e["newText"] == "Renamed"
+                && e["range"]["start"]["line"] == 2
+                && e["range"]["start"]["character"] == 6
+                && e["range"]["end"]["character"] == 10
+        }),
+        "no Core declaration edit in {edits:?}"
+    );
+    // The FreshRequired ladder compiled the reverse-dependency closure.
+    assert!(!calls.is_empty(), "rename did not compile the domain");
+}
+
+/// A failed compile in the rename ladder is a hard error
+/// (`LsError::CompileFailed` -> `RequestFailed`), never a partial or empty edit.
+#[test]
+fn rename_with_a_failing_compile_is_a_request_failed_error() {
+    let (result, _calls) = run_rename(false, "Renamed");
+    assert_eq!(
+        result["error"]["code"], -32803,
+        "expected RequestFailed, got {result}"
+    );
 }

@@ -5,16 +5,16 @@
 //! equivalent): the query orchestrator, the workspace URI mapping, the workspace
 //! root, and the build model's URI ownership (`uri_to_target`, backing the
 //! `requireSemanticdb` gate). [`CoreHandlers`] is the production [`Handlers`]
-//! impl. It wires the index-backed, PC-free ready methods — `references`,
-//! `documentHighlight`, `workspace/symbol`, `prepareRename`, and the
-//! `scala3SemanticLs.reindex` and `scala3SemanticLs.compile` executeCommand
-//! actions — over the engine's [`ReferencesEngine`] / [`DocumentHighlightService`]
-//! / workspace-symbol resolver / [`RenameEngine`] and the retained build
-//! compiler, each gated (where the source applies it) by `requireSemanticdb`,
-//! converting SemanticDB coordinates and URIs to the LSP result shapes. The
-//! remaining ready methods (the PC-backed queries and full rename) attach as the
-//! PC island / compile ladder are wired; until then they answer a typed
-//! placeholder error.
+//! impl. It wires the ready methods that the engine + retained build compiler
+//! answer without the PC island — `references`, `documentHighlight`,
+//! `workspace/symbol`, `prepareRename`, `rename` (the FreshRequired compile
+//! ladder), and the `scala3SemanticLs.reindex` and `scala3SemanticLs.compile`
+//! executeCommand actions — over the engine's [`ReferencesEngine`] /
+//! [`DocumentHighlightService`] / workspace-symbol resolver / [`RenameEngine`]
+//! and the retained build compiler, each gated (where the source applies it) by
+//! `requireSemanticdb`, converting SemanticDB coordinates and URIs to the LSP
+//! result shapes. The remaining PC-backed ready methods attach as the PC island
+//! is wired; until then they answer a typed placeholder error.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -114,6 +114,7 @@ impl Handlers<CoreServices> for CoreHandlers {
             }
             "workspace/symbol" => workspace_symbol(id, cx.services, &cx.request.params),
             "textDocument/prepareRename" => prepare_rename(id, cx.services, &cx.request.params),
+            "textDocument/rename" => rename(id, cx.services, &cx.request.params),
             "workspace/executeCommand" => execute_command(id, cx.services, &cx.request.params),
             other => not_implemented(id, other),
         }
@@ -234,6 +235,39 @@ fn prepare_rename(id: RequestId, services: &CoreServices, params: &Value) -> Res
     match engine.prepare_rename(&sdb_uri, pos.line, pos.character) {
         Ok(span) => ok_json(id, &convert::range(span)),
         Err(_) => Response::success(id, Value::Null),
+    }
+}
+
+/// `textDocument/rename`: rename the symbol under the cursor across the workspace
+/// via the FreshRequired compile ladder — compile the reverse-dependency closure
+/// through the retained build compiler, reingest, re-resolve against the fresh
+/// snapshot, apply the safety gates — and return the edits as an LSP
+/// `WorkspaceEdit`. Ports `ScalaLs.rename`: `requireSemanticdb` gates first, and
+/// with NO inner catch (unlike prepareRename) EVERY failure — a dirty/PC-only
+/// buffer, an invalid new name, an unrenameable cursor, a failed compile, an
+/// unmappable result URI — is a hard `RequestFailed`, never an empty/null result.
+fn rename(id: RequestId, services: &CoreServices, params: &Value) -> Response {
+    let Some(raw) = text_document_uri(params) else {
+        return invalid_params(id, "rename: missing textDocument.uri");
+    };
+    if let Err(error) = services.require_semanticdb(&raw) {
+        return request_failed(id, &error);
+    }
+    let uri = normalize_uri(&raw);
+    let Some(sdb_uri) = services.to_sdb_uri(&uri) else {
+        return request_failed(id, &LsError::NotIndexed { uri });
+    };
+    let Some(pos) = position(params) else {
+        return invalid_params(id, "rename: missing position");
+    };
+    let new_name = params.get("newName").and_then(Value::as_str).unwrap_or("");
+    let engine = RenameEngine::new(&services.orchestrator, services.compiler.as_ref());
+    match engine.rename(&sdb_uri, pos.line, pos.character, new_name) {
+        Ok(plan) => match convert::workspace_edit(&plan, |sdb| services.to_file_uri(sdb)) {
+            Ok(edit) => ok_json(id, &edit),
+            Err(error) => request_failed(id, &error),
+        },
+        Err(error) => request_failed(id, &error),
     }
 }
 
