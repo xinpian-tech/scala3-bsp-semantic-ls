@@ -4,6 +4,7 @@
 //! behavior-preserving port of the `ls.core` server, wired over the Rust engine,
 //! BSP client, and PC-island boundary crates.
 
+pub mod bootstrap;
 pub mod capabilities;
 pub mod cli;
 pub mod convert;
@@ -16,6 +17,7 @@ pub mod server;
 pub mod services;
 pub mod workspace_uris;
 
+pub use bootstrap::{from_bsp, workspace_source_facts, BspDocFacts, IndexBootstrap, ModelSource};
 pub use capabilities::{
     initialize_result, server_capabilities, InitializeResult, ServerCapabilities,
 };

@@ -4,12 +4,13 @@
 //! [`CoreServices`] is the `S` the ready state owns (the Scala `CoreServices`
 //! equivalent): the query orchestrator, the workspace URI mapping, and the
 //! workspace root. [`CoreHandlers`] is the production [`Handlers`] impl. It
-//! wires the index-backed, PC-free query methods — `references` and
-//! `documentHighlight` — over the engine's [`ReferencesEngine`] /
-//! [`DocumentHighlightService`], converting SemanticDB coordinates and URIs to
-//! the LSP result shapes. The remaining ready methods (the PC-backed queries,
-//! rename, `workspace/symbol`, and the `executeCommand` actions) attach as their
-//! subsystems are wired; until then they answer a typed placeholder error.
+//! wires the index-backed, PC-free query methods — `references`,
+//! `documentHighlight`, and `workspace/symbol` — over the engine's
+//! [`ReferencesEngine`] / [`DocumentHighlightService`] / workspace-symbol
+//! resolver, converting SemanticDB coordinates and URIs to the LSP result
+//! shapes. The remaining ready methods (the PC-backed queries, rename, and the
+//! `executeCommand` actions) attach as their subsystems are wired; until then
+//! they answer a typed placeholder error.
 
 use std::path::PathBuf;
 

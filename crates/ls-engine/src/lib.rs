@@ -19,6 +19,7 @@ pub mod targets;
 
 pub use highlight::{DocHighlight, DocumentHighlightService, HighlightKind};
 pub use ingest::{ingest, IngestReport, SemanticdbFileError};
+pub use ls_semanticdb::DocFacts;
 pub use orchestrator::{
     current_thread_label, CursorSymbol, QueryOrchestrator, ResolutionSource, WorkspaceSymbolEntry,
 };
