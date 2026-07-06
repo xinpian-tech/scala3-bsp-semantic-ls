@@ -15,10 +15,20 @@ use crate::protocol::{Diagnostic, DiagnosticCode, Position, PublishDiagnosticsPa
 pub fn to_lsp_diagnostic(d: &bsp::Diagnostic) -> Diagnostic {
     Diagnostic {
         range: d.range.as_ref().map(to_lsp_range).unwrap_or(ORIGIN_RANGE),
-        severity: d.severity.and_then(|s| u32::try_from(s).ok()),
+        severity: d.severity.and_then(to_lsp_severity),
         code: d.code.as_ref().map(to_lsp_code),
         source: d.source.clone(),
         message: d.message.clone(),
+    }
+}
+
+/// BSP and LSP share the severity integers 1..=4 (Error/Warning/Information/
+/// Hint). Any other value is not a valid severity — a build server's enum has no
+/// such member — so it maps to unset rather than being forwarded verbatim.
+fn to_lsp_severity(bsp: i32) -> Option<u32> {
+    match bsp {
+        1..=4 => Some(bsp as u32),
+        _ => None,
     }
 }
 
@@ -42,6 +52,8 @@ fn to_lsp_range(r: &bsp::Range) -> Range {
     }
 }
 
+// LSP positions are unsigned; a build server sends non-negative coordinates, so
+// a stray negative clamps to 0 rather than emitting an out-of-range position.
 fn to_lsp_position(p: &bsp::Position) -> Position {
     Position {
         line: u32::try_from(p.line).unwrap_or(0),
@@ -384,5 +396,36 @@ mod tests {
             message: "m".to_string(),
         };
         assert_eq!(to_lsp_diagnostic(&d).severity, None);
+    }
+
+    #[test]
+    fn valid_severities_pass_through_and_out_of_range_maps_to_none() {
+        let base = bsp::Range {
+            start: bsp::Position {
+                line: 0,
+                character: 0,
+            },
+            end: bsp::Position {
+                line: 0,
+                character: 1,
+            },
+        };
+        let with_sev = |sev: Option<i32>| bsp::Diagnostic {
+            range: Some(base.clone()),
+            severity: sev,
+            code: None,
+            source: None,
+            message: "m".to_string(),
+        };
+        for sev in 1..=4 {
+            assert_eq!(
+                to_lsp_diagnostic(&with_sev(Some(sev))).severity,
+                Some(sev as u32)
+            );
+        }
+        // A value outside the 1..=4 enum is unset, not forwarded raw.
+        assert_eq!(to_lsp_diagnostic(&with_sev(Some(0))).severity, None);
+        assert_eq!(to_lsp_diagnostic(&with_sev(Some(5))).severity, None);
+        assert_eq!(to_lsp_diagnostic(&with_sev(Some(-1))).severity, None);
     }
 }
