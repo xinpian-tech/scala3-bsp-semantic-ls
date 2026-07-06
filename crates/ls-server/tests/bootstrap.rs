@@ -18,12 +18,12 @@ use serde_json::{json, Value};
 
 use ls_bsp::model::{BspProjectModel, BspTarget};
 use ls_engine::{CompileOutcome, CompileService};
-use ls_index_model::uri::path_to_uri;
+use ls_index_model::uri::{normalize_uri, path_to_uri};
 use ls_index_model::LsError;
 use ls_server::{
-    serve, Bootstrap, BootstrapContext, CoreHandlers, CoreServices, DocumentStore, IndexBootstrap,
-    LoadOutcome, ModelSource, PublishDiagnosticsParams, ReadyModel, ServerCore, ServerHooks,
-    WorkspaceState,
+    serve, Bootstrap, BootstrapContext, CoreHandlers, CoreServices, DocumentStore, Handlers,
+    IndexBootstrap, LoadOutcome, ModelSource, PcLocation, PcQueryService, PublishDiagnosticsParams,
+    ReadyModel, Request, RequestContext, RequestId, ServerCore, ServerHooks, WorkspaceState,
 };
 
 fn fixtures_root() -> PathBuf {
@@ -41,6 +41,7 @@ fn fixture_model() -> BspProjectModel {
         scala_version: "3".to_string(),
         scalac_options: Vec::new(),
         class_directory: fx.join(out),
+        classpath: Vec::new(),
         semanticdb_root: Some(fx.join(out)),
         sourceroot: Some(src.clone()),
         sources: Vec::new(),
@@ -277,6 +278,7 @@ fn model_with_non_indexable_owner() -> (BspProjectModel, String) {
         scala_version: "3".to_string(),
         scalac_options: Vec::new(),
         class_directory: fx.join("noindex-out"),
+        classpath: Vec::new(),
         // No SemanticDB output: owns sources but is not indexable.
         semanticdb_root: None,
         sourceroot: Some(fx.join("noindex")),
@@ -666,6 +668,128 @@ fn ready_fixture_services() -> (CoreServices, tempfile::TempDir) {
         WorkspaceState::Ready(services) => (services, store_root),
         other => panic!("bootstrap not ready: {}", other.status_line()),
     }
+}
+
+/// A fake PC returning canned locations, so the ready definition/typeDefinition
+/// handlers are driven over the real fixture-ingested services (the production
+/// `IslandPcService` would need a live JVM to answer).
+#[derive(Clone, Default)]
+struct FakePc {
+    definition: Vec<PcLocation>,
+    type_definition: Vec<PcLocation>,
+}
+
+impl PcQueryService for FakePc {
+    fn definition(&self, _t: &str, _u: &str, _txt: &str, _l: u32, _c: u32) -> Vec<PcLocation> {
+        self.definition.clone()
+    }
+    fn type_definition(&self, _t: &str, _u: &str, _txt: &str, _l: u32, _c: u32) -> Vec<PcLocation> {
+        self.type_definition.clone()
+    }
+}
+
+fn drive(services: &CoreServices, documents: &DocumentStore, method: &str, params: Value) -> Value {
+    let request = Request {
+        id: RequestId::Number(1),
+        method: method.to_string(),
+        params,
+    };
+    let response = CoreHandlers.handle(RequestContext {
+        request: &request,
+        services,
+        workspace_root: None,
+        documents,
+        shutting_down: false,
+    });
+    serde_json::to_value(&response).unwrap()
+}
+
+/// definition and typeDefinition each route to their own PC op (proven by
+/// distinct canned locations) over an open, owned buffer that passes
+/// `requireSemanticdb`, and the PC `file://` locations convert to LSP locations.
+#[test]
+fn definition_and_type_definition_route_to_the_pc_over_an_open_owned_buffer() {
+    let (mut services, _root) = ready_fixture_services();
+    // The document store keys by normalized URI (as `did_open` does), and the
+    // handler looks the open buffer up by the normalized request URI; the fixture
+    // root carries a `..`, so normalize to match.
+    let core_uri = normalize_uri(&path_to_uri(
+        &fixtures_root().join("sources/a/src/pkga/Core.scala"),
+    ));
+    services.pc = Box::new(FakePc {
+        definition: vec![PcLocation {
+            uri: core_uri.clone(),
+            start_line: 2,
+            start_character: 6,
+            end_line: 2,
+            end_character: 10,
+        }],
+        type_definition: vec![PcLocation {
+            uri: core_uri.clone(),
+            start_line: 5,
+            start_character: 0,
+            end_line: 5,
+            end_character: 4,
+        }],
+    });
+    let documents = DocumentStore::new();
+    documents.open(&core_uri, "class Core\n");
+    let pos = json!({
+        "textDocument": { "uri": core_uri.clone() },
+        "position": { "line": 2, "character": 6 }
+    });
+
+    let def = drive(
+        &services,
+        &documents,
+        "textDocument/definition",
+        pos.clone(),
+    );
+    assert_eq!(
+        def["result"],
+        json!([{
+            "uri": core_uri,
+            "range": { "start": { "line": 2, "character": 6 }, "end": { "line": 2, "character": 10 } }
+        }])
+    );
+
+    let type_def = drive(&services, &documents, "textDocument/typeDefinition", pos);
+    assert_eq!(
+        type_def["result"],
+        json!([{
+            "uri": core_uri,
+            "range": { "start": { "line": 5, "character": 0 }, "end": { "line": 5, "character": 4 } }
+        }])
+    );
+}
+
+/// `withPcBuffer`: an owned URI that passes `requireSemanticdb` but is NOT an
+/// open buffer answers the empty list — the PC is never consulted (the fake
+/// would return a location, yet the result is empty).
+#[test]
+fn definition_over_an_owned_but_unopened_buffer_is_an_empty_list() {
+    let (mut services, _root) = ready_fixture_services();
+    let core_uri = normalize_uri(&path_to_uri(
+        &fixtures_root().join("sources/a/src/pkga/Core.scala"),
+    ));
+    services.pc = Box::new(FakePc {
+        definition: vec![PcLocation {
+            uri: core_uri.clone(),
+            start_line: 0,
+            start_character: 0,
+            end_line: 0,
+            end_character: 1,
+        }],
+        ..Default::default()
+    });
+    // The buffer is not opened, so the PC serves nothing for it.
+    let documents = DocumentStore::new();
+    let params = json!({
+        "textDocument": { "uri": core_uri },
+        "position": { "line": 2, "character": 6 }
+    });
+    let def = drive(&services, &documents, "textDocument/definition", params);
+    assert_eq!(def["result"], json!([]));
 }
 
 /// The no-BSP recovered-index fallback (`ScalaLs.requireSemanticdb`'s

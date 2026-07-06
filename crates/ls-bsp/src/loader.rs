@@ -75,6 +75,15 @@ impl ProjectModelLoader {
                 }
             })?;
             let options = options_item.options.clone();
+            // The compile classpath feeds the presentation compiler's per-target
+            // config; a classpath entry that does not parse as a file uri is
+            // dropped rather than failing the whole model load (the PC degrades on
+            // a partial classpath; the global index does not use it).
+            let classpath: Vec<PathBuf> = options_item
+                .classpath
+                .iter()
+                .filter_map(|entry| uri_to_path(entry).ok())
+                .collect();
             let semanticdb = SemanticdbFlags::extract(&options, &class_directory, &workspace_root);
             let sources = expand_sources(
                 sources_by_target
@@ -100,6 +109,7 @@ impl ProjectModelLoader {
                 scala_version: scala_version.clone(),
                 scalac_options: options,
                 class_directory,
+                classpath,
                 semanticdb_root: semanticdb.semanticdb_root,
                 sourceroot: Some(semanticdb.sourceroot),
                 sources,

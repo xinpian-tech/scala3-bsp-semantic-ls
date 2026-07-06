@@ -13,6 +13,7 @@ fn target(id: &str, deps: &[&str]) -> BspTarget {
         scala_version: "3.8.4".to_string(),
         scalac_options: vec!["-Xsemanticdb".to_string()],
         class_directory: PathBuf::from(format!("/out/{id}/classes")),
+        classpath: vec![PathBuf::from(format!("/out/{id}/classes"))],
         semanticdb_root: Some(PathBuf::from(format!("/out/{id}/classes"))),
         sourceroot: Some(PathBuf::from("/ws")),
         sources: vec![PathBuf::from(format!("/ws/{id}/src/Main.scala"))],

@@ -13,11 +13,14 @@
 //! [`DocumentHighlightService`] / workspace-symbol resolver / [`RenameEngine`]
 //! and the retained build compiler, each gated (where the source applies it) by
 //! `requireSemanticdb`, converting SemanticDB coordinates and URIs to the LSP
-//! result shapes. The remaining PC-backed ready methods attach as the PC island
-//! is wired; until then they answer a typed placeholder error.
+//! result shapes. It also wires `definition`/`typeDefinition` over the embedded
+//! PC island (`CoreServices.pc`). The remaining PC-backed ready methods
+//! (completion/resolve/hover/signatureHelp) attach as their result carriers are
+//! wired; until then they answer a typed placeholder error.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use serde_json::{json, Value};
 
@@ -26,11 +29,13 @@ use ls_engine::{
     QueryOrchestrator, ReferencesEngine, ReferencesResult, RenameEngine, WorkspaceSymbolEntry,
 };
 use ls_index_model::uri::normalize_uri;
-use ls_index_model::LsError;
+use ls_index_model::{LsError, Span};
 
 use crate::capabilities::commands;
 use crate::convert::{self, DocumentHighlight, Location, WorkspaceSymbol};
+use crate::documents::DocumentStore;
 use crate::jsonrpc::{error_codes, RequestId, Response, ResponseError};
+use crate::pc::{PcLocation, PcQueryService};
 use crate::protocol::Position;
 use crate::server::{Handlers, RequestContext};
 use crate::workspace_uris::WorkspaceUris;
@@ -39,17 +44,24 @@ use crate::workspace_uris::WorkspaceUris;
 /// the query orchestrator, the workspace URI mapping, the workspace root, and the
 /// live build model's URI ownership (`uri_to_target`).
 pub struct CoreServices {
-    pub orchestrator: QueryOrchestrator,
+    /// The query engine. Shared (`Arc`) because the PC island's cross-file
+    /// `symbol_definition` resolver answers from this same index.
+    pub orchestrator: Arc<QueryOrchestrator>,
     pub uris: WorkspaceUris,
     pub workspace_root: Option<PathBuf>,
     /// Normalized `file://` URI -> owning bspId, from the build project model
-    /// (`WorkspaceState`'s `uriToTarget`). Backs the `requireSemanticdb` gate.
+    /// (`WorkspaceState`'s `uriToTarget`). Backs the `requireSemanticdb` gate and
+    /// names the PC target a buffer's PC request runs against.
     pub uri_to_target: HashMap<String, String>,
     /// The live build compile capability (the Scala `CoreServices.compiler`):
     /// the `compile` executeCommand and the rename compile ladder run through it.
     /// In production it retains the BSP session; index-only injections get the
     /// disconnected stub.
     pub compiler: Box<dyn CompileService>,
+    /// The presentation-compiler query capability (the Scala `CoreServices.pc`):
+    /// the definition-family PC methods run through it. In production it lazily
+    /// boots the embedded JVM island on the first PC request.
+    pub pc: Box<dyn PcQueryService>,
     /// Whether a live BSP session backs this workspace (the Scala `s.session`
     /// being non-empty). `false` only in the no-BSP recovered-index warm-restart
     /// mode; it gates the `require_semanticdb` persisted-index fallback so that
@@ -58,12 +70,14 @@ pub struct CoreServices {
 }
 
 impl CoreServices {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
-        orchestrator: QueryOrchestrator,
+        orchestrator: Arc<QueryOrchestrator>,
         uris: WorkspaceUris,
         workspace_root: Option<PathBuf>,
         uri_to_target: HashMap<String, String>,
         compiler: Box<dyn CompileService>,
+        pc: Box<dyn PcQueryService>,
         bsp_connected: bool,
     ) -> CoreServices {
         CoreServices {
@@ -72,6 +86,7 @@ impl CoreServices {
             workspace_root,
             uri_to_target,
             compiler,
+            pc,
             bsp_connected,
         }
     }
@@ -138,6 +153,12 @@ impl Handlers<CoreServices> for CoreHandlers {
             "workspace/symbol" => workspace_symbol(id, cx.services, &cx.request.params),
             "textDocument/prepareRename" => prepare_rename(id, cx.services, &cx.request.params),
             "textDocument/rename" => rename(id, cx.services, &cx.request.params),
+            "textDocument/definition" => {
+                definition(id, cx.services, cx.documents, &cx.request.params)
+            }
+            "textDocument/typeDefinition" => {
+                type_definition(id, cx.services, cx.documents, &cx.request.params)
+            }
             "workspace/executeCommand" => execute_command(id, cx.services, &cx.request.params),
             other => not_implemented(id, other),
         }
@@ -292,6 +313,101 @@ fn rename(id: RequestId, services: &CoreServices, params: &Value) -> Response {
         },
         Err(error) => request_failed(id, &error),
     }
+}
+
+/// `textDocument/definition`: go-to-definition of the cursor symbol through the
+/// presentation compiler over the open buffer. Ports `ScalaLs.definition`.
+fn definition(
+    id: RequestId,
+    services: &CoreServices,
+    documents: &DocumentStore,
+    params: &Value,
+) -> Response {
+    pc_locations(
+        id,
+        services,
+        documents,
+        params,
+        |pc, target, uri, text, l, c| pc.definition(target, uri, text, l, c),
+    )
+}
+
+/// `textDocument/typeDefinition`: the type-definition variant, otherwise
+/// identical to [`definition`]. Ports `ScalaLs.typeDefinition`.
+fn type_definition(
+    id: RequestId,
+    services: &CoreServices,
+    documents: &DocumentStore,
+    params: &Value,
+) -> Response {
+    pc_locations(
+        id,
+        services,
+        documents,
+        params,
+        |pc, target, uri, text, l, c| pc.type_definition(target, uri, text, l, c),
+    )
+}
+
+/// The shared body of `definition`/`typeDefinition`. `requireSemanticdb` runs
+/// FIRST and *outside* the buffer fallback (ports the Scala guard preceding
+/// `withPcBuffer`): a URI the model does not own via an indexable target is a
+/// hard `NoSemanticdb`/`RequestFailed`, not an empty result. Only a missing
+/// position, a not-open buffer (the `withPcBuffer` fallback), a URI the model
+/// does not name a target for, or the PC yielding nothing answers the empty
+/// location list.
+fn pc_locations(
+    id: RequestId,
+    services: &CoreServices,
+    documents: &DocumentStore,
+    params: &Value,
+    run: impl Fn(&dyn PcQueryService, &str, &str, &str, u32, u32) -> Vec<PcLocation>,
+) -> Response {
+    let Some(raw) = text_document_uri(params) else {
+        return Response::success(id, json!([]));
+    };
+    if let Err(error) = services.require_semanticdb(&raw) {
+        return request_failed(id, &error);
+    }
+    let Some(pos) = position(params) else {
+        return Response::success(id, json!([]));
+    };
+    let uri = normalize_uri(&raw);
+    // `withPcBuffer`: the presentation compiler serves only an open (dirty)
+    // buffer; a URI with no open buffer answers the empty list.
+    let Some(text) = documents.text(&uri) else {
+        return Response::success(id, json!([]));
+    };
+    let Some(target_id) = services.uri_to_target.get(&uri) else {
+        return Response::success(id, json!([]));
+    };
+    let locations = run(
+        services.pc.as_ref(),
+        target_id,
+        &uri,
+        &text,
+        pos.line,
+        pos.character,
+    );
+    ok_json(id, &pc_locations_to_lsp(&locations))
+}
+
+/// PC definition locations (already `file://` URIs) -> LSP locations.
+pub fn pc_locations_to_lsp(locations: &[PcLocation]) -> Vec<Location> {
+    locations
+        .iter()
+        .map(|loc| {
+            convert::location(
+                &loc.uri,
+                Span::new(
+                    loc.start_line,
+                    loc.start_character,
+                    loc.end_line,
+                    loc.end_character,
+                ),
+            )
+        })
+        .collect()
 }
 
 /// `workspace/executeCommand` for the ready-path commands the message loop
@@ -468,6 +584,30 @@ mod tests {
     use crate::documents::DocumentStore;
     use crate::jsonrpc::Request;
 
+    /// A fake PC that returns canned locations, so the definition/typeDefinition
+    /// handlers are exercised without an embedded JVM.
+    #[derive(Default)]
+    struct FakePc {
+        definition: Vec<PcLocation>,
+        type_definition: Vec<PcLocation>,
+    }
+
+    impl PcQueryService for FakePc {
+        fn definition(&self, _t: &str, _u: &str, _x: &str, _l: u32, _c: u32) -> Vec<PcLocation> {
+            self.definition.clone()
+        }
+        fn type_definition(
+            &self,
+            _t: &str,
+            _u: &str,
+            _x: &str,
+            _l: u32,
+            _c: u32,
+        ) -> Vec<PcLocation> {
+            self.type_definition.clone()
+        }
+    }
+
     // Reference hits become locations; a hit whose URI cannot be resolved to a
     // file is dropped rather than emitted with a bad URI.
     #[test]
@@ -525,7 +665,7 @@ mod tests {
     /// glue's error/empty paths end-to-end (params -> URI map -> engine -> shape).
     fn unindexed_services(root: &Path) -> CoreServices {
         let store = Store::open(root).unwrap();
-        let orchestrator = QueryOrchestrator::with_defaults(store);
+        let orchestrator = Arc::new(QueryOrchestrator::with_defaults(store));
         let uris = WorkspaceUris::new(&[root.to_path_buf()]);
         CoreServices::new(
             orchestrator,
@@ -533,6 +673,7 @@ mod tests {
             Some(root.to_path_buf()),
             HashMap::new(),
             Box::new(UnavailableCompiler),
+            Box::<FakePc>::default(),
             true,
         )
     }
@@ -649,6 +790,49 @@ mod tests {
             workspace_symbol(RequestId::Number(1), &services, &json!({ "query": "Foo" }));
         let value = serde_json::to_value(&response).unwrap();
         assert_eq!(value["result"], json!([]));
+    }
+
+    // `requireSemanticdb` runs first and *outside* the buffer fallback, so
+    // definition over a URI the model does not own is a hard NoSemanticdb error,
+    // not an empty location list (the guard-escalation contract).
+    #[test]
+    fn definition_over_an_unowned_uri_is_a_hard_error() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("A.scala"), "object A").unwrap();
+        let services = unindexed_services(dir.path());
+        let documents = DocumentStore::new();
+        let response = definition(
+            RequestId::Number(1),
+            &services,
+            &documents,
+            &position_params(dir.path()),
+        );
+        let value = serde_json::to_value(&response).unwrap();
+        assert_eq!(value["error"]["code"], error_codes::REQUEST_FAILED);
+        assert!(value["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("has no SemanticDB output"));
+    }
+
+    // A PC location (already a `file://` URI) converts to an LSP location with the
+    // direct range mapping.
+    #[test]
+    fn pc_locations_to_lsp_maps_uri_and_range() {
+        let locations = [PcLocation {
+            uri: "file:///ws/a/Core.scala".to_string(),
+            start_line: 2,
+            start_character: 6,
+            end_line: 2,
+            end_character: 10,
+        }];
+        assert_eq!(
+            serde_json::to_value(pc_locations_to_lsp(&locations)).unwrap(),
+            json!([{
+                "uri": "file:///ws/a/Core.scala",
+                "range": { "start": { "line": 2, "character": 6 }, "end": { "line": 2, "character": 10 } }
+            }])
+        );
     }
 
     // A non-empty-authority `file://host/...` URI must be unmappable: the shared

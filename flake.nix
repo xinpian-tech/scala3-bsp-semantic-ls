@@ -138,6 +138,20 @@
           LS_PC_TARGET_CLASSPATH = "${scalaLibraryJar}:${scala3LibraryJar}";
           ZAOZI_PCPLUGIN_JAR = "${zaoziPcpluginJar}/zaozi-pcplugin.jar";
         });
+
+        # The live go-to-definition check at the ls-server layer: boots the
+        # PRODUCTION island through the real `IndexBootstrap` -> `IslandPcService`
+        # and drives `textDocument/definition` through the real `CoreHandlers`
+        # dispatch over an open buffer, proving the ls-server -> PC-island seam
+        # end-to-end (the presentation compiler resolves an in-buffer symbol).
+        pc-server-definition-check = craneLib.cargoTest (rust.commonArgs // {
+          inherit (rust) cargoArtifacts;
+          cargoTestExtraArgs = "-p ls-server --test live_pc";
+          nativeBuildInputs = [ jdk ];
+          LS_LIBJVM = "${jdk.home}/lib/server/libjvm.so";
+          PC_HOST_AGENT_JAR = "${pcHostAgentJar}/pc-host-agent.jar";
+          LS_PC_TARGET_CLASSPATH = "${scalaLibraryJar}:${scala3LibraryJar}";
+        });
         pc-host-agent-check = pkgs.runCommand "check-pc-host-agent"
           { nativeBuildInputs = [ jdk ]; } ''
           jar="${pcHostAgentJar}/pc-host-agent.jar"
@@ -175,6 +189,7 @@
           pc-recovery = pc-recovery-check;
           pc-definition = pc-definition-check;
           pc-zaozi = pc-zaozi-check;
+          pc-server-definition = pc-server-definition-check;
         };
 
         packages = {

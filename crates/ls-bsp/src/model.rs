@@ -16,6 +16,10 @@ pub struct BspTarget {
     pub scala_version: String,
     pub scalac_options: Vec<String>,
     pub class_directory: PathBuf,
+    /// The target's compile classpath (from `buildTarget/scalacOptions`),
+    /// resolved to filesystem paths. Feeds the presentation compiler's per-target
+    /// config; the global index does not use it.
+    pub classpath: Vec<PathBuf>,
     pub semanticdb_root: Option<PathBuf>,
     pub sourceroot: Option<PathBuf>,
     pub sources: Vec<PathBuf>,

@@ -12,6 +12,7 @@ pub mod diagnostics;
 pub mod documents;
 pub mod jsonrpc;
 pub mod lifecycle;
+pub mod pc;
 pub mod protocol;
 pub mod server;
 pub mod services;
@@ -39,11 +40,13 @@ pub use jsonrpc::{
 pub use lifecycle::{
     pre_ready_outcome, require_ready, Method, NotReadyError, PreReadyOutcome, WorkspaceState,
 };
+pub use pc::{pc_options, IslandPcService, PcLocation, PcQueryService, SymbolResolver};
 pub use protocol::{Diagnostic, DiagnosticCode, Position, PublishDiagnosticsParams, Range};
 pub use server::{
     serve, Bootstrap, BootstrapContext, Handlers, RequestContext, ServerCore, ServerHooks,
 };
 pub use services::{
-    highlights_to_lsp, references_locations, workspace_symbol_of, CoreHandlers, CoreServices,
+    highlights_to_lsp, pc_locations_to_lsp, references_locations, workspace_symbol_of,
+    CoreHandlers, CoreServices,
 };
 pub use workspace_uris::WorkspaceUris;

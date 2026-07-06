@@ -26,9 +26,12 @@ use ls_engine::{
     CompileOutcome, CompileService, DocFacts, QueryOrchestrator, TargetSpec, WorkspaceTargets,
 };
 use ls_index_model::uri::normalize_uri;
+use ls_index_model::Loc;
+use ls_pc_abi::payloads::{origin, LocationsResult, Rng, TargetConfig};
 use ls_store::Store;
 
 use crate::lifecycle::WorkspaceState;
+use crate::pc::{pc_options, IslandPcService, SymbolResolver};
 use crate::server::{Bootstrap, BootstrapContext};
 use crate::services::{CoreServices, UnavailableCompiler};
 use crate::workspace_uris::WorkspaceUris;
@@ -75,6 +78,70 @@ pub fn from_bsp(model: &BspProjectModel, doc_facts: BspDocFacts) -> WorkspaceTar
         })
         .collect();
     WorkspaceTargets::new(specs)
+}
+
+/// The presentation-compiler target registrations, one per doubly-rooted
+/// (indexable + sourceroot) target — the same set `from_bsp` ingests. A
+/// non-doubly-rooted target's buffer is rejected by `requireSemanticdb` before
+/// any PC request, so it needs no PC registration. Ports the `pcConfigs`
+/// construction: the PC classpath is the target's dependency classpath PLUS its
+/// own compiled output directory, deduped preserving order
+/// (`(classpathOf… :+ t.classDirectory).distinct`) — the class directory lets
+/// the PC resolve same-target symbols from sibling sources; the scalac options
+/// are SemanticDB-stripped (so the PC does not re-emit SemanticDB); the source
+/// path is empty (`sourceDirs = Vector.empty`), since the SemanticDB sourceroot
+/// is the workspace root, not a source directory.
+fn pc_target_configs(model: &BspProjectModel) -> Vec<TargetConfig> {
+    model
+        .indexable_targets()
+        .into_iter()
+        .filter(|t| t.sourceroot.is_some())
+        .map(|t| {
+            let mut classpath: Vec<String> = Vec::new();
+            for path in t
+                .classpath
+                .iter()
+                .chain(std::iter::once(&t.class_directory))
+            {
+                let entry = path_string(path);
+                if !classpath.contains(&entry) {
+                    classpath.push(entry);
+                }
+            }
+            TargetConfig {
+                bsp_id: t.bsp_id.clone(),
+                scala_version: t.scala_version.clone(),
+                classpath,
+                scalac_options: pc_options(&t.scalac_options),
+                source_dirs: Vec::new(),
+            }
+        })
+        .collect()
+}
+
+/// Index definition locations -> the ABI `LocationsResult` the island's
+/// `symbol_definition` resolver returns. The engine already emits `file://`
+/// URIs; they are tagged workspace-origin.
+fn locations_result(locations: Vec<Loc>) -> LocationsResult {
+    LocationsResult {
+        locations: locations
+            .into_iter()
+            .map(|loc| ls_pc_abi::payloads::Location {
+                uri: loc.uri,
+                range: Rng {
+                    start_line: loc.span.start_line,
+                    start_character: loc.span.start_char,
+                    end_line: loc.span.end_line,
+                    end_character: loc.span.end_char,
+                },
+                origin: origin::WORKSPACE,
+            })
+            .collect(),
+    }
+}
+
+fn path_string(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
 }
 
 /// The build model plus the live compile capability the ready bundle retains.
@@ -173,18 +240,36 @@ impl<M: ModelSource> IndexBootstrap<M> {
             .iter()
             .map(|t| t.sourceroot.clone())
             .collect();
+        // The PC target registrations are built before the model is dropped.
+        let pc_targets = pc_target_configs(&model);
         let store = Store::open(&workspace_root.join(STORE_DIR)).map_err(|e| e.to_string())?;
-        let orchestrator = QueryOrchestrator::with_defaults(store);
+        // `Arc` because the PC island's cross-file `symbol_definition` resolver
+        // answers from this same query engine.
+        let orchestrator = Arc::new(QueryOrchestrator::with_defaults(store));
         orchestrator
             .ingest(Arc::new(workspace))
             .map_err(|e| e.to_string())?;
         let uris = WorkspaceUris::new(&sourceroots);
+        // The cross-file `symbol_definition` resolver the PC island calls when it
+        // has no in-buffer source position for a symbol: it answers from the
+        // global index (with forward-closure pruning by the requesting buffer's
+        // target), ports `WorkspaceState`'s `SymbolSearch.definition` wiring.
+        let resolver_orchestrator = orchestrator.clone();
+        let resolver: Box<SymbolResolver> = Box::new(move |symbol: &str, from_uri: &str| {
+            locations_result(resolver_orchestrator.symbol_definition(symbol, from_uri))
+        });
+        let pc = Box::new(IslandPcService::new(
+            workspace_root.to_path_buf(),
+            pc_targets,
+            resolver,
+        ));
         Ok(CoreServices::new(
             orchestrator,
             uris,
             Some(workspace_root.to_path_buf()),
             uri_to_target,
             compiler,
+            pc,
             // A live build model was loaded, so a BSP session backs this
             // workspace; the persisted-index fallback stays inert here.
             true,
@@ -228,8 +313,10 @@ impl LiveBspModelSource {
 
 impl ModelSource for LiveBspModelSource {
     fn load(&self, workspace_root: &Path) -> Result<LoadOutcome, String> {
-        // No `.bsp` connection file: reach `Ready` over the recovered persisted
-        // index instead of failing. Ports `defaultConnect` returning `None`.
+        // No `.bsp` connection file: report the no-BSP case distinctly (ports
+        // `defaultConnect` returning `None`). The bootstrap then declines it to a
+        // failed state — the recovered-index warm restart is deferred (see
+        // `IndexBootstrap::build`), so no build connection means no ready server.
         let Some(connection) = BspDiscovery::pick(workspace_root) else {
             return Ok(LoadOutcome::NoBsp);
         };
@@ -326,6 +413,7 @@ mod tests {
             scala_version: "3.3.1".to_string(),
             scalac_options: Vec::new(),
             class_directory: PathBuf::from("/out").join(bsp_id),
+            classpath: Vec::new(),
             semanticdb_root: semanticdb_root.map(PathBuf::from),
             sourceroot: sourceroot.map(PathBuf::from),
             sources: Vec::new(),
@@ -399,6 +487,29 @@ mod tests {
         assert!(!ws.targets[0].facts("other.scala").generated);
     }
 
+    // Ports the Scala `pcConfigs` classpath/sourceDirs construction: the PC
+    // classpath is the dependency classpath PLUS the target's own class directory,
+    // deduped preserving order; the scalac options are SemanticDB-stripped; the
+    // source path is empty.
+    #[test]
+    fn pc_target_configs_append_the_class_directory_deduped_with_empty_source_dirs() {
+        let mut t = target("a", Some("/out/a"), Some("/src"));
+        // The class directory is also already listed in the dependency classpath,
+        // so the `.distinct` dedup must collapse it to one entry.
+        t.classpath = vec![PathBuf::from("/dep/lib.jar"), PathBuf::from("/out/a")];
+        t.class_directory = PathBuf::from("/out/a");
+        t.scalac_options = vec!["-Xsemanticdb".to_string(), "-deprecation".to_string()];
+        let model = BspProjectModel::new(vec![t], HashMap::new());
+        let configs = pc_target_configs(&model);
+        assert_eq!(configs.len(), 1);
+        assert_eq!(
+            configs[0].classpath,
+            vec!["/dep/lib.jar".to_string(), "/out/a".to_string()]
+        );
+        assert_eq!(configs[0].scalac_options, vec!["-deprecation".to_string()]);
+        assert!(configs[0].source_dirs.is_empty());
+    }
+
     #[test]
     fn bootstrap_without_a_workspace_root_fails() {
         let bootstrap = IndexBootstrap::new(|_root: &Path| {
@@ -439,16 +550,17 @@ mod tests {
             .is_empty());
     }
 
-    // The live model source fails cleanly (not a panic) when the workspace has
-    // no BSP connection file, surfacing the discovery error as the detail.
+    // With no `.bsp` connection file the live source reports the no-BSP case
+    // (`LoadOutcome::NoBsp`) rather than erroring; the bootstrap declines it to a
+    // failed state separately.
     #[test]
     fn live_model_source_without_a_connection_file_selects_no_bsp() {
         let dir = tempfile::tempdir().unwrap();
-        // No `.bsp` connection file: the live source selects the no-BSP
-        // recovered-index mode rather than failing (ports `defaultConnect` -> None).
+        // No `.bsp` connection file: the live source reports the no-BSP case
+        // (ports `defaultConnect` -> None), not an error.
         let outcome = LiveBspModelSource::new()
             .load(dir.path())
-            .expect("no .bsp connection is the recovered-index mode, not an error");
+            .expect("no .bsp connection reports the no-BSP case, not an error");
         assert!(matches!(outcome, LoadOutcome::NoBsp));
     }
 

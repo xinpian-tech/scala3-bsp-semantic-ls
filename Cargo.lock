@@ -194,6 +194,8 @@ dependencies = [
  "ls-bsp",
  "ls-engine",
  "ls-index-model",
+ "ls-jvm",
+ "ls-pc-abi",
  "ls-store",
  "serde",
  "serde_json",

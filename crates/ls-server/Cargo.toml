@@ -14,6 +14,8 @@ ls-index-model = { path = "../ls-index-model" }
 ls-engine = { path = "../ls-engine" }
 ls-bsp = { path = "../ls-bsp" }
 ls-store = { path = "../ls-store" }
+ls-jvm = { path = "../ls-jvm" }
+ls-pc-abi = { path = "../ls-pc-abi" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
