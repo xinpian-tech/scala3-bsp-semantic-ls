@@ -27,7 +27,8 @@ use ls_jvm::backend::VtableBackend;
 use ls_jvm::watchdog::{PcError, PcRequest, QueryKind, Supervisor};
 use ls_jvm::{boot_island, install_symbol_definition_resolver, IslandConfig};
 use ls_pc_abi::payloads::{
-    CompletionList, DefinitionResult, HoverResult, LocationsResult, SignatureHelp, TargetConfig,
+    CompletionItem, CompletionList, DefinitionResult, HoverResult, LocationsResult, SignatureHelp,
+    TargetConfig,
 };
 use serde_json::Value;
 
@@ -86,6 +87,19 @@ pub trait PcQueryService: Send + Sync {
     /// Signature help at `(line, character)`, as an LSP `SignatureHelp` JSON value,
     /// or `null` when the presentation compiler has nothing at the point.
     fn signature_help(&self, uri: &str, line: u32, character: u32) -> Value;
+
+    /// Whether `target_id` is a registered PC target config — the Scala
+    /// `s.pcConfigs.contains(target)` gate that a completion-resolve must pass
+    /// before it runs against the presentation compiler.
+    fn is_registered(&self, target_id: &str) -> bool;
+
+    /// Resolve (enrich) an LSP completion `item` — carrying SemanticDB `symbol`,
+    /// against the presentation compiler for `target_id` — returning the enriched
+    /// item as LSP JSON. Degrades to the original `item` unchanged on any
+    /// boundary/decode/encode failure (the Scala `resolved.getOrElse(item)`
+    /// fallback: a resolve that cannot enrich returns the item the client already
+    /// has, never an error).
+    fn resolve_completion_item(&self, target_id: &str, symbol: &str, item: &Value) -> Value;
 }
 
 /// The `symbol_definition` resolver the island calls when the presentation
@@ -238,12 +252,25 @@ impl IslandPcService {
             .map(|b| b.text.clone())
     }
 
-    /// Ensures the island is booted (booting + replaying the mirrored buffers on
-    /// the first query), dispatches the query against the already-mirrored buffer,
-    /// and returns the raw reply bytes. `None` on a boot failure or any boundary
-    /// error, so each query method degrades to its own empty/null fallback —
-    /// matching the Scala PC methods' empty/null result when the compiler yields
-    /// nothing. The per-query carrier is decoded by the caller.
+    /// Boots the island on the first PC request (booting + replaying the mirrored
+    /// buffers), dispatches `request` over the booted driver, and returns the raw
+    /// reply bytes. `None` on a boot failure or any boundary error — the shared
+    /// path behind every PC query and completion resolve, so an index-only session
+    /// that only opens buffers keeps a zero-JVM process until the first request.
+    fn dispatch(&self, request: PcRequest) -> Option<Vec<u8>> {
+        let mut guard = self.state.lock().expect("pc island state mutex");
+        let state = &mut *guard;
+        if state.driver.is_none() && !boot(state) {
+            return None;
+        }
+        let driver = state.driver.as_mut()?;
+        driver.request(request).ok()
+    }
+
+    /// Dispatches a query against the already-mirrored buffer and returns the raw
+    /// reply bytes; the per-query carrier is decoded by the caller. `None` degrades
+    /// to each query method's own empty/null fallback — matching the Scala PC
+    /// methods' empty/null result when the compiler yields nothing.
     fn query_reply(
         &self,
         kind: QueryKind,
@@ -251,24 +278,12 @@ impl IslandPcService {
         line: u32,
         character: u32,
     ) -> Option<Vec<u8>> {
-        let mut guard = self.state.lock().expect("pc island state mutex");
-        let state = &mut *guard;
-
-        // The buffer is already mirrored by the document notifications; the query
-        // is the first thing that boots the island (so an index-only session that
-        // only opens buffers keeps a zero-JVM process).
-        if state.driver.is_none() && !boot(state) {
-            return None;
-        }
-        let driver = state.driver.as_mut()?;
-        driver
-            .request(PcRequest::Query {
-                kind,
-                uri: uri.to_string(),
-                line,
-                character,
-            })
-            .ok()
+        self.dispatch(PcRequest::Query {
+            kind,
+            uri: uri.to_string(),
+            line,
+            character,
+        })
     }
 
     /// Dispatches a definition-family query and decodes the `DefinitionResult`
@@ -398,6 +413,29 @@ impl PcQueryService for IslandPcService {
             .and_then(|reply| SignatureHelp::decode(&reply).ok())
             .map(|help| crate::pc_convert::signature_help(&help))
             .unwrap_or(Value::Null)
+    }
+
+    fn is_registered(&self, target_id: &str) -> bool {
+        self.state
+            .lock()
+            .expect("pc island state mutex")
+            .is_registered(target_id)
+    }
+
+    fn resolve_completion_item(&self, target_id: &str, symbol: &str, item: &Value) -> Value {
+        // Re-encode the item the client echoed back into the flat carrier the
+        // island decodes; a carrier that will not encode degrades to the item.
+        let Ok(encoded) = crate::pc_convert::completion_item_to_carrier(item).encode() else {
+            return item.clone();
+        };
+        self.dispatch(PcRequest::Resolve {
+            target_id: target_id.to_string(),
+            symbol: symbol.to_string(),
+            item: encoded,
+        })
+        .and_then(|reply| CompletionItem::decode(&reply).ok())
+        .map(|resolved| crate::pc_convert::completion_item(&resolved))
+        .unwrap_or_else(|| item.clone())
     }
 }
 
@@ -855,5 +893,53 @@ mod tests {
             pc.completion(a, 0, 0),
             crate::pc_convert::empty_completions()
         );
+    }
+
+    // `is_registered` reflects the registered PC targets — the resolve gate.
+    #[test]
+    fn is_registered_reflects_the_registered_targets() {
+        let (pc, _calls) = booted("t", Vec::new());
+        assert!(pc.is_registered("t"));
+        assert!(!pc.is_registered("other"));
+    }
+
+    // A booted resolve encodes the echoed item, dispatches `PcRequest::Resolve`,
+    // and renders the enriched reply; a backend error degrades to the original item.
+    #[test]
+    fn a_booted_resolve_dispatches_and_renders_the_enriched_item() {
+        let enriched = CompletionItem {
+            label: "foo".to_string(),
+            label_details: None,
+            kind: Some(2),
+            tags: None,
+            detail: Some("def foo: Int".to_string()),
+            documentation: None,
+            deprecated: None,
+            preselect: None,
+            sort_text: None,
+            filter_text: None,
+            insert_text: None,
+            insert_text_format: None,
+            insert_text_mode: None,
+            text_edit: None,
+            text_edit_text: None,
+            additional_text_edits: None,
+            commit_characters: None,
+            command: None,
+            data: None,
+        }
+        .encode()
+        .expect("encode enriched item");
+        let item = serde_json::json!({ "label": "foo", "data": { "symbol": "s" } });
+
+        // The resolve dispatch consumes the single queued reply (no did_open needed).
+        let (pc, _calls) = booted("t", vec![Ok(enriched)]);
+        let out = pc.resolve_completion_item("t", "s", &item);
+        assert_eq!(out["label"], "foo");
+        assert_eq!(out["detail"], "def foo: Int");
+
+        // A backend error degrades to the original item, unchanged.
+        let (pc, _calls) = booted("t", vec![Err(PcError::Backend(-1))]);
+        assert_eq!(pc.resolve_completion_item("t", "s", &item), item);
     }
 }

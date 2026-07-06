@@ -22,7 +22,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Value};
 
@@ -68,6 +68,10 @@ pub struct CoreServices {
     /// mode; it gates the `require_semanticdb` persisted-index fallback so that
     /// fallback applies exclusively when no live model is authoritative.
     pub bsp_connected: bool,
+    /// The target that owned the most recent completion request's buffer (the
+    /// Scala `lastCompletionTarget`). `completion` records it; `completionItem/
+    /// resolve` reads it to name the PC target the enrichment runs against.
+    last_completion_target: Mutex<Option<String>>,
 }
 
 impl CoreServices {
@@ -89,6 +93,7 @@ impl CoreServices {
             compiler,
             pc,
             bsp_connected,
+            last_completion_target: Mutex::new(None),
         }
     }
 
@@ -159,11 +164,9 @@ impl Handlers<CoreServices> for CoreHandlers {
             "textDocument/completion" => completion(id, cx.services, &cx.request.params),
             "textDocument/hover" => hover(id, cx.services, &cx.request.params),
             "textDocument/signatureHelp" => signature_help(id, cx.services, &cx.request.params),
-            // Advertised as `resolveProvider`; the presentation-compiler enrichment
-            // path is not yet attached, so — like the pre-ready dispatch and the
-            // Scala `case _ => item` fallback — echo the item back unchanged rather
-            // than answer a typed error.
-            "completionItem/resolve" => Response::success(id, cx.request.params.clone()),
+            "completionItem/resolve" => {
+                resolve_completion_item(id, cx.services, &cx.request.params)
+            }
             "workspace/executeCommand" => execute_command(id, cx.services, &cx.request.params),
             other => not_implemented(id, other),
         }
@@ -399,16 +402,24 @@ fn pc_locations(
 
 /// `textDocument/completion`: presentation-compiler completion over the open
 /// (dirty) buffer, as an LSP `CompletionList`. Ports `ScalaLs.completion` — the
-/// `withPcBuffer` fallback is an empty, complete completion list. Records the
-/// buffer's target as `lastCompletionTarget` is deferred with the resolve
-/// enrichment; the list itself is complete.
+/// `withPcBuffer` fallback is an empty, complete completion list. After the gates
+/// pass it records the buffer's owning target as `lastCompletionTarget`, so a
+/// following `completionItem/resolve` can name the PC target to enrich against.
 fn completion(id: RequestId, services: &CoreServices, params: &Value) -> Response {
     pc_value(
         id,
         services,
         params,
         crate::pc_convert::empty_completions(),
-        |pc, uri, line, character| pc.completion(uri, line, character),
+        |services, uri, line, character| {
+            if let Some(target) = services.uri_to_target.get(uri) {
+                *services
+                    .last_completion_target
+                    .lock()
+                    .expect("last completion target mutex") = Some(target.clone());
+            }
+            services.pc.completion(uri, line, character)
+        },
     )
 }
 
@@ -421,7 +432,7 @@ fn hover(id: RequestId, services: &CoreServices, params: &Value) -> Response {
         services,
         params,
         Value::Null,
-        |pc, uri, line, character| pc.hover(uri, line, character),
+        |services, uri, line, character| services.pc.hover(uri, line, character),
     )
 }
 
@@ -434,7 +445,7 @@ fn signature_help(id: RequestId, services: &CoreServices, params: &Value) -> Res
         services,
         params,
         Value::Null,
-        |pc, uri, line, character| pc.signature_help(uri, line, character),
+        |services, uri, line, character| services.pc.signature_help(uri, line, character),
     )
 }
 
@@ -444,13 +455,15 @@ fn signature_help(id: RequestId, services: &CoreServices, params: &Value) -> Res
 /// target is a hard `NoSemanticdb`/`RequestFailed`, never the fallback), then the
 /// `withPcBuffer` gate (`is_open`) answers `fallback` for a buffer the PC mirror
 /// does not hold. The PC method itself degrades a boundary/decode failure to the
-/// same fallback, so the compiler yielding nothing is never an error.
+/// same fallback, so the compiler yielding nothing is never an error. `run`
+/// receives the whole `services` (not just the PC) so `completion` can record its
+/// `lastCompletionTarget` inside the gated body, matching the Scala `withPcBuffer`.
 fn pc_value(
     id: RequestId,
     services: &CoreServices,
     params: &Value,
     fallback: Value,
-    run: impl Fn(&dyn PcQueryService, &str, u32, u32) -> Value,
+    run: impl Fn(&CoreServices, &str, u32, u32) -> Value,
 ) -> Response {
     let Some(raw) = text_document_uri(params) else {
         return Response::success(id, fallback);
@@ -465,7 +478,44 @@ fn pc_value(
     if !services.pc.is_open(&uri) {
         return Response::success(id, fallback);
     }
-    Response::success(id, run(services.pc.as_ref(), &uri, pos.line, pos.character))
+    Response::success(id, run(services, &uri, pos.line, pos.character))
+}
+
+/// `completionItem/resolve`: enrich the item through the presentation compiler.
+/// Ports `ScalaLs.resolveCompletionItem`: when the item carries a SemanticDB
+/// `data.symbol`, the last completion's target is known, and that target is still
+/// a registered PC config, resolve against the PC; otherwise (and on any PC
+/// failure) echo the item back unchanged (the Scala `resolved.getOrElse(item)`).
+fn resolve_completion_item(id: RequestId, services: &CoreServices, item: &Value) -> Response {
+    let enriched = resolve_enriched(services, item).unwrap_or_else(|| item.clone());
+    Response::success(id, enriched)
+}
+
+/// The enriched item when the symbol / last-completion-target / registration gates
+/// all hold, else `None` (the caller echoes the item). The PC resolve itself
+/// degrades to the original item on a boundary failure.
+fn resolve_enriched(services: &CoreServices, item: &Value) -> Option<Value> {
+    let symbol = data_symbol(item)?;
+    let target = services
+        .last_completion_target
+        .lock()
+        .expect("last completion target mutex")
+        .clone()?;
+    if !services.pc.is_registered(&target) {
+        return None;
+    }
+    Some(services.pc.resolve_completion_item(&target, &symbol, item))
+}
+
+/// The SemanticDB symbol carried in a completion item's `data.symbol`, but only
+/// when `data` is a JSON object and `symbol` a JSON string. Ports
+/// `ScalaLs.dataSymbol`.
+fn data_symbol(item: &Value) -> Option<String> {
+    item.get("data")?
+        .as_object()?
+        .get("symbol")?
+        .as_str()
+        .map(str::to_string)
 }
 
 /// PC definition locations (already `file://` URIs) -> LSP locations.
@@ -669,6 +719,8 @@ mod tests {
         completion: Value,
         hover: Value,
         signature_help: Value,
+        registered: bool,
+        resolved: Option<Value>,
     }
 
     impl PcQueryService for FakePc {
@@ -692,6 +744,12 @@ mod tests {
         }
         fn signature_help(&self, _u: &str, _l: u32, _c: u32) -> Value {
             self.signature_help.clone()
+        }
+        fn is_registered(&self, _t: &str) -> bool {
+            self.registered
+        }
+        fn resolve_completion_item(&self, _t: &str, _s: &str, item: &Value) -> Value {
+            self.resolved.clone().unwrap_or_else(|| item.clone())
         }
     }
 
@@ -751,6 +809,12 @@ mod tests {
     /// sourceroot, but the engine has no occurrences, so it exercises the real
     /// glue's error/empty paths end-to-end (params -> URI map -> engine -> shape).
     fn unindexed_services(root: &Path) -> CoreServices {
+        services_with_pc(root, FakePc::default())
+    }
+
+    /// Like [`unindexed_services`] but with a caller-supplied fake PC, for the
+    /// completion-resolve gate tests.
+    fn services_with_pc(root: &Path, pc: FakePc) -> CoreServices {
         let store = Store::open(root).unwrap();
         let orchestrator = Arc::new(QueryOrchestrator::with_defaults(store));
         let uris = WorkspaceUris::new(&[root.to_path_buf()]);
@@ -760,7 +824,7 @@ mod tests {
             Some(root.to_path_buf()),
             HashMap::new(),
             Box::new(UnavailableCompiler),
-            Box::<FakePc>::default(),
+            Box::new(pc),
             true,
         )
     }
@@ -832,11 +896,12 @@ mod tests {
             .contains("not yet available"));
     }
 
-    // A ready `completionItem/resolve` echoes the item back unchanged (the Scala
-    // `case _ => item` fallback), never a typed error, while its presentation-
-    // compiler enrichment path is unattached.
+    // A ready `completionItem/resolve` with no recorded `lastCompletionTarget`
+    // echoes the item back unchanged (the Scala `resolved.getOrElse(item)` /
+    // `case _ => item` fallback), never a typed error — driven through the real
+    // handler dispatch.
     #[test]
-    fn completion_item_resolve_echoes_the_item_when_ready() {
+    fn completion_item_resolve_echoes_without_a_last_completion_target() {
         let dir = tempfile::tempdir().unwrap();
         let services = unindexed_services(dir.path());
         let documents = DocumentStore::new();
@@ -854,6 +919,95 @@ mod tests {
             shutting_down: false,
         });
         assert_eq!(serde_json::to_value(&response).unwrap()["result"], item);
+    }
+
+    // When the item carries a `data.symbol`, a `lastCompletionTarget` is recorded,
+    // and that target is a registered PC config, resolve runs against the PC and
+    // returns the enriched item (ports `ScalaLs.resolveCompletionItem`'s success).
+    #[test]
+    fn completion_item_resolve_enriches_when_symbol_target_and_registration_hold() {
+        let dir = tempfile::tempdir().unwrap();
+        let enriched = json!({ "label": "foo", "detail": "def foo: Int" });
+        let services = services_with_pc(
+            dir.path(),
+            FakePc {
+                registered: true,
+                resolved: Some(enriched.clone()),
+                ..Default::default()
+            },
+        );
+        *services.last_completion_target.lock().unwrap() = Some("t".to_string());
+        let item = json!({ "label": "foo", "data": { "symbol": "scala/foo." } });
+        let value = serde_json::to_value(resolve_completion_item(
+            RequestId::Number(1),
+            &services,
+            &item,
+        ))
+        .unwrap();
+        assert_eq!(value["result"], enriched);
+    }
+
+    // Each broken gate echoes the item unchanged rather than resolving: no
+    // `data.symbol`, and a target that is not a registered PC config.
+    #[test]
+    fn completion_item_resolve_echoes_when_a_gate_is_unmet() {
+        let dir = tempfile::tempdir().unwrap();
+        let would_enrich = json!({ "label": "X" });
+
+        // No `data.symbol` (even with a target + registration): echo the item.
+        let services = services_with_pc(
+            dir.path(),
+            FakePc {
+                registered: true,
+                resolved: Some(would_enrich.clone()),
+                ..Default::default()
+            },
+        );
+        *services.last_completion_target.lock().unwrap() = Some("t".to_string());
+        let no_symbol = json!({ "label": "foo" });
+        assert_eq!(
+            serde_json::to_value(resolve_completion_item(
+                RequestId::Number(1),
+                &services,
+                &no_symbol
+            ))
+            .unwrap()["result"],
+            no_symbol
+        );
+
+        // A target that is not a registered PC config: echo the item.
+        let services = services_with_pc(
+            dir.path(),
+            FakePc {
+                registered: false,
+                resolved: Some(would_enrich),
+                ..Default::default()
+            },
+        );
+        *services.last_completion_target.lock().unwrap() = Some("t".to_string());
+        let item = json!({ "label": "foo", "data": { "symbol": "s" } });
+        assert_eq!(
+            serde_json::to_value(resolve_completion_item(
+                RequestId::Number(1),
+                &services,
+                &item
+            ))
+            .unwrap()["result"],
+            item
+        );
+    }
+
+    // `data_symbol` reads `data.symbol` only when `data` is an object and `symbol`
+    // a JSON string (ports `ScalaLs.dataSymbol`).
+    #[test]
+    fn data_symbol_reads_a_string_symbol_only() {
+        assert_eq!(
+            data_symbol(&json!({ "data": { "symbol": "s" } })),
+            Some("s".to_string())
+        );
+        assert_eq!(data_symbol(&json!({ "data": { "symbol": 3 } })), None);
+        assert_eq!(data_symbol(&json!({ "data": "not-an-object" })), None);
+        assert_eq!(data_symbol(&json!({ "label": "x" })), None);
     }
 
     // `requireSemanticdb` runs first and *outside* the buffer fallback for the PC

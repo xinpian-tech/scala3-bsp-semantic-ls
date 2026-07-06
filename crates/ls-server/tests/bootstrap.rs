@@ -683,6 +683,8 @@ struct FakePc {
     completion: Value,
     hover: Value,
     signature_help: Value,
+    registered: bool,
+    resolved: Option<Value>,
     events: Arc<Mutex<Vec<String>>>,
     open: Arc<Mutex<Vec<String>>>,
 }
@@ -722,6 +724,12 @@ impl PcQueryService for FakePc {
     }
     fn signature_help(&self, _u: &str, _l: u32, _c: u32) -> Value {
         self.signature_help.clone()
+    }
+    fn is_registered(&self, _t: &str) -> bool {
+        self.registered
+    }
+    fn resolve_completion_item(&self, _t: &str, _s: &str, item: &Value) -> Value {
+        self.resolved.clone().unwrap_or_else(|| item.clone())
     }
 }
 
@@ -896,6 +904,39 @@ fn pc_query_methods_over_an_owned_but_unopened_buffer_answer_the_fallback() {
     assert_eq!(
         drive(&services, "textDocument/signatureHelp", pos)["result"],
         Value::Null
+    );
+}
+
+/// `lastCompletionTarget` handshake: `completion` records the owning target, so a
+/// following `completionItem/resolve` for an item carrying `data.symbol` (with the
+/// target still a registered PC config) enriches through the PC. Drives both over
+/// the real `CoreHandlers` dispatch, proving the completion write feeds resolve.
+#[test]
+fn completion_records_the_target_so_a_following_resolve_enriches() {
+    let (mut services, _root) = ready_fixture_services();
+    let core_uri = core_uri();
+    let enriched = json!({ "label": "foo", "detail": "def foo: Int" });
+    services.pc = Box::new(FakePc {
+        completion: json!({ "isIncomplete": false, "items": [ { "label": "foo" } ] }),
+        registered: true,
+        resolved: Some(enriched.clone()),
+        ..Default::default()
+    });
+    CoreHandlers.on_did_open(&services, &core_uri, "class Core\n");
+    // Completion records lastCompletionTarget = the buffer's owning target.
+    drive(
+        &services,
+        "textDocument/completion",
+        json!({
+            "textDocument": { "uri": core_uri },
+            "position": { "line": 2, "character": 6 }
+        }),
+    );
+    // Resolve now enriches via the PC, keyed by that recorded target.
+    let item = json!({ "label": "foo", "data": { "symbol": "pkga/Core#foo()." } });
+    assert_eq!(
+        drive(&services, "completionItem/resolve", item)["result"],
+        enriched
     );
 }
 
