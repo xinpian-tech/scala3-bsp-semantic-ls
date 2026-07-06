@@ -22,7 +22,8 @@ use ls_index_model::uri::path_to_uri;
 use ls_index_model::LsError;
 use ls_server::{
     serve, Bootstrap, BootstrapContext, CoreHandlers, CoreServices, DocumentStore, IndexBootstrap,
-    ModelSource, PublishDiagnosticsParams, ReadyModel, ServerCore, ServerHooks, WorkspaceState,
+    LoadOutcome, ModelSource, PublishDiagnosticsParams, ReadyModel, ServerCore, ServerHooks,
+    WorkspaceState,
 };
 
 fn fixtures_root() -> PathBuf {
@@ -441,15 +442,25 @@ struct CompilingModelSource {
 }
 
 impl ModelSource for CompilingModelSource {
-    fn load(&self, _root: &Path) -> Result<ReadyModel, String> {
-        Ok(ReadyModel {
+    fn load(&self, _root: &Path) -> Result<LoadOutcome, String> {
+        Ok(LoadOutcome::Model(ReadyModel {
             model: fixture_model(),
             compiler: Box::new(RecordingCompiler {
                 succeed: self.succeed,
                 fail_reason: self.fail_reason.clone(),
                 calls: self.calls.clone(),
             }),
-        })
+        }))
+    }
+}
+
+/// A model source that selects the no-BSP recovered-index mode: no live model,
+/// serve whatever the store recovered.
+struct NoBspSource;
+
+impl ModelSource for NoBspSource {
+    fn load(&self, _root: &Path) -> Result<LoadOutcome, String> {
+        Ok(LoadOutcome::NoBsp)
     }
 }
 
@@ -700,4 +711,73 @@ fn a_live_session_suppresses_the_persisted_index_fallback() {
         .require_semanticdb(&core)
         .expect_err("a live session must not serve a uri it no longer owns");
     assert!(matches!(err, LsError::NoSemanticdb { .. }), "got {err:?}");
+}
+
+/// Serving over the recovered index with no build connection is deferred: with
+/// no connection the workspace does not reach Ready, and source-scoped queries
+/// answer the not-ready contract rather than serving a divergent recovered
+/// index. This keeps the deferred mode absent from the served surface (never
+/// advertised-and-broken). `LiveBspModelSource` still detects the no-connection
+/// case (`LoadOutcome::NoBsp`); the bootstrap declines to serve it.
+#[test]
+fn no_bsp_connection_is_a_deferred_failed_bootstrap() {
+    let store_root = tempfile::tempdir().unwrap();
+    let core_uri = path_to_uri(&fixtures_root().join("sources/a/src/pkga/Core.scala"));
+
+    let input = [
+        frame(request(
+            1,
+            "initialize",
+            json!({ "rootUri": path_to_uri(store_root.path()) }),
+        )),
+        frame(notification("initialized", json!({}))),
+        frame(request(
+            2,
+            "textDocument/references",
+            json!({
+                "textDocument": { "uri": core_uri },
+                "position": { "line": 2, "character": 6 },
+                "context": { "includeDeclaration": true }
+            }),
+        )),
+        frame(notification("exit", json!({}))),
+    ]
+    .concat();
+
+    let mut reader = Cursor::new(input);
+    let mut writer = Vec::new();
+    let mut core = ServerCore::new();
+    let bootstrap = IndexBootstrap::new(NoBspSource);
+    let publish = |_p: PublishDiagnosticsParams| {};
+    let on_changed = || {};
+    let hooks = ServerHooks {
+        publish_diagnostics: &publish,
+        on_build_targets_changed: &on_changed,
+    };
+    serve(
+        &mut reader,
+        &mut writer,
+        &mut core,
+        &CoreHandlers,
+        &bootstrap,
+        &hooks,
+    )
+    .unwrap();
+
+    // The no-BSP bootstrap does not reach Ready; it is a clean Failed state.
+    assert!(
+        !core.state.is_ready(),
+        "no-BSP bootstrap must not reach Ready"
+    );
+
+    // references does not serve a recovered index; it answers the not-ready path.
+    let out = responses(writer);
+    let refs = out
+        .iter()
+        .find(|r| r["id"] == 2)
+        .expect("references response");
+    assert!(
+        refs.get("error").is_some(),
+        "references must answer the not-ready contract, not a served result: {refs}"
+    );
 }

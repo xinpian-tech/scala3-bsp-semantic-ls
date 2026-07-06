@@ -85,26 +85,41 @@ pub struct ReadyModel {
     pub compiler: Box<dyn CompileService>,
 }
 
+/// The outcome of asking a [`ModelSource`] for a workspace's build model.
+pub enum LoadOutcome {
+    /// A live BSP session produced a project model (with its retained compiler).
+    Model(ReadyModel),
+    /// No BSP connection is available (the `session = None` case of
+    /// `WorkspaceState.run`). Serving the recovered index without a build
+    /// connection is deferred, so the bootstrap declines rather than reaching
+    /// `Ready`; this variant lets the source report that case distinctly from a
+    /// connected-but-failed load.
+    NoBsp,
+}
+
 /// A source of the build project model for a workspace root. In production it
-/// connects to the build server, loads the model (via `BspDiscovery`,
-/// `BspSession`, and `ProjectModelLoader`), and hands the retained session's
-/// compile capability to the ready bundle; tests inject a fixture. A load error
-/// is carried as a human-readable detail for the failed-bootstrap state.
+/// discovers the build server and, when one is present, loads the model (via
+/// `BspDiscovery`, `BspSession`, and `ProjectModelLoader`), handing the retained
+/// session's compile capability to the ready bundle; with no connection it
+/// yields [`LoadOutcome::NoBsp`] for the recovered-index mode. Tests inject a
+/// fixture. A load error (a connected server that fails to load) is carried as a
+/// human-readable detail for the failed-bootstrap state.
 pub trait ModelSource {
-    fn load(&self, workspace_root: &Path) -> Result<ReadyModel, String>;
+    fn load(&self, workspace_root: &Path) -> Result<LoadOutcome, String>;
 }
 
 /// A closure that only produces the model gets the disconnected compiler, so an
-/// index-only test/injection needs no build server.
+/// index-only test/injection needs no build server. A closure never selects the
+/// no-BSP recovered-index mode: it either produces a model or fails.
 impl<F> ModelSource for F
 where
     F: Fn(&Path) -> Result<BspProjectModel, String>,
 {
-    fn load(&self, workspace_root: &Path) -> Result<ReadyModel, String> {
-        Ok(ReadyModel {
+    fn load(&self, workspace_root: &Path) -> Result<LoadOutcome, String> {
+        Ok(LoadOutcome::Model(ReadyModel {
             model: self(workspace_root)?,
             compiler: Box::new(UnavailableCompiler),
-        })
+        }))
     }
 }
 
@@ -128,7 +143,21 @@ impl<M: ModelSource> IndexBootstrap<M> {
     /// Loads the model, ingests it into a fresh store under the root, and returns
     /// the assembled services, or a human-readable detail on the first failure.
     fn build(&self, workspace_root: &Path) -> Result<CoreServices, String> {
-        let ReadyModel { model, compiler } = self.model_source.load(workspace_root)?;
+        let ReadyModel { model, compiler } =
+            match self.model_source.load(workspace_root)? {
+                LoadOutcome::Model(ready) => ready,
+                // The no-BSP warm-restart mode over the recovered index is deferred
+                // (see the deferral note in the cutover docs): the server requires a
+                // build connection. Faithful recovered-index serving needs the target
+                // dependency graph to scope references, but the persisted segment does
+                // not carry it — a permissive fallback would answer references across
+                // independent, identically-named symbols in unrelated targets. So this
+                // fails cleanly rather than serving a divergent index.
+                LoadOutcome::NoBsp => return Err(
+                    "no build server connection found (the no-BSP warm-restart mode is deferred)"
+                        .to_string(),
+                ),
+            };
         let workspace = from_bsp(&model, workspace_source_facts());
         // The model's URI ownership, keyed by normalized `file://` URI (as
         // `WorkspaceState` does with `Uris.normalize`), backs `requireSemanticdb`.
@@ -198,8 +227,12 @@ impl LiveBspModelSource {
 }
 
 impl ModelSource for LiveBspModelSource {
-    fn load(&self, workspace_root: &Path) -> Result<ReadyModel, String> {
-        let connection = BspDiscovery::required(workspace_root).map_err(|e| e.to_string())?;
+    fn load(&self, workspace_root: &Path) -> Result<LoadOutcome, String> {
+        // No `.bsp` connection file: reach `Ready` over the recovered persisted
+        // index instead of failing. Ports `defaultConnect` returning `None`.
+        let Some(connection) = BspDiscovery::pick(workspace_root) else {
+            return Ok(LoadOutcome::NoBsp);
+        };
         let session = BspSession::launch(
             workspace_root.to_path_buf(),
             &connection.details,
@@ -208,10 +241,10 @@ impl ModelSource for LiveBspModelSource {
         )
         .map_err(|e| e.to_string())?;
         match load_project_model(&session) {
-            Ok(model) => Ok(ReadyModel {
+            Ok(model) => Ok(LoadOutcome::Model(ReadyModel {
                 model,
                 compiler: Box::new(BspCompileService::new(session)),
-            }),
+            })),
             Err(detail) => {
                 // A launched build server must not be left running past a failed load.
                 session.shutdown();
@@ -409,15 +442,14 @@ mod tests {
     // The live model source fails cleanly (not a panic) when the workspace has
     // no BSP connection file, surfacing the discovery error as the detail.
     #[test]
-    fn live_model_source_without_a_connection_file_errors() {
+    fn live_model_source_without_a_connection_file_selects_no_bsp() {
         let dir = tempfile::tempdir().unwrap();
-        // `ReadyModel` holds a boxed compiler and is not `Debug`, so unwrap the
-        // error side directly rather than through `expect_err`.
-        let err = LiveBspModelSource::new()
+        // No `.bsp` connection file: the live source selects the no-BSP
+        // recovered-index mode rather than failing (ports `defaultConnect` -> None).
+        let outcome = LiveBspModelSource::new()
             .load(dir.path())
-            .err()
-            .expect("no .bsp connection file should fail");
-        assert!(err.contains(".bsp"), "{err}");
+            .expect("no .bsp connection is the recovered-index mode, not an error");
+        assert!(matches!(outcome, LoadOutcome::NoBsp));
     }
 
     #[test]
