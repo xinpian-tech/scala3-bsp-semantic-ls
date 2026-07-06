@@ -27,4 +27,6 @@ pub use lifecycle::{
     pre_ready_outcome, require_ready, Method, NotReadyError, PreReadyOutcome, WorkspaceState,
 };
 pub use protocol::{Diagnostic, DiagnosticCode, Position, PublishDiagnosticsParams, Range};
-pub use server::{serve, Bootstrap, Handlers, ServerCore};
+pub use server::{
+    serve, Bootstrap, BootstrapContext, Handlers, RequestContext, ServerCore, ServerHooks,
+};

@@ -2,18 +2,20 @@
 //!
 //! [`serve`] reads framed JSON-RPC messages, answers `initialize` with the
 //! capability surface (leaving the workspace [`WorkspaceState::NotReady`]), runs
-//! bootstrap on `initialized` (transitioning to [`WorkspaceState::Ready`] or
-//! [`WorkspaceState::Failed`]), keeps the document store in sync, serves the
-//! per-method pre-ready fallbacks until the workspace is ready, and handles
+//! bootstrap on `initialized` (transitioning to [`WorkspaceState::Ready`], which
+//! owns the ready services, or [`WorkspaceState::Failed`]), keeps the document
+//! store in sync, serves the per-method pre-ready fallbacks until the workspace
+//! is ready, delegates ready-path requests to the services, and handles
 //! `shutdown`/`exit`. A behavior-preserving port of the `ls.core.ScalaLs`
 //! lifecycle.
 //!
-//! Two collaborators are injected seams, wired to the real subsystems in later
-//! slices: [`Bootstrap`] (build-server discovery + JVM boot + ingest, producing
-//! the ready state) and [`Handlers`] (the ready-path request handlers over the
-//! engine/BSP/PC layers). This slice runs bootstrap inline on `initialized`; the
-//! production server must run it off the message loop so pre-ready requests are
-//! served while bootstrap is in flight.
+//! The ready services and the request/command handlers are reached through an
+//! explicit context ([`BootstrapContext`], [`RequestContext`]), so a production
+//! [`Bootstrap`]/[`Handlers`] pair — over BSP discovery, the embedded JVM,
+//! ingest, and the engine — attaches to the ready state without a second copy of
+//! server state. Bootstrap runs on the message loop here; running it off the
+//! loop so pre-ready requests are served concurrently is an orthogonal
+//! concurrency change.
 
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -29,34 +31,64 @@ use crate::jsonrpc::{
     Notification, Request, RequestId, Response, ResponseError,
 };
 use crate::lifecycle::{pre_ready_outcome, require_ready, Method, PreReadyOutcome, WorkspaceState};
+use crate::protocol::PublishDiagnosticsParams;
 
-/// The workspace bootstrap, run on `initialized`: it produces the next state
-/// (ready or failed) for the given workspace root. The production impl discovers
-/// the build server, boots the JVM, and ingests; tests inject a fixed outcome.
-pub trait Bootstrap {
-    fn run(&self, workspace_root: Option<&Path>) -> WorkspaceState;
+/// The inputs and callbacks the bootstrap needs: the normalized workspace root,
+/// the open-buffer document store, a hook to publish build diagnostics to the
+/// client, and a hook the build server calls when its target set changes.
+pub struct BootstrapContext<'a> {
+    pub workspace_root: Option<&'a Path>,
+    pub documents: &'a DocumentStore,
+    pub publish_diagnostics: &'a dyn Fn(PublishDiagnosticsParams),
+    pub on_build_targets_changed: &'a dyn Fn(),
+}
+
+/// The workspace bootstrap, run on `initialized`. It discovers the build server,
+/// boots the JVM, and ingests, producing either the ready services or a failure;
+/// tests inject a fixed transition.
+pub trait Bootstrap<S> {
+    fn run(&self, cx: BootstrapContext<'_>) -> WorkspaceState<S>;
+}
+
+/// The context a ready-path handler receives: the request plus everything the
+/// retained server reads to answer it — the ready services, the workspace root,
+/// the open documents, and whether the server is shutting down.
+pub struct RequestContext<'a, S> {
+    pub request: &'a Request,
+    pub services: &'a S,
+    pub workspace_root: Option<&'a Path>,
+    pub documents: &'a DocumentStore,
+    pub shutting_down: bool,
 }
 
 /// The subsystem-backed request handlers, delegated to for the work that needs
-/// the engine/BSP/PC layers: the ready-path query answers, `completionItem/
-/// resolve` when ready, the ready-path `executeCommand` actions, and the doctor
-/// report (which renders in any state). Wired to the real subsystems in a later
-/// slice; the loop owns the pre-ready fallbacks that need no subsystem.
-pub trait Handlers {
-    fn handle(&self, request: &Request) -> Response;
+/// the engine/BSP/PC services: the ready-path query answers, `completionItem/
+/// resolve` when ready, and the ready-path `executeCommand` actions. The doctor
+/// report is a context built-in ([`doctor_report`]) so it renders in every
+/// state. The production impl is wired over the real subsystems; tests inject a
+/// fake.
+pub trait Handlers<S> {
+    fn handle(&self, cx: RequestContext<'_, S>) -> Response;
+}
+
+/// The client-facing callbacks the server is wired with: publishing diagnostics
+/// and reacting to build-target changes.
+pub struct ServerHooks<'a> {
+    pub publish_diagnostics: &'a dyn Fn(PublishDiagnosticsParams),
+    pub on_build_targets_changed: &'a dyn Fn(),
 }
 
 /// The mutable server state driven by the message loop.
-pub struct ServerCore {
-    pub state: WorkspaceState,
+pub struct ServerCore<S> {
+    pub state: WorkspaceState<S>,
     pub docs: DocumentStore,
     pub workspace_root: Option<PathBuf>,
     pub shutting_down: bool,
     initialized: bool,
 }
 
-impl ServerCore {
-    pub fn new() -> ServerCore {
+impl<S> ServerCore<S> {
+    pub fn new() -> ServerCore<S> {
         ServerCore {
             state: WorkspaceState::NotReady {
                 detail: "initialize has not run".to_string(),
@@ -82,14 +114,24 @@ impl ServerCore {
         initialize_result()
     }
 
-    /// Handles `initialized` by running bootstrap and adopting its outcome.
-    pub fn run_bootstrap(&mut self, bootstrap: &impl Bootstrap) {
-        self.state = bootstrap.run(self.workspace_root.as_deref());
+    /// Handles `initialized` by running bootstrap with the context it needs and
+    /// adopting its outcome.
+    pub fn run_bootstrap(&mut self, bootstrap: &impl Bootstrap<S>, hooks: &ServerHooks<'_>) {
+        let next = {
+            let cx = BootstrapContext {
+                workspace_root: self.workspace_root.as_deref(),
+                documents: &self.docs,
+                publish_diagnostics: hooks.publish_diagnostics,
+                on_build_targets_changed: hooks.on_build_targets_changed,
+            };
+            bootstrap.run(cx)
+        };
+        self.state = next;
     }
 
     /// Handles `shutdown`: idempotently marks the server shutting down and moves
-    /// to `NotReady("server is shut down")`. Ready-service teardown lands with
-    /// the services.
+    /// to `NotReady("server is shut down")`. Ready-service teardown is the
+    /// bootstrap's inverse and is owned by the services.
     pub fn shutdown(&mut self) {
         if !self.shutting_down {
             self.shutting_down = true;
@@ -121,7 +163,8 @@ impl ServerCore {
     fn did_save(&self, params: &Value) {
         // A save that carries the text refreshes the open buffer so dirtiness
         // clears even when the editor folded the last edit into the save. The
-        // reverse-dependency compile/reingest is a later slice.
+        // reverse-dependency compile and reingest belong to the didSave build
+        // flow, not this buffer sync.
         let (Some(uri), Some(text)) = (
             document_uri(params),
             params.get("text").and_then(Value::as_str),
@@ -134,7 +177,7 @@ impl ServerCore {
     }
 }
 
-impl Default for ServerCore {
+impl<S> Default for ServerCore<S> {
     fn default() -> Self {
         ServerCore::new()
     }
@@ -147,12 +190,13 @@ enum Flow {
 }
 
 /// Runs the stdio server loop until `exit` or a clean end of input.
-pub fn serve(
+pub fn serve<S>(
     reader: &mut impl BufRead,
     writer: &mut impl Write,
-    core: &mut ServerCore,
-    handlers: &impl Handlers,
-    bootstrap: &impl Bootstrap,
+    core: &mut ServerCore<S>,
+    handlers: &impl Handlers<S>,
+    bootstrap: &impl Bootstrap<S>,
+    hooks: &ServerHooks<'_>,
 ) -> io::Result<()> {
     while let Some(body) = read_frame(reader)? {
         match parse_incoming(&body) {
@@ -161,7 +205,7 @@ pub fn serve(
                 write_frame(writer, &response)?;
             }
             Ok(Incoming::Notification(note)) => {
-                if let Flow::Stop = dispatch_notification(core, bootstrap, note) {
+                if let Flow::Stop = dispatch_notification(core, bootstrap, hooks, note) {
                     break;
                 }
             }
@@ -171,7 +215,11 @@ pub fn serve(
     Ok(())
 }
 
-fn dispatch_request(core: &mut ServerCore, handlers: &impl Handlers, request: Request) -> Response {
+fn dispatch_request<S>(
+    core: &mut ServerCore<S>,
+    handlers: &impl Handlers<S>,
+    request: Request,
+) -> Response {
     // `request.id` is cloned rather than moved so the `request.method` borrow
     // taken by the match scrutinee stays valid across the arms; a request id is
     // a small integer or short string.
@@ -194,18 +242,18 @@ fn dispatch_request(core: &mut ServerCore, handlers: &impl Handlers, request: Re
                 format!("received {method} before initialize"),
             ),
         ),
-        // Advertised as `resolveProvider`: resolve via the subsystems when ready,
+        // Advertised as `resolveProvider`: resolve via the services when ready,
         // otherwise echo the item back unchanged (the Scala `case _ => item`).
         "completionItem/resolve" => {
             if core.state.is_ready() {
-                handlers.handle(&request)
+                ready_handle(core, handlers, &request)
             } else {
                 Response::success(request.id.clone(), request.params.clone())
             }
         }
         "workspace/executeCommand" => execute_command(core, handlers, &request),
         method => match readiness_method(method) {
-            Some(_) if core.state.is_ready() => handlers.handle(&request),
+            Some(_) if core.state.is_ready() => ready_handle(core, handlers, &request),
             Some(kind) => pre_ready_response(request.id.clone(), kind, &core.state),
             None => Response::failure(
                 request.id.clone(),
@@ -218,16 +266,35 @@ fn dispatch_request(core: &mut ServerCore, handlers: &impl Handlers, request: Re
     }
 }
 
+/// Delegates a ready-path request to the handlers with the full request context.
+/// Only called when the workspace is ready.
+fn ready_handle<S>(
+    core: &ServerCore<S>,
+    handlers: &impl Handlers<S>,
+    request: &Request,
+) -> Response {
+    let services = core
+        .state
+        .ready()
+        .expect("ready_handle is only called when the workspace is ready");
+    handlers.handle(RequestContext {
+        request,
+        services,
+        workspace_root: core.workspace_root.as_deref(),
+        documents: &core.docs,
+        shutting_down: core.shutting_down,
+    })
+}
+
 /// Dispatches `workspace/executeCommand` as ScalaLs does: the doctor report
-/// renders in any state; reindex/compile/pcPluginStatus run through the
-/// subsystems when ready and otherwise answer a typed "unavailable" status
-/// string; an unknown command is an invalid-params error.
-fn execute_command(core: &ServerCore, handlers: &impl Handlers, request: &Request) -> Response {
-    let command = request
-        .params
-        .get("command")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
+/// renders in any state from the context; reindex/compile/pcPluginStatus run
+/// through the services when ready and otherwise answer a typed "unavailable"
+/// status string; an unknown command is an invalid-params error.
+fn execute_command<S>(
+    core: &ServerCore<S>,
+    handlers: &impl Handlers<S>,
+    request: &Request,
+) -> Response {
     let ready = core.state.is_ready();
     let unavailable = |action: &str| {
         Response::success(
@@ -238,31 +305,45 @@ fn execute_command(core: &ServerCore, handlers: &impl Handlers, request: &Reques
             )),
         )
     };
-    match command {
-        commands::DOCTOR => handlers.handle(request),
-        commands::REINDEX if ready => handlers.handle(request),
-        commands::REINDEX => unavailable("reindex"),
-        commands::COMPILE if ready => handlers.handle(request),
-        commands::COMPILE => unavailable("compile"),
-        commands::PC_PLUGIN_STATUS if ready => handlers.handle(request),
-        commands::PC_PLUGIN_STATUS => unavailable("pc plugin status"),
+    match request.params.get("command").and_then(Value::as_str) {
+        Some(commands::DOCTOR) => {
+            Response::success(request.id.clone(), Value::String(doctor_report(core)))
+        }
+        Some(commands::REINDEX) if ready => ready_handle(core, handlers, request),
+        Some(commands::REINDEX) => unavailable("reindex"),
+        Some(commands::COMPILE) if ready => ready_handle(core, handlers, request),
+        Some(commands::COMPILE) => unavailable("compile"),
+        Some(commands::PC_PLUGIN_STATUS) if ready => ready_handle(core, handlers, request),
+        Some(commands::PC_PLUGIN_STATUS) => unavailable("pc plugin status"),
+        // A missing command is `null` in the Scala `ExecuteCommandParams`, so its
+        // unknown-command message interpolates the string "null"; a present but
+        // unknown command uses its own text.
         other => Response::failure(
             request.id.clone(),
             ResponseError::new(
                 error_codes::INVALID_PARAMS,
-                format!("unknown command '{other}'"),
+                format!("unknown command '{}'", other.unwrap_or("null")),
             ),
         ),
     }
 }
 
-fn dispatch_notification(
-    core: &mut ServerCore,
-    bootstrap: &impl Bootstrap,
+/// The `scala3SemanticLs.doctor` result. Renders the `state:` header from the
+/// current context in every state, matching `DoctorCommand.report`. The
+/// runtime/store/semanticdb/postings/pc report sections are gathered by the
+/// doctor module.
+fn doctor_report<S>(core: &ServerCore<S>) -> String {
+    format!("state: {}\n\n", core.state.status_line())
+}
+
+fn dispatch_notification<S>(
+    core: &mut ServerCore<S>,
+    bootstrap: &impl Bootstrap<S>,
+    hooks: &ServerHooks<'_>,
     note: Notification,
 ) -> Flow {
     match note.method.as_str() {
-        "initialized" => core.run_bootstrap(bootstrap),
+        "initialized" => core.run_bootstrap(bootstrap, hooks),
         "exit" => return Flow::Stop,
         "textDocument/didOpen" => core.did_open(&note.params),
         "textDocument/didChange" => core.did_change(&note.params),
@@ -276,7 +357,7 @@ fn dispatch_notification(
 
 /// The pre-ready response for a readiness-sensitive request: the fixed per-method
 /// fallback the server returns before the workspace is ready.
-fn pre_ready_response(id: RequestId, method: Method, state: &WorkspaceState) -> Response {
+fn pre_ready_response<S>(id: RequestId, method: Method, state: &WorkspaceState<S>) -> Response {
     match pre_ready_outcome(method) {
         PreReadyOutcome::NotReadyError => {
             let message = require_ready(state)
@@ -361,19 +442,38 @@ fn last_change_text(params: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
     use std::io::Cursor;
 
-    struct FixedBootstrap(WorkspaceState);
-    impl Bootstrap for FixedBootstrap {
-        fn run(&self, _workspace_root: Option<&Path>) -> WorkspaceState {
-            self.0.clone()
+    /// A fake ready-services bundle carrying a marker the handler echoes, so a
+    /// test can prove the `Ready(services)` value reached the handler.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct FakeServices {
+        tag: String,
+    }
+
+    /// Handlers that echo the whole request context back, so a dropped context
+    /// field fails the asserting test rather than passing silently.
+    struct EchoHandlers;
+    impl Handlers<FakeServices> for EchoHandlers {
+        fn handle(&self, cx: RequestContext<'_, FakeServices>) -> Response {
+            Response::success(
+                cx.request.id.clone(),
+                json!({
+                    "method": cx.request.method,
+                    "services": cx.services.tag,
+                    "root": cx.workspace_root.map(|p| p.display().to_string()),
+                    "openDocs": cx.documents.open_uris(),
+                    "shuttingDown": cx.shutting_down,
+                }),
+            )
         }
     }
 
-    struct EchoHandlers;
-    impl Handlers for EchoHandlers {
-        fn handle(&self, request: &Request) -> Response {
-            Response::success(request.id.clone(), json!({ "handled": request.method }))
+    struct FixedBootstrap(WorkspaceState<FakeServices>);
+    impl Bootstrap<FakeServices> for FixedBootstrap {
+        fn run(&self, _cx: BootstrapContext<'_>) -> WorkspaceState<FakeServices> {
+            self.0.clone()
         }
     }
 
@@ -390,7 +490,6 @@ mod tests {
         json!({ "jsonrpc": "2.0", "method": method, "params": params })
     }
 
-    /// Reads every framed response written to `bytes` and indexes them by id.
     fn responses(bytes: Vec<u8>) -> Vec<Value> {
         let mut reader = Cursor::new(bytes);
         let mut out = Vec::new();
@@ -400,16 +499,34 @@ mod tests {
         out
     }
 
-    fn run(input: Vec<Vec<u8>>, bootstrap: WorkspaceState) -> (ServerCore, Vec<Value>) {
+    fn ready(tag: &str) -> WorkspaceState<FakeServices> {
+        WorkspaceState::Ready(FakeServices {
+            tag: tag.to_string(),
+        })
+    }
+
+    /// Drives `serve` over the scripted input with the echo handlers, a fixed
+    /// bootstrap outcome, and no-op hooks.
+    fn run(
+        input: Vec<Vec<u8>>,
+        bootstrap: WorkspaceState<FakeServices>,
+    ) -> (ServerCore<FakeServices>, Vec<Value>) {
         let mut reader = Cursor::new(input.concat());
         let mut writer = Vec::new();
         let mut core = ServerCore::new();
+        let publish = |_p: PublishDiagnosticsParams| {};
+        let on_changed = || {};
+        let hooks = ServerHooks {
+            publish_diagnostics: &publish,
+            on_build_targets_changed: &on_changed,
+        };
         serve(
             &mut reader,
             &mut writer,
             &mut core,
             &EchoHandlers,
             &FixedBootstrap(bootstrap),
+            &hooks,
         )
         .unwrap();
         (core, responses(writer))
@@ -437,10 +554,9 @@ mod tests {
                 frame(notification("exit", json!({}))),
             ],
             // Never sent `initialized`, so the workspace stays not-ready.
-            WorkspaceState::Ready,
+            ready("unused"),
         );
 
-        // initialize answered the capabilities and stayed not-ready.
         assert_eq!(out[0]["id"], 1);
         assert_eq!(
             out[0]["result"]["serverInfo"]["name"],
@@ -448,15 +564,11 @@ mod tests {
         );
         assert!(!core.state.is_ready());
         assert_eq!(core.workspace_root, Some(PathBuf::from("/ws")));
-
-        // Document sync recorded the open buffer under the normalized uri.
         assert_eq!(
             core.docs.text("file:///ws/a.scala").as_deref(),
             Some("hello")
         );
 
-        // completion -> empty complete list; references -> not-ready error;
-        // hover -> null; definition -> empty array.
         assert_eq!(out[1]["id"], 2);
         assert_eq!(
             out[1]["result"],
@@ -470,27 +582,171 @@ mod tests {
             .starts_with("workspace is not ready"));
         assert_eq!(out[3]["result"], Value::Null);
         assert_eq!(out[4]["result"], json!([]));
-
-        // shutdown -> null, and the server is marked shutting down.
-        assert_eq!(out[5]["id"], 6);
         assert_eq!(out[5]["result"], Value::Null);
         assert!(core.shutting_down);
     }
 
+    // The ready seam: the services, workspace root, and open documents all reach
+    // the ready handler through the request context.
     #[test]
-    fn initialized_runs_bootstrap_and_ready_requests_delegate_to_handlers() {
+    fn ready_context_exposes_services_root_and_documents() {
         let (core, out) = run(
             vec![
-                frame(request(1, "initialize", json!({}))),
+                frame(request(1, "initialize", json!({ "rootUri": "file:///ws" }))),
+                frame(notification(
+                    "textDocument/didOpen",
+                    json!({ "textDocument": { "uri": "file:///ws/a.scala", "text": "x" } }),
+                )),
                 frame(notification("initialized", json!({}))),
                 frame(request(2, "textDocument/completion", json!({}))),
                 frame(notification("exit", json!({}))),
             ],
-            WorkspaceState::Ready,
+            ready("svc-42"),
         );
         assert!(core.state.is_ready());
-        assert_eq!(out[1]["id"], 2);
-        assert_eq!(out[1]["result"]["handled"], "textDocument/completion");
+        let result = &out[1]["result"];
+        assert_eq!(result["method"], "textDocument/completion");
+        assert_eq!(result["services"], "svc-42");
+        assert_eq!(result["root"], "/ws");
+        assert_eq!(result["openDocs"], json!(["file:///ws/a.scala"]));
+        assert_eq!(result["shuttingDown"], false);
+    }
+
+    // The ready seam reaches references/rename, completionItem/resolve, and the
+    // ready executeCommand actions too — all through the same context.
+    #[test]
+    fn ready_seam_reaches_every_delegated_method() {
+        for (method, params) in [
+            ("textDocument/references", json!({})),
+            ("textDocument/rename", json!({})),
+            ("completionItem/resolve", json!({ "label": "x" })),
+            (
+                "workspace/executeCommand",
+                json!({ "command": "scala3SemanticLs.reindex" }),
+            ),
+            (
+                "workspace/executeCommand",
+                json!({ "command": "scala3SemanticLs.compile" }),
+            ),
+            (
+                "workspace/executeCommand",
+                json!({ "command": "scala3SemanticLs.pcPluginStatus" }),
+            ),
+        ] {
+            let (_core, out) = run(
+                vec![
+                    frame(request(1, "initialize", json!({}))),
+                    frame(notification("initialized", json!({}))),
+                    frame(request(2, method, params)),
+                    frame(notification("exit", json!({}))),
+                ],
+                ready("svc"),
+            );
+            assert_eq!(
+                out[1]["result"]["services"], "svc",
+                "{method} lost the services"
+            );
+        }
+    }
+
+    // Bootstrap receives the workspace root, the open documents, and both hooks.
+    #[test]
+    fn bootstrap_receives_root_documents_and_hooks() {
+        struct RecordingBootstrap;
+        impl Bootstrap<FakeServices> for RecordingBootstrap {
+            fn run(&self, cx: BootstrapContext<'_>) -> WorkspaceState<FakeServices> {
+                (cx.on_build_targets_changed)();
+                (cx.publish_diagnostics)(PublishDiagnosticsParams {
+                    uri: "file:///ws/a.scala".to_string(),
+                    diagnostics: Vec::new(),
+                });
+                WorkspaceState::Ready(FakeServices {
+                    tag: format!(
+                        "root={} docs={}",
+                        cx.workspace_root
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_default(),
+                        cx.documents.open_uris().len()
+                    ),
+                })
+            }
+        }
+
+        let mut reader = Cursor::new(
+            [
+                frame(request(1, "initialize", json!({ "rootUri": "file:///ws" }))),
+                frame(notification(
+                    "textDocument/didOpen",
+                    json!({ "textDocument": { "uri": "file:///ws/a.scala", "text": "x" } }),
+                )),
+                frame(notification("initialized", json!({}))),
+                frame(notification("exit", json!({}))),
+            ]
+            .concat(),
+        );
+        let mut writer = Vec::new();
+        let mut core = ServerCore::new();
+        let changed = Cell::new(0);
+        let published = Cell::new(0);
+        let on_changed = || changed.set(changed.get() + 1);
+        let publish = |_p: PublishDiagnosticsParams| published.set(published.get() + 1);
+        let hooks = ServerHooks {
+            publish_diagnostics: &publish,
+            on_build_targets_changed: &on_changed,
+        };
+        serve(
+            &mut reader,
+            &mut writer,
+            &mut core,
+            &EchoHandlers,
+            &RecordingBootstrap,
+            &hooks,
+        )
+        .unwrap();
+
+        assert_eq!(
+            changed.get(),
+            1,
+            "on_build_targets_changed hook not received"
+        );
+        assert_eq!(published.get(), 1, "publish_diagnostics hook not received");
+        assert_eq!(core.state.ready().unwrap().tag, "root=/ws docs=1");
+    }
+
+    // Doctor renders the state header from the context in every state.
+    #[test]
+    fn doctor_renders_the_state_header_in_every_state() {
+        let doctor = |state: WorkspaceState<FakeServices>, send_initialized: bool| {
+            let mut input = vec![frame(request(1, "initialize", json!({})))];
+            if send_initialized {
+                input.push(frame(notification("initialized", json!({}))));
+            }
+            input.push(frame(request(
+                2,
+                "workspace/executeCommand",
+                json!({ "command": "scala3SemanticLs.doctor" }),
+            )));
+            input.push(frame(notification("exit", json!({}))));
+            let (_core, out) = run(input, state);
+            out[1]["result"].as_str().unwrap().to_string()
+        };
+        // Not ready (no initialized): the pre-ready state header.
+        assert_eq!(
+            doctor(ready("unused"), false),
+            "state: not ready: waiting for the initialized notification\n\n"
+        );
+        // Ready.
+        assert_eq!(doctor(ready("svc"), true), "state: ready\n\n");
+        // Failed.
+        assert_eq!(
+            doctor(
+                WorkspaceState::Failed {
+                    detail: "no build server".to_string()
+                },
+                true
+            ),
+            "state: bootstrap failed: no build server\n\n"
+        );
     }
 
     #[test]
@@ -505,11 +761,10 @@ mod tests {
                 detail: "no build server".to_string(),
             },
         );
+        assert!(matches!(core.state, WorkspaceState::Failed { .. }));
         assert_eq!(
-            core.state,
-            WorkspaceState::Failed {
-                detail: "no build server".to_string()
-            }
+            core.state.status_line(),
+            "bootstrap failed: no build server"
         );
     }
 
@@ -520,73 +775,49 @@ mod tests {
                 frame(request(1, "textDocument/hover", json!({}))),
                 frame(notification("exit", json!({}))),
             ],
-            WorkspaceState::Ready,
+            ready("unused"),
         );
         assert_eq!(out[0]["error"]["code"], error_codes::SERVER_NOT_INITIALIZED);
     }
 
-    // Ports the ls.core.ScalaLs.executeCommand dispatch.
+    // Ports the ls.core.ScalaLs.executeCommand pre-ready dispatch.
     #[test]
-    fn execute_command_routes_by_command_and_readiness() {
-        // Not ready (no `initialized`): doctor renders via the handlers in any
-        // state; reindex answers the unavailable status string; an unknown
-        // command is an invalid-params error.
+    fn execute_command_pre_ready_and_unknown() {
         let (_core, out) = run(
             vec![
                 frame(request(1, "initialize", json!({}))),
                 frame(request(
                     2,
                     "workspace/executeCommand",
-                    json!({ "command": "scala3SemanticLs.doctor" }),
+                    json!({ "command": "scala3SemanticLs.reindex" }),
                 )),
                 frame(request(
                     3,
                     "workspace/executeCommand",
-                    json!({ "command": "scala3SemanticLs.reindex" }),
-                )),
-                frame(request(
-                    4,
-                    "workspace/executeCommand",
                     json!({ "command": "bogus.command" }),
                 )),
+                // No `command` field: Scala's null getCommand renders "null".
+                frame(request(4, "workspace/executeCommand", json!({}))),
                 frame(notification("exit", json!({}))),
             ],
-            WorkspaceState::Ready,
+            ready("unused"),
         );
-        assert_eq!(out[1]["id"], 2);
-        assert_eq!(out[1]["result"]["handled"], "workspace/executeCommand");
-        assert_eq!(out[2]["id"], 3);
         assert_eq!(
-            out[2]["result"],
+            out[1]["result"],
             "reindex unavailable: workspace is not ready: waiting for the initialized notification"
         );
-        assert_eq!(out[3]["id"], 4);
-        assert_eq!(out[3]["error"]["code"], error_codes::INVALID_PARAMS);
-    }
-
-    #[test]
-    fn execute_command_reindex_delegates_to_handlers_when_ready() {
-        let (_core, out) = run(
-            vec![
-                frame(request(1, "initialize", json!({}))),
-                frame(notification("initialized", json!({}))),
-                frame(request(
-                    2,
-                    "workspace/executeCommand",
-                    json!({ "command": "scala3SemanticLs.reindex" }),
-                )),
-                frame(notification("exit", json!({}))),
-            ],
-            WorkspaceState::Ready,
+        assert_eq!(out[2]["error"]["code"], error_codes::INVALID_PARAMS);
+        assert_eq!(
+            out[2]["error"]["message"],
+            "unknown command 'bogus.command'"
         );
-        assert_eq!(out[1]["id"], 2);
-        assert_eq!(out[1]["result"]["handled"], "workspace/executeCommand");
+        assert_eq!(out[3]["error"]["message"], "unknown command 'null'");
     }
 
-    // Ports ls.core.ScalaLs.resolveCompletionItem: echo pre-ready, resolve ready.
+    // Ports ls.core.ScalaLs.resolveCompletionItem: echo pre-ready.
     #[test]
-    fn completion_item_resolve_echoes_pre_ready_and_delegates_when_ready() {
-        let (_c1, out1) = run(
+    fn completion_item_resolve_echoes_pre_ready() {
+        let (_core, out) = run(
             vec![
                 frame(request(1, "initialize", json!({}))),
                 frame(request(
@@ -596,39 +827,24 @@ mod tests {
                 )),
                 frame(notification("exit", json!({}))),
             ],
-            WorkspaceState::Ready,
+            ready("unused"),
         );
-        assert_eq!(out1[1]["result"], json!({ "label": "foo", "data": 7 }));
-
-        let (_c2, out2) = run(
-            vec![
-                frame(request(1, "initialize", json!({}))),
-                frame(notification("initialized", json!({}))),
-                frame(request(
-                    2,
-                    "completionItem/resolve",
-                    json!({ "label": "foo" }),
-                )),
-                frame(notification("exit", json!({}))),
-            ],
-            WorkspaceState::Ready,
-        );
-        assert_eq!(out2[1]["result"]["handled"], "completionItem/resolve");
+        assert_eq!(out[1]["result"], json!({ "label": "foo", "data": 7 }));
     }
 
     #[test]
     fn shutdown_is_idempotent() {
-        let mut core = ServerCore::new();
+        let mut core: ServerCore<FakeServices> = ServerCore::new();
         core.shutdown();
-        core.state = WorkspaceState::Ready; // a stray later transition
-        core.shutdown(); // second shutdown must not overwrite state again
+        core.state = ready("late");
+        core.shutdown();
         assert!(core.state.is_ready());
         assert!(core.shutting_down);
     }
 
     #[test]
     fn did_change_full_sync_takes_the_last_change_and_did_close_drops_the_buffer() {
-        let core = ServerCore::new();
+        let core: ServerCore<FakeServices> = ServerCore::new();
         core.did_open(&json!({ "textDocument": { "uri": "file:///a", "text": "v1" } }));
         core.did_change(&json!({
             "textDocument": { "uri": "file:///a" },
@@ -641,9 +857,8 @@ mod tests {
 
     #[test]
     fn did_save_with_text_refreshes_an_open_buffer_only() {
-        let core = ServerCore::new();
+        let core: ServerCore<FakeServices> = ServerCore::new();
         core.did_save(&json!({ "textDocument": { "uri": "file:///a" }, "text": "saved" }));
-        // Not open -> the save text is ignored.
         assert!(!core.docs.is_open("file:///a"));
         core.did_open(&json!({ "textDocument": { "uri": "file:///a", "text": "v1" } }));
         core.did_save(&json!({ "textDocument": { "uri": "file:///a" }, "text": "saved" }));
