@@ -47,8 +47,46 @@ fn fixture_model() -> BspProjectModel {
             target("fixture-b", "out-b", vec!["fixture-a".to_string()]),
             target("fixture-c", "out-c", Vec::new()),
         ],
-        HashMap::new(),
+        uri_to_target_for(&src),
     )
+}
+
+/// Recursively collect every `.scala` file under `dir`.
+fn collect_scala(dir: &Path, out: &mut Vec<PathBuf>) {
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            collect_scala(&path, out);
+        } else if path.extension().and_then(|e| e.to_str()) == Some("scala") {
+            out.push(path);
+        }
+    }
+}
+
+/// The corpus's URI ownership: each source mapped to its target by top-level
+/// directory (`a`/`b`/`c`; `shared`/`dep` belong to `fixture-a`). Mirrors what
+/// `ProjectModelLoader` builds from `buildTarget/sources`.
+fn uri_to_target_for(src: &Path) -> HashMap<String, String> {
+    let mut files = Vec::new();
+    collect_scala(src, &mut files);
+    files
+        .into_iter()
+        .map(|file| {
+            let top = file
+                .strip_prefix(src)
+                .unwrap()
+                .components()
+                .next()
+                .and_then(|c| c.as_os_str().to_str())
+                .unwrap_or_default();
+            let target = match top {
+                "b" => "fixture-b",
+                "c" => "fixture-c",
+                _ => "fixture-a",
+            };
+            (path_to_uri(&file), target.to_string())
+        })
+        .collect()
 }
 
 fn frame(body: Value) -> Vec<u8> {
@@ -108,6 +146,25 @@ fn production_bootstrap_ingests_the_model_and_serves_real_queries() {
             5,
             "workspace/executeCommand",
             json!({ "command": "scala3SemanticLs.reindex" }),
+        )),
+        // A source the live model does not own -> gated out by requireSemanticdb.
+        frame(request(
+            6,
+            "textDocument/references",
+            json!({
+                "textDocument": { "uri": "file:///elsewhere/Outside.scala" },
+                "position": { "line": 0, "character": 0 }
+            }),
+        )),
+        // An owned source passes the gate: documentHighlight answers real
+        // occurrences over the index (not the gate's hard error).
+        frame(request(
+            7,
+            "textDocument/documentHighlight",
+            json!({
+                "textDocument": { "uri": core_uri },
+                "position": { "line": 2, "character": 6 }
+            }),
         )),
         frame(notification("exit", json!({}))),
     ]
@@ -173,5 +230,30 @@ fn production_bootstrap_ingests_the_model_and_serves_real_queries() {
     assert!(
         summary.starts_with("ingest: segment ") && summary.contains(" docs "),
         "unexpected reindex summary: {summary}"
+    );
+
+    // references for a source the model does not own fails through
+    // requireSemanticdb with NoSemanticdb, not a NotIndexed or empty result.
+    let gated = &by_id(6)["error"];
+    assert_eq!(
+        gated["code"], -32803,
+        "requireSemanticdb should RequestFailed"
+    );
+    assert!(
+        gated["message"]
+            .as_str()
+            .unwrap()
+            .contains("has no SemanticDB output"),
+        "expected NoSemanticdb message, got {gated}"
+    );
+
+    // documentHighlight over the owned Core source passes the gate and returns
+    // real same-document occurrences (the class declaration at minimum).
+    let highlights = by_id(7)["result"]
+        .as_array()
+        .expect("documentHighlight result array");
+    assert!(
+        !highlights.is_empty(),
+        "expected highlights for Core, got none"
     );
 }

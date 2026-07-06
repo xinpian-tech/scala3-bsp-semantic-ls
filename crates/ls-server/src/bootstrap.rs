@@ -20,6 +20,7 @@ use std::sync::Arc;
 use ls_bsp::model::BspProjectModel;
 use ls_bsp::{BspClientHandlers, BspDiscovery, BspSession, BspSessionConfig, ProjectModelLoader};
 use ls_engine::{DocFacts, QueryOrchestrator, TargetSpec, WorkspaceTargets};
+use ls_index_model::uri::normalize_uri;
 use ls_store::Store;
 
 use crate::lifecycle::WorkspaceState;
@@ -110,6 +111,13 @@ impl<M: ModelSource> IndexBootstrap<M> {
     fn build(&self, workspace_root: &Path) -> Result<CoreServices, String> {
         let model = self.model_source.load(workspace_root)?;
         let workspace = from_bsp(&model, workspace_source_facts());
+        // The model's URI ownership, keyed by normalized `file://` URI (as
+        // `WorkspaceState` does with `Uris.normalize`), backs `requireSemanticdb`.
+        let uri_to_target = model
+            .uri_to_target
+            .iter()
+            .map(|(uri, bsp_id)| (normalize_uri(uri), bsp_id.clone()))
+            .collect();
         // Sourceroots for the URI mapping are collected before the targets move
         // into the ingest; `WorkspaceUris` de-duplicates and orders them.
         let sourceroots: Vec<PathBuf> = workspace
@@ -127,6 +135,7 @@ impl<M: ModelSource> IndexBootstrap<M> {
             orchestrator,
             uris,
             Some(workspace_root.to_path_buf()),
+            uri_to_target,
         ))
     }
 }
