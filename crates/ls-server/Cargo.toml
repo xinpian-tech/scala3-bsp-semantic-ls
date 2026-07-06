@@ -11,10 +11,12 @@ workspace = true
 
 [dependencies]
 ls-index-model = { path = "../ls-index-model" }
+ls-engine = { path = "../ls-engine" }
 ls-bsp = { path = "../ls-bsp" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 [dev-dependencies]
+ls-store = { path = "../ls-store" }
 serde_json = "1"
 tempfile = "3"

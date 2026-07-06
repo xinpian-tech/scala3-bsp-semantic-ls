@@ -192,7 +192,9 @@ name = "ls-server"
 version = "0.1.0"
 dependencies = [
  "ls-bsp",
+ "ls-engine",
  "ls-index-model",
+ "ls-store",
  "serde",
  "serde_json",
  "tempfile",

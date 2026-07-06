@@ -6,17 +6,24 @@
 
 pub mod capabilities;
 pub mod cli;
+pub mod convert;
 pub mod diagnostics;
 pub mod documents;
 pub mod jsonrpc;
 pub mod lifecycle;
 pub mod protocol;
 pub mod server;
+pub mod services;
+pub mod workspace_uris;
 
 pub use capabilities::{
     initialize_result, server_capabilities, InitializeResult, ServerCapabilities,
 };
 pub use cli::{parse_args, resolve_doctor_dir, CliAction};
+pub use convert::{
+    highlight_kind, location, range, symbol_kind, workspace_edit, DocumentHighlight,
+    DocumentHighlightKind, Location, SymbolKind, TextEdit, WorkspaceEdit,
+};
 pub use diagnostics::{to_lsp_diagnostic, DiagnosticRouter};
 pub use documents::DocumentStore;
 pub use jsonrpc::{
@@ -30,3 +37,5 @@ pub use protocol::{Diagnostic, DiagnosticCode, Position, PublishDiagnosticsParam
 pub use server::{
     serve, Bootstrap, BootstrapContext, Handlers, RequestContext, ServerCore, ServerHooks,
 };
+pub use services::{highlights_to_lsp, references_locations, CoreHandlers, CoreServices};
+pub use workspace_uris::WorkspaceUris;
