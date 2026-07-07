@@ -22,9 +22,8 @@ use ls_index_model::uri::{normalize_uri, path_to_uri};
 use ls_index_model::LsError;
 use ls_server::{
     read_frame, reload_build_model, serve, Bootstrap, BuildCompiler, CoreHandlers, CoreServices,
-    DocumentStore, Handlers, IndexBootstrap, LoadOutcome, ModelSource, PcLocation, PcQueryService,
-    PublishDiagnosticsParams, ReadyModel, Request, RequestContext, RequestId, ServerCore,
-    ServerHooks, WorkspaceState,
+    DocumentStore, Handlers, IndexBootstrap, LoadOutcome, ModelSource, OutputSink, PcLocation,
+    PcQueryService, ReadyModel, Request, RequestContext, RequestId, ServerCore, WorkspaceState,
 };
 
 fn fixtures_root() -> PathBuf {
@@ -572,21 +571,9 @@ where
             continue;
         }
         let mut reader = std::io::Cursor::new(chunk);
-        let mut writer = Vec::new();
-        let publish = |_p: PublishDiagnosticsParams| {};
-        let hooks = ServerHooks {
-            publish_diagnostics: &publish,
-        };
-        serve(
-            &mut reader,
-            &mut writer,
-            core,
-            handlers,
-            bootstrap(),
-            &hooks,
-        )
-        .unwrap();
-        out.extend(responses(writer));
+        let sink = OutputSink::new(Vec::new());
+        serve(&mut reader, &sink, core, handlers, bootstrap()).unwrap();
+        out.extend(responses(sink.written()));
     }
     out
 }

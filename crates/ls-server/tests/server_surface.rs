@@ -27,8 +27,7 @@ use ls_engine::{CompileOutcome, CompileService};
 use ls_index_model::uri::path_to_uri;
 use ls_server::{
     libjvm_mapped, read_frame, serve, Bootstrap, BuildCompiler, CoreHandlers, Handlers,
-    IndexBootstrap, LoadOutcome, ModelSource, PublishDiagnosticsParams, ReadyModel, ServerCore,
-    ServerHooks,
+    IndexBootstrap, LoadOutcome, ModelSource, OutputSink, ReadyModel, ServerCore,
 };
 
 // --- fixture model + black-box harness ---------------------------------------
@@ -161,21 +160,9 @@ where
             continue;
         }
         let mut reader = Cursor::new(chunk);
-        let mut writer = Vec::new();
-        let publish = |_p: PublishDiagnosticsParams| {};
-        let hooks = ServerHooks {
-            publish_diagnostics: &publish,
-        };
-        serve(
-            &mut reader,
-            &mut writer,
-            core,
-            handlers,
-            bootstrap(),
-            &hooks,
-        )
-        .unwrap();
-        out.extend(responses(writer));
+        let sink = OutputSink::new(Vec::new());
+        serve(&mut reader, &sink, core, handlers, bootstrap()).unwrap();
+        out.extend(responses(sink.written()));
     }
     out
 }

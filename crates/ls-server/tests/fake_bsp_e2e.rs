@@ -3,20 +3,23 @@
 //! bootstrap here loads the project model over the REAL BSP client (a real
 //! `BspSession` speaking JSON-RPC to the fake server over a `UnixStream`) and
 //! retains it in the REAL session-backed compiler, so `initialize`/`initialized`
-//! handshake, model load, and session teardown all run through production code.
-//! A port of the index-only + lifecycle tranche of the Scala `LsEndToEndTest`.
+//! handshake, model load, compile, diagnostics forwarding, and session teardown
+//! all run through production code. A port of the Scala `LsEndToEndTest`.
 //!
 //! The fake server describes the committed `ls-engine` SemanticDB fixture corpus
 //! (targets `fixture-a`/`fixture-b`/`fixture-c` with real `.semanticdb` under
 //! `out-a`/`out-b`/`out-c`) plus one `fixture-nosdb` target compiled WITHOUT
 //! `-Xsemanticdb`, so its source stays a hard `NoSemanticdb` error (SemanticDB
-//! is mandatory — a source in such a target is a hard error, never empty).
+//! is mandatory — a source in such a target is a hard error, never empty). It
+//! drives capabilities + the real BSP handshake, index queries, compile-diagnostic
+//! forwarding (publish / clear / clear-once suppression), rename over the retained
+//! compiler (success + compile failure), `buildTarget/didChange` reload, the
+//! dirty-buffer PC-only surface (JVM-free), and LSP shutdown teardown.
 //!
-//! Not covered here (deferred): the compile-diagnostic forwarding scenarios (the
-//! live BSP→router→client wiring is a separate step) and the presentation-compiler
-//! scenarios (completion / dirty overlay / PC-only), which need a real embedded
-//! JVM and are exercised env-gated by `live_pc.rs`.
+//! The presentation-compiler completion scenario needs a real embedded JVM and is
+//! env-gated exactly like `live_pc.rs` (skips cleanly when the JVM env is absent).
 
+use std::collections::VecDeque;
 use std::io::{BufReader, Cursor, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -27,12 +30,13 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
+use ls_bsp::protocol::PublishDiagnosticsParams as BspPublishDiagnosticsParams;
 use ls_bsp::uri::path_to_uri;
 use ls_bsp::wire::{read_message, write_message};
 use ls_bsp::{BspClientHandlers, BspSession, BspSessionConfig};
 use ls_server::{
-    read_frame, ready_model_from_session, serve, CoreHandlers, IndexBootstrap, LoadOutcome,
-    ModelSource, PublishDiagnosticsParams, ServerCore, ServerHooks,
+    read_frame, ready_model_from_session, serve, CoreHandlers, DiagnosticRouter, IndexBootstrap,
+    LoadOutcome, ModelSource, OutputSink, ServerCore,
 };
 
 // --- fixture corpus geometry --------------------------------------------------
@@ -47,15 +51,45 @@ fn target_id(name: &str) -> String {
 
 // --- in-process fake BSP server -----------------------------------------------
 
-/// A minimal fake BSP server over a `UnixStream`, describing the fixture corpus.
-/// The three indexable targets carry `-Xsemanticdb` pointing at the committed
-/// `out-*` targetroots; `fixture-nosdb` carries no SemanticDB flag.
+/// How the fake should react to the next `buildTarget/compile`: which status to
+/// return, which `build/publishDiagnostics` notifications to emit first, and
+/// whether to fire a `buildTarget/didChange` (swapping the advertised targets so a
+/// subsequent model refetch sees the reloaded set).
+#[derive(Clone)]
+struct CompileScript {
+    status: i64,
+    diagnostics: Vec<Value>,
+    reload_to: Option<Vec<Value>>,
+}
+
+impl CompileScript {
+    fn ok() -> CompileScript {
+        CompileScript {
+            status: 1,
+            diagnostics: Vec::new(),
+            reload_to: None,
+        }
+    }
+}
+
+/// A fake BSP server over a `UnixStream`, describing the fixture corpus. The three
+/// indexable targets carry `-Xsemanticdb` pointing at the committed `out-*`
+/// targetroots; `fixture-nosdb` carries no SemanticDB flag. Its reaction to
+/// `buildTarget/compile` (status, diagnostics, reload) is scriptable per test.
 struct FakeBuildServer {
     sources_root: PathBuf,
     nosdb_source: PathBuf,
     initialize_received: AtomicBool,
     initialized_notified: AtomicBool,
     shutdown_requested: AtomicBool,
+    exit_received: AtomicBool,
+    /// The build targets advertised for `workspace/buildTargets`; a `didChange`
+    /// reload swaps this so a refetch observes the new set.
+    current_targets: Mutex<Vec<Value>>,
+    /// Scripts consumed one per `buildTarget/compile`; empties to a plain success.
+    compile_scripts: Mutex<VecDeque<CompileScript>>,
+    /// The target ids seen across all compile requests (rename asserts a compile ran).
+    compiled_targets: Mutex<Vec<String>>,
 }
 
 impl FakeBuildServer {
@@ -66,7 +100,21 @@ impl FakeBuildServer {
             initialize_received: AtomicBool::new(false),
             initialized_notified: AtomicBool::new(false),
             shutdown_requested: AtomicBool::new(false),
+            exit_received: AtomicBool::new(false),
+            current_targets: Mutex::new(default_targets()),
+            compile_scripts: Mutex::new(VecDeque::new()),
+            compiled_targets: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Advertise a restricted initial target set (for the reload scenario).
+    fn set_targets(&self, targets: Vec<Value>) {
+        *self.current_targets.lock().unwrap() = targets;
+    }
+
+    /// Queue the fake's reaction to the next compile.
+    fn script_compile(&self, script: CompileScript) {
+        self.compile_scripts.lock().unwrap().push_back(script);
     }
 
     /// Returns false to stop serving (on `build/exit`).
@@ -84,11 +132,14 @@ impl FakeBuildServer {
                 self.shutdown_requested.store(true, Ordering::SeqCst);
                 reply(writer, id, Value::Null);
             }
-            "build/exit" => return false,
+            "build/exit" => {
+                self.exit_received.store(true, Ordering::SeqCst);
+                return false;
+            }
             "workspace/buildTargets" => reply(writer, id, self.build_targets()),
             "buildTarget/sources" => reply(writer, id, self.sources(&params)),
             "buildTarget/scalacOptions" => reply(writer, id, self.scalac_options(&params)),
-            "buildTarget/compile" => reply(writer, id, json!({ "statusCode": 1 })),
+            "buildTarget/compile" => self.compile(writer, id, &params),
             _ => {
                 if let Some(id) = id {
                     reply_error(writer, id, -32601, &format!("method not found: {method}"));
@@ -108,13 +159,31 @@ impl FakeBuildServer {
     }
 
     fn build_targets(&self) -> Value {
-        let targets = vec![
-            build_target("fixture-a", &[]),
-            build_target("fixture-b", &["fixture-a"]),
-            build_target("fixture-c", &[]),
-            build_target("fixture-nosdb", &[]),
-        ];
-        json!({ "targets": targets })
+        json!({ "targets": self.current_targets.lock().unwrap().clone() })
+    }
+
+    /// Runs the queued compile script (or a plain success): records the requested
+    /// target ids, emits any scripted `build/publishDiagnostics`, optionally fires a
+    /// `buildTarget/didChange` + swaps the advertised targets, then replies status.
+    fn compile(&self, writer: &mut UnixStream, id: Option<Value>, params: &Value) {
+        self.compiled_targets
+            .lock()
+            .unwrap()
+            .extend(requested_names(params));
+        let script = self
+            .compile_scripts
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or_else(CompileScript::ok);
+        for diagnostic in &script.diagnostics {
+            notify(writer, "build/publishDiagnostics", diagnostic.clone());
+        }
+        if let Some(reloaded) = script.reload_to {
+            *self.current_targets.lock().unwrap() = reloaded;
+            notify(writer, "buildTarget/didChange", json!({ "changes": [] }));
+        }
+        reply(writer, id, json!({ "statusCode": script.status }));
     }
 
     fn sources(&self, params: &Value) -> Value {
@@ -200,6 +269,15 @@ fn build_target(name: &str, deps: &[&str]) -> Value {
     })
 }
 
+fn default_targets() -> Vec<Value> {
+    vec![
+        build_target("fixture-a", &[]),
+        build_target("fixture-b", &["fixture-a"]),
+        build_target("fixture-c", &[]),
+        build_target("fixture-nosdb", &[]),
+    ]
+}
+
 fn requested_names(params: &Value) -> Vec<String> {
     params
         .get("targets")
@@ -229,6 +307,34 @@ fn reply_error(writer: &mut UnixStream, id: Value, code: i64, message: &str) {
     );
 }
 
+fn notify(writer: &mut UnixStream, method: &str, params: Value) {
+    let _ = write_message(
+        writer,
+        &json!({ "jsonrpc": "2.0", "method": method, "params": params }),
+    );
+}
+
+/// One `build/publishDiagnostics` params for a file+target: `reset` replaces that
+/// target's list for the file, and an empty `diagnostics` under `reset` clears it.
+fn bsp_diagnostics(file_uri: &str, target: &str, reset: bool, diagnostics: Value) -> Value {
+    json!({
+        "textDocument": { "uri": file_uri },
+        "buildTarget": { "uri": target_id(target) },
+        "diagnostics": diagnostics,
+        "reset": reset,
+    })
+}
+
+fn bsp_error(message: &str, code: &str) -> Value {
+    json!({
+        "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 4 } },
+        "severity": 1,
+        "code": code,
+        "source": "sc",
+        "message": message,
+    })
+}
+
 fn serve_fake(server: Arc<FakeBuildServer>, stream: UnixStream) -> JoinHandle<()> {
     thread::spawn(move || {
         let read_half = stream.try_clone().expect("clone server stream");
@@ -256,6 +362,12 @@ struct FakeBspModelSource {
     workspace_root: PathBuf,
     streams: Arc<Mutex<Option<Streams>>>,
     reload_flag: Arc<AtomicBool>,
+    /// The production diagnostics plumbing: the session's `on_diagnostics` routes
+    /// each BSP publish through this router and writes the accepted LSP publish
+    /// straight to the shared output sink (the same sink the loop writes responses
+    /// to), exactly as production does.
+    router: Arc<Mutex<DiagnosticRouter>>,
+    sink: Arc<OutputSink<Vec<u8>>>,
 }
 
 impl ModelSource for FakeBspModelSource {
@@ -267,8 +379,15 @@ impl ModelSource for FakeBspModelSource {
             .take()
             .ok_or_else(|| "fake BSP streams already consumed".to_string())?;
         let reload = Arc::clone(&self.reload_flag);
+        let router = Arc::clone(&self.router);
+        let sink = Arc::clone(&self.sink);
         let handlers = BspClientHandlers::new()
-            .on_did_change_build_target(move |_| reload.store(true, Ordering::SeqCst));
+            .on_did_change_build_target(move |_| reload.store(true, Ordering::SeqCst))
+            .on_diagnostics(move |params: BspPublishDiagnosticsParams| {
+                if let Some(publish) = router.lock().unwrap().accept(&params) {
+                    let _ = sink.publish_diagnostics(&publish);
+                }
+            });
         let session = BspSession::connect(
             self.workspace_root.clone(),
             input,
@@ -314,6 +433,8 @@ fn setup(reload_flag: Arc<AtomicBool>) -> E2e {
         workspace_root: workspace_root.clone(),
         streams: Arc::new(Mutex::new(Some((input, output)))),
         reload_flag,
+        router: Arc::new(Mutex::new(DiagnosticRouter::new())),
+        sink: Arc::new(OutputSink::new(Vec::new())),
     };
     E2e {
         server,
@@ -369,30 +490,24 @@ fn serve_pumped(
     input: Vec<u8>,
 ) -> Vec<Value> {
     let split = split_after_initialized(&input);
-    let mut out = Vec::new();
     for chunk in [input[..split].to_vec(), input[split..].to_vec()] {
         if chunk.is_empty() {
             continue;
         }
         let mut reader = Cursor::new(chunk);
-        let mut writer = Vec::new();
-        let publish = |_p: PublishDiagnosticsParams| {};
-        let hooks = ServerHooks {
-            publish_diagnostics: &publish,
-        };
         let bootstrap = IndexBootstrap::new(source.clone());
+        // Responses (loop) and diagnostics (BSP reader thread) share one sink, just
+        // like production; all frames accumulate in it across both passes.
         serve(
             &mut reader,
-            &mut writer,
+            source.sink.as_ref(),
             core,
             &CoreHandlers,
             bootstrap,
-            &hooks,
         )
         .unwrap();
-        out.extend(responses(writer));
     }
-    out
+    responses(source.sink.written())
 }
 
 fn by_id(out: &[Value], id: i64) -> &Value {
@@ -422,6 +537,28 @@ fn eventually(clue: &str, cond: impl Fn() -> bool) {
         thread::sleep(Duration::from_millis(10));
     }
     assert!(cond(), "condition not reached within 3000ms: {clue}");
+}
+
+/// The `textDocument/publishDiagnostics` notifications the loop wrote.
+fn publishes(out: &[Value]) -> Vec<&Value> {
+    out.iter()
+        .filter(|m| m["method"] == "textDocument/publishDiagnostics")
+        .collect()
+}
+
+fn execute(id: i64, command: &str) -> Vec<u8> {
+    request(
+        id,
+        "workspace/executeCommand",
+        json!({ "command": command }),
+    )
+}
+
+fn did_open(uri: &str, text: &str) -> Vec<u8> {
+    notification(
+        "textDocument/didOpen",
+        json!({ "textDocument": { "uri": uri, "languageId": "scala", "version": 1, "text": text } }),
+    )
 }
 
 // --- scenarios ----------------------------------------------------------------
@@ -596,4 +733,368 @@ fn dropping_the_server_tears_down_the_bsp_session() {
     eventually("BSP session shut down on teardown", || {
         e2e.server.shutdown_requested.load(Ordering::SeqCst)
     });
+}
+
+// A build-server `build/publishDiagnostics` arriving during a compile is routed
+// through the diagnostics router and forwarded to the client as an LSP
+// `textDocument/publishDiagnostics`.
+#[test]
+fn compile_error_diagnostics_are_published_to_the_client() {
+    let mut core = ServerCore::new();
+    let e2e = setup(core.reload_flag());
+    let uri = core_uri();
+    e2e.server.script_compile(CompileScript {
+        status: 1,
+        diagnostics: vec![bsp_diagnostics(
+            &uri,
+            "fixture-a",
+            true,
+            json!([bsp_error("value unused", "unused-value")]),
+        )],
+        reload_to: None,
+    });
+    let input = session_input(
+        &e2e.workspace_root,
+        vec![execute(2, "scala3SemanticLs.compile")],
+    );
+    let out = serve_pumped(&mut core, &e2e.source, input);
+
+    let published = publishes(&out);
+    let core_publish = published
+        .iter()
+        .find(|p| p["params"]["uri"] == uri)
+        .unwrap_or_else(|| panic!("no publishDiagnostics for Core.scala in {out:?}"));
+    let diagnostics = core_publish["params"]["diagnostics"].as_array().unwrap();
+    assert_eq!(diagnostics.len(), 1, "{core_publish}");
+    assert_eq!(diagnostics[0]["message"], "value unused");
+    assert_eq!(diagnostics[0]["severity"], 1);
+}
+
+// After a non-empty publish, a clean reset (empty diagnostics for that target)
+// forwards exactly one clear for the file.
+#[test]
+fn a_clean_reset_clears_the_previously_published_diagnostics() {
+    let mut core = ServerCore::new();
+    let e2e = setup(core.reload_flag());
+    let uri = core_uri();
+    e2e.server.script_compile(CompileScript {
+        status: 1,
+        diagnostics: vec![bsp_diagnostics(
+            &uri,
+            "fixture-a",
+            true,
+            json!([bsp_error("boom", "unused-local")]),
+        )],
+        reload_to: None,
+    });
+    e2e.server.script_compile(CompileScript {
+        status: 1,
+        diagnostics: vec![bsp_diagnostics(&uri, "fixture-a", true, json!([]))],
+        reload_to: None,
+    });
+    let input = session_input(
+        &e2e.workspace_root,
+        vec![
+            execute(2, "scala3SemanticLs.compile"),
+            execute(3, "scala3SemanticLs.compile"),
+        ],
+    );
+    let out = serve_pumped(&mut core, &e2e.source, input);
+
+    let core_publishes: Vec<_> = publishes(&out)
+        .into_iter()
+        .filter(|p| p["params"]["uri"] == uri)
+        .collect();
+    assert!(
+        core_publishes.len() >= 2,
+        "expected a publish then a clear: {out:?}"
+    );
+    assert!(
+        core_publishes.last().unwrap()["params"]["diagnostics"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "the final publish must clear the file: {core_publishes:?}"
+    );
+}
+
+// A clean reset for a file that was never published non-empty is suppressed: no
+// LSP publish is emitted (clear-once semantics).
+#[test]
+fn a_never_published_clean_reset_is_suppressed() {
+    let mut core = ServerCore::new();
+    let e2e = setup(core.reload_flag());
+    let fresh = path_to_uri(&fixtures_root().join("sources/b/src/pkgb/UseB.scala"));
+    e2e.server.script_compile(CompileScript {
+        status: 1,
+        diagnostics: vec![bsp_diagnostics(&fresh, "fixture-b", true, json!([]))],
+        reload_to: None,
+    });
+    let input = session_input(
+        &e2e.workspace_root,
+        vec![execute(2, "scala3SemanticLs.compile")],
+    );
+    let out = serve_pumped(&mut core, &e2e.source, input);
+
+    assert!(
+        publishes(&out).iter().all(|p| p["params"]["uri"] != fresh),
+        "an empty reset for a never-published file must not publish: {out:?}"
+    );
+}
+
+// `textDocument/rename` runs the fresh-required ladder over the RETAINED BSP
+// session: it compiles through the fake server and returns a cross-file
+// `WorkspaceEdit`.
+#[test]
+fn rename_over_the_retained_bsp_compiler_edits_and_compiles() {
+    let mut core = ServerCore::new();
+    let e2e = setup(core.reload_flag());
+    let uri = path_to_uri(&fixtures_root().join("sources/a/src/pkga/Item.scala"));
+    let input = session_input(
+        &e2e.workspace_root,
+        vec![request(
+            2,
+            "textDocument/rename",
+            json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": 2, "character": 11 },
+                "newName": "Renamed",
+            }),
+        )],
+    );
+    let out = serve_pumped(&mut core, &e2e.source, input);
+
+    let result = &by_id(&out, 2)["result"];
+    let changes = result["changes"]
+        .as_object()
+        .unwrap_or_else(|| panic!("rename returned no WorkspaceEdit: {}", by_id(&out, 2)));
+    assert!(!changes.is_empty(), "rename produced no edits: {result}");
+    assert!(
+        changes
+            .values()
+            .flat_map(|edits| edits.as_array().unwrap())
+            .any(|edit| edit["newText"] == "Renamed"),
+        "no edit renames to the new name: {result}"
+    );
+    assert!(
+        !e2e.server.compiled_targets.lock().unwrap().is_empty(),
+        "rename must compile over the retained BSP session"
+    );
+}
+
+// A failing `buildTarget/compile` fails the rename with a typed `CompileFailed`
+// error, over the retained session.
+#[test]
+fn rename_surfaces_a_bsp_compile_failure() {
+    let mut core = ServerCore::new();
+    let e2e = setup(core.reload_flag());
+    let uri = path_to_uri(&fixtures_root().join("sources/a/src/pkga/Item.scala"));
+    // The next compile the rename issues fails (statusCode 2).
+    e2e.server.script_compile(CompileScript {
+        status: 2,
+        diagnostics: Vec::new(),
+        reload_to: None,
+    });
+    let input = session_input(
+        &e2e.workspace_root,
+        vec![request(
+            2,
+            "textDocument/rename",
+            json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": 2, "character": 11 },
+                "newName": "Renamed",
+            }),
+        )],
+    );
+    let out = serve_pumped(&mut core, &e2e.source, input);
+
+    let response = by_id(&out, 2);
+    assert!(
+        response.get("result").is_none(),
+        "a failing compile must fail the rename: {response}"
+    );
+    assert!(
+        response["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("buildTarget/compile failed"),
+        "expected a compile-failure message: {response}"
+    );
+}
+
+// A build server `buildTarget/didChange` reloads the model over the retained
+// session: a symbol in a target absent from the initial model becomes searchable
+// after the reload refetches the enlarged target set.
+#[test]
+fn a_build_target_did_change_reloads_the_model_over_the_session() {
+    let mut core = ServerCore::new();
+    let e2e = setup(core.reload_flag());
+    // Start without fixture-c, so its `UseC` object is not yet indexed.
+    e2e.server.set_targets(vec![
+        build_target("fixture-a", &[]),
+        build_target("fixture-b", &["fixture-a"]),
+        build_target("fixture-nosdb", &[]),
+    ]);
+    // The compile fires a didChange and swaps in the full target set (adds
+    // fixture-c) so the model refetch observes it.
+    e2e.server.script_compile(CompileScript {
+        status: 1,
+        diagnostics: Vec::new(),
+        reload_to: Some(default_targets()),
+    });
+    let input = session_input(
+        &e2e.workspace_root,
+        vec![
+            request(2, "workspace/symbol", json!({ "query": "UseC" })),
+            execute(3, "scala3SemanticLs.compile"),
+            request(4, "workspace/symbol", json!({ "query": "UseC" })),
+        ],
+    );
+    let out = serve_pumped(&mut core, &e2e.source, input);
+
+    // Fuzzy search may surface near-name hits (e.g. `UseCounter`); assert on the
+    // exact `UseC` symbol, which lives only in fixture-c.
+    assert!(
+        !by_id(&out, 2)["result"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["name"] == "UseC"),
+        "UseC must be absent before the reload: {}",
+        by_id(&out, 2)
+    );
+    assert!(
+        by_id(&out, 4)["result"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["name"] == "UseC"),
+        "UseC must be searchable after the reload refetches fixture-c: {}",
+        by_id(&out, 4)
+    );
+}
+
+// An unsaved top-level declaration the index has never seen is PC-only over the
+// wire: `workspace/symbol` surfaces it with the unsaved-buffer container, and
+// references/rename at it are the hard PC-only rejection (JVM-free — the overlay's
+// dirty-buffer scan answers before any live PC query).
+#[test]
+fn an_unsaved_top_level_symbol_is_pc_only_over_the_wire() {
+    let mut core = ServerCore::new();
+    let e2e = setup(core.reload_flag());
+    let uri = core_uri();
+    // A dirty buffer (differs from disk) declaring a new top-level object.
+    let text = "package pkga\n\nobject GhostWidget:\n  def z = 1\n";
+    let at = json!({ "textDocument": { "uri": uri }, "position": { "line": 2, "character": 10 } });
+    let input = session_input(
+        &e2e.workspace_root,
+        vec![
+            did_open(&uri, text),
+            request(2, "workspace/symbol", json!({ "query": "GhostWidget" })),
+            request(3, "textDocument/references", at.clone()),
+            request(
+                4,
+                "textDocument/rename",
+                json!({
+                    "textDocument": { "uri": uri },
+                    "position": { "line": 2, "character": 10 },
+                    "newName": "Renamed",
+                }),
+            ),
+        ],
+    );
+    let out = serve_pumped(&mut core, &e2e.source, input);
+
+    let symbols = by_id(&out, 2)["result"].as_array().expect("symbol array");
+    let ghost = symbols
+        .iter()
+        .find(|s| s["name"] == "GhostWidget")
+        .unwrap_or_else(|| panic!("GhostWidget not surfaced by workspace/symbol: {symbols:?}"));
+    assert_eq!(ghost["containerName"], "unsaved buffer (PC-only)");
+
+    for id in [3, 4] {
+        let response = by_id(&out, id);
+        assert!(
+            response.get("result").is_none(),
+            "id {id} must be the hard PC-only rejection: {response}"
+        );
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("PC-only plugin"),
+            "id {id}: {response}"
+        );
+    }
+}
+
+// LSP `shutdown` then `exit` returns the shutdown response, ends the serve loop,
+// and — as the ready services drop — tears the retained BSP session down
+// (`build/shutdown` + `build/exit` reach the fake server).
+#[test]
+fn lsp_shutdown_then_exit_tears_down_the_bsp_session() {
+    let mut core = ServerCore::new();
+    let e2e = setup(core.reload_flag());
+    let input = session_input(&e2e.workspace_root, vec![request(2, "shutdown", json!({}))]);
+    let out = serve_pumped(&mut core, &e2e.source, input);
+
+    assert_eq!(
+        by_id(&out, 2)["result"],
+        Value::Null,
+        "shutdown returns null"
+    );
+    assert!(core.shutting_down, "shutdown set the shutting-down state");
+
+    drop(core);
+    eventually("BSP session shut down + exited on teardown", || {
+        e2e.server.shutdown_requested.load(Ordering::SeqCst)
+            && e2e.server.exit_received.load(Ordering::SeqCst)
+    });
+}
+
+// Env-gated (like `live_pc.rs`): with a real JVM + PC host jar + a target
+// classpath, completion over an open buffer routes through the real island PC.
+// Skips cleanly when the JVM environment is absent.
+#[test]
+fn pc_completion_over_the_fake_bsp_model() {
+    if std::env::var_os("LS_LIBJVM").is_none()
+        || std::env::var_os("PC_HOST_AGENT_JAR").is_none()
+        || std::env::var_os("LS_PC_TARGET_CLASSPATH").is_none()
+    {
+        eprintln!(
+            "fake_bsp_e2e: skipping PC completion — set LS_LIBJVM + PC_HOST_AGENT_JAR + \
+             LS_PC_TARGET_CLASSPATH to run it"
+        );
+        return;
+    }
+    let mut core = ServerCore::new();
+    let e2e = setup(core.reload_flag());
+    // Complete a member of the fixture `Core` in an open buffer under fixture-a.
+    let uri = core_uri();
+    let text = "package pkga\n\nobject Probe:\n  val c = Core.make(\"x\").\n";
+    let input = session_input(
+        &e2e.workspace_root,
+        vec![
+            did_open(&uri, text),
+            request(
+                2,
+                "textDocument/completion",
+                json!({
+                    "textDocument": { "uri": uri },
+                    "position": { "line": 3, "character": 24 },
+                }),
+            ),
+        ],
+    );
+    let out = serve_pumped(&mut core, &e2e.source, input);
+
+    let completion = &by_id(&out, 2)["result"];
+    let items = completion["items"]
+        .as_array()
+        .unwrap_or_else(|| panic!("completion returned no list: {completion}"));
+    assert!(
+        !items.is_empty(),
+        "the real island PC returned no completions: {completion}"
+    );
 }

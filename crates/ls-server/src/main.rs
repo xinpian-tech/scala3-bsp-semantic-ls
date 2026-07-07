@@ -6,17 +6,17 @@
 //! stdout is reserved for the protocol: diagnostics and log lines go to stderr,
 //! so the JSON-RPC stream is never corrupted.
 
-use std::io::{self, BufReader, Write};
+use std::io::{self, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
+use ls_bsp::protocol::PublishDiagnosticsParams as BspPublishDiagnosticsParams;
 use ls_server::doctor::DoctorReport;
 use ls_server::{
-    dump_report, parse_args, resolve_doctor_dir, serve, CliAction, CoreHandlers, IndexBootstrap,
-    LiveBspModelSource, PublishDiagnosticsParams, ServerCore, ServerHooks, SERVER_NAME,
-    SERVER_VERSION,
+    dump_report, parse_args, resolve_doctor_dir, serve, CliAction, CoreHandlers, DiagnosticRouter,
+    IndexBootstrap, LiveBspModelSource, OutputSink, ServerCore, SERVER_NAME, SERVER_VERSION,
 };
 
 fn main() -> ExitCode {
@@ -82,33 +82,40 @@ fn offline_doctor_report(root: &Path, json: bool) -> String {
 /// process lifetime; stdout carries only protocol frames.
 fn serve_stdio() {
     let stdin = io::stdin();
-    let stdout = io::stdout();
     let mut reader = BufReader::new(stdin.lock());
-    let mut writer = stdout.lock();
+    // The output sink is shared: the message loop writes request responses and the
+    // BSP session's reader thread writes `textDocument/publishDiagnostics` through
+    // the one lock, so a diagnostic reaches the editor immediately even while the
+    // loop is parked reading the next request. `io::Stdout` (not a held lock) is
+    // Send + Sync so the sink can be shared with the reader thread.
+    let sink = Arc::new(OutputSink::new(io::stdout()));
     let mut core = ServerCore::new();
     // The build server's `buildTarget/didChange` (delivered on the session reader
     // thread) sets the loop's reload flag; the loop drains it and reloads the model.
     let reload_flag = core.reload_flag();
     let on_build_targets_changed: Arc<dyn Fn() + Send + Sync> =
         Arc::new(move || reload_flag.store(true, Ordering::SeqCst));
-    let bootstrap = IndexBootstrap::new(LiveBspModelSource::new(on_build_targets_changed));
-    // Diagnostics publishing attaches with the diagnostics router; the index
-    // bootstrap emits none, so it is a no-op.
-    let publish = |_p: PublishDiagnosticsParams| {};
-    let hooks = ServerHooks {
-        publish_diagnostics: &publish,
+    // The build server's `build/publishDiagnostics` (delivered on the session
+    // reader thread) is routed through one `DiagnosticRouter` (per-URI merge across
+    // targets, per-target reset, clear-once suppression); each accepted LSP publish
+    // is written straight to the sink as a `textDocument/publishDiagnostics`.
+    let router = Arc::new(Mutex::new(DiagnosticRouter::new()));
+    let on_diagnostics: Arc<dyn Fn(BspPublishDiagnosticsParams) + Send + Sync> = {
+        let router = Arc::clone(&router);
+        let sink = Arc::clone(&sink);
+        Arc::new(move |params| {
+            if let Some(publish) = router.lock().unwrap().accept(&params) {
+                let _ = sink.publish_diagnostics(&publish);
+            }
+        })
     };
-    if let Err(error) = serve(
-        &mut reader,
-        &mut writer,
-        &mut core,
-        &CoreHandlers,
-        bootstrap,
-        &hooks,
-    ) {
+    let bootstrap = IndexBootstrap::new(LiveBspModelSource::new(
+        on_build_targets_changed,
+        on_diagnostics,
+    ));
+    if let Err(error) = serve(&mut reader, &sink, &mut core, &CoreHandlers, bootstrap) {
         eprintln!("{SERVER_NAME}: serve loop ended: {error}");
     }
-    let _ = writer.flush();
 }
 
 #[cfg(test)]

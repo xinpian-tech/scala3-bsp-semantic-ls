@@ -50,7 +50,7 @@ pub use lifecycle::{
 pub use ls_jvm::libjvm_mapped;
 pub use pc::{pc_options, IslandPcService, PcLocation, PcQueryService, SymbolResolver};
 pub use protocol::{Diagnostic, DiagnosticCode, Position, PublishDiagnosticsParams, Range};
-pub use server::{serve, Bootstrap, Handlers, RequestContext, ServerCore, ServerHooks};
+pub use server::{serve, Bootstrap, Handlers, OutputSink, RequestContext, ServerCore};
 pub use services::{
     highlights_to_lsp, pc_locations_to_lsp, references_locations, workspace_symbol_of,
     BuildCompiler, CoreHandlers, CoreServices,

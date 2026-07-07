@@ -21,9 +21,10 @@
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 
+use serde::Serialize;
 use serde_json::{json, Value};
 
 use ls_index_model::uri::{normalize, normalize_uri, uri_to_path};
@@ -32,8 +33,8 @@ use crate::capabilities::{commands, initialize_result, InitializeResult};
 use crate::doctor::DoctorReport;
 use crate::documents::DocumentStore;
 use crate::jsonrpc::{
-    error_codes, parse_incoming, read_frame, write_frame, write_null_id_error, Incoming,
-    Notification, Request, RequestId, Response, ResponseError,
+    error_codes, parse_incoming, read_frame, write_frame, Incoming, Notification, Request,
+    RequestId, Response, ResponseError,
 };
 use crate::lifecycle::{pre_ready_outcome, require_ready, Method, PreReadyOutcome, WorkspaceState};
 use crate::protocol::PublishDiagnosticsParams;
@@ -120,12 +121,45 @@ pub trait Handlers<S> {
     }
 }
 
-/// The client-facing callbacks the server is wired with: publishing diagnostics
-/// to the editor. (The build server's target-change notification is wired
-/// directly into the live model source's session, which sets the loop's reload
-/// flag; it does not flow through here.)
-pub struct ServerHooks<'a> {
-    pub publish_diagnostics: &'a dyn Fn(PublishDiagnosticsParams),
+/// A thread-safe, frame-atomic output sink for the client connection. Both the
+/// message loop (request responses) and the build server's reader thread (async
+/// `textDocument/publishDiagnostics`) write whole frames through the one lock, so
+/// frames never interleave on the wire and a diagnostic that arrives while the
+/// loop is parked reading the next request still reaches the editor immediately —
+/// the loop no longer has to wake to flush it. Ports the LSP client's inherent
+/// thread-safe `publishDiagnostics`.
+pub struct OutputSink<W> {
+    writer: Mutex<W>,
+}
+
+impl<W: Write> OutputSink<W> {
+    pub fn new(writer: W) -> OutputSink<W> {
+        OutputSink {
+            writer: Mutex::new(writer),
+        }
+    }
+
+    /// Writes one framed message, holding the lock across the whole frame.
+    pub fn send(&self, message: &impl Serialize) -> io::Result<()> {
+        write_frame(&mut *self.writer.lock().unwrap(), message)
+    }
+
+    /// Publishes diagnostics for one file as a `textDocument/publishDiagnostics`
+    /// notification. Callable from the build server's reader thread.
+    pub fn publish_diagnostics(&self, params: &PublishDiagnosticsParams) -> io::Result<()> {
+        self.send(&json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/publishDiagnostics",
+            "params": params,
+        }))
+    }
+}
+
+impl<W: Write + Clone> OutputSink<W> {
+    /// A copy of everything written so far (test-only; production writes stdout).
+    pub fn written(&self) -> W {
+        self.writer.lock().unwrap().clone()
+    }
 }
 
 /// The mutable server state driven by the message loop.
@@ -262,21 +296,21 @@ enum Flow {
 }
 
 /// Runs the stdio server loop until `exit` or a clean end of input.
-pub fn serve<S, B>(
+pub fn serve<S, B, W>(
     reader: &mut impl BufRead,
-    writer: &mut impl Write,
+    sink: &OutputSink<W>,
     core: &mut ServerCore<S>,
     handlers: &impl Handlers<S>,
     bootstrap: B,
-    _hooks: &ServerHooks<'_>,
 ) -> io::Result<()>
 where
     S: Send + 'static,
     B: Bootstrap<S> + Send + Sync + 'static,
+    W: Write,
 {
-    // `_hooks` carries the client diagnostics-publish seam; the async bootstrap
-    // does not consume it (the index bootstrap emits no diagnostics), and BSP
-    // diagnostics routing to it is wired with the diagnostics router.
+    // Build-server diagnostics are written to `sink` directly from the session
+    // reader thread (see the live model source's `on_diagnostics`); the loop only
+    // writes request responses, and the shared lock keeps the two serialized.
     let bootstrap = Arc::new(bootstrap);
     let mut exiting = false;
     while let Some(body) = read_frame(reader)? {
@@ -287,7 +321,7 @@ where
         match parse_incoming(&body) {
             Ok(Incoming::Request(request)) => {
                 let response = dispatch_request(core, handlers, request);
-                write_frame(writer, &response)?;
+                sink.send(&response)?;
             }
             Ok(Incoming::Notification(note)) => {
                 if let Flow::Stop = dispatch_notification(core, handlers, &bootstrap, note) {
@@ -295,7 +329,7 @@ where
                     break;
                 }
             }
-            Err(error) => write_null_id_error(writer, &error)?,
+            Err(error) => sink.send(&null_id_error(&error))?,
         }
     }
     if exiting || core.shutting_down {
@@ -310,6 +344,12 @@ where
         drain_bootstrap(core, &*bootstrap);
     }
     Ok(())
+}
+
+/// The `null`-id error response for a frame that could not be parsed into a
+/// request (so no id is available to correlate the reply).
+fn null_id_error(error: &ResponseError) -> Value {
+    json!({ "jsonrpc": "2.0", "id": Value::Null, "error": error })
 }
 
 /// Spawns the bootstrap worker on `initialized`: one worker per session (a second
@@ -776,21 +816,44 @@ mod tests {
         bootstrap: &WorkspaceState<FakeServices>,
     ) -> Vec<Value> {
         let mut reader = Cursor::new(frames.concat());
-        let mut writer = Vec::new();
-        let publish = |_p: PublishDiagnosticsParams| {};
-        let hooks = ServerHooks {
-            publish_diagnostics: &publish,
-        };
+        let sink = OutputSink::new(Vec::new());
         serve(
             &mut reader,
-            &mut writer,
+            &sink,
             core,
             &EchoHandlers,
             FixedBootstrap(bootstrap.clone()),
-            &hooks,
         )
         .unwrap();
-        responses(writer)
+        responses(sink.written())
+    }
+
+    #[test]
+    fn output_sink_publishes_diagnostics_as_a_notification_frame() {
+        // The sink the BSP reader thread publishes through (independent of the
+        // message loop) writes a well-formed `textDocument/publishDiagnostics`.
+        let publish: PublishDiagnosticsParams = serde_json::from_value(json!({
+            "uri": "file:///x.scala",
+            "diagnostics": [{
+                "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 4}},
+                "severity": 1,
+                "message": "boom",
+            }],
+        }))
+        .unwrap();
+        let sink = OutputSink::new(Vec::new());
+        sink.publish_diagnostics(&publish).unwrap();
+
+        let out = responses(sink.written());
+        let published = out
+            .iter()
+            .find(|m| m["method"] == "textDocument/publishDiagnostics")
+            .expect("a publishDiagnostics notification");
+        assert_eq!(published["params"]["uri"], "file:///x.scala");
+        assert_eq!(
+            published["params"]["diagnostics"].as_array().unwrap().len(),
+            1
+        );
     }
 
     /// Drives `serve` over the scripted input, pumping to ready across the
@@ -965,22 +1028,17 @@ mod tests {
             ]
             .concat(),
         );
-        let mut writer = Vec::new();
         let mut core = ServerCore::new();
         let replayed_docs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let publish = |_p: PublishDiagnosticsParams| {};
-        let hooks = ServerHooks {
-            publish_diagnostics: &publish,
-        };
+        let sink = OutputSink::new(Vec::new());
         serve(
             &mut reader,
-            &mut writer,
+            &sink,
             &mut core,
             &EchoHandlers,
             RecordingBootstrap {
                 replayed_docs: Arc::clone(&replayed_docs),
             },
-            &hooks,
         )
         .unwrap();
 
@@ -1164,22 +1222,10 @@ mod tests {
             ]
             .concat(),
         );
-        let mut writer = Vec::new();
         let mut core = ServerCore::new();
-        let publish = |_p: PublishDiagnosticsParams| {};
-        let hooks = ServerHooks {
-            publish_diagnostics: &publish,
-        };
+        let sink = OutputSink::new(Vec::new());
         // Returns promptly (no block on the gated worker).
-        serve(
-            &mut reader,
-            &mut writer,
-            &mut core,
-            &EchoHandlers,
-            bootstrap,
-            &hooks,
-        )
-        .unwrap();
+        serve(&mut reader, &sink, &mut core, &EchoHandlers, bootstrap).unwrap();
 
         assert!(
             !core.state.is_ready(),
@@ -1190,7 +1236,7 @@ mod tests {
             other => panic!("expected shut-down NotReady, got {:?}", other.status_line()),
         }
         // The shutdown response was served; no request was answered as ready.
-        let out = responses(writer);
+        let out = responses(sink.written());
         assert!(out
             .iter()
             .any(|r| r["id"] == 2 && r["result"] == Value::Null));
@@ -1209,19 +1255,14 @@ mod tests {
             ]
             .concat(),
         );
-        let mut writer = Vec::new();
         let mut core = ServerCore::new();
-        let publish = |_p: PublishDiagnosticsParams| {};
-        let hooks = ServerHooks {
-            publish_diagnostics: &publish,
-        };
+        let sink = OutputSink::new(Vec::new());
         serve(
             &mut reader,
-            &mut writer,
+            &sink,
             &mut core,
             &EchoHandlers,
             FixedBootstrap(ready("svc")),
-            &hooks,
         )
         .unwrap();
         assert!(
@@ -1596,18 +1637,13 @@ mod tests {
             .concat();
             for group in [pre, post] {
                 let mut reader = Cursor::new(group);
-                let mut writer = Vec::new();
-                let publish = |_p: PublishDiagnosticsParams| {};
-                let hooks = ServerHooks {
-                    publish_diagnostics: &publish,
-                };
+                let sink = OutputSink::new(Vec::new());
                 serve(
                     &mut reader,
-                    &mut writer,
+                    &sink,
                     &mut core,
                     &handlers,
                     FixedBootstrap(bootstrap_state.clone()),
-                    &hooks,
                 )
                 .unwrap();
             }

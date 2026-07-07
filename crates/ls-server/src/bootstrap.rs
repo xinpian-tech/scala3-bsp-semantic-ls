@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use ls_bsp::model::BspProjectModel;
+use ls_bsp::protocol::PublishDiagnosticsParams as BspPublishDiagnosticsParams;
 use ls_bsp::{
     BspClientHandlers, BspCompileOutcome, BspDiscovery, BspSession, BspSessionConfig,
     ProjectModelLoader,
@@ -469,12 +470,20 @@ pub struct LiveBspModelSource {
     /// `buildTarget/didChange`, so the server schedules a model reload. The
     /// production hook sets the message loop's reload flag.
     on_build_targets_changed: Arc<dyn Fn() + Send + Sync>,
+    /// Called (on the BSP reader thread) for each `build/publishDiagnostics`, so
+    /// the server routes it through the diagnostics router and queues the LSP
+    /// publish for the loop to forward to the editor.
+    on_diagnostics: Arc<dyn Fn(BspPublishDiagnosticsParams) + Send + Sync>,
 }
 
 impl LiveBspModelSource {
-    pub fn new(on_build_targets_changed: Arc<dyn Fn() + Send + Sync>) -> Self {
+    pub fn new(
+        on_build_targets_changed: Arc<dyn Fn() + Send + Sync>,
+        on_diagnostics: Arc<dyn Fn(BspPublishDiagnosticsParams) + Send + Sync>,
+    ) -> Self {
         LiveBspModelSource {
             on_build_targets_changed,
+            on_diagnostics,
         }
     }
 }
@@ -491,7 +500,10 @@ impl ModelSource for LiveBspModelSource {
         // The build server drives reloads: a `buildTarget/didChange` notification
         // (delivered on the session's reader thread) fires the reload hook.
         let on_changed = self.on_build_targets_changed.clone();
-        let handlers = BspClientHandlers::new().on_did_change_build_target(move |_| on_changed());
+        let on_diagnostics = self.on_diagnostics.clone();
+        let handlers = BspClientHandlers::new()
+            .on_did_change_build_target(move |_| on_changed())
+            .on_diagnostics(move |params| on_diagnostics(params));
         let session = BspSession::launch(
             workspace_root.to_path_buf(),
             &connection.details,
@@ -722,7 +734,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // No `.bsp` connection file: the live source reports the no-BSP case
         // (ports `defaultConnect` -> None), not an error.
-        let outcome = LiveBspModelSource::new(Arc::new(|| {}))
+        let outcome = LiveBspModelSource::new(Arc::new(|| {}), Arc::new(|_| {}))
             .load(dir.path())
             .expect("no .bsp connection reports the no-BSP case, not an error");
         assert!(matches!(outcome, LoadOutcome::NoBsp));
