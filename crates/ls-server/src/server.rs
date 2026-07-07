@@ -51,13 +51,15 @@ pub trait Bootstrap<S> {
     /// on the bootstrap worker thread; must not borrow server state.
     fn build(&self, workspace_root: Option<PathBuf>) -> WorkspaceState<S>;
 
-    /// Seed the freshly-ready services from the open buffers, on the message loop
-    /// after Ready is installed. Default no-op (a fake has no buffer mirror).
-    fn replay(&self, _services: &S, _documents: &DocumentStore) {}
+    /// Seed the freshly-ready services from the open buffers (and install any
+    /// document-backed overlay), on the message loop after Ready is installed.
+    /// Receives the shared document-store handle so a Ready bundle can retain it.
+    /// Default no-op (a fake has no buffer mirror).
+    fn replay(&self, _services: &S, _documents: &Arc<DocumentStore>) {}
 
     /// Reload the ready services after the build server reports its targets
     /// changed, reusing the durable handles. `old` is the current ready bundle.
-    fn reload(&self, old: S, _documents: &DocumentStore) -> WorkspaceState<S> {
+    fn reload(&self, old: S, _documents: &Arc<DocumentStore>) -> WorkspaceState<S> {
         WorkspaceState::Ready(old)
     }
 }
@@ -119,7 +121,9 @@ pub struct ServerHooks<'a> {
 /// The mutable server state driven by the message loop.
 pub struct ServerCore<S> {
     pub state: WorkspaceState<S>,
-    pub docs: DocumentStore,
+    /// The open-buffer store, a shared handle so the ready bundle's PC-backed
+    /// dirty-buffer overlay reads the SAME live buffers the message loop updates.
+    pub docs: Arc<DocumentStore>,
     pub workspace_root: Option<PathBuf>,
     pub shutting_down: bool,
     initialized: bool,
@@ -143,7 +147,7 @@ impl<S> ServerCore<S> {
             state: WorkspaceState::NotReady {
                 detail: "initialize has not run".to_string(),
             },
-            docs: DocumentStore::new(),
+            docs: Arc::new(DocumentStore::new()),
             workspace_root: None,
             shutting_down: false,
             initialized: false,
@@ -901,7 +905,7 @@ mod tests {
                     ),
                 })
             }
-            fn replay(&self, _services: &FakeServices, documents: &DocumentStore) {
+            fn replay(&self, _services: &FakeServices, documents: &Arc<DocumentStore>) {
                 self.replayed_docs
                     .store(documents.open_uris().len(), Ordering::SeqCst);
             }
@@ -961,7 +965,7 @@ mod tests {
             fn reload(
                 &self,
                 _old: FakeServices,
-                _documents: &DocumentStore,
+                _documents: &Arc<DocumentStore>,
             ) -> WorkspaceState<FakeServices> {
                 ready("reloaded")
             }

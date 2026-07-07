@@ -38,9 +38,11 @@ use ls_index_model::{LsError, Span};
 
 use crate::build_scheduler::BuildScheduler;
 use crate::capabilities::commands;
-use crate::convert::{self, DocumentHighlight, Location, WorkspaceSymbol};
+use crate::convert::{self, DocumentHighlight, Location, SymbolKind, WorkspaceSymbol};
+use crate::documents::DocumentStore;
 use crate::jsonrpc::{error_codes, RequestId, Response, ResponseError};
 use crate::pc::{PcLocation, PcQueryService};
+use crate::pc_overlay::{PcOnlySymbol, PcOverlayInner};
 use crate::protocol::Position;
 use crate::server::{Handlers, RequestContext};
 use crate::workspace_uris::WorkspaceUris;
@@ -67,8 +69,10 @@ pub struct CoreServices {
     pub compiler: Arc<dyn BuildCompiler>,
     /// The presentation-compiler query capability (the Scala `CoreServices.pc`):
     /// the definition-family PC methods run through it. In production it lazily
-    /// boots the embedded JVM island on the first PC request.
-    pub pc: Box<dyn PcQueryService>,
+    /// boots the embedded JVM island on the first PC request. `Arc` so the
+    /// production dirty-buffer [`PcOverlay`](crate::pc_overlay::PcOverlay) holds a
+    /// clone for its symbol-at-cursor resolution over the same island.
+    pub pc: Arc<dyn PcQueryService>,
     /// Whether a live BSP session backs this workspace (the Scala `s.session`
     /// being non-empty). `false` only in the no-BSP recovered-index warm-restart
     /// mode; it gates the `require_semanticdb` persisted-index fallback so that
@@ -84,6 +88,13 @@ pub struct CoreServices {
     /// reference that could not heal inline enqueues a reindex-only job. Dropping
     /// the services stops and joins its worker.
     scheduler: BuildScheduler,
+    /// The `Arc` handle to the PC-backed dirty-buffer overlay that lives inside
+    /// `orchestrator` (the boxed [`DirtyBufferOverlay`]). Held here to
+    /// [`install`](PcOverlayInner::install) its late-bound environment once the
+    /// ready bundle exists and to answer `workspace/symbol`'s PC-only unsaved
+    /// top-level symbols. The Scala `PcOverlay` reference retained by
+    /// `WorkspaceState`.
+    pub(crate) pc_overlay: Arc<PcOverlayInner>,
 }
 
 /// The retained build capability: a [`CompileService`] that can also refetch the
@@ -107,8 +118,9 @@ impl CoreServices {
         workspace_root: Option<PathBuf>,
         uri_to_target: HashMap<String, String>,
         compiler: Arc<dyn BuildCompiler>,
-        pc: Box<dyn PcQueryService>,
+        pc: Arc<dyn PcQueryService>,
         bsp_connected: bool,
+        pc_overlay: Arc<PcOverlayInner>,
     ) -> CoreServices {
         let scheduler = BuildScheduler::new(Arc::clone(&orchestrator), Arc::clone(&compiler));
         CoreServices {
@@ -121,7 +133,41 @@ impl CoreServices {
             bsp_connected,
             last_completion_target: Mutex::new(None),
             scheduler,
+            pc_overlay,
         }
+    }
+
+    /// Install the PC-backed dirty-buffer overlay's late-bound environment (the
+    /// Scala `PcOverlay.install(pc, toFileUri, isIndexedName)`), binding the
+    /// shared document store, the PC query seam, and two closures reaching back
+    /// into this ready bundle for URI mapping and index name-membership. Called
+    /// at Ready adoption and after a reload (once `docs` is available). The
+    /// closures hold a `Weak<QueryOrchestrator>` so the overlay — which lives
+    /// inside that orchestrator — introduces no reference cycle.
+    pub fn install_pc_overlay(&self, docs: Arc<DocumentStore>) {
+        let uri_orch = Arc::downgrade(&self.orchestrator);
+        let uris = self.uris.clone();
+        let to_file_uri = Box::new(move |sdb: &str| {
+            uri_orch
+                .upgrade()
+                .and_then(|orch| uris.to_file_uri(sdb, &orch))
+        });
+        let name_orch = Arc::downgrade(&self.orchestrator);
+        // Fail-safe: a dropped orchestrator (never during a live query) reads as
+        // indexed, so a membership check never spuriously refuses references/rename.
+        let is_indexed_name = Box::new(move |name: &str| {
+            name_orch
+                .upgrade()
+                .is_none_or(|orch| orch.workspace_symbol_name_exists(name))
+        });
+        self.pc_overlay
+            .install(docs, Arc::clone(&self.pc), to_file_uri, is_indexed_name);
+    }
+
+    /// PC-only unsaved top-level symbols matching `query` (the overlay's
+    /// `pcOnlySymbols`), for the `workspace/symbol` augmentation.
+    pub fn pc_only_symbols(&self, query: &str) -> Vec<PcOnlySymbol> {
+        self.pc_overlay.pc_only_symbols(query)
     }
 
     /// Enqueue a background reingest on the build-job scheduler (Scala
@@ -373,13 +419,47 @@ const WORKSPACE_SYMBOL_LIMIT: usize = 200;
 /// pre-ready fallback (an empty list) is served before the workspace is ready.
 fn workspace_symbol(id: RequestId, services: &CoreServices, params: &Value) -> Response {
     let query = params.get("query").and_then(Value::as_str).unwrap_or("");
-    let symbols: Vec<WorkspaceSymbol> = services
+    let mut symbols: Vec<WorkspaceSymbol> = services
         .orchestrator
         .workspace_symbols(query, WORKSPACE_SYMBOL_LIMIT)
         .iter()
         .map(workspace_symbol_of)
         .collect();
+    // Merge top-level symbols from open unsaved buffers the persisted index has
+    // never seen, flagged PC-only, AFTER the index hits (Scala `ScalaLs.symbol`).
+    symbols.extend(
+        services
+            .pc_only_symbols(query)
+            .iter()
+            .map(pc_only_workspace_symbol),
+    );
     ok_json(id, &symbols)
+}
+
+/// The `containerName` marking a `workspace/symbol` entry that exists only in an
+/// open, unsaved buffer (the Scala `ScalaLs.PcOnlyContainer`).
+const PC_ONLY_CONTAINER: &str = "unsaved buffer (PC-only)";
+
+/// Render a PC-only unsaved top-level symbol as an LSP `WorkspaceSymbol`,
+/// mapping its declaration keyword to a `SymbolKind` (Scala
+/// `pcOnlyWorkspaceSymbol`).
+fn pc_only_workspace_symbol(symbol: &PcOnlySymbol) -> WorkspaceSymbol {
+    let kind = match symbol.keyword.as_str() {
+        "object" => SymbolKind::Object,
+        "class" => SymbolKind::Class,
+        "trait" => SymbolKind::Interface,
+        "enum" => SymbolKind::Enum,
+        "def" => SymbolKind::Method,
+        "val" | "var" => SymbolKind::Variable,
+        "type" => SymbolKind::TypeParameter,
+        _ => SymbolKind::Object,
+    };
+    WorkspaceSymbol {
+        name: symbol.name.clone(),
+        kind,
+        location: convert::location(&symbol.file_uri, symbol.span),
+        container_name: Some(PC_ONLY_CONTAINER.to_string()),
+    }
 }
 
 /// `textDocument/prepareRename`: validate that a rename can start under the
@@ -918,7 +998,9 @@ mod tests {
     /// completion-resolve gate tests.
     fn services_with_pc(root: &Path, pc: FakePc) -> CoreServices {
         let store = Store::open(root).unwrap();
-        let orchestrator = Arc::new(QueryOrchestrator::with_defaults(store));
+        let overlay = crate::pc_overlay::PcOverlay::new();
+        let pc_overlay = overlay.handle();
+        let orchestrator = Arc::new(QueryOrchestrator::new(store, Box::new(overlay), true));
         let uris = WorkspaceUris::new(&[root.to_path_buf()]);
         CoreServices::new(
             orchestrator,
@@ -926,8 +1008,9 @@ mod tests {
             Some(root.to_path_buf()),
             HashMap::new(),
             Arc::new(UnavailableCompiler),
-            Box::new(pc),
+            Arc::new(pc),
             true,
+            pc_overlay,
         )
     }
 
@@ -1023,7 +1106,9 @@ mod tests {
     ) -> (CoreServices, Arc<Mutex<Vec<Vec<String>>>>) {
         use ls_engine::{TargetSpec, WorkspaceTargets};
         let store = Store::open(root).unwrap();
-        let orchestrator = Arc::new(QueryOrchestrator::with_defaults(store));
+        let overlay = crate::pc_overlay::PcOverlay::new();
+        let pc_overlay = overlay.handle();
+        let orchestrator = Arc::new(QueryOrchestrator::new(store, Box::new(overlay), true));
         // Empty SemanticDB roots (0 docs) — enough to record the workspace so
         // `reverse_dependency_closure` resolves; the compile targets are what matter.
         std::fs::create_dir_all(root.join("out-a")).unwrap();
@@ -1044,8 +1129,9 @@ mod tests {
             Some(root.to_path_buf()),
             uri_to_target,
             compiler,
-            Box::new(FakePc::default()),
+            Arc::new(FakePc::default()),
             true,
+            pc_overlay,
         )
         .with_scheduler_debounce(std::time::Duration::from_millis(2));
         (services, calls)
@@ -1319,6 +1405,37 @@ mod tests {
             workspace_symbol(RequestId::Number(1), &services, &json!({ "query": "Foo" }));
         let value = serde_json::to_value(&response).unwrap();
         assert_eq!(value["result"], json!([]));
+    }
+
+    // `workspace/symbol` appends PC-only top-level declarations from open unsaved
+    // buffers the persisted index has never seen, flagged with the PC-only
+    // container (Scala `ScalaLs.symbol` merge of `overlay.pcOnlySymbols`).
+    #[test]
+    fn workspace_symbol_appends_pc_only_unsaved_top_level_symbols() {
+        let dir = tempfile::tempdir().unwrap();
+        let services = unindexed_services(dir.path());
+        // Install the overlay over a dirty buffer holding an unindexed `object`.
+        let docs = Arc::new(DocumentStore::new());
+        docs.open("file:///ws/Fresh.scala", "object Widget:\n  def x = 1\n");
+        services.install_pc_overlay(docs);
+
+        let response =
+            workspace_symbol(RequestId::Number(1), &services, &json!({ "query": "wid" }));
+        let value = serde_json::to_value(&response).unwrap();
+        let entries = value["result"].as_array().expect("result array");
+        let widget = entries
+            .iter()
+            .find(|s| s["name"] == "Widget")
+            .expect("the PC-only Widget symbol");
+        assert_eq!(widget["kind"], 19, "object => SymbolKind.Object");
+        assert_eq!(widget["containerName"], "unsaved buffer (PC-only)");
+        assert_eq!(
+            widget["location"]["uri"], "file:///ws/Fresh.scala",
+            "located in the unsaved buffer"
+        );
+        // A query matching nothing in the buffer yields no PC-only entries.
+        let empty = workspace_symbol(RequestId::Number(2), &services, &json!({ "query": "zzz" }));
+        assert_eq!(serde_json::to_value(&empty).unwrap()["result"], json!([]));
     }
 
     // `requireSemanticdb` runs first and *outside* the buffer fallback, so

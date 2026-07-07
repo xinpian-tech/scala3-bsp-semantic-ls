@@ -27,8 +27,8 @@ use ls_jvm::backend::VtableBackend;
 use ls_jvm::watchdog::{PcError, PcRequest, QueryKind, Supervisor};
 use ls_jvm::{boot_island, install_symbol_definition_resolver, IslandConfig};
 use ls_pc_abi::payloads::{
-    CompletionItem, CompletionList, DefinitionResult, HoverResult, LocationsResult, SignatureHelp,
-    TargetConfig,
+    origin, CompletionItem, CompletionList, DefinitionResult, HoverResult, LocationsResult,
+    PrepareRenameResult, Rng, SignatureHelp, TargetConfig,
 };
 use serde_json::Value;
 
@@ -42,6 +42,46 @@ pub struct PcLocation {
     pub start_character: u32,
     pub end_line: u32,
     pub end_character: u32,
+}
+
+/// A source span in LSP coordinates (zero-based line, UTF-16 character,
+/// end-exclusive) — the seam's own type so the trait and its fakes do not
+/// depend on the ABI carrier crate. The dirty-buffer overlay reads it from PC
+/// `prepare_rename` as the presentation-only occurrence span.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PcSpan {
+    pub start_line: u32,
+    pub start_character: u32,
+    pub end_line: u32,
+    pub end_character: u32,
+}
+
+/// Where a PC definition location resolves (mirrors the Scala `DefinitionOrigin`
+/// and the ABI `origin` ordinals). The overlay treats anything that is not
+/// [`PcDefOrigin::Workspace`] as a PC-plugin / synthetic origin.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PcDefOrigin {
+    Workspace,
+    Synthetic,
+    Plugin,
+}
+
+/// One resolved definition location plus its origin.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PcDefLocation {
+    pub uri: String,
+    pub span: PcSpan,
+    pub origin: PcDefOrigin,
+}
+
+/// A PC definition result preserving the resolved SemanticDB `symbol` plus its
+/// origin-tagged locations — the overlay's symbol-at-cursor truth over a dirty
+/// buffer (the Scala `DefinitionResult`). An empty `symbol` means the
+/// presentation compiler could not resolve a symbol at the cursor.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PcDefinition {
+    pub symbol: String,
+    pub locations: Vec<PcDefLocation>,
 }
 
 /// The presentation-compiler capability the ready services own. The document
@@ -87,6 +127,25 @@ pub trait PcQueryService: Send + Sync {
     /// Signature help at `(line, character)`, as an LSP `SignatureHelp` JSON value,
     /// or `null` when the presentation compiler has nothing at the point.
     fn signature_help(&self, uri: &str, line: u32, character: u32) -> Value;
+
+    /// Prepare-rename span at `(line, character)` in the mirrored buffer `uri` —
+    /// the presentation compiler's rename range when the symbol is file-locally
+    /// renameable, else `None` (dotty offers rename ranges only for file-local
+    /// symbols). The dirty-buffer overlay uses it as the presentation-only
+    /// occurrence span, falling back to the identifier token under the cursor.
+    /// Default `None`: a services bundle with no PC island offers no range.
+    fn prepare_rename(&self, _uri: &str, _line: u32, _character: u32) -> Option<PcSpan> {
+        None
+    }
+
+    /// Definition at `(line, character)` in the mirrored buffer `uri`, preserving
+    /// the resolved SemanticDB symbol and per-location [`PcDefOrigin`] — the
+    /// overlay's symbol-at-cursor truth over a dirty buffer (the Scala
+    /// `pc.definition` feeding `PcOverlay`). Default empty: no island resolves
+    /// nothing.
+    fn definition_result(&self, _uri: &str, _line: u32, _character: u32) -> PcDefinition {
+        PcDefinition::default()
+    }
 
     /// Whether `target_id` is a registered PC target config — the Scala
     /// `s.pcConfigs.contains(target)` gate that a completion-resolve must pass
@@ -423,6 +482,20 @@ impl PcQueryService for IslandPcService {
             .unwrap_or(Value::Null)
     }
 
+    fn prepare_rename(&self, uri: &str, line: u32, character: u32) -> Option<PcSpan> {
+        self.query_reply(QueryKind::PrepareRename, uri, line, character)
+            .and_then(|reply| PrepareRenameResult::decode(&reply).ok())
+            .and_then(|result| result.0)
+            .map(pc_span_of)
+    }
+
+    fn definition_result(&self, uri: &str, line: u32, character: u32) -> PcDefinition {
+        self.query_reply(QueryKind::Definition, uri, line, character)
+            .and_then(|reply| DefinitionResult::decode(&reply).ok())
+            .map(pc_definition_of)
+            .unwrap_or_default()
+    }
+
     fn is_registered(&self, target_id: &str) -> bool {
         self.state
             .lock()
@@ -579,6 +652,42 @@ fn pc_location_of(loc: ls_pc_abi::payloads::Location) -> PcLocation {
         start_character: loc.range.start_character,
         end_line: loc.range.end_line,
         end_character: loc.range.end_character,
+    }
+}
+
+fn pc_span_of(range: Rng) -> PcSpan {
+    PcSpan {
+        start_line: range.start_line,
+        start_character: range.start_character,
+        end_line: range.end_line,
+        end_character: range.end_character,
+    }
+}
+
+/// Maps an ABI `origin` ordinal to a [`PcDefOrigin`]. `WORKSPACE` and `PLUGIN`
+/// map exactly; `SYNTHETIC` and any unknown ordinal fold to `Synthetic` (the
+/// overlay only distinguishes workspace from non-workspace, so an unknown
+/// ordinal safely reads as non-workspace).
+fn pc_def_origin_of(ordinal: u32) -> PcDefOrigin {
+    match ordinal {
+        origin::WORKSPACE => PcDefOrigin::Workspace,
+        origin::PLUGIN => PcDefOrigin::Plugin,
+        _ => PcDefOrigin::Synthetic,
+    }
+}
+
+fn pc_definition_of(result: DefinitionResult) -> PcDefinition {
+    PcDefinition {
+        symbol: result.symbol,
+        locations: result
+            .locations
+            .into_iter()
+            .map(|loc| PcDefLocation {
+                uri: loc.uri,
+                span: pc_span_of(loc.range),
+                origin: pc_def_origin_of(loc.origin),
+            })
+            .collect(),
     }
 }
 

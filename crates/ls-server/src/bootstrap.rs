@@ -32,7 +32,8 @@ use ls_store::Store;
 
 use crate::documents::DocumentStore;
 use crate::lifecycle::WorkspaceState;
-use crate::pc::{pc_options, IslandPcService, SymbolResolver};
+use crate::pc::{pc_options, IslandPcService, PcQueryService, SymbolResolver};
+use crate::pc_overlay::PcOverlay;
 use crate::server::Bootstrap;
 use crate::services::{BuildCompiler, CoreServices, UnavailableCompiler};
 use crate::workspace_uris::WorkspaceUris;
@@ -258,7 +259,13 @@ impl<M: ModelSource> IndexBootstrap<M> {
         // `syncWriteThrough = true`). The ready services' build scheduler is only
         // the FALLBACK — `references_ok` enqueues a background reingest solely for
         // results that STILL carry `needs_reindex` (write-through unavailable/failed).
-        let orchestrator = Arc::new(QueryOrchestrator::with_defaults(store));
+        // The production dirty-buffer overlay lives inside the orchestrator; its
+        // late-bound environment is installed at Ready adoption (once `docs` and
+        // the ready bundle exist). The retained `handle` lets the ready services
+        // install it and answer `workspace/symbol`'s PC-only unsaved symbols.
+        let overlay = PcOverlay::new();
+        let pc_overlay = overlay.handle();
+        let orchestrator = Arc::new(QueryOrchestrator::new(store, Box::new(overlay), true));
         orchestrator
             .ingest(Arc::new(workspace))
             .map_err(|e| e.to_string())?;
@@ -271,7 +278,7 @@ impl<M: ModelSource> IndexBootstrap<M> {
         let resolver: Box<SymbolResolver> = Box::new(move |symbol: &str, from_uri: &str| {
             locations_result(resolver_orchestrator.symbol_definition(symbol, from_uri))
         });
-        let pc = Box::new(IslandPcService::new(
+        let pc: Arc<dyn PcQueryService> = Arc::new(IslandPcService::new(
             workspace_root.to_path_buf(),
             pc_targets,
             resolver,
@@ -286,6 +293,7 @@ impl<M: ModelSource> IndexBootstrap<M> {
             // A live build model was loaded, so a BSP session backs this
             // workspace; the persisted-index fallback stays inert here.
             true,
+            pc_overlay,
         ))
     }
 }
@@ -303,11 +311,19 @@ impl<M: ModelSource> Bootstrap<CoreServices> for IndexBootstrap<M> {
         }
     }
 
-    fn replay(&self, services: &CoreServices, documents: &DocumentStore) {
+    fn replay(&self, services: &CoreServices, documents: &Arc<DocumentStore>) {
+        // Install the dirty-buffer overlay's environment (binding this same
+        // shared document store) before replaying, so a PC query over a buffer
+        // opened pre-ready sees the installed overlay.
+        services.install_pc_overlay(Arc::clone(documents));
         replay_open_buffers(services, documents);
     }
 
-    fn reload(&self, old: CoreServices, documents: &DocumentStore) -> WorkspaceState<CoreServices> {
+    fn reload(
+        &self,
+        old: CoreServices,
+        documents: &Arc<DocumentStore>,
+    ) -> WorkspaceState<CoreServices> {
         reload_build_model(old, documents)
     }
 }
@@ -322,7 +338,7 @@ impl<M: ModelSource> Bootstrap<CoreServices> for IndexBootstrap<M> {
 /// behavior-preserving port of `ScalaLs.reloadBuildModel`.
 pub fn reload_build_model(
     old: CoreServices,
-    documents: &DocumentStore,
+    documents: &Arc<DocumentStore>,
 ) -> WorkspaceState<CoreServices> {
     let model = match old.compiler.refetch_model() {
         Ok(model) => model,
@@ -369,7 +385,11 @@ pub fn reload_build_model(
         old.compiler, // reused: same retained session
         old.pc,       // reused: same island
         true,
+        old.pc_overlay, // reused: same overlay inside the reused orchestrator
     );
+    // Re-install the overlay environment with the refreshed URI mapping (the
+    // sourceroots may have changed) before replaying the open buffers.
+    updated.install_pc_overlay(Arc::clone(documents));
     replay_open_buffers(&updated, documents);
     WorkspaceState::Ready(updated)
 }

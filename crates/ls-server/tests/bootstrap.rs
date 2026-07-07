@@ -594,7 +594,7 @@ where
 fn ready_over<M: ModelSource>(
     bootstrap: &IndexBootstrap<M>,
     root: &Path,
-    documents: &DocumentStore,
+    documents: &Arc<DocumentStore>,
 ) -> CoreServices {
     match bootstrap.build(Some(root.to_path_buf())) {
         WorkspaceState::Ready(services) => {
@@ -611,7 +611,7 @@ fn ready_over<M: ModelSource>(
 #[test]
 fn a_build_target_change_reload_refetches_reingests_and_reconfigures() {
     let dir = tempfile::tempdir().unwrap();
-    let documents = DocumentStore::new();
+    let documents = Arc::new(DocumentStore::new());
     let bootstrap = IndexBootstrap::new(ReloadingModelSource {
         initial: fixture_model_ab_only(),
         reload: fixture_model(),
@@ -642,7 +642,7 @@ fn a_build_target_change_reload_refetches_reingests_and_reconfigures() {
 #[test]
 fn a_build_target_change_reload_keeps_the_snapshot_on_a_refetch_failure() {
     let dir = tempfile::tempdir().unwrap();
-    let documents = DocumentStore::new();
+    let documents = Arc::new(DocumentStore::new());
     // The closure blanket source gives an `UnavailableCompiler`, whose
     // `refetch_model` fails, so the reload must keep the loaded snapshot.
     let bootstrap = IndexBootstrap::new(|_root: &Path| Ok(fixture_model_ab_only()));
@@ -667,7 +667,7 @@ fn a_build_target_change_reload_keeps_the_snapshot_on_a_refetch_failure() {
 #[test]
 fn a_build_target_change_reload_to_an_empty_model_keeps_the_prior_index() {
     let dir = tempfile::tempdir().unwrap();
-    let documents = DocumentStore::new();
+    let documents = Arc::new(DocumentStore::new());
     let bootstrap = IndexBootstrap::new(ReloadingModelSource {
         initial: fixture_model(),
         reload: BspProjectModel::new(Vec::new(), HashMap::new()),
@@ -970,7 +970,7 @@ impl PcQueryService for FakePc {
 }
 
 fn drive(services: &CoreServices, method: &str, params: Value) -> Value {
-    let documents = DocumentStore::new();
+    let documents = Arc::new(DocumentStore::new());
     let request = Request {
         id: RequestId::Number(1),
         method: method.to_string(),
@@ -1003,7 +1003,7 @@ fn core_uri() -> String {
 fn definition_and_type_definition_route_to_the_pc_over_an_open_owned_buffer() {
     let (mut services, _root) = ready_fixture_services();
     let core_uri = core_uri();
-    services.pc = Box::new(FakePc {
+    services.pc = Arc::new(FakePc {
         definition: vec![PcLocation {
             uri: core_uri.clone(),
             start_line: 2,
@@ -1054,7 +1054,7 @@ fn definition_and_type_definition_route_to_the_pc_over_an_open_owned_buffer() {
 fn definition_over_an_owned_but_unopened_buffer_is_an_empty_list() {
     let (mut services, _root) = ready_fixture_services();
     let core_uri = core_uri();
-    services.pc = Box::new(FakePc {
+    services.pc = Arc::new(FakePc {
         definition: vec![PcLocation {
             uri: core_uri.clone(),
             start_line: 0,
@@ -1084,7 +1084,7 @@ fn completion_hover_and_signature_help_route_to_the_pc_over_an_open_owned_buffer
     let completion = json!({ "isIncomplete": false, "items": [ { "label": "foo", "kind": 2 } ] });
     let hover = json!({ "contents": { "kind": "markdown", "value": "T" } });
     let signature = json!({ "signatures": [ { "label": "f(a: Int)" } ], "activeSignature": 0 });
-    services.pc = Box::new(FakePc {
+    services.pc = Arc::new(FakePc {
         completion: completion.clone(),
         hover: hover.clone(),
         signature_help: signature.clone(),
@@ -1118,7 +1118,7 @@ fn completion_hover_and_signature_help_route_to_the_pc_over_an_open_owned_buffer
 fn pc_query_methods_over_an_owned_but_unopened_buffer_answer_the_fallback() {
     let (mut services, _root) = ready_fixture_services();
     let core_uri = core_uri();
-    services.pc = Box::new(FakePc {
+    services.pc = Arc::new(FakePc {
         completion: json!({ "isIncomplete": true, "items": [ { "label": "x" } ] }),
         hover: json!({ "contents": "present" }),
         signature_help: json!({ "signatures": [ { "label": "g()" } ] }),
@@ -1152,7 +1152,7 @@ fn completion_records_the_target_so_a_following_resolve_enriches() {
     let (mut services, _root) = ready_fixture_services();
     let core_uri = core_uri();
     let enriched = json!({ "label": "foo", "detail": "def foo: Int" });
-    services.pc = Box::new(FakePc {
+    services.pc = Arc::new(FakePc {
         completion: json!({ "isIncomplete": false, "items": [ { "label": "foo" } ] }),
         registered: true,
         resolved: Some(enriched.clone()),
@@ -1185,7 +1185,7 @@ fn on_did_change_opens_an_unmirrored_buffer_then_updates_it() {
     let core_uri = core_uri();
     let fake = FakePc::default();
     let events = fake.events.clone();
-    services.pc = Box::new(fake);
+    services.pc = Arc::new(fake);
 
     // First change: the PC has no buffer, so it opens (owner resolved to fixture-a).
     CoreHandlers.on_did_change(&services, &core_uri, "v1");
@@ -1212,7 +1212,7 @@ fn on_did_change_opens_an_unmirrored_buffer_then_updates_it() {
 #[test]
 fn ready_replays_pre_opened_buffers_into_the_pc_mirror() {
     let store_root = tempfile::tempdir().unwrap();
-    let documents = DocumentStore::new();
+    let documents = Arc::new(DocumentStore::new());
     let core_uri = core_uri();
     // Opened during the pre-ready window.
     documents.open(&core_uri, "class Core\n");

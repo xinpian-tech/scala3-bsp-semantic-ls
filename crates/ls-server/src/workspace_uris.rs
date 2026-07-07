@@ -17,6 +17,7 @@ use ls_index_model::uri::{normalize, path_to_uri, uri_to_path};
 
 /// The sourceroots of a ready workspace, sorted so lookups prefer the deepest
 /// containing root.
+#[derive(Clone)]
 pub struct WorkspaceUris {
     /// Absolutized + normalized + distinct sourceroots, sorted deepest-first.
     roots: Vec<PathBuf>,
