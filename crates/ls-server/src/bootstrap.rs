@@ -94,6 +94,7 @@ fn doctor_targets_of(model: &BspProjectModel) -> DoctorTargets {
         all_ids,
         unavailable_ids,
         indexable_roots,
+        ..Default::default()
     }
 }
 
@@ -192,9 +193,19 @@ fn path_string(path: &Path) -> String {
 pub struct ReadyModel {
     pub model: BspProjectModel,
     pub compiler: Arc<dyn BuildCompiler>,
+    /// The build server's `build/initialize` display name, threaded into the
+    /// doctor `BSP` section. `None` for index-only injections with no session.
+    pub server_name: Option<String>,
+    /// The build server's `build/initialize` version.
+    pub server_version: Option<String>,
 }
 
 /// The outcome of asking a [`ModelSource`] for a workspace's build model.
+// A one-shot bootstrap return whose `Model` payload is destructured immediately;
+// the `Model`/`NoBsp` size gap is irrelevant here and boxing would only add a
+// heap allocation on the hot ready path (and obscure the `.map(LoadOutcome::Model)`
+// call sites).
+#[allow(clippy::large_enum_variant)]
 pub enum LoadOutcome {
     /// A live BSP session produced a project model (with its retained compiler).
     Model(ReadyModel),
@@ -230,6 +241,8 @@ where
         Ok(LoadOutcome::Model(ReadyModel {
             model: self(workspace_root)?,
             compiler: Arc::new(UnavailableCompiler),
+            server_name: None,
+            server_version: None,
         }))
     }
 }
@@ -255,7 +268,12 @@ impl<M: ModelSource> IndexBootstrap<M> {
     /// the assembled services, or a human-readable detail on the first failure.
     /// This is the heavy work the bootstrap worker runs off the message loop.
     fn build_services(&self, workspace_root: &Path) -> Result<CoreServices, String> {
-        let ReadyModel { model, compiler } =
+        let ReadyModel {
+            model,
+            compiler,
+            server_name,
+            server_version,
+        } =
             match self.model_source.load(workspace_root)? {
                 LoadOutcome::Model(ready) => ready,
                 // The no-BSP warm-restart mode over the recovered index is deferred
@@ -288,8 +306,11 @@ impl<M: ModelSource> IndexBootstrap<M> {
         // The PC target registrations are built before the model is dropped.
         let pc_targets = pc_target_configs(&model);
         // The doctor's full-target inventory (all Scala 3 targets + unavailable +
-        // indexable roots) is captured from the model before it is dropped.
-        let doctor_targets = doctor_targets_of(&model);
+        // indexable roots) is captured from the model before it is dropped, plus
+        // the build server's initialize identity for the doctor `server:` line.
+        let mut doctor_targets = doctor_targets_of(&model);
+        doctor_targets.server_name = server_name;
+        doctor_targets.server_version = server_version;
         let store = Store::open(&workspace_root.join(STORE_DIR)).map_err(|e| e.to_string())?;
         // `Arc` because the PC island's cross-file `symbol_definition` resolver
         // answers from this same query engine. `with_defaults` is the production
@@ -398,7 +419,13 @@ pub fn reload_build_model(
         .map(|t| t.sourceroot.clone())
         .collect();
     let pc_targets = pc_target_configs(&model);
-    let doctor_targets = doctor_targets_of(&model);
+    // The refetch reuses the same session WITHOUT re-initializing, so the build
+    // server identity is unchanged — carry it from the old bundle onto the
+    // rebuilt inventory (the refetched model has no initialize result of its own).
+    let mut doctor_targets = doctor_targets_of(&model);
+    let (old_name, old_version) = old.bsp_server();
+    doctor_targets.server_name = old_name;
+    doctor_targets.server_version = old_version;
     let uri_to_target = model
         .uri_to_target
         .iter()
@@ -524,9 +551,11 @@ impl ModelSource for LiveBspModelSource {
 /// both exercise the same real session-backed compiler.
 pub fn ready_model_from_session(session: BspSession) -> Result<ReadyModel, String> {
     match load_project_model(&session) {
-        Ok(model) => Ok(ReadyModel {
+        Ok((model, server_name, server_version)) => Ok(ReadyModel {
             model,
             compiler: Arc::new(BspCompileService::new(session)),
+            server_name,
+            server_version,
         }),
         Err(detail) => {
             session.shutdown();
@@ -537,11 +566,16 @@ pub fn ready_model_from_session(session: BspSession) -> Result<ReadyModel, Strin
 }
 
 /// Initializes the session and loads the project model, mapping any `BspError`
-/// to a detail string. Separated so the caller retains or tears down the session
-/// by the outcome.
-fn load_project_model(session: &BspSession) -> Result<BspProjectModel, String> {
-    session.initialize().map_err(|e| e.to_string())?;
-    ProjectModelLoader::load(session).map_err(|e| e.to_string())
+/// to a detail string. Returns the build server's `build/initialize` display
+/// name + version alongside the model (the Scala doctor `server:` line), so the
+/// ready bundle can surface them. Separated so the caller retains or tears down
+/// the session by the outcome.
+fn load_project_model(
+    session: &BspSession,
+) -> Result<(BspProjectModel, Option<String>, Option<String>), String> {
+    let init = session.initialize().map_err(|e| e.to_string())?;
+    let model = ProjectModelLoader::load(session).map_err(|e| e.to_string())?;
+    Ok((model, Some(init.display_name), Some(init.version)))
 }
 
 /// The live build compile capability: it owns the retained BSP session and

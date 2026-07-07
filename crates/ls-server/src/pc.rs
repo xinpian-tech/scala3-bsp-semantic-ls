@@ -279,6 +279,12 @@ struct Buffered {
 /// presentation compiler's class-load + init under `nix flake check` parallelism,
 /// so it is sized like the live sweep rather than the 15s production budget.
 const REQUEST_DEADLINE: Duration = Duration::from_secs(120);
+
+/// The per-request deadline used ONLY when the test fault seam (`LS_PC_TEST_FAULT`)
+/// is armed: below the fault hook's ~60s wedge busy-loop so a wedged dispatch
+/// times out (and the dispatch-generation recovery is observable) within a test,
+/// yet high enough for a cold first completion under parallel-CI load.
+const FAULT_REQUEST_DEADLINE: Duration = Duration::from_secs(20);
 /// The premain registration deadline, sized for a cold JVM boot under parallel
 /// live checks.
 const RENDEZVOUS_TIMEOUT: Duration = Duration::from_secs(60);
@@ -599,15 +605,31 @@ fn boot(state: &mut IslandState) -> bool {
     if let Some(resolver) = state.resolver.take() {
         install_symbol_definition_resolver(resolver);
     }
+    // A clearly test-scoped fault seam: when `LS_PC_TEST_FAULT` is set, arm the
+    // Java-side fault property (`-Dls.pc.host.testFault=<kind>`) and tighten the
+    // per-request deadline so a wedged dispatch times out — and the watchdog's
+    // dispatch-generation recovery becomes observable — within a test. The env
+    // var is unset in production, so production boot behavior is unchanged.
+    let test_fault = std::env::var("LS_PC_TEST_FAULT").ok();
+    let fault_options: Vec<String> = test_fault
+        .as_deref()
+        .filter(|kind| !kind.is_empty())
+        .map(|kind| vec![format!("-Dls.pc.host.testFault={kind}")])
+        .unwrap_or_default();
+    let request_deadline = if fault_options.is_empty() {
+        REQUEST_DEADLINE
+    } else {
+        FAULT_REQUEST_DEADLINE
+    };
     let config = IslandConfig {
         libjvm: &libjvm,
         agent_jar: &agent_jar,
         extra_classpath: &[],
         workspace_root: Some(&state.workspace_root),
-        extra_jvm_options: &[],
+        extra_jvm_options: &fault_options,
         rendezvous_timeout: RENDEZVOUS_TIMEOUT,
         max_abandoned_generations: 4,
-        request_deadline: REQUEST_DEADLINE,
+        request_deadline,
         cancel_grace: Duration::from_millis(500),
     };
     let sup = match boot_island(&config) {

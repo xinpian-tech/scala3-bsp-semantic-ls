@@ -1,4 +1,5 @@
-{ pkgs, jdk, mill, zaozi-src ? null }:
+{ pkgs, jdk, mill, zaozi-src ? null
+, pcHostAgentJar ? null, scalaLibraryJar ? null, scala3LibraryJar ? null }:
 
 pkgs.mkShell {
   packages = with pkgs; [
@@ -36,6 +37,17 @@ pkgs.mkShell {
   # On nixpkgs jdk25 it lives under ${jdk.home} (= ${jdk}/lib/openjdk), NOT
   # $JAVA_HOME/lib/server — expose the exact path (mirrors LS_SQLITE_LIB).
   LS_LIBJVM = "${jdk.home}/lib/server/libjvm.so";
+
+  # The presentation-compiler boot inputs, so the real-BSP PC rows
+  # (`scripts/it-real-bsp-rs.sh`) and the `ls-jvm`/`ls-server` live PC checks run
+  # for real in the dev shell — the mill-built island host agent jar plus the
+  # Scala standard-library classpath the embedded compiler resolves against.
+  # Null when the flake is used without these inputs (then the PC rows skip).
+  PC_HOST_AGENT_JAR =
+    if pcHostAgentJar == null then "" else "${pcHostAgentJar}/pc-host-agent.jar";
+  LS_PC_TARGET_CLASSPATH =
+    if scalaLibraryJar == null || scala3LibraryJar == null then ""
+    else "${scalaLibraryJar}:${scala3LibraryJar}";
   # The SQLite shared library consumed by the ls-sqlite-ffm FFM binding.
   # System SQLite is never used; only the Nix-provided library is a valid
   # runtime dependency.

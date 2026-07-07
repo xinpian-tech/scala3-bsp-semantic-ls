@@ -183,6 +183,16 @@ impl CoreServices {
         self.pc_overlay.pc_only_symbols(query)
     }
 
+    /// The retained build server `(display name, version)` from `build/initialize`
+    /// (the doctor `server:` line). Read by `reload_build_model` to carry the
+    /// identity across a model refetch, which does not re-initialize the session.
+    pub(crate) fn bsp_server(&self) -> (Option<String>, Option<String>) {
+        (
+            self.doctor_targets.server_name.clone(),
+            self.doctor_targets.server_version.clone(),
+        )
+    }
+
     /// The live doctor report for a ready workspace (the Scala
     /// `DoctorCommand.input`): `Runtime`/`Nix`/`Store` from the host, workspace
     /// files, and read-only store, plus the live `BSP`/`SemanticDB`/`PC` sections
@@ -886,15 +896,16 @@ pub fn highlights_to_lsp(highlights: &[DocHighlight]) -> Vec<DocumentHighlight> 
 
 /// A resolved workspace-symbol entry -> LSP `WorkspaceSymbol`.
 /// The live doctor `BSP` section from the full-target inventory. Server
-/// name/version are not retained in the Rust ready bundle (the initialize result
-/// is consumed at bootstrap), so they render `unknown`. Counts and lists come
-/// from ALL Scala 3 targets — including those without SemanticDB output — so the
+/// name/version come from the retained `build/initialize` identity (the Scala
+/// `server: <name>` line); they render `unknown` only for an index-only injection
+/// that captured no initialize result. Counts and lists come from ALL Scala 3
+/// targets — including those without SemanticDB output — so the
 /// `-Xsemanticdb`-missing targets are surfaced, not hidden (the Scala
 /// `BspSection.gather`: `model.targets` + `model.unavailableTargets`).
 fn bsp_section(targets: &DoctorTargets) -> crate::doctor::BspSection {
     crate::doctor::BspSection {
-        server_name: None,
-        server_version: None,
+        server_name: targets.server_name.clone(),
+        server_version: targets.server_version.clone(),
         target_count: targets.all_ids.len(),
         scala3_targets: targets.all_ids.clone(),
         index_unavailable_targets: targets.unavailable_ids.clone(),
@@ -1741,11 +1752,16 @@ mod tests {
     #[test]
     fn bsp_section_counts_all_targets_and_surfaces_the_unavailable_ones() {
         let targets = DoctorTargets {
+            server_name: Some("mill-bsp".to_string()),
+            server_version: Some("1.1.2".to_string()),
             all_ids: vec!["a".to_string(), "b".to_string()],
             unavailable_ids: vec!["b".to_string()],
             indexable_roots: vec![("a".to_string(), PathBuf::from("/ws/out-a"))],
         };
         let section = bsp_section(&targets);
+        // The retained build/initialize identity flows into the `server:` line.
+        assert_eq!(section.server_name.as_deref(), Some("mill-bsp"));
+        assert_eq!(section.server_version.as_deref(), Some("1.1.2"));
         assert_eq!(section.target_count, 2);
         assert_eq!(
             section.scala3_targets,
@@ -1776,6 +1792,7 @@ mod tests {
                 ("a".to_string(), root_a.clone()),
                 ("b".to_string(), root_b.clone()),
             ],
+            ..Default::default()
         };
         let section = semanticdb_section(&targets);
         assert_eq!(section.roots.len(), 2);

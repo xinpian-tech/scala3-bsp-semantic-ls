@@ -29,6 +29,13 @@ const LIST_CAP: usize = 20;
 /// Scala doctor reads `model.targets` + `model.unavailableTargets`).
 #[derive(Default)]
 pub struct DoctorTargets {
+    /// The build server's display name from `build/initialize` (the Scala
+    /// `server: <name>` doctor line), or `None` when no initialize result was
+    /// captured (index-only injections). Retained here so it survives into the
+    /// ready bundle the doctor reads.
+    pub server_name: Option<String>,
+    /// The build server's version from `build/initialize`.
+    pub server_version: Option<String>,
     /// All Scala 3 target bspIds, sorted (the Scala `model.targets`).
     pub all_ids: Vec<String>,
     /// bspIds of targets without SemanticDB output, sorted (the Scala

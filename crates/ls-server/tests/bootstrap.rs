@@ -457,6 +457,8 @@ impl ModelSource for CompilingModelSource {
                 fail_reason: self.fail_reason.clone(),
                 calls: self.calls.clone(),
             }),
+            server_name: None,
+            server_version: None,
         }))
     }
 }
@@ -524,6 +526,8 @@ impl ModelSource for ReloadingModelSource {
             compiler: Arc::new(ReloadingCompiler {
                 reload_model: self.reload.clone(),
             }),
+            server_name: None,
+            server_version: None,
         }))
     }
 }

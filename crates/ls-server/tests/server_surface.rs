@@ -205,6 +205,8 @@ impl ModelSource for RecordingModelSource {
             compiler: Arc::new(RecordingCompiler {
                 calls: self.calls.clone(),
             }),
+            server_name: None,
+            server_version: None,
         }))
     }
 }
