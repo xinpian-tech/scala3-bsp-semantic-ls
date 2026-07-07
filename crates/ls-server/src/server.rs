@@ -29,6 +29,7 @@ use serde_json::{json, Value};
 use ls_index_model::uri::{normalize, normalize_uri, uri_to_path};
 
 use crate::capabilities::{commands, initialize_result, InitializeResult};
+use crate::doctor::DoctorReport;
 use crate::documents::DocumentStore;
 use crate::jsonrpc::{
     error_codes, parse_incoming, read_frame, write_frame, write_null_id_error, Incoming,
@@ -78,9 +79,9 @@ pub struct RequestContext<'a, S> {
 /// The subsystem-backed request handlers, delegated to for the work that needs
 /// the engine/BSP/PC services: the ready-path query answers, `completionItem/
 /// resolve` when ready, and the ready-path `executeCommand` actions. The doctor
-/// report is a context built-in ([`doctor_report`]) so it renders in every
-/// state. The production impl is wired over the real subsystems; tests inject a
-/// fake.
+/// report renders in every state ([`doctor_result`]); its live sections come from
+/// the [`Handlers::doctor`] hook when ready. The production impl is wired over the
+/// real subsystems; tests inject a fake.
 ///
 /// The document-lifecycle hooks (`on_did_open`/`on_did_change`/`on_did_close`)
 /// let the ready services react to buffer notifications — the production impl
@@ -108,6 +109,15 @@ pub trait Handlers<S> {
     /// debounced compile-first reingest of the saved file's reverse-dependency
     /// closure.
     fn on_did_save(&self, _services: &S, _uri: &str) {}
+
+    /// The live doctor report for a ready workspace (the `Runtime`/`Nix`/`Store`
+    /// plus the live `BSP`/`SemanticDB`/`PC` sections). `None` when this handler
+    /// has no live report to add (a fake, or a non-`CoreServices` bundle), in
+    /// which case the offline report is rendered from the workspace root. Never
+    /// boots the embedded JVM.
+    fn doctor(&self, _services: &S, _workspace_root: Option<&Path>) -> Option<DoctorReport> {
+        None
+    }
 }
 
 /// The client-facing callbacks the server is wired with: publishing diagnostics
@@ -512,7 +522,7 @@ fn execute_command<S>(
     };
     match request.params.get("command").and_then(Value::as_str) {
         Some(commands::DOCTOR) => {
-            Response::success(request.id.clone(), Value::String(doctor_report(core)))
+            Response::success(request.id.clone(), doctor_result(core, handlers, request))
         }
         Some(commands::REINDEX) if ready => ready_handle(core, handlers, request),
         Some(commands::REINDEX) => unavailable("reindex"),
@@ -531,19 +541,50 @@ fn execute_command<S>(
     }
 }
 
-/// The `scala3SemanticLs.doctor` result. Renders the `state:` header plus the
-/// `Store` section (manifest/segment/state facts from the on-disk store under the
-/// workspace root) in every state, matching `DoctorCommand.report`'s
-/// always-available sections. The store facts come from the same boot-recovery
-/// read the server uses, so the report renders offline and pre-bootstrap and
-/// boots no JVM. The remaining `DoctorCommand` sections (Runtime host facts +
-/// live island status, BSP/SemanticDB/PC/Nix) are gathered as they are ported.
-fn doctor_report<S>(core: &ServerCore<S>) -> String {
-    format!(
-        "state: {}\n\n{}",
-        core.state.status_line(),
-        crate::store_dump::store_section(core.workspace_root.as_deref()),
-    )
+/// The `scala3SemanticLs.doctor` result (the Scala `DoctorCommand.report`).
+/// Renders the full typed report in every state: a ready workspace gets the live
+/// `BSP`/`SemanticDB`/`PC` sections from `Handlers::doctor`; any other state gets
+/// the offline report (`Runtime`/`Nix`/`Store` populated, the live sections
+/// `unavailable`). Text carries a `state:` header; the `{"json": true}` argument
+/// returns the structured object with a `state` field. Boots no JVM.
+fn doctor_result<S>(core: &ServerCore<S>, handlers: &impl Handlers<S>, request: &Request) -> Value {
+    let root = core.workspace_root.clone();
+    let report = core
+        .state
+        .ready()
+        .and_then(|services| handlers.doctor(services, root.as_deref()))
+        .unwrap_or_else(|| DoctorReport::offline(&doctor_root(root.as_deref())));
+    let status = core.state.status_line();
+    if doctor_json_requested(request) {
+        let mut value = report.render_json();
+        if let Value::Object(map) = &mut value {
+            map.insert("state".to_string(), Value::String(status));
+        }
+        value
+    } else {
+        Value::String(format!("state: {status}\n\n{}", report.render_text()))
+    }
+}
+
+/// The workspace root for an offline doctor report, defaulting to the current
+/// directory when the server never received one (the Scala `Path.of(".")`).
+fn doctor_root(workspace_root: Option<&Path>) -> PathBuf {
+    workspace_root
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// Whether the doctor executeCommand asked for JSON output — `arguments: [{
+/// "json": true }]`.
+fn doctor_json_requested(request: &Request) -> bool {
+    request
+        .params
+        .get("arguments")
+        .and_then(Value::as_array)
+        .and_then(|args| args.first())
+        .and_then(|arg| arg.get("json"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
 }
 
 fn dispatch_notification<S, B>(
@@ -1256,11 +1297,11 @@ mod tests {
         }
     }
 
-    // Doctor renders the state header plus the Store section in every state.
-    // With no `rootUri` the workspace root is unset, so the Store section reports
-    // that; the store-fact rendering itself is covered by the store_dump tests.
+    // Doctor renders the state header plus the full typed report in every state.
+    // `FakeServices` has no live `doctor` hook, so every state renders the offline
+    // report — all seven headings, live-only sections `unavailable`.
     #[test]
-    fn doctor_renders_the_state_header_and_store_section_in_every_state() {
+    fn doctor_renders_the_state_header_and_all_sections_in_every_state() {
         let doctor = |state: WorkspaceState<FakeServices>, send_initialized: bool| {
             let mut input = vec![frame(request(1, "initialize", json!({})))];
             if send_initialized {
@@ -1275,26 +1316,65 @@ mod tests {
             let (_core, out) = run(input, state);
             out[1]["result"].as_str().unwrap().to_string()
         };
-        let store = "Store:\n  workspace root not set\n";
-        // Not ready (no initialized): the pre-ready state header.
-        assert_eq!(
-            doctor(ready("unused"), false),
-            format!("state: not ready: waiting for the initialized notification\n\n{store}")
+        let assert_report = |report: &str, expected_state: &str| {
+            assert!(
+                report.starts_with(&format!("state: {expected_state}\n\n")),
+                "{report}"
+            );
+            for heading in [
+                "Runtime:",
+                "Nix:",
+                "BSP:",
+                "SemanticDB:",
+                "Store:",
+                "PC:",
+                "PC Plugins:",
+            ] {
+                assert!(report.contains(heading), "missing {heading} in {report}");
+            }
+            // Live-only sections are unavailable (no ready CoreServices bundle).
+            assert!(
+                report.contains("BSP:\n  unavailable: no BSP connection"),
+                "{report}"
+            );
+        };
+        assert_report(
+            &doctor(ready("unused"), false),
+            "not ready: waiting for the initialized notification",
         );
-        // Ready.
-        assert_eq!(
-            doctor(ready("svc"), true),
-            format!("state: ready\n\n{store}")
-        );
-        // Failed.
-        assert_eq!(
-            doctor(
+        assert_report(&doctor(ready("svc"), true), "ready");
+        assert_report(
+            &doctor(
                 WorkspaceState::Failed {
-                    detail: "no build server".to_string()
+                    detail: "no build server".to_string(),
                 },
-                true
+                true,
             ),
-            format!("state: bootstrap failed: no build server\n\n{store}")
+            "bootstrap failed: no build server",
+        );
+    }
+
+    // The `{"json": true}` argument returns the structured report with a `state`
+    // field and a `store` key (no `sqlite`/`postings`).
+    #[test]
+    fn doctor_json_argument_returns_the_structured_report() {
+        let input = vec![
+            frame(request(1, "initialize", json!({}))),
+            frame(request(
+                2,
+                "workspace/executeCommand",
+                json!({ "command": "scala3SemanticLs.doctor", "arguments": [{ "json": true }] }),
+            )),
+            frame(notification("exit", json!({}))),
+        ];
+        let (_core, out) = run(input, ready("svc"));
+        let result = &out[1]["result"];
+        assert!(result.is_object(), "json result is an object: {result}");
+        assert!(result.get("store").is_some());
+        assert!(result.get("sqlite").is_none());
+        assert_eq!(
+            result["state"],
+            "not ready: waiting for the initialized notification"
         );
     }
 

@@ -152,6 +152,13 @@ pub trait PcQueryService: Send + Sync {
     /// before it runs against the presentation compiler.
     fn is_registered(&self, target_id: &str) -> bool;
 
+    /// The registered PC target ids (sorted), for the doctor `PC` section.
+    /// Non-invasive: reads the config mirror, never boots the island. Default
+    /// empty (a services bundle with no PC island registers nothing).
+    fn registered_targets(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     /// Resolve (enrich) an LSP completion `item` — carrying SemanticDB `symbol`,
     /// against the presentation compiler for `target_id` — returning the enriched
     /// item as LSP JSON. Degrades to the original `item` unchanged on any
@@ -501,6 +508,19 @@ impl PcQueryService for IslandPcService {
             .lock()
             .expect("pc island state mutex")
             .is_registered(target_id)
+    }
+
+    fn registered_targets(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self
+            .state
+            .lock()
+            .expect("pc island state mutex")
+            .targets
+            .iter()
+            .map(|t| t.bsp_id.clone())
+            .collect();
+        ids.sort();
+        ids
     }
 
     fn resolve_completion_item(&self, target_id: &str, symbol: &str, item: &Value) -> Value {

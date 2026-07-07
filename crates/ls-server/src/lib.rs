@@ -10,6 +10,7 @@ pub mod capabilities;
 pub mod cli;
 pub mod convert;
 pub mod diagnostics;
+pub mod doctor;
 pub mod documents;
 pub mod jsonrpc;
 pub mod lifecycle;

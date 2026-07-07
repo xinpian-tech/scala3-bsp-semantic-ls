@@ -13,8 +13,9 @@ pub enum CliAction {
     Version,
     /// Print the offline doctor report for `dir`, then exit. `dir` is the raw
     /// argument (or `.`); the entry point resolves it to an absolute, normalized
-    /// path with [`resolve_doctor_dir`] before rendering the report.
-    Doctor { dir: PathBuf },
+    /// path with [`resolve_doctor_dir`] before rendering the report. `json`
+    /// requests the structured JSON report instead of the text layout.
+    Doctor { dir: PathBuf, json: bool },
     /// Print an offline dump of the on-disk index store at `dir` (manifest,
     /// workspace-state, and segment-header facts), then exit. Like `--doctor`,
     /// `dir` is the raw argument (or `.`) resolved with [`resolve_doctor_dir`];
@@ -54,10 +55,28 @@ pub fn parse_args(args: &[String]) -> CliAction {
         [] => CliAction::Serve,
         [flag] if flag == "--doctor" => CliAction::Doctor {
             dir: PathBuf::from("."),
+            json: false,
         },
         [flag, dir] if flag == "--doctor" && !is_flag(dir) => CliAction::Doctor {
             dir: PathBuf::from(dir),
+            json: false,
         },
+        [flag, j] if flag == "--doctor" && j == "--json" => CliAction::Doctor {
+            dir: PathBuf::from("."),
+            json: true,
+        },
+        [flag, j, dir] if flag == "--doctor" && j == "--json" && !is_flag(dir) => {
+            CliAction::Doctor {
+                dir: PathBuf::from(dir),
+                json: true,
+            }
+        }
+        [flag, dir, j] if flag == "--doctor" && !is_flag(dir) && j == "--json" => {
+            CliAction::Doctor {
+                dir: PathBuf::from(dir),
+                json: true,
+            }
+        }
         [cmd] if cmd == "dump" => CliAction::Dump {
             dir: PathBuf::from("."),
         },
@@ -106,7 +125,8 @@ mod tests {
         assert_eq!(
             parse_args(&args(&["--doctor"])),
             CliAction::Doctor {
-                dir: PathBuf::from(".")
+                dir: PathBuf::from("."),
+                json: false,
             }
         );
     }
@@ -116,7 +136,33 @@ mod tests {
         assert_eq!(
             parse_args(&args(&["--doctor", "/tmp/ws"])),
             CliAction::Doctor {
-                dir: PathBuf::from("/tmp/ws")
+                dir: PathBuf::from("/tmp/ws"),
+                json: false,
+            }
+        );
+    }
+
+    #[test]
+    fn doctor_json_flag_selects_the_structured_report() {
+        assert_eq!(
+            parse_args(&args(&["--doctor", "--json"])),
+            CliAction::Doctor {
+                dir: PathBuf::from("."),
+                json: true,
+            }
+        );
+        assert_eq!(
+            parse_args(&args(&["--doctor", "--json", "/tmp/ws"])),
+            CliAction::Doctor {
+                dir: PathBuf::from("/tmp/ws"),
+                json: true,
+            }
+        );
+        assert_eq!(
+            parse_args(&args(&["--doctor", "/tmp/ws", "--json"])),
+            CliAction::Doctor {
+                dir: PathBuf::from("/tmp/ws"),
+                json: true,
             }
         );
     }

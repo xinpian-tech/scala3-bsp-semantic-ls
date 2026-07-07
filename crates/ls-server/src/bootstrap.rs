@@ -30,6 +30,7 @@ use ls_index_model::Loc;
 use ls_pc_abi::payloads::{origin, LocationsResult, Rng, TargetConfig};
 use ls_store::Store;
 
+use crate::doctor::DoctorTargets;
 use crate::documents::DocumentStore;
 use crate::lifecycle::WorkspaceState;
 use crate::pc::{pc_options, IslandPcService, PcQueryService, SymbolResolver};
@@ -57,6 +58,42 @@ pub type BspDocFacts = Arc<dyn Fn(&str, &str) -> DocFacts + Send + Sync>;
 /// best-effort project info that attaches with the live session.
 pub fn workspace_source_facts() -> BspDocFacts {
     Arc::new(|_, _| DocFacts::workspace_source())
+}
+
+/// Distills the doctor `BSP`/`SemanticDB` target inventory from the full project
+/// model — ALL Scala 3 targets, which of them lack SemanticDB output, and the
+/// indexable targetroots — so the doctor reports off the same inventory the Scala
+/// `DoctorCommand` reads (`model.targets` + `model.unavailableTargets`), not the
+/// indexable-only ingest view. Boots nothing; pure data.
+fn doctor_targets_of(model: &BspProjectModel) -> DoctorTargets {
+    let mut all_ids: Vec<String> = model
+        .indexable_targets()
+        .iter()
+        .chain(model.unavailable_targets().iter())
+        .map(|t| t.bsp_id.clone())
+        .collect();
+    all_ids.sort();
+    let mut unavailable_ids: Vec<String> = model
+        .unavailable_targets()
+        .iter()
+        .map(|t| t.bsp_id.clone())
+        .collect();
+    unavailable_ids.sort();
+    let mut indexable_roots: Vec<(String, PathBuf)> = model
+        .indexable_targets()
+        .iter()
+        .filter_map(|t| {
+            t.semanticdb_root
+                .clone()
+                .map(|root| (t.bsp_id.clone(), root))
+        })
+        .collect();
+    indexable_roots.sort_by(|a, b| a.0.cmp(&b.0));
+    DoctorTargets {
+        all_ids,
+        unavailable_ids,
+        indexable_roots,
+    }
 }
 
 /// Maps the BSP project model to the ingest pipeline's [`WorkspaceTargets`]: one
@@ -249,6 +286,9 @@ impl<M: ModelSource> IndexBootstrap<M> {
             .collect();
         // The PC target registrations are built before the model is dropped.
         let pc_targets = pc_target_configs(&model);
+        // The doctor's full-target inventory (all Scala 3 targets + unavailable +
+        // indexable roots) is captured from the model before it is dropped.
+        let doctor_targets = doctor_targets_of(&model);
         let store = Store::open(&workspace_root.join(STORE_DIR)).map_err(|e| e.to_string())?;
         // `Arc` because the PC island's cross-file `symbol_definition` resolver
         // answers from this same query engine. `with_defaults` is the production
@@ -294,6 +334,7 @@ impl<M: ModelSource> IndexBootstrap<M> {
             // workspace; the persisted-index fallback stays inert here.
             true,
             pc_overlay,
+            doctor_targets,
         ))
     }
 }
@@ -356,6 +397,7 @@ pub fn reload_build_model(
         .map(|t| t.sourceroot.clone())
         .collect();
     let pc_targets = pc_target_configs(&model);
+    let doctor_targets = doctor_targets_of(&model);
     let uri_to_target = model
         .uri_to_target
         .iter()
@@ -386,6 +428,7 @@ pub fn reload_build_model(
         old.pc,       // reused: same island
         true,
         old.pc_overlay, // reused: same overlay inside the reused orchestrator
+        doctor_targets, // refreshed from the reloaded model
     );
     // Re-install the overlay environment with the refreshed URI mapping (the
     // sourceroots may have changed) before replaying the open buffers.

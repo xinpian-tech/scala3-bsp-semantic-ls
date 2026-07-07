@@ -23,7 +23,7 @@
 //! fallback).
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Value};
@@ -39,6 +39,10 @@ use ls_index_model::{LsError, Span};
 use crate::build_scheduler::BuildScheduler;
 use crate::capabilities::commands;
 use crate::convert::{self, DocumentHighlight, Location, SymbolKind, WorkspaceSymbol};
+use crate::doctor::{
+    DoctorReport, DoctorTargets, NixSection, PcPluginsSection, PcSection, RuntimeSection,
+    SectionState, StoreSection,
+};
 use crate::documents::DocumentStore;
 use crate::jsonrpc::{error_codes, RequestId, Response, ResponseError};
 use crate::pc::{PcLocation, PcQueryService};
@@ -95,6 +99,13 @@ pub struct CoreServices {
     /// top-level symbols. The Scala `PcOverlay` reference retained by
     /// `WorkspaceState`.
     pub(crate) pc_overlay: Arc<PcOverlayInner>,
+    /// The doctor's full-target inventory (all Scala 3 targets, the unavailable
+    /// subset, and the indexable targetroots), captured from the build project
+    /// model at bootstrap/reload. The doctor's `BSP`/`SemanticDB` sections read
+    /// off this, NOT the indexable-only ingest `WorkspaceTargets`, so a target
+    /// without SemanticDB output is counted and surfaced (the Scala doctor's
+    /// `model.targets`/`model.unavailableTargets`).
+    doctor_targets: DoctorTargets,
 }
 
 /// The retained build capability: a [`CompileService`] that can also refetch the
@@ -121,6 +132,7 @@ impl CoreServices {
         pc: Arc<dyn PcQueryService>,
         bsp_connected: bool,
         pc_overlay: Arc<PcOverlayInner>,
+        doctor_targets: DoctorTargets,
     ) -> CoreServices {
         let scheduler = BuildScheduler::new(Arc::clone(&orchestrator), Arc::clone(&compiler));
         CoreServices {
@@ -134,6 +146,7 @@ impl CoreServices {
             last_completion_target: Mutex::new(None),
             scheduler,
             pc_overlay,
+            doctor_targets,
         }
     }
 
@@ -168,6 +181,48 @@ impl CoreServices {
     /// `pcOnlySymbols`), for the `workspace/symbol` augmentation.
     pub fn pc_only_symbols(&self, query: &str) -> Vec<PcOnlySymbol> {
         self.pc_overlay.pc_only_symbols(query)
+    }
+
+    /// The live doctor report for a ready workspace (the Scala
+    /// `DoctorCommand.input`): `Runtime`/`Nix`/`Store` from the host, workspace
+    /// files, and read-only store, plus the live `BSP`/`SemanticDB`/`PC` sections
+    /// gathered from the ingested workspace targets and the PC config. Fully
+    /// non-invasive — the `PC` worker status reads `/proc/self/maps`, so the
+    /// report never boots the embedded JVM. `PC Plugins` is `unavailable` (the
+    /// `pcPluginStatus` inspection is not ported).
+    pub fn doctor_report(&self) -> DoctorReport {
+        let root = self.workspace_root.as_deref();
+        // A ready workspace loaded a build model, so BSP + SemanticDB are always
+        // available here (an empty model is a valid zero-target ready state); the
+        // `unavailable` rendering is the offline path (`DoctorReport::offline`).
+        let bsp = SectionState::Available(bsp_section(&self.doctor_targets));
+        let semanticdb = SectionState::Available(semanticdb_section(&self.doctor_targets));
+        let booted = ls_jvm::libjvm_mapped();
+        let registered = self.pc.registered_targets();
+        let pc = SectionState::Available(PcSection {
+            worker_status: if booted {
+                "booted".to_string()
+            } else {
+                "not booted (cold)".to_string()
+            },
+            // Non-invasive: a booted island holds its registered targets active;
+            // a cold island has none (enumerating active would require a query).
+            active_targets: if booted {
+                registered.clone()
+            } else {
+                Vec::new()
+            },
+            registered_targets: registered,
+        });
+        DoctorReport {
+            runtime: RuntimeSection::gather(),
+            nix: NixSection::gather(root.unwrap_or_else(|| Path::new("."))),
+            bsp,
+            semanticdb,
+            store: StoreSection::gather(root),
+            pc,
+            pc_plugins: SectionState::Unavailable(PcPluginsSection::DEFERRED.to_string()),
+        }
     }
 
     /// Enqueue a background reingest on the build-job scheduler (Scala
@@ -328,6 +383,14 @@ impl Handlers<CoreServices> for CoreHandlers {
 
     fn on_did_save(&self, services: &CoreServices, uri: &str) {
         services.schedule_save_build(uri);
+    }
+
+    fn doctor(
+        &self,
+        services: &CoreServices,
+        _workspace_root: Option<&Path>,
+    ) -> Option<DoctorReport> {
+        Some(services.doctor_report())
     }
 }
 
@@ -822,6 +885,86 @@ pub fn highlights_to_lsp(highlights: &[DocHighlight]) -> Vec<DocumentHighlight> 
 }
 
 /// A resolved workspace-symbol entry -> LSP `WorkspaceSymbol`.
+/// The live doctor `BSP` section from the full-target inventory. Server
+/// name/version are not retained in the Rust ready bundle (the initialize result
+/// is consumed at bootstrap), so they render `unknown`. Counts and lists come
+/// from ALL Scala 3 targets — including those without SemanticDB output — so the
+/// `-Xsemanticdb`-missing targets are surfaced, not hidden (the Scala
+/// `BspSection.gather`: `model.targets` + `model.unavailableTargets`).
+fn bsp_section(targets: &DoctorTargets) -> crate::doctor::BspSection {
+    crate::doctor::BspSection {
+        server_name: None,
+        server_version: None,
+        target_count: targets.all_ids.len(),
+        scala3_targets: targets.all_ids.clone(),
+        index_unavailable_targets: targets.unavailable_ids.clone(),
+    }
+}
+
+/// The live doctor `SemanticDB` section: one root fact per indexable target, its
+/// existence + `.semanticdb` file count read from the REAL SemanticDB directory
+/// (`<targetroot>/META-INF/semanticdb`, the `SemanticdbLocator` resolution), not
+/// the targetroot itself — so a target whose `META-INF/semanticdb` was cleaned
+/// reads `missing` even though its class-output targetroot still exists. Doc
+/// freshness is `None` (`unavailable: not computed yet`), matching the Scala
+/// `stats = None` gather. Roots are pre-sorted by bspId in [`DoctorTargets`].
+fn semanticdb_section(targets: &DoctorTargets) -> crate::doctor::SemanticdbSection {
+    let roots = targets
+        .indexable_roots
+        .iter()
+        .map(|(bsp_id, targetroot)| {
+            let semanticdb_dir = targetroot.join("META-INF").join("semanticdb");
+            let exists = semanticdb_dir.is_dir();
+            let semanticdb_file_count = if exists {
+                count_semanticdb_files(&semanticdb_dir)
+            } else {
+                0
+            };
+            crate::doctor::SemanticdbRoot {
+                bsp_id: bsp_id.clone(),
+                semanticdb_root: semanticdb_dir.display().to_string(),
+                exists,
+                semanticdb_file_count,
+            }
+        })
+        .collect();
+    crate::doctor::SemanticdbSection {
+        roots,
+        freshness: None,
+        generated_source_count: 0,
+        stale_targets: Vec::new(),
+    }
+}
+
+/// Count `.semanticdb` files under `root` (recursive), read-only. Symlinked
+/// entries are NOT followed — `entry.file_type()` reports the link itself, so a
+/// symlink cycle under a targetroot cannot make the doctor loop forever (a status
+/// check must always terminate).
+fn count_semanticdb_files(root: &Path) -> usize {
+    let mut count = 0;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            // `file_type()` does not traverse symlinks, so a symlinked directory
+            // is neither recursed into nor miscounted.
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                stack.push(entry.path());
+            } else if file_type.is_file()
+                && entry.path().extension().and_then(|e| e.to_str()) == Some("semanticdb")
+            {
+                count += 1;
+            }
+        }
+    }
+    count
+}
+
 pub fn workspace_symbol_of(entry: &WorkspaceSymbolEntry) -> WorkspaceSymbol {
     WorkspaceSymbol {
         name: entry.display.clone(),
@@ -1011,6 +1154,7 @@ mod tests {
             Arc::new(pc),
             true,
             pc_overlay,
+            DoctorTargets::default(),
         )
     }
 
@@ -1132,6 +1276,7 @@ mod tests {
             Arc::new(FakePc::default()),
             true,
             pc_overlay,
+            DoctorTargets::default(),
         )
         .with_scheduler_debounce(std::time::Duration::from_millis(2));
         (services, calls)
@@ -1588,6 +1733,65 @@ mod tests {
             error,
             LsError::NoSemanticdb { uri } if uri == "file:///ws/A.scala"
         ));
+    }
+
+    // The doctor BSP section counts and lists ALL Scala 3 targets and surfaces the
+    // ones without SemanticDB output (the misconfiguration the doctor exists to
+    // report) — it must NOT read off the indexable-only ingest view.
+    #[test]
+    fn bsp_section_counts_all_targets_and_surfaces_the_unavailable_ones() {
+        let targets = DoctorTargets {
+            all_ids: vec!["a".to_string(), "b".to_string()],
+            unavailable_ids: vec!["b".to_string()],
+            indexable_roots: vec![("a".to_string(), PathBuf::from("/ws/out-a"))],
+        };
+        let section = bsp_section(&targets);
+        assert_eq!(section.target_count, 2);
+        assert_eq!(
+            section.scala3_targets,
+            vec!["a".to_string(), "b".to_string()]
+        );
+        assert_eq!(section.index_unavailable_targets, vec!["b".to_string()]);
+    }
+
+    // The doctor SemanticDB section resolves each root to the REAL
+    // `<targetroot>/META-INF/semanticdb` directory (the locator semantics), so a
+    // targetroot that exists but has no `META-INF/semanticdb` reads `missing`.
+    #[test]
+    fn semanticdb_section_resolves_the_meta_inf_semanticdb_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        // Target `a`: a real META-INF/semanticdb with one `.semanticdb` file.
+        let root_a = dir.path().join("out-a");
+        let sdb_a = root_a.join("META-INF").join("semanticdb");
+        std::fs::create_dir_all(&sdb_a).unwrap();
+        std::fs::write(sdb_a.join("A.scala.semanticdb"), b"x").unwrap();
+        // Target `b`: the targetroot exists (class output) but no META-INF/semanticdb.
+        let root_b = dir.path().join("out-b");
+        std::fs::create_dir_all(&root_b).unwrap();
+
+        let targets = DoctorTargets {
+            all_ids: vec!["a".to_string(), "b".to_string()],
+            unavailable_ids: Vec::new(),
+            indexable_roots: vec![
+                ("a".to_string(), root_a.clone()),
+                ("b".to_string(), root_b.clone()),
+            ],
+        };
+        let section = semanticdb_section(&targets);
+        assert_eq!(section.roots.len(), 2);
+        // `a`: exists, one file, root reported as the META-INF/semanticdb dir.
+        assert!(section.roots[0].exists, "a should exist");
+        assert_eq!(section.roots[0].semanticdb_file_count, 1);
+        assert!(
+            section.roots[0]
+                .semanticdb_root
+                .ends_with("META-INF/semanticdb"),
+            "{}",
+            section.roots[0].semanticdb_root
+        );
+        // `b`: targetroot exists but the semanticdb dir does not → missing.
+        assert!(!section.roots[1].exists, "b's semanticdb dir is missing");
+        assert_eq!(section.roots[1].semanticdb_file_count, 0);
     }
 
     // ingest_summary reproduces Bootstrap.ingestSummary's format byte-for-byte.

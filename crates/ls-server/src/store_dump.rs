@@ -80,6 +80,36 @@ pub fn dump_report(root: &Path) -> String {
     out
 }
 
+/// The typed store facts for the doctor `Store` section: a `(status, facts)`
+/// pair. `status` names the store state (`no workspace root` / `no store` /
+/// `empty` / `error` / `active`); `facts` are the human-readable fact lines. The
+/// read is strictly read-only (`Store::open_readonly`), so it boots no JVM and
+/// never disturbs a live server that owns the same store.
+pub fn store_facts(workspace_root: Option<&Path>) -> (String, Vec<String>) {
+    match workspace_root {
+        None => (
+            "no workspace root".to_string(),
+            vec!["workspace root not set".to_string()],
+        ),
+        Some(root) => {
+            let store_dir = root.join(crate::bootstrap::STORE_DIR);
+            if !store_dir.exists() {
+                return (
+                    "no store".to_string(),
+                    vec!["no store at this workspace root".to_string()],
+                );
+            }
+            let facts = store_fact_lines(&store_dir);
+            let status = match facts.first() {
+                Some(line) if line.starts_with("error:") => "error",
+                Some(line) if line.starts_with("manifest: none") => "empty",
+                _ => "active",
+            };
+            (status.to_string(), facts)
+        }
+    }
+}
+
 /// The doctor `Store` section: the store facts indented under a `Store:` heading
 /// (the retained `Doctor.section` layout). The store lives at
 /// `<workspace_root>/.scala3-bsp-semantic-ls`; a workspace root that was never

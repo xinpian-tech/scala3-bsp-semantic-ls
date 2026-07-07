@@ -208,7 +208,8 @@ fn pc_hit(env: &Env, file_uri: &str, line: u32, character: u32) -> Option<Overla
             && span_of_pc(dl.span.clone()) == span
     });
     // PC-only exactly when the definition resolves only into non-workspace
-    // (synthetic/plugin) origins (plan 14.5).
+    // (synthetic/plugin) origins — a symbol that exists only through a PC plugin,
+    // which global references and rename must refuse.
     let pc_only = !defs.locations.is_empty()
         && defs
             .locations

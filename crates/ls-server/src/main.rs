@@ -12,10 +12,11 @@ use std::process::ExitCode;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
+use ls_server::doctor::DoctorReport;
 use ls_server::{
-    dump_report, parse_args, resolve_doctor_dir, serve, store_section, CliAction, CoreHandlers,
-    IndexBootstrap, LiveBspModelSource, PublishDiagnosticsParams, ServerCore, ServerHooks,
-    SERVER_NAME, SERVER_VERSION,
+    dump_report, parse_args, resolve_doctor_dir, serve, CliAction, CoreHandlers, IndexBootstrap,
+    LiveBspModelSource, PublishDiagnosticsParams, ServerCore, ServerHooks, SERVER_NAME,
+    SERVER_VERSION,
 };
 
 fn main() -> ExitCode {
@@ -25,9 +26,12 @@ fn main() -> ExitCode {
             println!("{}", version_line());
             ExitCode::SUCCESS
         }
-        CliAction::Doctor { dir } => {
+        CliAction::Doctor { dir, json } => {
             let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-            println!("{}", offline_doctor_report(&resolve_doctor_dir(&dir, &cwd)));
+            println!(
+                "{}",
+                offline_doctor_report(&resolve_doctor_dir(&dir, &cwd), json)
+            );
             ExitCode::SUCCESS
         }
         CliAction::Dump { dir } => {
@@ -52,21 +56,25 @@ fn version_line() -> String {
     format!("{SERVER_NAME} {SERVER_VERSION}")
 }
 
-/// `--doctor [dir]`: the offline report. Pre-bootstrap the build server and
-/// presentation compiler are not connected, but the on-disk index store under the
-/// workspace root is inspected directly, so the `Store` section renders the same
-/// manifest/segment/state facts the live doctor shows. The remaining
-/// `DoctorCommand` sections (Runtime host facts + live island status,
-/// BSP/SemanticDB/PC/Nix) are gathered as they are ported.
-fn offline_doctor_report(root: &Path) -> String {
-    format!(
+/// `--doctor [dir]`: the offline report over the typed [`DoctorReport`] model.
+/// Pre-bootstrap the build server and presentation compiler are not connected, so
+/// the live `BSP`/`SemanticDB`/`PC`/`PC Plugins` sections render `unavailable`;
+/// `Runtime`/`Nix`/`Store` are gathered from the host, the workspace files, and
+/// the read-only on-disk store. `--json` returns the structured object. Boots no
+/// JVM.
+fn offline_doctor_report(root: &Path, json: bool) -> String {
+    let report = DoctorReport::offline(root);
+    let header = format!(
         "{SERVER_NAME} {SERVER_VERSION}\n\
          state: offline (--doctor): build server and presentation compiler not connected\n\
-         workspace: {}\n\n\
-         {}",
-        root.display(),
-        store_section(Some(root)),
-    )
+         workspace: {}",
+        root.display()
+    );
+    if json {
+        report.render_json().to_string()
+    } else {
+        format!("{header}\n\n{}", report.render_text())
+    }
 }
 
 /// Runs the stdio JSON-RPC server: the live-BSP bootstrap on `initialized`, the
@@ -114,7 +122,7 @@ mod tests {
 
     #[test]
     fn offline_doctor_report_names_the_workspace_state_and_store() {
-        let report = offline_doctor_report(Path::new("/ws/x"));
+        let report = offline_doctor_report(Path::new("/ws/x"), false);
         assert!(report.contains("scala3-bsp-semantic-ls"));
         assert!(report.contains("workspace: /ws/x"));
         assert!(report.contains("offline"));
@@ -124,5 +132,17 @@ mod tests {
             report.contains("no store at this workspace root"),
             "{report}"
         );
+        // All seven headings render, live-only ones as `unavailable`.
+        assert!(report.contains("Runtime:"), "{report}");
+        assert!(report.contains("BSP:\n  unavailable:"), "{report}");
+    }
+
+    #[test]
+    fn offline_doctor_json_is_a_structured_object_with_a_store_key() {
+        let json = offline_doctor_report(Path::new("/ws/x"), true);
+        let value: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        assert!(value.get("store").is_some());
+        assert!(value.get("sqlite").is_none());
+        assert_eq!(value["bsp"]["unavailable"], "no BSP connection");
     }
 }
