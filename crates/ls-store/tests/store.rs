@@ -177,6 +177,66 @@ fn janitor_defers_deletion_until_snapshot_drops() {
     assert!(state_file(root, 2).is_file());
 }
 
+fn committed_segment_dirs(root: &Path) -> usize {
+    std::fs::read_dir(root.join("segments"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .count()
+}
+
+#[test]
+fn publishes_auto_reclaim_drained_superseded_generations() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let store = Store::open(root).unwrap();
+
+    // Three publishes, retaining nothing. A publish loads the current snapshot
+    // into a local before swapping, so it pins the immediately-prior generation
+    // across its OWN publish-tail janitor; that generation is reclaimed by the
+    // NEXT publish's janitor. So after gen2, gen1 is still on disk; after gen3,
+    // gen1 is auto-reclaimed with NO explicit `run_janitor` and no retained
+    // snapshot — the publish-time half of the reclaim obligation (drained
+    // superseded generations must not accumulate across re-ingests). The
+    // retained-then-released half is covered by
+    // `janitor_defers_deletion_until_snapshot_drops`.
+    store.publish(&data(1, 1), b"g1", 0).unwrap();
+    store.publish(&data(1, 1), b"g2", 0).unwrap();
+    assert!(
+        seg_dir(root, 1).is_dir(),
+        "gen1 is pinned across its immediate successor's janitor pass"
+    );
+    store.publish(&data(1, 1), b"g3", 0).unwrap();
+    assert!(
+        !seg_dir(root, 1).exists(),
+        "gen1 segment not auto-reclaimed by a later publish"
+    );
+    assert!(
+        !state_file(root, 1).exists(),
+        "gen1 state not auto-reclaimed by a later publish"
+    );
+    assert!(seg_dir(root, 3).is_dir());
+    assert!(state_file(root, 3).is_file());
+
+    // Superseded generations do not accumulate: only the active generation and
+    // at most the just-superseded (still-pinned) one remain on disk.
+    assert!(
+        committed_segment_dirs(root) <= 2,
+        "drained generations accumulated: {} segment dirs",
+        committed_segment_dirs(root)
+    );
+
+    // Once the last publish's local snapshot is gone, an explicit janitor sweep
+    // reclaims the remainder → exactly one committed segment generation.
+    store.run_janitor();
+    assert_eq!(
+        committed_segment_dirs(root),
+        1,
+        "expected exactly one committed segment dir after the janitor"
+    );
+    assert!(seg_dir(root, 3).is_dir());
+}
+
 // ---- negative: crash recovery (torn tmp / crash windows) ----
 
 #[test]

@@ -16,8 +16,11 @@
 //! compiler (success + compile failure), `buildTarget/didChange` reload, the
 //! dirty-buffer PC-only surface (JVM-free), and LSP shutdown teardown.
 //!
-//! The presentation-compiler completion scenario needs a real embedded JVM and is
-//! env-gated exactly like `live_pc.rs` (skips cleanly when the JVM env is absent).
+//! This binary boots no embedded JVM: the fake fixture corpus has no matching
+//! runtime classpath, so live presentation-compiler completion is covered where
+//! it is sound — over real mill in the `real_bsp_pc` binary (one JVM per process).
+//! Keeping this binary island-free makes its cold-start `libjvm_mapped()` check
+//! unconditionally valid.
 
 use std::collections::VecDeque;
 use std::io::{BufReader, Cursor, Read, Write};
@@ -619,22 +622,12 @@ fn workspace_symbol_over_the_real_bsp_model() {
 // A cold-start session that answers index-only queries over the REAL BSP client
 // (a real `BspSession`, not the fixture model) must never boot the embedded JVM:
 // no presentation-compiler request runs, so the island stays cold and libjvm is
-// never mapped into the process. Guarded on the full presentation-compiler env
-// being present because only then can a concurrent `pc_completion_over_the_fake_bsp_model`
-// in this binary boot the JVM and make the process-global `libjvm_mapped()` check
-// unreliable; the meaningful no-PC configuration (the JVM never boots) is exactly
-// when the PC env is incomplete, which is when this assertion runs.
+// never mapped into the process. This binary boots no island — the live-PC
+// completion lives in its own `real_bsp_pc` binary (one JVM per process) — so the
+// process-global `libjvm_mapped()` check is unconditionally sound here and runs
+// in every configuration.
 #[test]
 fn an_index_only_session_over_the_real_bsp_client_stays_jvm_free() {
-    if std::env::var_os("LS_LIBJVM").is_some()
-        && std::env::var_os("PC_HOST_AGENT_JAR").is_some()
-        && std::env::var_os("LS_PC_TARGET_CLASSPATH").is_some()
-    {
-        eprintln!(
-            "fake_bsp_e2e: skipping the cold-start JVM check — a concurrent PC test may boot the JVM"
-        );
-        return;
-    }
     assert!(
         !ls_server::libjvm_mapped(),
         "the embedded JVM must be unmapped before any session runs"
@@ -1103,50 +1096,4 @@ fn lsp_shutdown_then_exit_tears_down_the_bsp_session() {
         e2e.server.shutdown_requested.load(Ordering::SeqCst)
             && e2e.server.exit_received.load(Ordering::SeqCst)
     });
-}
-
-// Env-gated (like `live_pc.rs`): with a real JVM + PC host jar + a target
-// classpath, completion over an open buffer routes through the real island PC.
-// Skips cleanly when the JVM environment is absent.
-#[test]
-fn pc_completion_over_the_fake_bsp_model() {
-    if std::env::var_os("LS_LIBJVM").is_none()
-        || std::env::var_os("PC_HOST_AGENT_JAR").is_none()
-        || std::env::var_os("LS_PC_TARGET_CLASSPATH").is_none()
-    {
-        eprintln!(
-            "fake_bsp_e2e: skipping PC completion — set LS_LIBJVM + PC_HOST_AGENT_JAR + \
-             LS_PC_TARGET_CLASSPATH to run it"
-        );
-        return;
-    }
-    let mut core = ServerCore::new();
-    let e2e = setup(core.reload_flag());
-    // Complete a member of the fixture `Core` in an open buffer under fixture-a.
-    let uri = core_uri();
-    let text = "package pkga\n\nobject Probe:\n  val c = Core.make(\"x\").\n";
-    let input = session_input(
-        &e2e.workspace_root,
-        vec![
-            did_open(&uri, text),
-            request(
-                2,
-                "textDocument/completion",
-                json!({
-                    "textDocument": { "uri": uri },
-                    "position": { "line": 3, "character": 24 },
-                }),
-            ),
-        ],
-    );
-    let out = serve_pumped(&mut core, &e2e.source, input);
-
-    let completion = &by_id(&out, 2)["result"];
-    let items = completion["items"]
-        .as_array()
-        .unwrap_or_else(|| panic!("completion returned no list: {completion}"));
-    assert!(
-        !items.is_empty(),
-        "the real island PC returned no completions: {completion}"
-    );
 }
