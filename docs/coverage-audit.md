@@ -1,132 +1,144 @@
 # Rust port coverage audit
 
-This audit maps every retained Scala test suite (`modules/*/test/`), every §18.1
-references/rename correctness case, and every E0–E8 real-BSP row onto the Rust
-test(s) that prove it, and classifies the gaps. It is the fixture-coverage
-acceptance gate for the big-bang rewrite (the plan's CORE_RISKS: "big-bang makes
-fixture coverage existential").
+This audit maps **every** retained Scala test file under `modules/*/test/` (a
+path-qualified inventory, so duplicate basenames like the two
+`Jdk25GuardSuite.scala` never collapse), plus the §18.1 references/rename
+correctness matrix and the E0–E8 real-BSP rows, onto the Rust test(s) that prove
+it, and classifies the gaps. It is the fixture-coverage acceptance gate for the
+big-bang rewrite (the plan's CORE_RISKS: "big-bang makes fixture coverage
+existential"). `scripts/check-audit-inventory.sh` mechanically checks that every
+retained test-file path appears here.
 
-**Method.** The mapping was produced by a Codex analysis of both trees and
-independently cross-checked by two focused scans (a §18.1 matrix parity scan and
-a per-module suite scan); every disputed claim was resolved by reading the actual
-assertions on both sides. The Scala tree is retained read-only until cutover
-(task22), so each Rust test is diffed against its source suite.
+**Classification codes.**
+- **PORTED** — a Rust test proves the same behavior (named in the row).
+- **NON-PORT** — out of scope by a ratified decision (SQLite removed by the
+  decision-table row 7 of the rewrite decision record, `rlcr-rust.md:284`; AOT /
+  `AotTrain`; `ls-tasty` v1.1; the forked PC worker, replaced by the embedded
+  island; or a DEC-1/DEC-2 trim). The row states the authority.
+- **ISLAND** — the JVM presentation-compiler island is **not rewritten** (`ls-pc`
+  facade/SPI, `ls-zaozi-pcplugin`; decision table row 1, `rlcr-rust.md:278`).
+  These suites stay green on the retained Scala code (**AC-6.5 island parity**);
+  the Rust side proves the vtable boundary (named in the row).
+- **TASK22** — strictly docs/deletion/bench work with no runtime behavior to
+  assert now.
+- **SUPPORT** — a fixture/harness, not a standalone suite.
 
-**Classification.** Each Scala suite is exactly one of: **PORTED** (a Rust test
-proves the same behavior), **INTENTIONAL NON-PORT** (out of scope by a ratified
-decision — SQLite removal DEC-7, AOT/`AotTrain`, `ls-tasty`/dependency-index
-v1.1, or a DEC-1/DEC-2 trim), **REAL GAP** (a mandatory behavior with no proving
-Rust test), or **TASK22 OBLIGATION** (strictly docs/deletion/bench work).
+> Note: SQLite removal's authority is the **decision-table row 7** of the ratified
+> rewrite decision record, NOT "DEC-7" (DEC-7 is the `PcFacade.diagnostics`-ABI
+> decision, `rlcr-rust.md:229`). This audit cites the decision table.
 
 ## Verdict
 
-- **§18.1 correctness matrix: fully ported (22/22 families).** Every safe family
-  that the Scala `ReferencesAndQuerySuite`/`RenameSuite`/`RenameMutationSuite`
-  pins with an exact span set / exact rejection reason is pinned identically in
-  `crates/ls-engine/tests/{references_matrix,rename_matrix}.rs`; the SemanticDB
-  characterizations (`ScalacIntegrationSuite`) are in
-  `crates/ls-semanticdb/tests/scalac_integration.rs`.
-- **E0–E8 real-BSP rows: every non-trimmed row ported** over live mill in
-  `crates/ls-server/tests/real_bsp_{e2e,pc,pc_recovery}.rs`.
-- **One real gap found and closed this round:** the seeded-random differential
-  corpus (`RandomCorpusTest`) had no Rust equivalent → ported as
-  `crates/ls-store/tests/random_corpus.rs` (11 differential tests, green).
-- **SQLite / AOT / `ls-tasty`** suites are intentional non-ports by ratified
-  decision; the **DEC-1/DEC-2 trims** (`pcPluginStatus`, no-BSP warm restart) are
-  deferred and owe a task22 deferral note.
+- **§18.1: fully ported (22/22 families)** — exact span sets / exact rejection
+  reasons where the Scala oracle asserts them; inclusion-only where the Scala
+  oracle itself is inclusion-only (faithful parity, see §18.1 section).
+- **E0–E8: every non-trimmed row ported** over live mill.
+- **Zaozi cross-file navigation re-pointed at the production vtable** in
+  `crates/ls-jvm/tests/live_zaozi.rs` (verified live); the single-buffer
+  plugin-internal steering shapes stay ISLAND (AC-6.5).
+- Gaps found and closed across R15/R16: `RandomCorpusTest` (differential),
+  `IngestJanitorSuite` publish-time auto-reclaim, and the Zaozi normal-member /
+  exact-range / hover / missing-field boundary cases.
 
-## Per-suite coverage
+## Path-qualified inventory (all retained Scala test files)
 
-| Scala suite | module | class | proving Rust test / rationale |
-|---|---|---|---|
-| BspDiscoveryTest | ls-bsp | PORTED | `ls-bsp/tests/discovery.rs` |
-| BspLaunchTest | ls-bsp | PORTED | `ls-bsp/tests/launch.rs` |
-| BspProjectModelTest | ls-bsp | PORTED | `ls-bsp/tests/project_model.rs` |
-| BspSessionTest | ls-bsp | PORTED | `ls-bsp/tests/session.rs`, `mill_smoke.rs` |
-| SemanticdbFlagsTest | ls-bsp | PORTED | `ls-bsp/tests/semanticdb_flags.rs` |
-| WireDecoderSuite | ls-semanticdb | PORTED | `ls-semanticdb/tests/wire.rs` |
-| SymbolStringsSuite | ls-semanticdb | PORTED | `ls-semanticdb/tests/symbols.rs` |
-| ScalacIntegrationSuite | ls-semanticdb | PORTED | `ls-semanticdb/tests/scalac_integration.rs` (incl. `derives_clause_case_class_defined_and_derived_given_synthetic_only`) |
-| Md5Suite | ls-semanticdb | PORTED | `ls-semanticdb/tests/md5.rs`, `pipeline.rs` |
-| LocatorSuite | ls-semanticdb | PORTED | `ls-semanticdb/tests/locator.rs` |
-| GroupsSuite | ls-semanticdb | PORTED | `ls-semanticdb/tests/groups.rs`, `pipeline.rs` |
-| TargetGraphSuite | ls-index-model | PORTED | `ls-index-model/tests/properties.rs`, `src/bitset.rs` tests |
-| RuntimeContractSuite | ls-index-model | PORTED | `ls-index-model/tests/properties.rs`, `src/text.rs` tests |
-| RenameSuite | ls-rename | PORTED | `ls-engine/tests/rename_matrix.rs` (exact edit spans + rejection reasons) |
-| RenameMutationSuite | ls-rename | PORTED | `ls-engine/tests/rename_matrix.rs` (`stale_md5_*`, `fresh_snapshot_*`, `shared_source_disagreement_rejected`) |
-| ReferencesAndQuerySuite | ls-rename | PORTED | `ls-engine/tests/references_matrix.rs` — assertion-for-assertion parity (see §18.1 note) |
-| RawPathSuite | ls-rename | PORTED | `ls-engine/tests/engine.rs::raw_path_write_through_runs_inline_and_heals`, `references_raw_fallback_serves_same_doc` (production write-through) |
-| UnitSuites (Identifier / SymbolEncoding / WorkspaceTargets) | ls-rename | PORTED | identifier backtick-quoting `ls-engine/tests/engine.rs` (`identifiers::encode`); symbol string round-trip `engine.rs` + `ls-semanticdb/tests/symbols.rs`; reverse-dependency closure + duplicate-bspId refusal `ls-bsp/tests/project_model.rs`, `ls-engine/src/targets.rs` |
-| IngestJanitorSuite | ls-rename | PORTED | publish-time auto-reclaim of drained superseded generations `ls-store/tests/store.rs::publishes_auto_reclaim_drained_superseded_generations` (added this round); held-snapshot-defers-deletion `store.rs::janitor_defers_deletion_until_snapshot_drops`; live end-to-end `real_bsp_e2e.rs::real_bsp_repeated_saves_keep_a_single_committed_segment_dir` |
-| HandBuiltCorpusTest | ls-postings | PORTED | `ls-store/tests/segment.rs`, `symbol_at.rs` |
-| IntervalIndexTest | ls-postings | PORTED | `ls-store/tests/symbol_at.rs::interval_block_pruning`, `segment.rs::multi_block_group_chunks_and_skips` |
-| CorruptionTest | ls-postings | PORTED | `ls-store/tests/segment.rs`, `validation.rs`, `store.rs` corruption cases |
-| CurrentSnapshotFileSuite | ls-postings | PORTED | `ls-store/tests/store.rs::publish_then_reopen_preserves_pair`, `second_publish_increments_generation` (current.json → manifest+generation) |
-| SnapshotJanitorTest | ls-postings | PORTED | `ls-store/tests/store.rs::janitor_defers_deletion_until_snapshot_drops`; real-BSP segment hygiene |
-| SnapshotLifecycleTest | ls-postings | PORTED | `ls-store/tests/store.rs::retained_snapshot_survives_publish`, `second_publish_increments_generation` |
-| **RandomCorpusTest** | ls-postings | **REAL GAP → CLOSED** | `ls-store/tests/random_corpus.rs` (added this round) |
-| Jdk25GuardSuite | ls-postings | INTENTIONAL NON-PORT | Rust store is not Java-25-bound; guard obsolete |
-| RenderTest | ls-doctor | PORTED | `ls-server/src/doctor.rs::text_renders_the_seven_sections_in_fixed_order`, `unavailable_sections_render_the_reason_not_omitted` |
-| RuntimeNixSectionsTest | ls-doctor | PORTED | `ls-server/src/doctor.rs::text_renders_runtime_nix_and_pc_facts` |
-| StoreSectionsTest | ls-doctor | PORTED | `ls-server/src/doctor.rs::json_has_the_store_key_and_no_sqlite_or_postings`, real-BSP doctor checks |
-| BspLauncherCompatTest | ls-doctor | PORTED | `ls-bsp/tests/session.rs`, `mill_smoke.rs` (BSP launcher/session compat) |
-| CapabilitiesSuite | ls-core | PORTED | `ls-server/src/capabilities.rs` tests; `server_surface.rs` (incl. absence of `pcPluginStatus`) |
-| BuildTargetsChangeBufferingSuite | ls-core | PORTED | `ls-server/tests/bootstrap.rs::a_build_target_change_*` |
-| BootstrapRecoverySuite | ls-core | PORTED | `ls-server/tests/bootstrap.rs::no_bsp_recovered_index_*`; `ls-store/tests/store.rs::{torn_state_tmp_recovers_old,crash_after_state_before_manifest_recovers_old,state_generation_mismatch_rejected}` |
-| BootstrapJanitorSuite | ls-core | PORTED | `ls-store/tests/store.rs::open_readonly_recovers_without_creating_or_cleaning` (+ `assert_no_tmp_debris`) |
-| DiagnosticRouterSuite | ls-core | PORTED | `ls-server/src/diagnostics.rs` tests; `fake_bsp_e2e.rs::compile_error_diagnostics_are_published_to_the_client` |
-| DoctorCommandSuite | ls-core | PORTED | `ls-server/tests/server_surface.rs::execute_command_doctor_renders_text_and_json` |
-| ExecuteCommandSuite | ls-core | PORTED | `ls-server/tests/server_surface.rs::execute_command_reindex_compile_and_unknown` (`pcPluginStatus` trimmed — DEC-1) |
-| IndexPcDefinitionResolverSuite | ls-core | PORTED | `ls-engine/tests/engine.rs::symbol_definition_*`; `ls-jvm/tests/live_definition.rs` |
-| LspConvertSuite | ls-core | PORTED | `ls-server/src/convert.rs` tests |
-| PcOverlaySuite | ls-core | PORTED | `ls-server/src/pc_overlay.rs` tests; `references_matrix.rs` overlay tests; `fake_bsp_e2e.rs` PC-only-over-the-wire |
-| PcBackendSuite | ls-core | PORTED | `ls-jvm/tests/{live_boundary,live_recovery}.rs`; `real_bsp_pc_recovery.rs` (embedded island/watchdog model) |
-| UrisSuite | ls-core | PORTED | `ls-index-model/src/uri.rs` tests |
-| LsEndToEndTest | ls-core | PORTED | `ls-server/tests/fake_bsp_e2e.rs`, `bootstrap.rs`, `server_surface.rs` |
-| RealBspCoreTest | ls-core | PORTED | `real_bsp_e2e.rs`, `real_bsp_pc.rs` (E0/E1/E4/E5) |
-| RealBspLifecycleTest | ls-core | PORTED | `real_bsp_e2e.rs` (E2/E3/E6/E8 segment hygiene) |
-| RealBspIntegrationTest | ls-core | PORTED | `real_bsp_e2e.rs`, `real_bsp_pc.rs` |
-| RealBspIsolationTest | ls-core | PORTED | `real_bsp_pc_recovery.rs`, `ls-jvm/tests/live_recovery.rs` (E7 dispatch-generation recovery; E9 AOT non-port) |
-| AotTrainIntegrationTest | ls-core | INTENTIONAL NON-PORT | AOT island cache / `AotTrain` out of scope (also E9) |
-| MarshalSuite / CodecSuite / LayoutSuite / BoundarySuite / PcHostConfigSuite / PcHostOpsSuite | ls-pc-host | PORTED | `ls-pc-abi/tests/{roundtrip,fuzz,boundary,canary}.rs`; `ls-jvm/tests/live_boundary.rs` |
-| PcQuerySuite / PcSymbolSearchSuite / Utf16TextSuite / WorkerProtocolSuite / PcWorkerManagerSuite / ForkedWorkerSuite / PluginManagerSuite / CompilerPluginConfigSuite | ls-pc | PORTED | `ls-jvm/tests/{live_boundary,live_definition,live_recovery,live_zaozi}.rs`; `real_bsp_pc*.rs`. The old forked-worker/LRU-manager shape is replaced by the embedded island + watchdog; plugin-internals stay island-side (retained Scala). |
-| FuzzyRankSuite | (sqlite metastore) | PORTED | `ls-store/tests/search.rs` (fuzzy ranking moved to the segment search section) |
-| Sqlite3Suite / SchemaSuite / ReaderPoolSuite / MetaStoreSuite / DbSuite / TempDbFixture / IngestCheckpointSuite | sqlite | INTENTIONAL NON-PORT | DEC-7 removed SQLite (DB/WAL/schema/reader-pool/metastore/checkpoint); persistence + search replaced by the segment store, covered by `ls-store/tests/*` |
-| BenchSuite / OfflineCompileGuardSuite | ls-bench | TASK22 OBLIGATION | bench-smoke port; no server runtime behavior to assert now |
-| FakeBuildServer, E2eSupport, RealBspFixture, DoctorTestSupport, PcTestHarness, TestSupport, FixtureWorkspace, ProtoTestWriter | (various) | SUPPORT | fixtures/harnesses, not standalone suites |
+| Path | Class | Proving Rust test / rationale |
+|---|---|---|
+| modules/ls-bench/test/src/ls/bench/BenchSuite.scala | TASK22 | bench-smoke port; no server runtime behavior to assert now |
+| modules/ls-bench/test/src/ls/bench/OfflineCompileGuardSuite.scala | TASK22 | offline-CI compile guard; bench/packaging obligation |
+| modules/ls-bsp/test/src/ls/bsp/BspDiscoveryTest.scala | PORTED | `ls-bsp/tests/discovery.rs` |
+| modules/ls-bsp/test/src/ls/bsp/BspLaunchTest.scala | PORTED | `ls-bsp/tests/launch.rs` |
+| modules/ls-bsp/test/src/ls/bsp/BspProjectModelTest.scala | PORTED | `ls-bsp/tests/project_model.rs` |
+| modules/ls-bsp/test/src/ls/bsp/BspSessionTest.scala | PORTED | `ls-bsp/tests/session.rs`, `mill_smoke.rs` |
+| modules/ls-bsp/test/src/ls/bsp/FakeBuildServer.scala | SUPPORT | in-file fake BSP harness (→ `ls-server/tests/fake_bsp_e2e.rs`) |
+| modules/ls-bsp/test/src/ls/bsp/SemanticdbFlagsTest.scala | PORTED | `ls-bsp/tests/semanticdb_flags.rs` |
+| modules/ls-core/test/src/ls/core/AotTrainIntegrationTest.scala | NON-PORT | AOT island cache / `AotTrain` out of scope (also E9) |
+| modules/ls-core/test/src/ls/core/BootstrapJanitorSuite.scala | PORTED | `ls-store/tests/store.rs::open_readonly_recovers_without_creating_or_cleaning` (+ `assert_no_tmp_debris`) |
+| modules/ls-core/test/src/ls/core/BootstrapRecoverySuite.scala | PORTED | `ls-server/tests/bootstrap.rs::no_bsp_recovered_index_*`; `ls-store/tests/store.rs::{torn_state_tmp_recovers_old,crash_after_state_before_manifest_recovers_old,state_generation_mismatch_rejected}` |
+| modules/ls-core/test/src/ls/core/BuildTargetsChangeBufferingSuite.scala | PORTED | `ls-server/tests/bootstrap.rs::a_build_target_change_*` |
+| modules/ls-core/test/src/ls/core/CapabilitiesSuite.scala | PORTED | `ls-server/src/capabilities.rs` tests; `server_surface.rs` (incl. absence of `pcPluginStatus`) |
+| modules/ls-core/test/src/ls/core/DiagnosticRouterSuite.scala | PORTED | `ls-server/src/diagnostics.rs` tests; `fake_bsp_e2e.rs::compile_error_diagnostics_are_published_to_the_client` |
+| modules/ls-core/test/src/ls/core/DoctorCommandSuite.scala | PORTED | `ls-server/tests/server_surface.rs::execute_command_doctor_renders_text_and_json` |
+| modules/ls-core/test/src/ls/core/E2eSupport.scala | SUPPORT | fake-BSP e2e helpers |
+| modules/ls-core/test/src/ls/core/ExecuteCommandSuite.scala | PORTED | `ls-server/tests/server_surface.rs::execute_command_reindex_compile_and_unknown` (`pcPluginStatus` trimmed — DEC-1) |
+| modules/ls-core/test/src/ls/core/IndexPcDefinitionResolverSuite.scala | PORTED | `ls-engine/tests/engine.rs::symbol_definition_*`; `ls-jvm/tests/live_definition.rs` |
+| modules/ls-core/test/src/ls/core/LsEndToEndTest.scala | PORTED | `ls-server/tests/fake_bsp_e2e.rs`, `bootstrap.rs`, `server_surface.rs` |
+| modules/ls-core/test/src/ls/core/LspConvertSuite.scala | PORTED | `ls-server/src/convert.rs` tests |
+| modules/ls-core/test/src/ls/core/PcBackendSuite.scala | PORTED | `ls-jvm/tests/{live_boundary,live_recovery}.rs`; `real_bsp_pc_recovery.rs` (embedded island/watchdog model) |
+| modules/ls-core/test/src/ls/core/PcOverlaySuite.scala | PORTED | `ls-server/src/pc_overlay.rs` tests; `references_matrix.rs` overlay tests; `fake_bsp_e2e.rs` PC-only-over-the-wire |
+| modules/ls-core/test/src/ls/core/RealBspCoreTest.scala | PORTED | `real_bsp_e2e.rs`, `real_bsp_pc.rs` (E0/E1/E4/E5) |
+| modules/ls-core/test/src/ls/core/RealBspFixture.scala | SUPPORT | → `ls-server/tests/real_bsp_common/mod.rs` |
+| modules/ls-core/test/src/ls/core/RealBspIntegrationTest.scala | PORTED | `real_bsp_e2e.rs`, `real_bsp_pc.rs` |
+| modules/ls-core/test/src/ls/core/RealBspIsolationTest.scala | PORTED | `real_bsp_pc_recovery.rs`, `ls-jvm/tests/live_recovery.rs` (E7; E9 AOT NON-PORT) |
+| modules/ls-core/test/src/ls/core/RealBspLifecycleTest.scala | PORTED | `real_bsp_e2e.rs` (E2/E3/E6/E8) |
+| modules/ls-core/test/src/ls/core/UrisSuite.scala | PORTED | `ls-index-model/src/uri.rs` tests |
+| modules/ls-doctor/test/src/ls/doctor/BspLauncherCompatTest.scala | PORTED | `ls-bsp/tests/session.rs`, `mill_smoke.rs` |
+| modules/ls-doctor/test/src/ls/doctor/DoctorTestSupport.scala | SUPPORT | doctor test fixtures |
+| modules/ls-doctor/test/src/ls/doctor/RenderTest.scala | PORTED | `ls-server/src/doctor.rs::text_renders_the_seven_sections_in_fixed_order`, `unavailable_sections_render_the_reason_not_omitted` |
+| modules/ls-doctor/test/src/ls/doctor/RuntimeNixSectionsTest.scala | PORTED | `ls-server/src/doctor.rs::text_renders_runtime_nix_and_pc_facts` |
+| modules/ls-doctor/test/src/ls/doctor/StoreSectionsTest.scala | PORTED | `ls-server/src/doctor.rs::json_has_the_store_key_and_no_sqlite_or_postings`; real-BSP doctor checks |
+| modules/ls-index-model/test/src/ls/index/RuntimeContractSuite.scala | PORTED | `ls-index-model/tests/properties.rs`, `src/text.rs` tests |
+| modules/ls-index-model/test/src/ls/index/TargetGraphSuite.scala | PORTED | `ls-index-model/tests/properties.rs`, `src/bitset.rs` tests |
+| modules/ls-pc-host/test/src/ls/pc/host/BoundarySuite.scala | PORTED | `ls-pc-abi/tests/boundary.rs`; `ls-jvm/tests/live_boundary.rs` |
+| modules/ls-pc-host/test/src/ls/pc/host/codec/CodecSuite.scala | PORTED | `ls-pc-abi/tests/roundtrip.rs`, `fuzz.rs`, `boundary.rs` |
+| modules/ls-pc-host/test/src/ls/pc/host/LayoutSuite.scala | PORTED | `ls-pc-abi/tests/canary.rs`, `boundary.rs` |
+| modules/ls-pc-host/test/src/ls/pc/host/MarshalSuite.scala | PORTED | `ls-pc-abi/tests/roundtrip.rs` |
+| modules/ls-pc-host/test/src/ls/pc/host/PcHostConfigSuite.scala | PORTED | `ls-jvm/tests/live_boundary.rs`; `ls-server/src/doctor.rs` PC section |
+| modules/ls-pc-host/test/src/ls/pc/host/PcHostOpsSuite.scala | PORTED | `ls-pc-abi/tests/boundary.rs`; `ls-jvm/tests/live_boundary.rs` |
+| modules/ls-pc/test/src/ls/pc/CompilerPluginConfigSuite.scala | ISLAND | pc-plugins.json compiler-plugin loading proven at the boundary by `ls-jvm/tests/live_zaozi.rs` (boots the island via a real `pc-plugins.json`); island loader unchanged (AC-6.5) |
+| modules/ls-pc/test/src/ls/pc/ForkedWorkerSuite.scala | NON-PORT | forked PC worker deleted (`worker.scala`/`ForkedPcWorker`); replaced by the embedded island watchdog — `ls-jvm/tests/live_recovery.rs`, `real_bsp_pc_recovery.rs` |
+| modules/ls-pc/test/src/ls/pc/PcQuerySuite.scala | ISLAND | PC queries proven over the vtable by `ls-jvm/tests/live_boundary.rs`, `real_bsp_pc.rs`; island query code unchanged (AC-6.5) |
+| modules/ls-pc/test/src/ls/pc/PcSymbolSearchSuite.scala | PORTED | `ls-jvm/tests/live_definition.rs`; `ls-engine/tests/engine.rs::symbol_definition_*` |
+| modules/ls-pc/test/src/ls/pc/PcTestHarness.scala | SUPPORT | PC test fixtures |
+| modules/ls-pc/test/src/ls/pc/PcWorkerManagerSuite.scala | NON-PORT | forked LRU worker manager deleted; the embedded-island supervisor/generation lifecycle is `ls-jvm/tests/{live_boundary,live_recovery}.rs`. The island's own LRU instance cap is unchanged (AC-6.5) |
+| modules/ls-pc/test/src/ls/pc/PluginManagerSuite.scala | ISLAND | plugin SPI/loading unchanged in the island (AC-6.5); the loaded-plugin path is exercised at the boundary by `ls-jvm/tests/live_zaozi.rs` |
+| modules/ls-pc/test/src/ls/pc/Utf16TextSuite.scala | ISLAND | UTF-16 conversion unchanged in the island (AC-6.5); exercised via live PC positions in `ls-jvm/tests/live_boundary.rs` + `ls-pc-abi` position payloads |
+| modules/ls-pc/test/src/ls/pc/WorkerProtocolSuite.scala | NON-PORT | forked-worker wire protocol deleted; the vtable protocol is `ls-pc-abi/tests/roundtrip.rs`, `fuzz.rs`, `boundary.rs` |
+| modules/ls-postings/test/src/ls/postings/CorruptionTest.scala | PORTED | `ls-store/tests/segment.rs`, `validation.rs`, `store.rs` corruption cases |
+| modules/ls-postings/test/src/ls/postings/CurrentSnapshotFileSuite.scala | PORTED | `ls-store/tests/store.rs::publish_then_reopen_preserves_pair`, `second_publish_increments_generation` (current.json → manifest+generation) |
+| modules/ls-postings/test/src/ls/postings/HandBuiltCorpusTest.scala | PORTED | `ls-store/tests/segment.rs`, `symbol_at.rs` |
+| modules/ls-postings/test/src/ls/postings/IntervalIndexTest.scala | PORTED | `ls-store/tests/symbol_at.rs::interval_block_pruning`, `segment.rs::multi_block_group_chunks_and_skips` |
+| modules/ls-postings/test/src/ls/postings/Jdk25GuardSuite.scala | NON-PORT | Rust store is not Java-25-bound; guard obsolete (distinct from the sqlite `Jdk25GuardSuite`) |
+| modules/ls-postings/test/src/ls/postings/RandomCorpusTest.scala | PORTED | `ls-store/tests/random_corpus.rs` (seeded differential; added R15) |
+| modules/ls-postings/test/src/ls/postings/SnapshotJanitorTest.scala | PORTED | `ls-store/tests/store.rs::janitor_defers_deletion_until_snapshot_drops`, `publishes_auto_reclaim_drained_superseded_generations` |
+| modules/ls-postings/test/src/ls/postings/SnapshotLifecycleTest.scala | PORTED | `ls-store/tests/store.rs::retained_snapshot_survives_publish`, `second_publish_increments_generation` |
+| modules/ls-postings/test/src/ls/postings/TestSupport.scala | SUPPORT | `ls-store/tests/*` helpers |
+| modules/ls-rename/test/src/ls/rename/FixtureWorkspace.scala | SUPPORT | → `ls-engine/tests/fixture/mod.rs` |
+| modules/ls-rename/test/src/ls/rename/IngestCheckpointSuite.scala | NON-PORT | asserts the old SQLite-WAL publish-tail checkpoint (`IngestCheckpointSuite.scala:5,17,30`); WAL checkpointing disappeared with SQLite (decision-table row 7). The segment store's equivalent durability obligations — bounded committed generations, publish-time janitor, and manifest/state durability — are `ls-store/tests/store.rs::{publishes_auto_reclaim_drained_superseded_generations, janitor_defers_deletion_until_snapshot_drops, crash_after_state_before_manifest_recovers_old, torn_state_tmp_recovers_old}` |
+| modules/ls-rename/test/src/ls/rename/IngestJanitorSuite.scala | PORTED | `ls-store/tests/store.rs::publishes_auto_reclaim_drained_superseded_generations` (publish-time) + `janitor_defers_deletion_until_snapshot_drops` (held-then-released); live `real_bsp_e2e.rs::real_bsp_repeated_saves_keep_a_single_committed_segment_dir` |
+| modules/ls-rename/test/src/ls/rename/RawPathSuite.scala | PORTED | `ls-engine/tests/engine.rs::raw_path_write_through_runs_inline_and_heals`, `references_raw_fallback_serves_same_doc` |
+| modules/ls-rename/test/src/ls/rename/ReferencesAndQuerySuite.scala | PORTED | `ls-engine/tests/references_matrix.rs` — assertion-for-assertion parity (see §18.1 section) |
+| modules/ls-rename/test/src/ls/rename/RenameMutationSuite.scala | PORTED | `ls-engine/tests/rename_matrix.rs` (`stale_md5_*`, `fresh_snapshot_*`, `shared_source_disagreement_rejected`) |
+| modules/ls-rename/test/src/ls/rename/RenameSuite.scala | PORTED | `ls-engine/tests/rename_matrix.rs` (exact edit spans + rejection reasons) |
+| modules/ls-rename/test/src/ls/rename/UnitSuites.scala | PORTED | identifier backtick-quoting `ls-engine/tests/engine.rs` (`identifiers::encode`); symbol string round-trip `engine.rs` + `ls-semanticdb/tests/symbols.rs`; reverse-dependency closure + duplicate-bspId refusal `ls-bsp/tests/project_model.rs`, `ls-engine/src/targets.rs` |
+| modules/ls-semanticdb/test/src/ls/semanticdb/GroupsSuite.scala | PORTED | `ls-semanticdb/tests/groups.rs`, `pipeline.rs` |
+| modules/ls-semanticdb/test/src/ls/semanticdb/LocatorSuite.scala | PORTED | `ls-semanticdb/tests/locator.rs` |
+| modules/ls-semanticdb/test/src/ls/semanticdb/Md5Suite.scala | PORTED | `ls-semanticdb/tests/md5.rs`, `pipeline.rs` |
+| modules/ls-semanticdb/test/src/ls/semanticdb/ProtoTestWriter.scala | SUPPORT | `ls-semanticdb/tests/common/mod.rs`, `ls-engine/tests/common/mod.rs` |
+| modules/ls-semanticdb/test/src/ls/semanticdb/ScalacIntegrationSuite.scala | PORTED | `ls-semanticdb/tests/scalac_integration.rs` (incl. `derives_clause_case_class_defined_and_derived_given_synthetic_only`) |
+| modules/ls-semanticdb/test/src/ls/semanticdb/SymbolStringsSuite.scala | PORTED | `ls-semanticdb/tests/symbols.rs` |
+| modules/ls-semanticdb/test/src/ls/semanticdb/WireDecoderSuite.scala | PORTED | `ls-semanticdb/tests/wire.rs` |
+| modules/ls-sqlite-ffm/test/src/ls/sqlite/DbSuite.scala | NON-PORT | SQLite DB/WAL removed (decision-table row 7) |
+| modules/ls-sqlite-ffm/test/src/ls/sqlite/FuzzyRankSuite.scala | PORTED | `ls-store/tests/search.rs` (FuzzyRank moved to the segment search section) |
+| modules/ls-sqlite-ffm/test/src/ls/sqlite/Jdk25GuardSuite.scala | NON-PORT | SQLite module removed (decision-table row 7); distinct from the ls-postings `Jdk25GuardSuite` |
+| modules/ls-sqlite-ffm/test/src/ls/sqlite/MetaStoreSuite.scala | NON-PORT | SQLite metastore/FTS removed; search → `ls-store/tests/search.rs`, persistence → the segment store |
+| modules/ls-sqlite-ffm/test/src/ls/sqlite/ReaderPoolSuite.scala | NON-PORT | SQLite reader-connection pool removed (mmap segments need none) |
+| modules/ls-sqlite-ffm/test/src/ls/sqlite/SchemaSuite.scala | NON-PORT | SQLite schema/migration removed; superseded by the manifest/state pairing tests |
+| modules/ls-sqlite-ffm/test/src/ls/sqlite/Sqlite3Suite.scala | NON-PORT | SQLite FFM binding removed (decision-table row 7) |
+| modules/ls-sqlite-ffm/test/src/ls/sqlite/TempDbFixture.scala | SUPPORT | SQLite test fixture (module removed) |
+| modules/ls-zaozi-pcplugin/test/src/ls/zaozi/pcplugin/ZaoziPcCrossFileSuite.scala | PORTED | boundary re-pointed at the vtable: `ls-jvm/tests/live_zaozi.rs` — Dynamic field + normal member both reach the compiled-dependency library SOURCE through the index-backed `symbol_definition` resolver; the no-resolver baseline is implied by asserting the resolver produced the location |
+| modules/ls-zaozi-pcplugin/test/src/ls/zaozi/pcplugin/ZaoziPcForkedSuite.scala | NON-PORT | tests the forked PC worker transport (`--plugin-config` IPC), which is deleted (embedded island). The still-relevant `pc-plugins.json` compiler-plugin loading is proven at the boundary by `ls-jvm/tests/live_zaozi.rs`; plugin status by the doctor PC-Plugins section |
+| modules/ls-zaozi-pcplugin/test/src/ls/zaozi/pcplugin/ZaoziPcNavSuite.scala | PORTED+ISLAND | cross-file go-to, exact `val a` name range, hover round-trip, missing-field no-crash, and non-zaozi selectivity are re-pointed at the vtable in `ls-jvm/tests/live_zaozi.rs` (verified live). The single-buffer plugin-INTERNAL steering shapes (macro-expanded `getRefViaFieldValName`, nested/optional fields, writable receivers, applyDynamic identity, exact hover text) test the untouched Scala plugin and stay green there (AC-6.5, island) |
 
 ## §18.1 case coverage
 
-All 22 families are ported with the **same exactness the Scala oracle asserts**:
+Fully ported (22/22 families). Every safe family the Scala `ReferencesAndQuerySuite`/`RenameSuite`/`RenameMutationSuite` pins with an exact span set, and every unsafe family's exact rejection reason, is pinned identically in `crates/ls-engine/tests/{references_matrix,rename_matrix}.rs`; the SemanticDB characterizations (`ScalacIntegrationSuite`) are in `crates/ls-semanticdb/tests/scalac_integration.rs`.
 
-- **Exact span set / exact rejection reason (12 safe + all unsafe families):**
-  export forwarder, case-class copy, var getter/setter, val member (cross-file),
-  local val, nested local def, private member, top-level def/val, extension
-  method, given/using, inline def, opaque type; and every unsafe family
-  (override, generated, readonly, dependency, external, synthetic-only,
-  PC-only, unsaved dirty buffer, shared-source disagreement, stale-md5 /
-  fresh-snapshot, compile failure). Rust pins these with
-  `assert_eq!(spans_in(...), token_set(...))` / typed-error matches — identical
-  to the Scala `assertEquals(...toSet, tokenSpans.toSet)`.
-
-- **Inclusion / exclusion families (class-unify, apply-sugar, trait, object,
-  enum, method-overload):** these six are asserted with
-  `assert(containsToken(...))` + `nonEmpty` + critical exclusions **in the Scala
-  oracle itself** (`ReferencesAndQuerySuite` lines 56, 75, 84, 89, 93, 100 — no
-  `assertEquals` on the span set), because they carry synthetic
-  companion/constructor/`apply` occurrences whose exact set is
-  implementation-defined. The Rust matrix mirrors this shape exactly
-  (`references_matrix.rs` `class_references_unify_*`, `apply_sugar_unification_*`,
-  `trait_references_*`, `object_references_*`, `enum_references_*`,
-  `method_overloads_stay_separate`). This is **faithful parity, not a gap**:
-  strengthening the Rust side to an exact set would over-specify beyond the
-  ported spec and risk failing on legitimate synthetic occurrences the oracle
-  deliberately tolerates.
+The six families class-unify / apply-sugar / trait / object / enum / method-overload are asserted **inclusion-only in the Scala oracle itself** (`ReferencesAndQuerySuite` lines 56/75/84/89/93/100 use `assert(containsToken)` + non-empty + critical exclusions, not `assertEquals(...toSet)`), because they carry synthetic companion/constructor/`apply` occurrences whose exact set is implementation-defined. `references_matrix.rs` mirrors that shape 1:1 — faithful parity, not a gap.
 
 ## E0–E8 row coverage
 
-(The docs number these E1..E10; `RealBspCoreTest` also carries an E0. All
-non-trimmed rows are ported over live mill.)
+Every non-trimmed row is ported over live mill:
 
 | E-row | Rust equivalent |
 |---|---|
@@ -140,42 +152,23 @@ non-trimmed rows are ported over live mill.)
 | E7 PC dispatch-generation recovery | `real_bsp_pc_recovery.rs::real_bsp_forked_pc_recovers_from_a_dispatch_wedge`; `ls-jvm/tests/live_recovery.rs` |
 | E8 segment hygiene (repeated save) | `real_bsp_repeated_saves_keep_a_single_committed_segment_dir` |
 
-E8's no-BSP warm-restart half is DEC-1/DEC-2 trimmed (task22 deferral note);
-E9 AOT and E10 CI wiring are out of scope.
+E8's no-BSP warm-restart half is DEC-1/DEC-2 trimmed (task22 deferral note); E9 AOT and E10 CI wiring are out of scope.
 
-## Real gaps
+## Zaozi navigation: what is re-pointed at the vtable
 
-1. **`RandomCorpusTest` (ls-postings) → CLOSED this round.** The retained Scala
-   suite drives a 200-doc / 2000-symbol / ~20k-occurrence seeded-random corpus
-   through the writer and checks every reader obligation against a brute-force
-   reference. The Rust store had the deterministic `HandBuiltCorpusTest`/
-   `IntervalIndexTest` equivalents and a small `bruteforce_matches_naive_scan`,
-   but no scaled differential. Ported as `crates/ls-store/tests/random_corpus.rs`
-   (dependency-free `splitmix64` generator; 11 differential tests covering group
-   scans with/without target pruning, definition/rename scans, epoch-stale
-   dropping, per-doc scans, rename-profile round-trip, the symbol and doc
-   dictionaries, and 2000 `symbol_at` probes) — all green.
+The `ls-zaozi-pcplugin` module is **untouched** (decision table row 1). What the rewrite changed is the *transport*: navigation now flows through the embedded-island vtable + the Rust `symbol_definition` resolver instead of the deleted forked worker. So the **cross-file navigation** obligation is re-pointed at the production vtable in `crates/ls-jvm/tests/live_zaozi.rs` (verified live with the mill-built `zaoziPcplugin.jar`): the zaozi Dynamic field `io.a` and the normal member `io2.normalMethod()` both reach the compiled-dependency library SOURCE through the resolver; the definition lands on the exact `val a` name range; the `hover` vtable op round-trips with the plugin loaded; a missing zaozi field does not wedge the island; and a non-zaozi Dynamic access is left unchanged (plugin selectivity). The single-buffer plugin-internal steering shapes stay ISLAND (AC-6.5).
 
-2. **`IngestJanitorSuite` publish-time auto-reclaim (ls-postings/ls-rename) →
-   CLOSED this round.** The held-snapshot-defers-deletion half was already
-   covered (`store.rs::janitor_defers_deletion_until_snapshot_drops`), but the
-   publish-TIME half — a publish auto-reclaiming a *drained, unretained*
-   superseded generation with no explicit janitor — was proven only by the
-   `LS_REAL_BSP_IT`-gated `real_bsp_e2e.rs::real_bsp_repeated_saves_keep_a_single_committed_segment_dir`.
-   Added a fast unit test
-   `store.rs::publishes_auto_reclaim_drained_superseded_generations` that pins
-   the real contract (a publish pins the immediately-prior generation across its
-   own janitor, so a drained generation is reclaimed by the next publish; drained
-   generations do not accumulate).
+## Real gaps (found and closed)
 
-The six §18.1 inclusion-family items Codex flagged are faithful parity (above),
-not gaps. No other mandatory behavior lacks a proving Rust test.
+1. **`RandomCorpusTest` → `crates/ls-store/tests/random_corpus.rs`** (R15): a dependency-free `splitmix64` differential (200 docs / 2000 symbols / ~20k occurrences) vs a brute-force oracle across all scans, epoch-stale dropping, both dictionaries, rename profiles, and 2000 `symbol_at` probes.
+2. **`IngestJanitorSuite` publish-time auto-reclaim → `store.rs::publishes_auto_reclaim_drained_superseded_generations`** (R15): the publish-time half (a publish reclaiming a drained, unretained superseded generation) previously had only the gated E8 test.
+3. **Zaozi normal-member cross-file / exact range / hover / missing-field → `live_zaozi.rs`** (R16): the boundary cases `ZaoziPcCrossFileSuite`/`ZaoziPcNavSuite` prove that were not yet re-pointed at the vtable.
 
-## Task22 obligations (recorded, not this round)
+No other mandatory behavior lacks a proving Rust test.
 
-- Reconcile `docs/traceability.md` — it is the stale Scala-era doc (old
-  AC-1..AC-20 numbering, SQLite ACs) and must be rewritten/retired at cutover.
+## Task22 obligations (recorded, not audited-as-covered)
+
+- Reconcile `docs/traceability.md` (stale Scala-era doc: old AC-1..AC-20 numbering, SQLite ACs).
 - Port the bench smoke (`BenchSuite`/`OfflineCompileGuardSuite`).
-- Record the DEC-1/DEC-2 deferral notes (`pcPluginStatus`, no-BSP warm restart)
-  in the cutover docs; both must stay absent from the advertised surface.
-- The deletion sweep of the retained Scala modules.
+- Record the DEC-1/DEC-2 deferral notes (`pcPluginStatus`, no-BSP warm restart) in the cutover docs; both must stay absent from the advertised surface.
+- The deletion sweep of the retained Scala modules (incl. `ls-sqlite-ffm`, the forked-worker files, `AotTrain`).

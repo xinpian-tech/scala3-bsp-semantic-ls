@@ -13,7 +13,19 @@
 //!     forward-closure containing the library target;
 //!   * a NON-zaozi `scala.Dynamic` access of the same shape is left unchanged
 //!     (its `io.a` does NOT reach the in-buffer field) — the plugin is selective,
-//!     so the steering is the plugin's doing, not default PC behavior.
+//!     so the steering is the plugin's doing, not default PC behavior;
+//!   * a NORMAL member `io2.normalMethod()` of the compiled dependency also
+//!     reaches the library source through the resolver (the cross-file
+//!     normal-member path, not just plugin-steered fields);
+//!   * the `io.a` definition lands on the exact `val a` NAME range;
+//!   * the `hover` vtable op round-trips with the plugin loaded; and
+//!   * a missing zaozi field (`io.notAField`) does not error or wedge the island.
+//!
+//! This re-points the retained `ZaoziPcCrossFileSuite` / `ZaoziPcNavSuite`
+//! cross-file navigation at the production vtable. The single-buffer
+//! plugin-internal steering shapes (macro-expanded accessors, nested/optional
+//! fields, writable receivers, applyDynamic identity, exact hover text) stay
+//! covered by the retained Scala suites — the plugin itself is untouched.
 //!
 //! Env-gated like the other live tests (`LS_LIBJVM` + `PC_HOST_AGENT_JAR` +
 //! `LS_PC_TARGET_CLASSPATH`) plus `ZAOZI_PCPLUGIN_JAR`; skips cleanly when unset.
@@ -34,7 +46,7 @@ use ls_index_model::Loc;
 use ls_jvm::backend::VtableBackend;
 use ls_jvm::watchdog::{PcRequest, QueryKind, Supervisor};
 use ls_jvm::{boot_island, install_symbol_definition_resolver, IslandConfig};
-use ls_pc_abi::payloads::{origin, DefinitionResult, Location, Rng, TargetConfig};
+use ls_pc_abi::payloads::{origin, DefinitionResult, HoverResult, Location, Rng, TargetConfig};
 use ls_store::Store;
 
 const APP_TARGET_ID: &str = "zaozi-app";
@@ -69,6 +81,7 @@ object Use:
   val io2: LibBundle = new LibBundle
   val x = io.a
   val y = io2.normalMethod()
+  val z = io.notAField
 ";
 
 /// A non-zaozi `scala.Dynamic` access of the same shape, self-contained (the
@@ -168,15 +181,15 @@ fn compile_library(env: &Env, libsrc: &Path, libroot: &Path) {
     );
 }
 
-/// The definition start lines returned for the cursor `(line, character)` in
+/// The definition locations returned for the cursor `(line, character)` in
 /// `text` opened at `uri` under the app target.
-fn definition_lines(
+fn definition_locations(
     sup: &mut Supervisor<VtableBackend>,
     uri: &str,
     text: &str,
     line: u32,
     character: u32,
-) -> Vec<u32> {
+) -> Vec<Location> {
     sup.request(PcRequest::DidOpen {
         target_id: APP_TARGET_ID.to_string(),
         uri: uri.to_string(),
@@ -194,6 +207,18 @@ fn definition_lines(
     DefinitionResult::decode(&reply)
         .expect("decode definition")
         .locations
+}
+
+/// The definition start lines for the cursor (a projection of
+/// [`definition_locations`]).
+fn definition_lines(
+    sup: &mut Supervisor<VtableBackend>,
+    uri: &str,
+    text: &str,
+    line: u32,
+    character: u32,
+) -> Vec<u32> {
+    definition_locations(sup, uri, text, line, character)
         .iter()
         .map(|l| l.range.start_line)
         .collect()
@@ -333,6 +358,67 @@ fn live_zaozi_cross_file_go_to_routes_through_plugin_and_symbol_definition() {
             .any(|(sym, from)| sym.contains("LibBundle") && sym.contains('a') && from == &use_uri),
         "the resolver must be consulted for the LibBundle field symbol from the buffer; \
          got {consulted:?}"
+    );
+
+    // Normal-member cross-file: go-to on the NON-Dynamic `io2.normalMethod()` (a
+    // member of the compiled dependency `LibBundle`, no plugin steering) also
+    // reaches the library SOURCE through the index-backed resolver — the
+    // `ZaoziPcCrossFileSuite` normal-member path, proving the resolver serves
+    // ordinary compiled-dependency members, not just plugin-steered fields.
+    let (nm_line, nm_char) = cursor(USE_BUFFER, "normalMethod", 0);
+    let nm_defs = definition_locations(&mut sup, &use_uri, USE_BUFFER, nm_line, nm_char);
+    let normal_method_line = line_of(LIB_SOURCE, "def normalMethod");
+    assert!(
+        nm_defs
+            .iter()
+            .any(|l| l.uri == lib_uri && l.range.start_line == normal_method_line),
+        "cross-file go-to on the normal member io2.normalMethod should reach the library \
+         `def normalMethod` (line {normal_method_line}) in {lib_uri}; got {nm_defs:?}"
+    );
+
+    // Exact definition range: the go-to on the zaozi Dynamic `io.a` lands on the
+    // NAME span of `val a` (start..end characters), not merely the right line.
+    let a_defs = definition_locations(&mut sup, &use_uri, USE_BUFFER, use_line, use_char);
+    let val_a_text = LIB_SOURCE
+        .lines()
+        .find(|l| l.contains("val a: Int"))
+        .expect("lib source has `val a`");
+    let a_col = val_a_text.find("val a").unwrap() as u32 + 4; // the `a` after "val "
+    assert!(
+        a_defs.iter().any(|l| l.uri == lib_uri
+            && l.range.start_line == val_a_line
+            && l.range.start_character == a_col
+            && l.range.end_character == a_col + 1),
+        "the zaozi io.a definition must span the exact `a` name (line {val_a_line}, \
+         col {a_col}..{}); got {a_defs:?}",
+        a_col + 1
+    );
+
+    // Hover over the vtable: the hover op round-trips for the zaozi Dynamic access
+    // with the plugin loaded — a second production vtable op end-to-end, not just
+    // definition. (The exact hover text is a plugin-internal concern covered by
+    // the retained Scala `ZaoziPcNavSuite`; here we prove the boundary op works.)
+    {
+        let reply = sup
+            .request(PcRequest::Query {
+                kind: QueryKind::Hover,
+                uri: use_uri.clone(),
+                line: use_line,
+                character: use_char,
+            })
+            .expect("hover query");
+        HoverResult::decode(&reply).expect("hover round-trips over the vtable");
+    }
+
+    // Missing-field no-crash: go-to on a non-existent zaozi field must not error
+    // or wedge the island (the plugin's `selectDynamic` is total), and a normal
+    // query must still succeed afterwards.
+    let (miss_line, miss_char) = cursor(USE_BUFFER, "notAField", 0);
+    let _ = definition_locations(&mut sup, &use_uri, USE_BUFFER, miss_line, miss_char);
+    let after = definition_lines(&mut sup, &use_uri, USE_BUFFER, use_line, use_char);
+    assert!(
+        after.contains(&val_a_line),
+        "the island must still resolve io.a after a missing-field query; got {after:?}"
     );
 
     // Selectivity: a non-zaozi Dynamic access of the same shape is left unchanged —

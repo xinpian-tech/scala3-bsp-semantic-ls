@@ -45,3 +45,12 @@ fi
 # per process). The recovery row additionally arms the test fault hook.
 cargo test -p ls-server --test real_bsp_pc -- --nocapture
 LS_PC_TEST_FAULT=busyCompletion cargo test -p ls-server --test real_bsp_pc_recovery -- --nocapture
+
+# The zaozi PC-navigation vtable-boundary row (its own binary, one JVM). Needs the
+# zaozi plugin jar in addition to the PC env; the dev shell exports it. Skipped
+# with a note if the jar is absent (a separate flake input).
+if [[ -n "${ZAOZI_PCPLUGIN_JAR:-}" ]]; then
+  cargo test -p ls-jvm --test live_zaozi -- --nocapture
+else
+  echo "it-real-bsp-rs: ZAOZI_PCPLUGIN_JAR unset — skipping the live zaozi row." >&2
+fi

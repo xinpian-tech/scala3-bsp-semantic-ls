@@ -1,5 +1,6 @@
 { pkgs, jdk, mill, zaozi-src ? null
-, pcHostAgentJar ? null, scalaLibraryJar ? null, scala3LibraryJar ? null }:
+, pcHostAgentJar ? null, scalaLibraryJar ? null, scala3LibraryJar ? null
+, zaoziPcpluginJar ? null }:
 
 pkgs.mkShell {
   packages = with pkgs; [
@@ -48,6 +49,11 @@ pkgs.mkShell {
   LS_PC_TARGET_CLASSPATH =
     if scalaLibraryJar == null || scala3LibraryJar == null then ""
     else "${scalaLibraryJar}:${scala3LibraryJar}";
+  # The zaozi PC-navigation compiler plugin jar, so the live zaozi vtable-boundary
+  # test (`cargo test -p ls-jvm --test live_zaozi`) runs in the dev shell instead
+  # of skipping. Null when the flake is used without this input.
+  ZAOZI_PCPLUGIN_JAR =
+    if zaoziPcpluginJar == null then "" else "${zaoziPcpluginJar}/zaozi-pcplugin.jar";
   # The SQLite shared library consumed by the ls-sqlite-ffm FFM binding.
   # System SQLite is never used; only the Nix-provided library is a valid
   # runtime dependency.

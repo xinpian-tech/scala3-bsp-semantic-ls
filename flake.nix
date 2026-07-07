@@ -176,7 +176,7 @@
       {
         devShells.default = import ./nix/dev-shell.nix {
           inherit pkgs jdk mill zaozi-src;
-          inherit pcHostAgentJar scalaLibraryJar scala3LibraryJar;
+          inherit pcHostAgentJar scalaLibraryJar scala3LibraryJar zaoziPcpluginJar;
         };
 
         formatter = pkgs.nixpkgs-fmt;
