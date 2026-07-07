@@ -1,29 +1,34 @@
-//! The debounced, single-flight background reingest scheduler — a behavior-
+//! The debounced, single-flight background build-job scheduler — a behavior-
 //! preserving port of `ScalaLs.scheduleBuildJob`/`runBuildJob`.
 //!
-//! A RawSemanticDBPath reference that finds the index stale (`needs_reindex`)
-//! enqueues a full reingest that runs ASYNCHRONOUSLY on one index worker thread,
-//! so the reference response is served immediately (not blocked on the ingest).
-//! Rapid enqueues collapse into exactly one follow-up run (queue collapse), the
-//! run is delayed by a fixed debounce, and the worker is the sole background
-//! writer. The store's single-writer contract is also enforced independently by
-//! [`QueryOrchestrator::ingest`]'s internal lock, so a background reingest never
-//! races the message-loop ingest (the explicit reindex command / model reload /
-//! bootstrap).
+//! Two producers feed it, both collapsing into one debounced run:
+//! - `didSave` schedules a COMPILE-FIRST job over the reverse-dependency closure
+//!   of the saved file's target (`schedule(targets, compile_first=true)`).
+//! - A RawSemanticDBPath reference that could not heal inline schedules a
+//!   REINDEX-ONLY job (`schedule_reindex()` = `schedule(vec![], false)`).
 //!
-//! Only the reindex-only path (`compileFirst = false`) is wired here; the
-//! compile-first save path reuses this scheduler when `didSave` lands.
+//! Rapid schedules collapse into exactly one follow-up run (queue collapse); the
+//! run is delayed by a fixed debounce; the worker is the sole background writer.
+//! The worker compiles the sorted target set first (when a compile is pending),
+//! then full-reingests the CURRENT workspace on success — or on a reindex-only
+//! run. On compile FAILURE it logs and SKIPS the reingest, leaving the previous
+//! snapshot serving. The store's single-writer contract is enforced by
+//! [`QueryOrchestrator`]'s ingest lock, so a background reingest never races the
+//! message-loop ingest.
 
+use std::collections::BTreeSet;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use ls_engine::QueryOrchestrator;
+use ls_engine::{CompileOutcome, QueryOrchestrator};
+
+use crate::services::BuildCompiler;
 
 /// State shared between the message loop (which schedules) and the index worker
 /// thread (which drains), behind one mutex + condvar.
 struct Shared {
-    /// A reingest is pending (scheduled, not yet started). Set on schedule, cleared
+    /// A run is pending (scheduled, not yet started). Set on schedule, cleared
     /// when the worker begins a run — so schedules arriving during a run collapse
     /// into exactly one follow-up run.
     scheduled: bool,
@@ -33,12 +38,20 @@ struct Shared {
     due_at: Option<Instant>,
     /// Set on drop; the worker exits and skips any pending run.
     shutting_down: bool,
+    /// Target ids to compile before the reingest (accumulated across coalesced
+    /// schedules). Drained (sorted, since a `BTreeSet`) at run start.
+    pending_targets: BTreeSet<String>,
+    /// Whether a compile is requested for the next run (ORed across schedules).
+    pending_compile: bool,
     /// Number of drained runs the worker has completed, for deterministic tests.
     runs_completed: u64,
+    /// Number of runs that reached the reingest step (i.e. did NOT skip it on a
+    /// compile failure), for deterministic tests.
+    reingests_attempted: u64,
 }
 
-/// A background reingester. Owned by the ready services; dropping it stops and
-/// joins the worker thread.
+/// A background compile+reingester. Owned by the ready services; dropping it stops
+/// and joins the worker thread.
 pub(crate) struct BuildScheduler {
     shared: Arc<(Mutex<Shared>, Condvar)>,
     debounce: Duration,
@@ -49,22 +62,32 @@ impl BuildScheduler {
     /// The production debounce, matching the Scala `config.debounceMillis`.
     pub(crate) const DEFAULT_DEBOUNCE: Duration = Duration::from_millis(500);
 
-    pub(crate) fn new(orchestrator: Arc<QueryOrchestrator>) -> Self {
-        Self::with_debounce(orchestrator, Self::DEFAULT_DEBOUNCE)
+    pub(crate) fn new(
+        orchestrator: Arc<QueryOrchestrator>,
+        compiler: Arc<dyn BuildCompiler>,
+    ) -> Self {
+        Self::with_debounce(orchestrator, compiler, Self::DEFAULT_DEBOUNCE)
     }
 
-    pub(crate) fn with_debounce(orchestrator: Arc<QueryOrchestrator>, debounce: Duration) -> Self {
+    pub(crate) fn with_debounce(
+        orchestrator: Arc<QueryOrchestrator>,
+        compiler: Arc<dyn BuildCompiler>,
+        debounce: Duration,
+    ) -> Self {
         let shared = Arc::new((
             Mutex::new(Shared {
                 scheduled: false,
                 due_at: None,
                 shutting_down: false,
+                pending_targets: BTreeSet::new(),
+                pending_compile: false,
                 runs_completed: 0,
+                reingests_attempted: 0,
             }),
             Condvar::new(),
         ));
         let worker_shared = Arc::clone(&shared);
-        let handle = thread::spawn(move || worker_loop(&worker_shared, &orchestrator));
+        let handle = thread::spawn(move || worker_loop(&worker_shared, &orchestrator, &compiler));
         BuildScheduler {
             shared,
             debounce,
@@ -72,18 +95,28 @@ impl BuildScheduler {
         }
     }
 
-    /// Enqueue a background reingest (Scala `scheduleBuildJob(Vector.empty,
-    /// compileFirst = false)`). Coalesces: if a run is already pending, this just
-    /// joins it. Never blocks on the ingest.
-    pub(crate) fn schedule_reindex(&self) {
+    /// Schedule a build job (Scala `scheduleBuildJob(targets, compileFirst)`).
+    /// Accumulates the targets and the compile flag, and arms the single debounce
+    /// if a run is not already pending (coalesce otherwise). Never blocks.
+    pub(crate) fn schedule(&self, targets: Vec<String>, compile_first: bool) {
         let (lock, cvar) = &*self.shared;
         let mut shared = lock.lock().unwrap();
-        if shared.shutting_down || shared.scheduled {
+        if shared.shutting_down {
             return;
         }
-        shared.scheduled = true;
-        shared.due_at = Some(Instant::now() + self.debounce);
-        cvar.notify_all();
+        shared.pending_targets.extend(targets);
+        shared.pending_compile |= compile_first;
+        if !shared.scheduled {
+            shared.scheduled = true;
+            shared.due_at = Some(Instant::now() + self.debounce);
+            cvar.notify_all();
+        }
+    }
+
+    /// Enqueue a reindex-only background job (Scala `scheduleBuildJob(Vector.empty,
+    /// compileFirst = false)`) — the RawSemanticDBPath heal fallback.
+    pub(crate) fn schedule_reindex(&self) {
+        self.schedule(Vec::new(), false);
     }
 
     /// Test-only: block until at least `n` runs have completed, or `timeout`
@@ -107,6 +140,11 @@ impl BuildScheduler {
     pub(crate) fn runs_completed(&self) -> u64 {
         self.shared.0.lock().unwrap().runs_completed
     }
+
+    #[cfg(test)]
+    pub(crate) fn reingests_attempted(&self) -> u64 {
+        self.shared.0.lock().unwrap().reingests_attempted
+    }
 }
 
 impl Drop for BuildScheduler {
@@ -123,7 +161,11 @@ impl Drop for BuildScheduler {
     }
 }
 
-fn worker_loop(shared: &Arc<(Mutex<Shared>, Condvar)>, orchestrator: &QueryOrchestrator) {
+fn worker_loop(
+    shared: &Arc<(Mutex<Shared>, Condvar)>,
+    orchestrator: &QueryOrchestrator,
+    compiler: &Arc<dyn BuildCompiler>,
+) {
     let (lock, cvar) = &**shared;
     loop {
         let mut guard = lock.lock().unwrap();
@@ -150,23 +192,45 @@ fn worker_loop(shared: &Arc<(Mutex<Shared>, Condvar)>, orchestrator: &QueryOrche
                 }
             }
         }
-        // Begin the run: clear `scheduled` so schedules during the ingest arm a new
-        // run (one follow-up), and release the lock across the ingest.
+        // Begin the run: snapshot + clear the pending set so schedules during the
+        // job arm exactly one follow-up. `BTreeSet::into_iter` yields sorted ids
+        // (Scala `toVector.sorted`).
+        let targets: Vec<String> = std::mem::take(&mut guard.pending_targets)
+            .into_iter()
+            .collect();
+        let compile = guard.pending_compile;
+        guard.pending_compile = false;
         guard.scheduled = false;
         guard.due_at = None;
         drop(guard);
 
-        // Best-effort full reingest of the CURRENT workspace. `reingest_current`
-        // reads `current_workspace` INSIDE the orchestrator's ingest lock, so a
-        // heal that overlaps a concurrent `reload` re-ingests the reload's newer
-        // workspace instead of reverting it (a workspace with no indexable target
-        // is a no-op). A failure never propagates — the raw path already answered.
-        if let Some(Err(error)) = orchestrator.reingest_current() {
-            eprintln!("scala3-bsp-semantic-ls: background reingest failed: {error}");
+        // Compile first when requested; on failure log and SKIP the reingest so the
+        // previous snapshot keeps serving. A reindex-only run always reingests.
+        let should_reingest = if compile && !targets.is_empty() {
+            match compiler.compile(&targets) {
+                CompileOutcome::Ok => true,
+                CompileOutcome::Failed { reason } => {
+                    eprintln!(
+                        "scala3-bsp-semantic-ls: background compile of {} failed: {reason}",
+                        targets.join(", ")
+                    );
+                    false
+                }
+            }
+        } else {
+            true
+        };
+        if should_reingest {
+            if let Some(Err(error)) = orchestrator.reingest_current() {
+                eprintln!("scala3-bsp-semantic-ls: background reingest failed: {error}");
+            }
         }
 
         let mut guard = lock.lock().unwrap();
         guard.runs_completed += 1;
+        if should_reingest {
+            guard.reingests_attempted += 1;
+        }
         cvar.notify_all();
     }
 }
@@ -174,66 +238,127 @@ fn worker_loop(shared: &Arc<(Mutex<Shared>, Condvar)>, orchestrator: &QueryOrche
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ls_bsp::model::BspProjectModel;
+    use ls_engine::CompileService;
     use ls_store::Store;
+    use std::sync::Mutex as StdMutex;
     use tempfile::TempDir;
 
-    // A fresh (empty, unindexed) store. The `TempDir` is returned so the caller can
-    // bind it BEFORE the scheduler: reverse-drop-order then joins the worker (drops
-    // the scheduler) before deleting the directory. Its workspace has no indexable
-    // target, so a drained run is a no-op ingest — enough to observe run counting
-    // and coalescing without a real corpus.
-    fn empty_orchestrator() -> (TempDir, Arc<QueryOrchestrator>) {
+    /// Records every compile call and returns a scripted outcome. `refetch_model`
+    /// is unused by the scheduler (the reload flow does not go through it).
+    struct FakeCompiler {
+        fail: bool,
+        calls: Arc<StdMutex<Vec<Vec<String>>>>,
+    }
+
+    impl CompileService for FakeCompiler {
+        fn compile(&self, targets: &[String]) -> CompileOutcome {
+            self.calls.lock().unwrap().push(targets.to_vec());
+            if self.fail {
+                CompileOutcome::Failed {
+                    reason: "scripted failure".to_string(),
+                }
+            } else {
+                CompileOutcome::Ok
+            }
+        }
+    }
+
+    impl BuildCompiler for FakeCompiler {
+        fn refetch_model(&self) -> Result<BspProjectModel, String> {
+            Err("no reload in the scheduler test".to_string())
+        }
+    }
+
+    /// A scheduler over a fresh (empty, unindexed) store and a scripted compiler.
+    /// The `TempDir` is returned so the caller binds it BEFORE the scheduler:
+    /// reverse-drop-order joins the worker before deleting the directory.
+    fn scheduler(
+        debounce: Duration,
+        compile_fails: bool,
+    ) -> (TempDir, Arc<StdMutex<Vec<Vec<String>>>>, BuildScheduler) {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path()).unwrap();
-        // The scheduler's reingest path (`reingest_current`) is independent of the
-        // write-through mode, so the production `with_defaults` orchestrator is used.
-        (dir, Arc::new(QueryOrchestrator::with_defaults(store)))
+        let orchestrator = Arc::new(QueryOrchestrator::with_defaults(store));
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        let compiler: Arc<dyn BuildCompiler> = Arc::new(FakeCompiler {
+            fail: compile_fails,
+            calls: Arc::clone(&calls),
+        });
+        let sched = BuildScheduler::with_debounce(orchestrator, compiler, debounce);
+        (dir, calls, sched)
     }
 
     #[test]
-    fn a_single_schedule_drains_exactly_one_run() {
-        let (_dir, orchestrator) = empty_orchestrator();
-        let scheduler = BuildScheduler::with_debounce(orchestrator, Duration::ZERO);
-        scheduler.schedule_reindex();
-        assert_eq!(scheduler.wait_for_runs(1, Duration::from_secs(5)), 1);
-        // No further schedule: the count stays at exactly one.
-        assert_eq!(scheduler.runs_completed(), 1);
+    fn a_reindex_only_schedule_drains_one_run_and_reingests_without_compiling() {
+        let (_dir, calls, sched) = scheduler(Duration::ZERO, false);
+        sched.schedule_reindex();
+        assert_eq!(sched.wait_for_runs(1, Duration::from_secs(5)), 1);
+        assert_eq!(sched.reingests_attempted(), 1);
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "reindex-only must not compile"
+        );
     }
 
-    // Rapid schedules while a run is pending collapse into ONE run (Scala queue
-    // collapse: `scheduled` gates re-arming).
     #[test]
-    fn rapid_schedules_collapse_into_one_run() {
-        let (_dir, orchestrator) = empty_orchestrator();
-        // A long debounce keeps the first run pending while the burst arrives.
-        let scheduler = BuildScheduler::with_debounce(orchestrator, Duration::from_millis(80));
-        for _ in 0..50 {
-            scheduler.schedule_reindex();
-        }
-        assert_eq!(scheduler.wait_for_runs(1, Duration::from_secs(5)), 1);
-        // The burst collapsed: no second run was armed while the first was pending.
-        assert_eq!(scheduler.runs_completed(), 1);
+    fn a_compile_first_schedule_compiles_sorted_targets_then_reingests() {
+        let (_dir, calls, sched) = scheduler(Duration::ZERO, false);
+        // Deliberately unsorted; the worker drains a BTreeSet so compile sees sorted.
+        sched.schedule(vec!["b".to_string(), "a".to_string()], true);
+        assert_eq!(sched.wait_for_runs(1, Duration::from_secs(5)), 1);
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![vec!["a".to_string(), "b".to_string()]]
+        );
+        assert_eq!(sched.reingests_attempted(), 1, "compile Ok reingests");
     }
 
-    // A schedule arriving AFTER a run has started arms exactly one follow-up run.
+    #[test]
+    fn a_compile_failure_skips_the_reingest_leaving_the_old_snapshot() {
+        let (_dir, calls, sched) = scheduler(Duration::ZERO, true);
+        sched.schedule(vec!["a".to_string()], true);
+        assert_eq!(sched.wait_for_runs(1, Duration::from_secs(5)), 1);
+        assert_eq!(calls.lock().unwrap().len(), 1, "compile was attempted");
+        assert_eq!(
+            sched.reingests_attempted(),
+            0,
+            "compile failure must skip the reingest"
+        );
+    }
+
+    // Rapid schedules while a run is pending collapse into ONE run, and the
+    // accumulated targets + compile flag merge (Scala queue collapse).
+    #[test]
+    fn rapid_schedules_collapse_and_accumulate_targets() {
+        let (_dir, calls, sched) = scheduler(Duration::from_millis(80), false);
+        sched.schedule(vec!["a".to_string()], true);
+        sched.schedule(vec!["b".to_string()], false);
+        sched.schedule_reindex();
+        assert_eq!(sched.wait_for_runs(1, Duration::from_secs(5)), 1);
+        // One run, compiling the merged sorted target set once.
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![vec!["a".to_string(), "b".to_string()]]
+        );
+        assert_eq!(sched.runs_completed(), 1);
+    }
+
     #[test]
     fn a_schedule_after_a_run_arms_one_follow_up() {
-        let (_dir, orchestrator) = empty_orchestrator();
-        let scheduler = BuildScheduler::with_debounce(orchestrator, Duration::ZERO);
-        scheduler.schedule_reindex();
-        assert_eq!(scheduler.wait_for_runs(1, Duration::from_secs(5)), 1);
-        scheduler.schedule_reindex();
-        assert_eq!(scheduler.wait_for_runs(2, Duration::from_secs(5)), 2);
+        let (_dir, _calls, sched) = scheduler(Duration::ZERO, false);
+        sched.schedule_reindex();
+        assert_eq!(sched.wait_for_runs(1, Duration::from_secs(5)), 1);
+        sched.schedule_reindex();
+        assert_eq!(sched.wait_for_runs(2, Duration::from_secs(5)), 2);
     }
 
     // Dropping the scheduler stops and joins the worker promptly even with a long
     // debounce (shutdown wakes the debounce wait rather than sleeping it out).
     #[test]
     fn drop_joins_the_worker_without_waiting_out_the_debounce() {
-        let (_dir, orchestrator) = empty_orchestrator();
-        let scheduler = BuildScheduler::with_debounce(orchestrator, Duration::from_secs(3600));
-        scheduler.schedule_reindex();
-        // Would hang for an hour if drop waited out the debounce.
-        drop(scheduler);
+        let (_dir, _calls, sched) = scheduler(Duration::from_secs(3600), false);
+        sched.schedule_reindex();
+        drop(sched);
     }
 }

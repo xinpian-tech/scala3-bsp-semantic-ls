@@ -100,6 +100,12 @@ pub trait Handlers<S> {
     /// A buffer was closed (already dropped from the document store). `uri` is
     /// normalized.
     fn on_did_close(&self, _services: &S, _uri: &str) {}
+
+    /// A buffer was saved (its text, if sent, already re-synced). `uri` is
+    /// normalized. Ports the build-job tail of `ScalaLs.didSave`: schedule the
+    /// debounced compile-first reingest of the saved file's reverse-dependency
+    /// closure.
+    fn on_did_save(&self, _services: &S, _uri: &str) {}
 }
 
 /// The client-facing callbacks the server is wired with: publishing diagnostics
@@ -210,19 +216,21 @@ impl<S> ServerCore<S> {
         }
     }
 
-    fn did_save(&self, params: &Value) {
-        // A save that carries the text refreshes the open buffer so dirtiness
-        // clears even when the editor folded the last edit into the save. The
-        // reverse-dependency compile and reingest belong to the didSave build
-        // flow, not this buffer sync.
-        let (Some(uri), Some(text)) = (
-            document_uri(params),
-            params.get("text").and_then(Value::as_str),
-        ) else {
+    fn did_save(&self, handlers: &impl Handlers<S>, params: &Value) {
+        let Some(uri) = document_uri(params) else {
             return;
         };
-        if self.docs.is_open(&uri) {
-            self.docs.change(&uri, text);
+        // A save that carries the text refreshes the open buffer so dirtiness
+        // clears even when the editor folded the last edit into the save. The
+        // save still schedules its build job when no text is sent.
+        if let Some(text) = params.get("text").and_then(Value::as_str) {
+            if self.docs.is_open(&uri) {
+                self.docs.change(&uri, text);
+            }
+        }
+        // The reverse-dependency compile + reingest build job (Scala didSave tail).
+        if let Some(services) = self.state.ready() {
+            handlers.on_did_save(services, &uri);
         }
     }
 }
@@ -550,7 +558,7 @@ where
         "textDocument/didOpen" => core.did_open(handlers, &note.params),
         "textDocument/didChange" => core.did_change(handlers, &note.params),
         "textDocument/didClose" => core.did_close(handlers, &note.params),
-        "textDocument/didSave" => core.did_save(&note.params),
+        "textDocument/didSave" => core.did_save(handlers, &note.params),
         // Any other notification (including `$/setTrace`) is ignored.
         _ => {}
     }
@@ -1415,13 +1423,19 @@ mod tests {
     #[test]
     fn did_save_with_text_refreshes_an_open_buffer_only() {
         let core: ServerCore<FakeServices> = ServerCore::new();
-        core.did_save(&json!({ "textDocument": { "uri": "file:///a" }, "text": "saved" }));
+        core.did_save(
+            &EchoHandlers,
+            &json!({ "textDocument": { "uri": "file:///a" }, "text": "saved" }),
+        );
         assert!(!core.docs.is_open("file:///a"));
         core.did_open(
             &EchoHandlers,
             &json!({ "textDocument": { "uri": "file:///a", "text": "v1" } }),
         );
-        core.did_save(&json!({ "textDocument": { "uri": "file:///a" }, "text": "saved" }));
+        core.did_save(
+            &EchoHandlers,
+            &json!({ "textDocument": { "uri": "file:///a" }, "text": "saved" }),
+        );
         assert_eq!(core.docs.text("file:///a").as_deref(), Some("saved"));
     }
 

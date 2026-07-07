@@ -453,7 +453,7 @@ impl ModelSource for CompilingModelSource {
     fn load(&self, _root: &Path) -> Result<LoadOutcome, String> {
         Ok(LoadOutcome::Model(ReadyModel {
             model: fixture_model(),
-            compiler: Box::new(RecordingCompiler {
+            compiler: Arc::new(RecordingCompiler {
                 succeed: self.succeed,
                 fail_reason: self.fail_reason.clone(),
                 calls: self.calls.clone(),
@@ -522,7 +522,7 @@ impl ModelSource for ReloadingModelSource {
     fn load(&self, _root: &Path) -> Result<LoadOutcome, String> {
         Ok(LoadOutcome::Model(ReadyModel {
             model: self.initial.clone(),
-            compiler: Box::new(ReloadingCompiler {
+            compiler: Arc::new(ReloadingCompiler {
                 reload_model: self.reload.clone(),
             }),
         }))

@@ -62,8 +62,9 @@ pub struct CoreServices {
     /// the `compile` executeCommand and the rename compile ladder run through it,
     /// and the build-target-change reload refetches the project model over its
     /// retained session. In production it retains the BSP session; index-only
-    /// injections get the disconnected stub.
-    pub compiler: Box<dyn BuildCompiler>,
+    /// injections get the disconnected stub. `Arc` so the build-job scheduler's
+    /// background thread holds a clone and can run the didSave compile-first job.
+    pub compiler: Arc<dyn BuildCompiler>,
     /// The presentation-compiler query capability (the Scala `CoreServices.pc`):
     /// the definition-family PC methods run through it. In production it lazily
     /// boots the embedded JVM island on the first PC request.
@@ -77,10 +78,11 @@ pub struct CoreServices {
     /// Scala `lastCompletionTarget`). `completion` records it; `completionItem/
     /// resolve` reads it to name the PC target the enrichment runs against.
     last_completion_target: Mutex<Option<String>>,
-    /// The debounced, single-flight background reingester (the Scala
-    /// `scheduleBuildJob` index thread). A RawSemanticDBPath reference that finds
-    /// the index stale (`needs_reindex`) enqueues a reingest here; dropping the
-    /// services stops and joins its worker.
+    /// The debounced, single-flight background build-job scheduler (the Scala
+    /// `scheduleBuildJob` index thread). `didSave` enqueues a compile-first job
+    /// over the saved file's reverse-dependency closure; a RawSemanticDBPath
+    /// reference that could not heal inline enqueues a reindex-only job. Dropping
+    /// the services stops and joins its worker.
     scheduler: BuildScheduler,
 }
 
@@ -104,11 +106,11 @@ impl CoreServices {
         uris: WorkspaceUris,
         workspace_root: Option<PathBuf>,
         uri_to_target: HashMap<String, String>,
-        compiler: Box<dyn BuildCompiler>,
+        compiler: Arc<dyn BuildCompiler>,
         pc: Box<dyn PcQueryService>,
         bsp_connected: bool,
     ) -> CoreServices {
-        let scheduler = BuildScheduler::new(Arc::clone(&orchestrator));
+        let scheduler = BuildScheduler::new(Arc::clone(&orchestrator), Arc::clone(&compiler));
         CoreServices {
             orchestrator,
             uris,
@@ -129,11 +131,44 @@ impl CoreServices {
         self.scheduler.schedule_reindex();
     }
 
+    /// The `didSave` build job (the tail of Scala `ScalaLs.didSave`): schedule a
+    /// compile-first job over the reverse-dependency closure of the saved file's
+    /// target, then reingest. The closure is the exact upper bound of targets that
+    /// can reference a symbol defined in the saved file. With no owning target (or
+    /// an id unknown to the indexed workspace) it degrades to the owning target
+    /// alone, or to a reindex-only job when the file has no target at all. `uri`
+    /// must already be normalized (it is matched against `uri_to_target`).
+    pub fn schedule_save_build(&self, uri: &str) {
+        let targets = match self.uri_to_target.get(uri) {
+            Some(bsp_id) => {
+                let closure = self
+                    .orchestrator
+                    .workspace()
+                    .map(|ws| ws.reverse_dependency_closure(bsp_id))
+                    .unwrap_or_default();
+                if closure.is_empty() {
+                    vec![bsp_id.clone()]
+                } else {
+                    let mut targets: Vec<String> = closure.into_iter().collect();
+                    targets.sort();
+                    targets
+                }
+            }
+            None => Vec::new(),
+        };
+        let compile_first = !targets.is_empty();
+        self.scheduler.schedule(targets, compile_first);
+    }
+
     /// Test-only: replace the scheduler with a short-debounce one so background
     /// healing is observable without waiting out the production debounce.
     #[cfg(test)]
     fn with_scheduler_debounce(mut self, debounce: std::time::Duration) -> Self {
-        self.scheduler = BuildScheduler::with_debounce(Arc::clone(&self.orchestrator), debounce);
+        self.scheduler = BuildScheduler::with_debounce(
+            Arc::clone(&self.orchestrator),
+            Arc::clone(&self.compiler),
+            debounce,
+        );
         self
     }
 
@@ -243,6 +278,10 @@ impl Handlers<CoreServices> for CoreHandlers {
     /// unconditional `s.pc.didClose(uri)`.
     fn on_did_close(&self, services: &CoreServices, uri: &str) {
         services.pc.did_close(uri);
+    }
+
+    fn on_did_save(&self, services: &CoreServices, uri: &str) {
+        services.schedule_save_build(uri);
     }
 }
 
@@ -886,7 +925,7 @@ mod tests {
             uris,
             Some(root.to_path_buf()),
             HashMap::new(),
-            Box::new(UnavailableCompiler),
+            Arc::new(UnavailableCompiler),
             Box::new(pc),
             true,
         )
@@ -954,6 +993,100 @@ mod tests {
         assert_eq!(
             services.wait_for_reindex(1, std::time::Duration::from_secs(5)),
             1
+        );
+    }
+
+    /// Records every compile call; `refetch_model` is unused by the didSave path.
+    struct RecordingCompiler {
+        calls: Arc<Mutex<Vec<Vec<String>>>>,
+    }
+
+    impl ls_engine::CompileService for RecordingCompiler {
+        fn compile(&self, targets: &[String]) -> ls_engine::CompileOutcome {
+            self.calls.lock().unwrap().push(targets.to_vec());
+            ls_engine::CompileOutcome::Ok
+        }
+    }
+
+    impl BuildCompiler for RecordingCompiler {
+        fn refetch_model(&self) -> Result<ls_bsp::model::BspProjectModel, String> {
+            Err("no reload in the didSave test".to_string())
+        }
+    }
+
+    /// `CoreServices` over a workspace where `b` depends on `a`, a recording
+    /// compiler, and a short-debounce scheduler. Saving a file owned by `a` must
+    /// compile the reverse-dependency closure `{a, b}` (sorted) then reingest.
+    fn services_with_recording_compiler(
+        root: &Path,
+        uri_to_target: HashMap<String, String>,
+    ) -> (CoreServices, Arc<Mutex<Vec<Vec<String>>>>) {
+        use ls_engine::{TargetSpec, WorkspaceTargets};
+        let store = Store::open(root).unwrap();
+        let orchestrator = Arc::new(QueryOrchestrator::with_defaults(store));
+        // Empty SemanticDB roots (0 docs) — enough to record the workspace so
+        // `reverse_dependency_closure` resolves; the compile targets are what matter.
+        std::fs::create_dir_all(root.join("out-a")).unwrap();
+        std::fs::create_dir_all(root.join("out-b")).unwrap();
+        let ws = WorkspaceTargets::new(vec![
+            TargetSpec::new("a", root.join("out-a"), root.join("src")),
+            TargetSpec::new("b", root.join("out-b"), root.join("src"))
+                .with_deps(vec!["a".to_string()]),
+        ]);
+        orchestrator.ingest(Arc::new(ws)).unwrap();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let compiler: Arc<dyn BuildCompiler> = Arc::new(RecordingCompiler {
+            calls: Arc::clone(&calls),
+        });
+        let services = CoreServices::new(
+            orchestrator,
+            WorkspaceUris::new(&[root.to_path_buf()]),
+            Some(root.to_path_buf()),
+            uri_to_target,
+            compiler,
+            Box::new(FakePc::default()),
+            true,
+        )
+        .with_scheduler_debounce(std::time::Duration::from_millis(2));
+        (services, calls)
+    }
+
+    // didSave over a file owned by `a` schedules a compile-first job over the
+    // reverse-dependency closure `{a, b}` (Scala `didSave` -> `scheduleBuildJob`).
+    #[test]
+    fn did_save_schedules_compile_first_over_the_reverse_dependency_closure() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = path_to_uri(&dir.path().join("src/A.scala"));
+        let uri_to_target = HashMap::from([(uri.clone(), "a".to_string())]);
+        let (services, calls) = services_with_recording_compiler(dir.path(), uri_to_target);
+
+        services.schedule_save_build(&uri);
+        assert_eq!(
+            services.wait_for_reindex(1, std::time::Duration::from_secs(5)),
+            1
+        );
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![vec!["a".to_string(), "b".to_string()]],
+            "compile-first must cover the reverse-dependency closure, sorted"
+        );
+    }
+
+    // A save for a file with no owning target degrades to a reindex-only job: the
+    // run drains (reingest) but no compile is attempted.
+    #[test]
+    fn did_save_with_no_owning_target_schedules_reindex_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let (services, calls) = services_with_recording_compiler(dir.path(), HashMap::new());
+
+        services.schedule_save_build(&path_to_uri(&dir.path().join("src/Unowned.scala")));
+        assert_eq!(
+            services.wait_for_reindex(1, std::time::Duration::from_secs(5)),
+            1
+        );
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "a save with no target must not compile"
         );
     }
 

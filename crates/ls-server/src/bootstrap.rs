@@ -152,7 +152,7 @@ fn path_string(path: &Path) -> String {
 /// injections carry the disconnected stub.
 pub struct ReadyModel {
     pub model: BspProjectModel,
-    pub compiler: Box<dyn BuildCompiler>,
+    pub compiler: Arc<dyn BuildCompiler>,
 }
 
 /// The outcome of asking a [`ModelSource`] for a workspace's build model.
@@ -190,7 +190,7 @@ where
     fn load(&self, workspace_root: &Path) -> Result<LoadOutcome, String> {
         Ok(LoadOutcome::Model(ReadyModel {
             model: self(workspace_root)?,
-            compiler: Box::new(UnavailableCompiler),
+            compiler: Arc::new(UnavailableCompiler),
         }))
     }
 }
@@ -439,7 +439,7 @@ impl ModelSource for LiveBspModelSource {
         match load_project_model(&session) {
             Ok(model) => Ok(LoadOutcome::Model(ReadyModel {
                 model,
-                compiler: Box::new(BspCompileService::new(session)),
+                compiler: Arc::new(BspCompileService::new(session)),
             })),
             Err(detail) => {
                 // A launched build server must not be left running past a failed load.
