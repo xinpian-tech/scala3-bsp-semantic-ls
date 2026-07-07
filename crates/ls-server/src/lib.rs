@@ -5,6 +5,7 @@
 //! BSP client, and PC-island boundary crates.
 
 pub mod bootstrap;
+mod build_scheduler;
 pub mod capabilities;
 pub mod cli;
 pub mod convert;

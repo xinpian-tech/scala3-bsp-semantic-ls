@@ -36,6 +36,7 @@ use ls_engine::{
 use ls_index_model::uri::normalize_uri;
 use ls_index_model::{LsError, Span};
 
+use crate::build_scheduler::BuildScheduler;
 use crate::capabilities::commands;
 use crate::convert::{self, DocumentHighlight, Location, WorkspaceSymbol};
 use crate::jsonrpc::{error_codes, RequestId, Response, ResponseError};
@@ -76,6 +77,11 @@ pub struct CoreServices {
     /// Scala `lastCompletionTarget`). `completion` records it; `completionItem/
     /// resolve` reads it to name the PC target the enrichment runs against.
     last_completion_target: Mutex<Option<String>>,
+    /// The debounced, single-flight background reingester (the Scala
+    /// `scheduleBuildJob` index thread). A RawSemanticDBPath reference that finds
+    /// the index stale (`needs_reindex`) enqueues a reingest here; dropping the
+    /// services stops and joins its worker.
+    scheduler: BuildScheduler,
 }
 
 /// The retained build capability: a [`CompileService`] that can also refetch the
@@ -102,6 +108,7 @@ impl CoreServices {
         pc: Box<dyn PcQueryService>,
         bsp_connected: bool,
     ) -> CoreServices {
+        let scheduler = BuildScheduler::new(Arc::clone(&orchestrator));
         CoreServices {
             orchestrator,
             uris,
@@ -111,7 +118,29 @@ impl CoreServices {
             pc,
             bsp_connected,
             last_completion_target: Mutex::new(None),
+            scheduler,
         }
+    }
+
+    /// Enqueue a background reingest on the build-job scheduler (Scala
+    /// `scheduleBuildJob(Vector.empty, compileFirst = false)`). Called when a
+    /// RawSemanticDBPath query reports `needs_reindex`; never blocks the caller.
+    pub fn schedule_reindex(&self) {
+        self.scheduler.schedule_reindex();
+    }
+
+    /// Test-only: replace the scheduler with a short-debounce one so background
+    /// healing is observable without waiting out the production debounce.
+    #[cfg(test)]
+    fn with_scheduler_debounce(mut self, debounce: std::time::Duration) -> Self {
+        self.scheduler = BuildScheduler::with_debounce(Arc::clone(&self.orchestrator), debounce);
+        self
+    }
+
+    /// Test-only: block until the scheduler has drained at least `n` reingest runs.
+    #[cfg(test)]
+    fn wait_for_reindex(&self, n: u64, timeout: std::time::Duration) -> u64 {
+        self.scheduler.wait_for_runs(n, timeout)
     }
 
     /// `file://` URI -> SemanticDB URI against this workspace's index.
@@ -245,15 +274,25 @@ fn references(id: RequestId, services: &CoreServices, params: &Value) -> Respons
         .unwrap_or(false);
     let engine = ReferencesEngine::new(&services.orchestrator);
     match engine.references(&sdb_uri, pos.line, pos.character, include_declaration) {
-        // `result.needs_reindex` triggers a background reingest in the Scala
-        // server; that build scheduler is wired with the reindex flow, not here.
-        // The reference list itself is already complete.
-        Ok(result) => ok_json(
-            id,
-            &references_locations(&result, |sdb| services.to_file_uri(sdb)),
-        ),
+        Ok(result) => references_ok(id, services, &result),
         Err(error) => request_failed(id, &error),
     }
+}
+
+/// Shapes a successful `references` result. When the resolution fell through to
+/// the raw `.semanticdb` path (`needs_reindex`), enqueue a background reingest to
+/// heal the index (Scala `if result.needsReindex then scheduleBuildJob(
+/// Vector.empty, compileFirst = false)`) — then return the full, already-complete
+/// location list UNCHANGED. The healing is asynchronous; the response never waits
+/// on it and never varies with `needs_reindex`.
+fn references_ok(id: RequestId, services: &CoreServices, result: &ReferencesResult) -> Response {
+    if result.needs_reindex {
+        services.schedule_reindex();
+    }
+    ok_json(
+        id,
+        &references_locations(result, |sdb| services.to_file_uri(sdb)),
+    )
 }
 
 /// `textDocument/documentHighlight`: read/write occurrences of the cursor symbol
@@ -871,6 +910,51 @@ mod tests {
         let value = serde_json::to_value(&response).unwrap();
         assert_eq!(value["error"]["code"], error_codes::REQUEST_FAILED);
         assert!(value.get("result").is_none());
+    }
+
+    // A raw-`.semanticdb`-path references result (`needs_reindex`) enqueues a
+    // background reingest and returns the SAME location list it would without the
+    // flag — the response never varies with, or blocks on, the healing.
+    #[test]
+    fn references_needs_reindex_heals_in_background_without_changing_the_response() {
+        use ls_engine::{ReferenceHit, ReferencesResult};
+        use ls_index_model::{Loc, Role, Span};
+
+        let dir = tempfile::tempdir().unwrap();
+        let services = unindexed_services(dir.path())
+            .with_scheduler_debounce(std::time::Duration::from_millis(2));
+
+        let hit = ReferenceHit {
+            loc: Loc::new("A.scala".to_string(), Span::new(0, 0, 0, 1)),
+            role: Role::Reference,
+            from_overlay: false,
+        };
+        let cold = ReferencesResult {
+            hits: vec![hit.clone()],
+            needs_reindex: false,
+        };
+        let hot = ReferencesResult {
+            hits: vec![hit],
+            needs_reindex: true,
+        };
+
+        let cold_resp = references_ok(RequestId::Number(1), &services, &cold);
+        // needs_reindex=false schedules nothing: no run within a short window.
+        assert_eq!(
+            services.wait_for_reindex(1, std::time::Duration::from_millis(60)),
+            0
+        );
+
+        let hot_resp = references_ok(RequestId::Number(2), &services, &hot);
+        // Same hits -> byte-identical result body regardless of needs_reindex.
+        let cold_body = serde_json::to_value(&cold_resp).unwrap()["result"].clone();
+        let hot_body = serde_json::to_value(&hot_resp).unwrap()["result"].clone();
+        assert_eq!(cold_body, hot_body);
+        // The heal enqueued exactly one background reingest.
+        assert_eq!(
+            services.wait_for_reindex(1, std::time::Duration::from_secs(5)),
+            1
+        );
     }
 
     // `requireSemanticdb` runs outside the query's catch, so a URI the model does

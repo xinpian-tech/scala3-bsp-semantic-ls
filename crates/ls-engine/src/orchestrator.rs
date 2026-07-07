@@ -79,6 +79,12 @@ pub struct QueryOrchestrator {
     sync_write_through: bool,
     current_workspace: Mutex<Option<Arc<WorkspaceTargets>>>,
     last_write_through_thread: Mutex<Option<String>>,
+    /// Serializes full-generation ingests so a background reingest (the build-job
+    /// scheduler) never runs concurrently with a message-loop ingest (the explicit
+    /// reindex command, the build-target reload, or bootstrap). Enforces the
+    /// single-writer store contract regardless of the calling thread — the port's
+    /// stand-in for the Scala single `indexExecutor` all ingests run on.
+    ingest_lock: Mutex<()>,
 }
 
 impl QueryOrchestrator {
@@ -89,11 +95,23 @@ impl QueryOrchestrator {
             sync_write_through,
             current_workspace: Mutex::new(None),
             last_write_through_thread: Mutex::new(None),
+            ingest_lock: Mutex::new(()),
         }
     }
 
+    /// The default orchestrator: RawSemanticDBPath heals SYNCHRONOUSLY inline on
+    /// the calling thread (`sync_write_through = true`), clearing `needs_reindex`.
     pub fn with_defaults(store: Store) -> Self {
         Self::new(store, Box::new(NoopOverlay), true)
+    }
+
+    /// The production orchestrator: RawSemanticDBPath does NOT heal inline
+    /// (`sync_write_through = false`); it returns `needs_reindex = true`, and the
+    /// server's build-job scheduler runs the reingest asynchronously on its index
+    /// thread. Mirrors Scala serving from the raw `.semanticdb` then
+    /// `scheduleBuildJob`, rather than blocking the request on a full ingest.
+    pub fn with_async_reindex(store: Store) -> Self {
+        Self::new(store, Box::new(NoopOverlay), false)
     }
 
     pub fn store(&self) -> &Store {
@@ -131,11 +149,31 @@ impl QueryOrchestrator {
     }
 
     /// Runs a full-generation ingest and remembers the workspace description for
-    /// target-graph pruning.
+    /// target-graph pruning. Serialized by `ingest_lock` so concurrent ingests
+    /// (background reingest vs. a message-loop ingest) never race the store's
+    /// generation commit — the single-writer contract, enforced across threads.
     pub fn ingest(&self, workspace: Arc<WorkspaceTargets>) -> StoreResult<IngestReport> {
+        let _writer = self.ingest_lock.lock().unwrap();
         let (report, _snap) = ingest::ingest(&self.store, &workspace)?;
         *self.current_workspace.lock().unwrap() = Some(workspace);
         Ok(report)
+    }
+
+    /// Re-ingests the CURRENT workspace, reading it INSIDE the ingest lock so a
+    /// background heal always targets the latest committed model. This is what the
+    /// build-job scheduler calls: capturing the workspace under the lock (not
+    /// before it) guarantees a background reingest can never REVERT a concurrent
+    /// `reload` that swapped `current_workspace` — the reload's newer ingest is
+    /// never clobbered by a stale pre-captured workspace. Returns `None` when no
+    /// workspace is set or it has no indexable target, so the heal never commits an
+    /// empty segment over a live index (matches `reload`'s non-empty gate).
+    pub fn reingest_current(&self) -> Option<StoreResult<IngestReport>> {
+        let _writer = self.ingest_lock.lock().unwrap();
+        let workspace = self.current_workspace.lock().unwrap().clone()?;
+        if workspace.targets.is_empty() {
+            return None;
+        }
+        Some(ingest::ingest(&self.store, &workspace).map(|(report, _snap)| report))
     }
 
     // --- workspace symbol (BestEffort) ---
@@ -270,6 +308,7 @@ impl QueryOrchestrator {
             return false;
         };
         *self.last_write_through_thread.lock().unwrap() = Some(thread_label());
+        let _writer = self.ingest_lock.lock().unwrap();
         ingest::ingest(&self.store, &ws).is_ok()
     }
 

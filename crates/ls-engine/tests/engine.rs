@@ -672,6 +672,32 @@ fn references_raw_fallback_serves_same_doc() {
     assert_eq!(result.hits[0].loc.span, Span::new(1, 10, 1, 11));
 }
 
+// The background reindex scheduler heals via `reingest_current`, which reads the
+// workspace INSIDE the ingest lock. Pin the two invariants that fix relies on: an
+// unset workspace is a no-op (never commits an empty segment over a live index),
+// and a set workspace re-ingests the CURRENT model (not a stale pre-captured one,
+// so a concurrent reload is never reverted).
+#[test]
+fn reingest_current_heals_the_set_workspace_and_is_a_noop_when_unset() {
+    let dir = TempDir::new("reingestcurrent");
+    let (ws, _targetroot, _sourceroot) = build_ab(&dir);
+    let store = Store::open(&dir.sub("store")).unwrap();
+    let orch = QueryOrchestrator::new(store, Box::new(NoopOverlay), false);
+
+    assert!(
+        orch.reingest_current().is_none(),
+        "reingest_current with no workspace set must be a no-op"
+    );
+
+    orch.ingest(ws).unwrap();
+    assert!(
+        orch.reingest_current()
+            .expect("workspace set -> Some")
+            .is_ok(),
+        "reingest_current with a set workspace must re-ingest it"
+    );
+}
+
 #[test]
 fn rename_synthetic_only_symbol_rejected() {
     let dir = TempDir::new("synthetic");

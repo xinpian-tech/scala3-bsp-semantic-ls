@@ -250,8 +250,11 @@ impl<M: ModelSource> IndexBootstrap<M> {
         let pc_targets = pc_target_configs(&model);
         let store = Store::open(&workspace_root.join(STORE_DIR)).map_err(|e| e.to_string())?;
         // `Arc` because the PC island's cross-file `symbol_definition` resolver
-        // answers from this same query engine.
-        let orchestrator = Arc::new(QueryOrchestrator::with_defaults(store));
+        // answers from this same query engine. `with_async_reindex`: a
+        // RawSemanticDBPath query returns `needs_reindex` (it does NOT heal inline
+        // on the request thread), and the ready services' build-job scheduler runs
+        // the reingest asynchronously — Scala serves raw then `scheduleBuildJob`.
+        let orchestrator = Arc::new(QueryOrchestrator::with_async_reindex(store));
         orchestrator
             .ingest(Arc::new(workspace))
             .map_err(|e| e.to_string())?;
