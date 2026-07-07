@@ -616,6 +616,58 @@ fn workspace_symbol_over_the_real_bsp_model() {
         .ends_with("a/src/pkga/Core.scala"));
 }
 
+// A cold-start session that answers index-only queries over the REAL BSP client
+// (a real `BspSession`, not the fixture model) must never boot the embedded JVM:
+// no presentation-compiler request runs, so the island stays cold and libjvm is
+// never mapped into the process. Guarded on the full presentation-compiler env
+// being present because only then can a concurrent `pc_completion_over_the_fake_bsp_model`
+// in this binary boot the JVM and make the process-global `libjvm_mapped()` check
+// unreliable; the meaningful no-PC configuration (the JVM never boots) is exactly
+// when the PC env is incomplete, which is when this assertion runs.
+#[test]
+fn an_index_only_session_over_the_real_bsp_client_stays_jvm_free() {
+    if std::env::var_os("LS_LIBJVM").is_some()
+        && std::env::var_os("PC_HOST_AGENT_JAR").is_some()
+        && std::env::var_os("LS_PC_TARGET_CLASSPATH").is_some()
+    {
+        eprintln!(
+            "fake_bsp_e2e: skipping the cold-start JVM check — a concurrent PC test may boot the JVM"
+        );
+        return;
+    }
+    assert!(
+        !ls_server::libjvm_mapped(),
+        "the embedded JVM must be unmapped before any session runs"
+    );
+    let mut core = ServerCore::new();
+    let e2e = setup(core.reload_flag());
+    let uri = core_uri();
+    let input = session_input(
+        &e2e.workspace_root,
+        vec![
+            request(2, "workspace/symbol", json!({ "query": "Core" })),
+            request(
+                3,
+                "textDocument/references",
+                json!({
+                    "textDocument": { "uri": uri },
+                    "position": { "line": 2, "character": 6 },
+                    "context": { "includeDeclaration": true }
+                }),
+            ),
+        ],
+    );
+    let out = serve_pumped(&mut core, &e2e.source, input);
+    assert!(
+        by_id(&out, 2)["result"].is_array(),
+        "the index-only symbol query should answer over the real BSP model"
+    );
+    assert!(
+        !ls_server::libjvm_mapped(),
+        "an index-only session over the real BSP client must never boot the JVM"
+    );
+}
+
 // references + documentHighlight + prepareRename resolve over the real BSP model.
 #[test]
 fn references_highlight_and_prepare_rename_over_the_real_bsp_model() {
