@@ -41,8 +41,15 @@ struct Shared {
     /// Target ids to compile before the reingest (accumulated across coalesced
     /// schedules). Drained (sorted, since a `BTreeSet`) at run start.
     pending_targets: BTreeSet<String>,
-    /// Whether a compile is requested for the next run (ORed across schedules).
+    /// Whether a compile-first job is requested for the next run (ORed across
+    /// schedules).
     pending_compile: bool,
+    /// Whether a reindex-only heal is requested for the next run (ORed across
+    /// schedules). Tracked INDEPENDENTLY of `pending_compile` so a `references`
+    /// raw-path fallback heal that coalesces into a FAILING `didSave` compile is
+    /// still honored — a compile failure skips the reingest only when no
+    /// reindex-only intent shared the debounce window.
+    pending_reindex: bool,
     /// Number of drained runs the worker has completed, for deterministic tests.
     runs_completed: u64,
     /// Number of runs that reached the reingest step (i.e. did NOT skip it on a
@@ -81,6 +88,7 @@ impl BuildScheduler {
                 shutting_down: false,
                 pending_targets: BTreeSet::new(),
                 pending_compile: false,
+                pending_reindex: false,
                 runs_completed: 0,
                 reingests_attempted: 0,
             }),
@@ -96,16 +104,22 @@ impl BuildScheduler {
     }
 
     /// Schedule a build job (Scala `scheduleBuildJob(targets, compileFirst)`).
-    /// Accumulates the targets and the compile flag, and arms the single debounce
-    /// if a run is not already pending (coalesce otherwise). Never blocks.
+    /// A compile-first schedule accumulates `pending_targets` and sets
+    /// `pending_compile`; a non-compile schedule sets the INDEPENDENT
+    /// `pending_reindex` intent. Both arm the single debounce if a run is not
+    /// already pending (coalesce otherwise). Never blocks.
     pub(crate) fn schedule(&self, targets: Vec<String>, compile_first: bool) {
         let (lock, cvar) = &*self.shared;
         let mut shared = lock.lock().unwrap();
         if shared.shutting_down {
             return;
         }
-        shared.pending_targets.extend(targets);
-        shared.pending_compile |= compile_first;
+        if compile_first {
+            shared.pending_targets.extend(targets);
+            shared.pending_compile = true;
+        } else {
+            shared.pending_reindex = true;
+        }
         if !shared.scheduled {
             shared.scheduled = true;
             shared.due_at = Some(Instant::now() + self.debounce);
@@ -192,21 +206,25 @@ fn worker_loop(
                 }
             }
         }
-        // Begin the run: snapshot + clear the pending set so schedules during the
-        // job arm exactly one follow-up. `BTreeSet::into_iter` yields sorted ids
-        // (Scala `toVector.sorted`).
+        // Begin the run: snapshot + clear ALL pending intents so schedules during
+        // the job arm exactly one follow-up. `BTreeSet::into_iter` yields sorted
+        // ids (Scala `toVector.sorted`). `reindex` is tracked independently of the
+        // compile so a coalesced heal survives a compile failure.
         let targets: Vec<String> = std::mem::take(&mut guard.pending_targets)
             .into_iter()
             .collect();
         let compile = guard.pending_compile;
+        let reindex = guard.pending_reindex;
         guard.pending_compile = false;
+        guard.pending_reindex = false;
         guard.scheduled = false;
         guard.due_at = None;
         drop(guard);
 
-        // Compile first when requested; on failure log and SKIP the reingest so the
-        // previous snapshot keeps serving. A reindex-only run always reingests.
-        let should_reingest = if compile && !targets.is_empty() {
+        // Compile first when a compile-first job is pending; on failure log and
+        // leave the previous snapshot serving. `compile_ok` is true when no compile
+        // was attempted or the compile succeeded.
+        let compile_ok = if compile && !targets.is_empty() {
             match compiler.compile(&targets) {
                 CompileOutcome::Ok => true,
                 CompileOutcome::Failed { reason } => {
@@ -220,6 +238,11 @@ fn worker_loop(
         } else {
             true
         };
+        // Reingest on a successful (or no-op) compile, OR whenever a reindex-only
+        // intent shared this run — so a `references` heal is never dropped by a
+        // failing `didSave` compile. Skip the reingest ONLY for a failing
+        // compile-first run that carried no reindex-only intent.
+        let should_reingest = compile_ok || reindex;
         if should_reingest {
             if let Some(Err(error)) = orchestrator.reingest_current() {
                 eprintln!("scala3-bsp-semantic-ls: background reingest failed: {error}");
@@ -327,13 +350,13 @@ mod tests {
         );
     }
 
-    // Rapid schedules while a run is pending collapse into ONE run, and the
-    // accumulated targets + compile flag merge (Scala queue collapse).
+    // Rapid compile-first schedules while a run is pending collapse into ONE run,
+    // accumulating the merged sorted target set (Scala queue collapse).
     #[test]
-    fn rapid_schedules_collapse_and_accumulate_targets() {
+    fn rapid_compile_first_schedules_collapse_and_accumulate_targets() {
         let (_dir, calls, sched) = scheduler(Duration::from_millis(80), false);
         sched.schedule(vec!["a".to_string()], true);
-        sched.schedule(vec!["b".to_string()], false);
+        sched.schedule(vec!["b".to_string()], true);
         sched.schedule_reindex();
         assert_eq!(sched.wait_for_runs(1, Duration::from_secs(5)), 1);
         // One run, compiling the merged sorted target set once.
@@ -342,6 +365,25 @@ mod tests {
             vec![vec!["a".to_string(), "b".to_string()]]
         );
         assert_eq!(sched.runs_completed(), 1);
+    }
+
+    // The regression this round fixes: a reindex-only heal (the `references`
+    // fallback) that coalesces into a FAILING `didSave` compile must NOT be
+    // dropped — the run still attempts exactly one reingest, even though the
+    // compile failed. `pending_reindex` is tracked independently of the compile.
+    #[test]
+    fn a_reindex_only_heal_survives_a_coalesced_failing_compile() {
+        // A window long enough to hold the run pending while both producers arrive.
+        let (_dir, calls, sched) = scheduler(Duration::from_millis(80), true);
+        sched.schedule(vec!["a".to_string()], true); // failing compile-first save
+        sched.schedule_reindex(); // references raw-path heal, same window
+        assert_eq!(sched.wait_for_runs(1, Duration::from_secs(5)), 1);
+        assert_eq!(calls.lock().unwrap().len(), 1, "the compile was attempted");
+        assert_eq!(
+            sched.reingests_attempted(),
+            1,
+            "the coalesced reindex-only heal must still reingest despite the compile failure"
+        );
     }
 
     #[test]
