@@ -499,17 +499,27 @@ impl ModelSource for LiveBspModelSource {
             BspSessionConfig::default(),
         )
         .map_err(|e| e.to_string())?;
-        match load_project_model(&session) {
-            Ok(model) => Ok(LoadOutcome::Model(ReadyModel {
-                model,
-                compiler: Arc::new(BspCompileService::new(session)),
-            })),
-            Err(detail) => {
-                // A launched build server must not be left running past a failed load.
-                session.shutdown();
-                session.close();
-                Err(detail)
-            }
+        ready_model_from_session(session).map(LoadOutcome::Model)
+    }
+}
+
+/// Assemble the ready build model from a connected (not-yet-initialized) BSP
+/// session: initialize, load the project model, and — on success — retain the
+/// session inside the compiler so `compile`/`refetch_model` run over it; on
+/// failure tear the session down so a build server is never left running past a
+/// failed load. Shared by the live model source (over a launched subprocess) and
+/// the fake-BSP end-to-end harness (over an in-process `connect`ed server), so
+/// both exercise the same real session-backed compiler.
+pub fn ready_model_from_session(session: BspSession) -> Result<ReadyModel, String> {
+    match load_project_model(&session) {
+        Ok(model) => Ok(ReadyModel {
+            model,
+            compiler: Arc::new(BspCompileService::new(session)),
+        }),
+        Err(detail) => {
+            session.shutdown();
+            session.close();
+            Err(detail)
         }
     }
 }

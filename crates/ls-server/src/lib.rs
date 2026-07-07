@@ -24,8 +24,8 @@ pub mod store_dump;
 pub mod workspace_uris;
 
 pub use bootstrap::{
-    from_bsp, reload_build_model, workspace_source_facts, BspDocFacts, IndexBootstrap,
-    LiveBspModelSource, LoadOutcome, ModelSource, ReadyModel,
+    from_bsp, ready_model_from_session, reload_build_model, workspace_source_facts, BspDocFacts,
+    IndexBootstrap, LiveBspModelSource, LoadOutcome, ModelSource, ReadyModel,
 };
 pub use capabilities::{
     initialize_result, server_capabilities, InitializeResult, ServerCapabilities, SERVER_NAME,
