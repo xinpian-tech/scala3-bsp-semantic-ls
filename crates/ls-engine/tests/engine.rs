@@ -184,6 +184,12 @@ fn raw_path_write_through_runs_inline_and_heals() {
     let dir = TempDir::new("writethrough");
     let (ws, targetroot, sourceroot) = build_ab(&dir);
     let orch = orchestrator(&dir, ws);
+    // The production wiring (`with_defaults`) heals the raw path inline; the rest
+    // of this test proves that mode clears needs_reindex and heals the snapshot.
+    assert!(
+        orch.raw_path_writes_through(),
+        "with_defaults must write through synchronously (write-through parity)"
+    );
     // Add a doc not present in the published snapshot.
     let c = DocFixture::new("c/C.scala", "class C\n")
         .symbol(sym("pkg/C#", KIND_CLASS, 0, "C"))

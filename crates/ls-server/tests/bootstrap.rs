@@ -252,6 +252,30 @@ fn production_bootstrap_ingests_the_model_and_serves_real_queries() {
     );
 }
 
+/// Write-through parity regression guard: the PRODUCTION bootstrap must wire a
+/// RawSemanticDBPath that heals SYNCHRONOUSLY inline (clearing `needs_reindex`
+/// before returning), not an async-heal orchestrator that defers to the
+/// background scheduler. This goes through the real `IndexBootstrap::build` over
+/// the committed corpus and asserts the synchronous write-through mode; the engine
+/// test `raw_path_write_through_runs_inline_and_heals` proves that mode actually
+/// heals the snapshot inline so the next query resolves from the index (no
+/// scheduler wait). Guards against re-regressing production to
+/// `sync_write_through=false`.
+#[test]
+fn production_bootstrap_orchestrator_writes_through_synchronously() {
+    let dir = tempfile::tempdir().unwrap();
+    let bootstrap = IndexBootstrap::new(|_root: &Path| Ok(fixture_model()));
+    let state = bootstrap.build(Some(dir.path().to_path_buf()));
+    let services = state
+        .ready()
+        .expect("production bootstrap over the fixture corpus should be Ready");
+    assert!(
+        services.orchestrator.raw_path_writes_through(),
+        "production RawSemanticDBPath must heal inline (write-through parity), \
+         not defer to the background scheduler"
+    );
+}
+
 /// The indexable corpus plus one target that OWNS a source but produces no
 /// SemanticDB (`semanticdb_root: None` → excluded from `indexable_targets()` and
 /// so from the ingested workspace), whose source URI is still in `uri_to_target`.

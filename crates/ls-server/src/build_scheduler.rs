@@ -185,7 +185,9 @@ mod tests {
     fn empty_orchestrator() -> (TempDir, Arc<QueryOrchestrator>) {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path()).unwrap();
-        (dir, Arc::new(QueryOrchestrator::with_async_reindex(store)))
+        // The scheduler's reingest path (`reingest_current`) is independent of the
+        // write-through mode, so the production `with_defaults` orchestrator is used.
+        (dir, Arc::new(QueryOrchestrator::with_defaults(store)))
     }
 
     #[test]

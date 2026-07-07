@@ -250,11 +250,15 @@ impl<M: ModelSource> IndexBootstrap<M> {
         let pc_targets = pc_target_configs(&model);
         let store = Store::open(&workspace_root.join(STORE_DIR)).map_err(|e| e.to_string())?;
         // `Arc` because the PC island's cross-file `symbol_definition` resolver
-        // answers from this same query engine. `with_async_reindex`: a
-        // RawSemanticDBPath query returns `needs_reindex` (it does NOT heal inline
-        // on the request thread), and the ready services' build-job scheduler runs
-        // the reingest asynchronously — Scala serves raw then `scheduleBuildJob`.
-        let orchestrator = Arc::new(QueryOrchestrator::with_async_reindex(store));
+        // answers from this same query engine. `with_defaults` is the production
+        // orchestrator: `sync_write_through = true`, so a RawSemanticDBPath
+        // resolution runs the full-generation ingest INLINE and clears
+        // `needs_reindex` before returning (write-through parity; matches the
+        // Scala `WorkspaceState` default `QueryOrchestrator(..., overlay)` with
+        // `syncWriteThrough = true`). The ready services' build scheduler is only
+        // the FALLBACK — `references_ok` enqueues a background reingest solely for
+        // results that STILL carry `needs_reindex` (write-through unavailable/failed).
+        let orchestrator = Arc::new(QueryOrchestrator::with_defaults(store));
         orchestrator
             .ingest(Arc::new(workspace))
             .map_err(|e| e.to_string())?;

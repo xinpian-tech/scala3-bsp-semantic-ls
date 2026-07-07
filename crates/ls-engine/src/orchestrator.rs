@@ -99,19 +99,16 @@ impl QueryOrchestrator {
         }
     }
 
-    /// The default orchestrator: RawSemanticDBPath heals SYNCHRONOUSLY inline on
-    /// the calling thread (`sync_write_through = true`), clearing `needs_reindex`.
+    /// The production orchestrator: `sync_write_through = true`, so a
+    /// RawSemanticDBPath resolution heals SYNCHRONOUSLY inline on the calling
+    /// thread — running the full-generation ingest and clearing `needs_reindex`
+    /// before returning (the write-through parity contract; the Scala
+    /// `WorkspaceState` default). The `sync_write_through = false` mode (raw path
+    /// only serves and flags `needs_reindex`, healed later by a scheduled
+    /// reingest) is available via [`QueryOrchestrator::new`] and exercised by the
+    /// engine's async-mode tests; it is NOT the production wiring.
     pub fn with_defaults(store: Store) -> Self {
         Self::new(store, Box::new(NoopOverlay), true)
-    }
-
-    /// The production orchestrator: RawSemanticDBPath does NOT heal inline
-    /// (`sync_write_through = false`); it returns `needs_reindex = true`, and the
-    /// server's build-job scheduler runs the reingest asynchronously on its index
-    /// thread. Mirrors Scala serving from the raw `.semanticdb` then
-    /// `scheduleBuildJob`, rather than blocking the request on a full ingest.
-    pub fn with_async_reindex(store: Store) -> Self {
-        Self::new(store, Box::new(NoopOverlay), false)
     }
 
     pub fn store(&self) -> &Store {
@@ -146,6 +143,15 @@ impl QueryOrchestrator {
     /// calling (single index-executor) thread.
     pub fn last_write_through_thread_name(&self) -> Option<String> {
         self.last_write_through_thread.lock().unwrap().clone()
+    }
+
+    /// Whether a RawSemanticDBPath resolution heals SYNCHRONOUSLY inline —
+    /// running the full-generation ingest and clearing `needs_reindex` before
+    /// returning (the write-through parity contract, the production wiring). When
+    /// `false`, the raw path only serves and flags `needs_reindex` for a later
+    /// scheduled reingest. Lets a production-path test assert the mode is wired.
+    pub fn raw_path_writes_through(&self) -> bool {
+        self.sync_write_through
     }
 
     /// Runs a full-generation ingest and remembers the workspace description for
