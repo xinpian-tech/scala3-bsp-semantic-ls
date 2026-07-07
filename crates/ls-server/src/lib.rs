@@ -45,6 +45,9 @@ pub use jsonrpc::{
 pub use lifecycle::{
     pre_ready_outcome, require_ready, Method, NotReadyError, PreReadyOutcome, WorkspaceState,
 };
+// Re-exported so the doctor `PC` section and the cold-start assertion share one
+// non-invasive "is the embedded island mapped into this process?" check.
+pub use ls_jvm::libjvm_mapped;
 pub use pc::{pc_options, IslandPcService, PcLocation, PcQueryService, SymbolResolver};
 pub use protocol::{Diagnostic, DiagnosticCode, Position, PublishDiagnosticsParams, Range};
 pub use server::{serve, Bootstrap, Handlers, RequestContext, ServerCore, ServerHooks};
