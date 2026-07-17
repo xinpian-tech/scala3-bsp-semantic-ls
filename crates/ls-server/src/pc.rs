@@ -583,6 +583,47 @@ impl PcQueryService for IslandPcService {
     }
 }
 
+/// The workspace-level `javaHome` override, read from the optional
+/// `.scala3-bsp-semantic-ls/config.json` at the workspace root. Absent file,
+/// unparseable JSON, or a missing/non-string `javaHome` key all resolve to
+/// `None` — the config tier simply does not apply.
+fn workspace_config_java_home(workspace_root: &std::path::Path) -> Option<PathBuf> {
+    let text =
+        std::fs::read_to_string(workspace_root.join(".scala3-bsp-semantic-ls/config.json")).ok()?;
+    let value: Value = serde_json::from_str(&text).ok()?;
+    value.get("javaHome")?.as_str().map(PathBuf::from)
+}
+
+/// Resolves the embedded JVM's `libjvm.so` and the island host agent jar.
+///
+/// Java home precedence is config > env > nix-baked: the workspace config's
+/// `javaHome` wins; then the environment (`LS_LIBJVM` as an exact libjvm path,
+/// else `JAVA_HOME`); the nix-baked default is the packaged wrapper's
+/// `--set-default JAVA_HOME`/`PC_HOST_AGENT_JAR`, which by construction only
+/// applies when the variable is not already set. A resolved Java home locates
+/// libjvm at `<home>/lib/server/libjvm.so`.
+fn resolve_island_paths(
+    workspace_root: &std::path::Path,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Result<(PathBuf, PathBuf), String> {
+    let libjvm = if let Some(home) = workspace_config_java_home(workspace_root) {
+        home.join("lib/server/libjvm.so")
+    } else if let Some(path) = env("LS_LIBJVM") {
+        PathBuf::from(path)
+    } else if let Some(home) = env("JAVA_HOME") {
+        PathBuf::from(home).join("lib/server/libjvm.so")
+    } else {
+        return Err("no Java home for the PC island: set javaHome in \
+             .scala3-bsp-semantic-ls/config.json, or LS_LIBJVM / JAVA_HOME in the environment"
+            .to_string());
+    };
+    let agent_jar = env("PC_HOST_AGENT_JAR").map(PathBuf::from).ok_or_else(|| {
+        "PC_HOST_AGENT_JAR must point at the island host agent jar to boot the PC island"
+            .to_string()
+    })?;
+    Ok((libjvm, agent_jar))
+}
+
 /// Boots the island: installs the resolver (once), reads the JVM environment,
 /// boots, registers the targets, and replays the mirrored buffers. Records a
 /// boot failure so a broken environment does not re-attempt per request.
@@ -591,14 +632,14 @@ fn boot(state: &mut IslandState) -> bool {
     if state.boot_error.is_some() {
         return false;
     }
-    let (Some(libjvm), Some(agent_jar)) = (
-        std::env::var_os("LS_LIBJVM").map(PathBuf::from),
-        std::env::var_os("PC_HOST_AGENT_JAR").map(PathBuf::from),
-    ) else {
-        state.boot_error =
-            Some("LS_LIBJVM and PC_HOST_AGENT_JAR must be set to boot the PC island".to_string());
-        return false;
-    };
+    let (libjvm, agent_jar) =
+        match resolve_island_paths(&state.workspace_root, &|k| std::env::var(k).ok()) {
+            Ok(paths) => paths,
+            Err(detail) => {
+                state.boot_error = Some(detail);
+                return false;
+            }
+        };
     // The resolver slot is global and set-once; a second install (e.g. a second
     // workspace in the process) is ignored, which is correct — one server, one
     // process. Installed before boot so the premain sees it.
@@ -736,6 +777,82 @@ fn pc_definition_of(result: DefinitionResult) -> PcDefinition {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn env_of(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let owned: Vec<(String, String)> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        move |key: &str| owned.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
+    }
+
+    #[test]
+    fn island_paths_resolve_java_home_from_the_environment() {
+        let ws = tempfile::tempdir().unwrap();
+        let env = env_of(&[("JAVA_HOME", "/jdk"), ("PC_HOST_AGENT_JAR", "/a.jar")]);
+        let (libjvm, jar) = resolve_island_paths(ws.path(), &env).unwrap();
+        assert_eq!(libjvm, PathBuf::from("/jdk/lib/server/libjvm.so"));
+        assert_eq!(jar, PathBuf::from("/a.jar"));
+    }
+
+    #[test]
+    fn island_paths_prefer_the_exact_ls_libjvm_override_over_java_home() {
+        let ws = tempfile::tempdir().unwrap();
+        let env = env_of(&[
+            ("LS_LIBJVM", "/custom/libjvm.so"),
+            ("JAVA_HOME", "/jdk"),
+            ("PC_HOST_AGENT_JAR", "/a.jar"),
+        ]);
+        let (libjvm, _) = resolve_island_paths(ws.path(), &env).unwrap();
+        assert_eq!(libjvm, PathBuf::from("/custom/libjvm.so"));
+    }
+
+    #[test]
+    fn island_paths_prefer_the_workspace_config_over_every_env_tier() {
+        let ws = tempfile::tempdir().unwrap();
+        let conf_dir = ws.path().join(".scala3-bsp-semantic-ls");
+        std::fs::create_dir_all(&conf_dir).unwrap();
+        std::fs::write(
+            conf_dir.join("config.json"),
+            r#"{ "javaHome": "/config/jdk" }"#,
+        )
+        .unwrap();
+        let env = env_of(&[
+            ("LS_LIBJVM", "/custom/libjvm.so"),
+            ("JAVA_HOME", "/jdk"),
+            ("PC_HOST_AGENT_JAR", "/a.jar"),
+        ]);
+        let (libjvm, _) = resolve_island_paths(ws.path(), &env).unwrap();
+        assert_eq!(libjvm, PathBuf::from("/config/jdk/lib/server/libjvm.so"));
+    }
+
+    #[test]
+    fn island_paths_ignore_an_unparseable_workspace_config() {
+        let ws = tempfile::tempdir().unwrap();
+        let conf_dir = ws.path().join(".scala3-bsp-semantic-ls");
+        std::fs::create_dir_all(&conf_dir).unwrap();
+        std::fs::write(conf_dir.join("config.json"), "{ not json").unwrap();
+        let env = env_of(&[("JAVA_HOME", "/jdk"), ("PC_HOST_AGENT_JAR", "/a.jar")]);
+        let (libjvm, _) = resolve_island_paths(ws.path(), &env).unwrap();
+        assert_eq!(libjvm, PathBuf::from("/jdk/lib/server/libjvm.so"));
+    }
+
+    #[test]
+    fn island_paths_without_any_java_home_tier_are_a_typed_error() {
+        let ws = tempfile::tempdir().unwrap();
+        let env = env_of(&[("PC_HOST_AGENT_JAR", "/a.jar")]);
+        let err = resolve_island_paths(ws.path(), &env).unwrap_err();
+        assert!(err.contains("javaHome"), "{err}");
+        assert!(err.contains("JAVA_HOME"), "{err}");
+    }
+
+    #[test]
+    fn island_paths_without_the_agent_jar_are_a_typed_error() {
+        let ws = tempfile::tempdir().unwrap();
+        let env = env_of(&[("JAVA_HOME", "/jdk")]);
+        let err = resolve_island_paths(ws.path(), &env).unwrap_err();
+        assert!(err.contains("PC_HOST_AGENT_JAR"), "{err}");
+    }
 
     // Ports Bootstrap.pcOptions: strips the single-token generation flags, both
     // forms of the two-token flags, and keeps everything else in order.

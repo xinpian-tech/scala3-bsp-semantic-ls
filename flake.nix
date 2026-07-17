@@ -23,7 +23,10 @@
   };
 
   outputs = { self, nixpkgs, flake-utils, crane, mill-ivy-fetcher, zaozi }@inputs:
-    flake-utils.lib.eachDefaultSystem (system:
+    # Linux only by decision: the embedded-libjvm boundary (dlopen +
+    # JNI_CreateJavaVM + /proc/self/maps assertions) is exercised and supported
+    # on Linux exclusively; macOS is explicitly unsupported.
+    flake-utils.lib.eachSystem [ "x86_64-linux" "aarch64-linux" ] (system:
       let
         pkgs = import nixpkgs {
           inherit system;
@@ -152,6 +155,31 @@
           PC_HOST_AGENT_JAR = "${pcHostAgentJar}/pc-host-agent.jar";
           LS_PC_TARGET_CLASSPATH = "${scalaLibraryJar}:${scala3LibraryJar}";
         });
+        # The packaged CLI must work offline: `--version` prints the server
+        # identity, `--doctor` renders the full report (Store section included)
+        # pre-bootstrap, and `dump` inspects an absent store gracefully — all
+        # without booting a JVM.
+        lsPackage = pkgs.callPackage ./nix/package.nix {
+          inherit jdk pcHostAgentJar zaoziPcpluginJar;
+          rustWorkspace = rust.package;
+        };
+        package-cli-check = pkgs.runCommand "check-package-cli" { } ''
+          bin="${lsPackage}/bin/scala3-bsp-semantic-ls"
+          "$bin" --version | grep -q "scala3-bsp-semantic-ls" \
+            || { echo "--version did not print the server identity"; exit 1; }
+          mkdir ws
+          "$bin" --doctor ws | tee doctor.txt
+          grep -q "Store:" doctor.txt \
+            || { echo "--doctor did not render the Store section"; exit 1; }
+          "$bin" dump ws | grep -qi "no store" \
+            || { echo "dump did not report the absent store"; exit 1; }
+          [ -f "${lsPackage}/share/scala3-bsp-semantic-ls/pc-host-agent.jar" ] \
+            || { echo "packaged island agent jar missing"; exit 1; }
+          [ -f "${lsPackage}/share/scala3-bsp-semantic-ls/zaozi-pcplugin.jar" ] \
+            || { echo "packaged zaozi plugin jar missing"; exit 1; }
+          touch $out
+        '';
+
         pc-host-agent-check = pkgs.runCommand "check-pc-host-agent"
           { nativeBuildInputs = [ jdk ]; } ''
           jar="${pcHostAgentJar}/pc-host-agent.jar"
@@ -186,6 +214,7 @@
         }) // rust.checks // {
           spike-boundary = spike-boundary-check;
           pc-host-agent = pc-host-agent-check;
+          package-cli = package-cli-check;
           pc-boundary = pc-boundary-check;
           pc-recovery = pc-recovery-check;
           pc-definition = pc-definition-check;
@@ -194,10 +223,7 @@
         };
 
         packages = {
-          default = pkgs.callPackage ./nix/package.nix {
-            inherit mill jdk;
-            inherit (pkgs) sqlite;
-          };
+          default = lsPackage;
           # Exposed so `nix shell '.#mill' '.#mill-ivy-fetcher' -c mif run ...`
           # (plan section 15.3) works as documented.
           inherit mill;
