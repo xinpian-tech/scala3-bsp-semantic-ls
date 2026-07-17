@@ -1,17 +1,26 @@
 # Deployment Guide
 
-> Practical operator guide: **package → AOT → wire into BSP + an editor → verify
-> by hand.** It ties together the normative contracts in
-> [nix-build.md](nix-build.md) (build/packaging/AOT wrapper) and
-> [architecture.md](architecture.md) (subsystem behavior), and is derived from the
-> real `build.mill`, `nix/`, `scripts/`, and `modules/ls-core` sources — every
-> flag, path, and command below is quoted from the tree, not invented.
+> Practical operator guide: **package → wire into BSP + an editor → verify by
+> hand.** It ties together the normative contracts in
+> [nix-build.md](nix-build.md) (build/packaging) and
+> [architecture.md](architecture.md) (subsystem behavior), and is derived from
+> the real `flake.nix`, `nix/`, `scripts/`, and `crates/` sources — every flag,
+> path, and command below is quoted from the tree, not invented.
+
+The server is a **native Rust binary** (the cargo workspace under `crates/`,
+built with crane). The only JVM components in the product are the
+presentation-compiler island artifacts built by Mill: the PC-host agent jar (a
+`-javaagent` premain assembly) and the zaozi PC compiler-plugin jar. The JVM is
+embedded lazily — it boots in-process on the first presentation-compiler query,
+so an index-only session runs with **zero JVM in the process**. Per the v2
+decision record (plan-rust.md §0), the previous Scala/JVM core was replaced
+wholesale; there is no AOT training and no forked PC worker process.
 
 Contents:
 
 1. [Prerequisites](#1-prerequisites)
 2. [Packaging](#2-packaging)
-3. [AOT cache](#3-aot-cache)
+3. [Server CLI](#3-server-cli)
 4. [BSP + language-server integration](#4-bsp--language-server-integration)
 5. [Manual testing / verification](#5-manual-testing--verification)
 6. [Troubleshooting](#6-troubleshooting)
@@ -20,27 +29,35 @@ Contents:
 
 ## 1. Prerequisites
 
-The **only** supported toolchain (see [nix-build.md §1](nix-build.md)):
+### 1.1 Support envelope: Linux only
+
+The flake builds for `x86_64-linux` and `aarch64-linux` **only**. macOS is
+explicitly unsupported — a deliberate decision, not an omission: the embedded
+libjvm boundary (`dlopen` + `JNI_CreateJavaVM` + `/proc/self/maps` assertions)
+is exercised and supported on Linux exclusively, and `nix/package.nix` declares
+`platforms = lib.platforms.linux`.
+
+### 1.2 Toolchain
+
+Everything is provided by the flake (see [nix-build.md §1](nix-build.md)):
 
 ```text
-Java 25 only          (FFM SQLite binding, MemorySegment mmap, AOT cache, Compact Object Headers)
-Scala 3.8.4           (pinned in build.mill)
-Mill 1.1.2            (from mill-ivy-fetcher's mill-overlay)
-Nix >= 2.28           (mill-ivy-fetcher requirement)
+Rust (stable, nixpkgs)   crane-built cargo workspace; the deployable server binary
+Java 25                  island-only: runs the embedded presentation compiler
+Scala 3.8.4              pinned in build.mill (Deps.scalaVer); the bundled PC version
+Mill 1.1.2               builds the island jars (from mill-ivy-fetcher's mill-overlay)
+Nix >= 2.28              mill-ivy-fetcher requirement
 ```
 
 `nix develop` is the only entry point for building, locking, and testing. The
 repo-root `./mill` script is a thin launcher: it `exec`s `mill` from `PATH` and
-refuses to bootstrap outside the dev shell. All commands below assume you either
-ran `nix develop` first or prefix with `nix develop -c`.
+refuses to bootstrap outside the dev shell. All commands below assume you
+either ran `nix develop` first or prefix with `nix develop -c`.
 
-The dev shell exports (contract — code relies on these):
-
-| Variable          | Meaning                                                                 |
-|-------------------|-------------------------------------------------------------------------|
-| `JAVA_HOME`       | the Nix JDK 25; the only JDK the build/runtime may use                  |
-| `LS_JAVA_VERSION` | `"25"` — asserted by tooling/doctor                                     |
-| `LS_SQLITE_LIB`   | absolute path to the Nix `libsqlite3` the `ls-sqlite-ffm` FFM layer binds |
+The dev shell also exports the PC island boot inputs (`LS_LIBJVM`,
+`PC_HOST_AGENT_JAR`, `LS_PC_TARGET_CLASSPATH`, `ZAOZI_PCPLUGIN_JAR`), so a
+dev-built server and the live PC tests can boot the island without the packaged
+wrapper. See [nix-build.md §6](nix-build.md) for the full dev-shell contract.
 
 ---
 
@@ -53,158 +70,118 @@ nix build .#default
 ./result/bin/scala3-bsp-semantic-ls --version   # -> scala3-bsp-semantic-ls 0.1.0
 ```
 
-`packages.<system>.default` builds fully offline (`mill --no-daemon core.assembly`
-against the pre-fetched ivy cache) and installs a self-contained launcher:
+`packages.<system>.default` wraps the crane-built `ls-server` binary and ships
+the island artifacts alongside it:
 
 ```text
-result/bin/scala3-bsp-semantic-ls                              # makeWrapper launcher (the entry point)
-result/lib/scala3-bsp-semantic-ls/scala3-bsp-semantic-ls.jar   # core.assembly fat jar (main: ls.core.Main)
-result/share/scala3-bsp-semantic-ls/default-plugin-schema.json # PC plugin config schema
-result/share/scala3-bsp-semantic-ls/zaozi-pcplugin.jar         # PC compiler plugin: zaozi Dynamic bundle-field go-to/hover
+result/bin/scala3-bsp-semantic-ls                                # makeWrapper launcher around the Rust ls-server binary
+result/share/scala3-bsp-semantic-ls/pc-host-agent.jar            # PC island host agent (-javaagent premain assembly; mill pcHost.assembly)
+result/share/scala3-bsp-semantic-ls/zaozi-pcplugin.jar           # shipped PC compiler plugin (scalac -Xplugin; zaozi bundle-field go-to/hover)
+result/share/scala3-bsp-semantic-ls/default-plugin-schema.json   # JSON schema for pc-plugins.json (data, not required to run)
 ```
 
-The wrapper is `makeWrapper ${jdk25}/bin/java` with these baked-in settings — you
-get all of them for free when you launch the wrapped binary:
+The wrapper bakes exactly two defaults, both via `--set-default` (so any value
+already in the caller's environment wins):
 
-| Wrapper setting                                        | Purpose                                                        |
-|--------------------------------------------------------|----------------------------------------------------------------|
-| `--set JAVA_HOME <jdk25>`                               | Java 25 only runtime                                           |
-| `--set-default LS_SQLITE_LIB <libsqlite3>`             | pins the Nix SQLite for the FFM binding (override via env)     |
-| `--add-flags --enable-native-access=ALL-UNNAMED`       | grants FFM native access (the assembly runs on the class path) |
-| `--add-flags -XX:+UseCompactObjectHeaders`             | Java 25 compact object headers for the object-dense index      |
-| `--add-flags ${LS_AOT_CACHE:+-XX:AOTCache=$LS_AOT_CACHE}` | opt-in AOT cache — emitted only when `LS_AOT_CACHE` is set  |
-| `--add-flags -jar .../scala3-bsp-semantic-ls.jar`      | runs the assembly                                             |
+| Wrapper setting                          | Purpose                                                       |
+|------------------------------------------|---------------------------------------------------------------|
+| `--set-default JAVA_HOME <jdk25>`        | the Java home the embedded island boots from, if nothing else is configured |
+| `--set-default PC_HOST_AGENT_JAR <share/…/pc-host-agent.jar>` | the island host agent assembly loaded as `-javaagent` |
 
-`default-plugin-schema.json` in `share/` is the JSON schema for the PC plugin config
-file (`pc-plugins.json` — both `compilerPlugins` and `servicePluginJars`; see
-[plugin-spi.md](plugin-spi.md)); it is data, not required to run. `zaozi-pcplugin.jar`
-in `share/` is a shipped PC **compiler** plugin: point a workspace's `pc-plugins.json`
-`compilerPlugins` at it to make go-to-definition and hover resolve zaozi's dynamic
-`io.field` bundle accesses to the real field declaration (see [plugin-spi.md §2.1](plugin-spi.md)).
+There are no JVM launch flags in the wrapper — the binary is native. The island
+JVM's own flags (`--enable-native-access=ALL-UNNAMED`,
+`-XX:+UseCompactObjectHeaders`, the `-javaagent`) are composed inside the
+server at island boot, not by the wrapper.
 
 Package facts: `pname = scala3-bsp-semantic-ls`, `version = 0.1.0`,
-`mainProgram = scala3-bsp-semantic-ls`, platforms Linux + Darwin.
+`mainProgram = scala3-bsp-semantic-ls`, platforms **Linux only**.
 
-### 2.2 Dev / raw-jar build (`mill core.assembly`)
+### 2.2 Java-home resolution (config > env > nix-baked)
 
-For iteration you can build and run the fat jar directly:
+The embedded island needs a `libjvm`; it is located at
+`<javaHome>/lib/server/libjvm.so`. Resolution precedence, first hit wins:
+
+1. **Workspace config** — `<workspaceRoot>/.scala3-bsp-semantic-ls/config.json`
+   with `{"javaHome": "/abs/path/to/jdk"}`.
+2. **Environment** — `LS_LIBJVM` (an **exact** libjvm path, not a Java home),
+   else `JAVA_HOME`.
+3. **Nix-baked** — the wrapper's `--set-default JAVA_HOME` /
+   `PC_HOST_AGENT_JAR`, which by construction only apply when the tiers above
+   set nothing.
+
+With no tier at all, the first presentation-compiler query fails with a typed
+error (`no Java home for the PC island: set javaHome in
+.scala3-bsp-semantic-ls/config.json, or LS_LIBJVM / JAVA_HOME in the
+environment`); index-backed features are unaffected. The JVM boots **lazily** on
+the first PC query — starting the server, indexing, and answering
+references/rename/workspace-symbol never touch Java at all.
+
+### 2.3 Other flake packages
+
+| Package                     | Contents                                                              |
+|-----------------------------|-----------------------------------------------------------------------|
+| `.#rust-workspace`          | the crane-built cargo workspace (`bin/ls-server`, plus the spike/bench binaries) |
+| `.#pc-host-agent-jar`       | the island host agent assembly on its own                             |
+| `.#zaozi-pcplugin-jar`      | the zaozi PC compiler plugin jar on its own                           |
+| `.#spike-agent-jar`         | the embedded-JVM boundary-spike agent jar (dev/verification artifact) |
+| `.#mill`, `.#mill-ivy-fetcher` | the pinned Mill and `mif` used by the ivy-lock workflow            |
+| `.#zaozi-src`               | the pinned + patched zaozi source tree (real-repo validation input)   |
+
+### 2.4 Dev / raw-binary iteration
+
+For iteration, build and run the server straight from cargo inside the dev
+shell:
 
 ```bash
-nix develop -c mill core.assembly
-# -> out/core/assembly.dest/out.jar   (main class ls.core.Main)
+nix develop -c cargo build -p ls-server
+nix develop -c cargo run -p ls-server -- --version
 ```
 
-Running the raw jar means **you** must supply what the wrapper otherwise bakes in —
-JDK 25, the native-access + compact-headers flags, and `LS_SQLITE_LIB` (the dev
-shell already exports it):
+The dev shell's exported PC env (§1.2) stands in for the packaged wrapper's
+baked defaults, so a cargo-built server can boot the island too.
+
+### 2.5 Dependency locks & offline guarantee
+
+Two locks, both committed:
+
+- **`Cargo.lock`** — the Rust dependency closure; crane vendors it so the
+  package build is fully offline.
+- **`nix/ivy-lock.nix`** — the Maven/ivy closure for the **island modules
+  only** (the Mill build). After any `build.mill` dependency change:
 
 ```bash
-java --enable-native-access=ALL-UNNAMED -XX:+UseCompactObjectHeaders \
-  -jar out/core/assembly.dest/out.jar          # stdio LSP server (see §4)
+nix develop -c ./scripts/regen-ivy-lock.sh     # regenerate (determinism guards)
+nix develop -c ./scripts/check-ivy-lock.sh     # CI gate: lock == build.mill
 ```
 
-Only the `core` module is the deployable server. `bench` also declares a `Main`
-(`ls.bench.BenchMain`), but it is a benchmark/JFR harness, not the shipped artifact.
-
-### 2.3 Dependency lock & offline guarantee
-
-The full ivy/Maven closure is locked into `nix/ivy-lock.nix` (fixed-output
-`fetchMaven` entries) and consumed offline by the package build. After **any**
-change to `build.mill` dependencies you must regenerate and commit it, or the
-offline `package` build and CI gate fail:
-
-```bash
-nix develop -c ./scripts/regen-ivy-lock.sh     # preferred (determinism guards)
-./scripts/check-ivy-lock.sh                    # CI gate: lock == build.mill
-```
-
-`nix flake check` runs four gates: `java25-toolchain`, `ivy-lock-present`,
-`mill-ivy-fetcher-input`, and the full offline `package` build. See
-[nix-build.md §3–5](nix-build.md) for the normative details.
+See [nix-build.md §4](nix-build.md) for the normative locking details and
+[nix-build.md §5](nix-build.md) for the full `nix flake check` suite.
 
 ---
 
-## 3. AOT cache
+## 3. Server CLI
 
-An optional JDK 25 AOT cache (`-XX:AOTCache`) speeds up cold start and the first
-request. It is **opt-in** and never required — without it the server runs normally
-and the doctor reports `AOT cache: missing (no -XX:AOTCache flag)`.
+The binary is primarily the stdio LSP server; it has three offline modes. All
+of them work pre-bootstrap and boot **no JVM**.
 
-### 3.1 Build a cache — `scripts/aot-train.sh`
+| Invocation                  | Meaning                                                                            |
+|-----------------------------|------------------------------------------------------------------------------------|
+| *(no arguments)*            | start the stdio LSP server                                                         |
+| `--version`                 | print `scala3-bsp-semantic-ls 0.1.0` and exit                                      |
+| `--doctor [dir] [--json]`   | print the offline doctor report for `dir` (default `.`) and exit; `--json` emits the structured object |
+| `dump [dir]`                | print a read-only inspection of the on-disk index store at `dir` (manifest, active segment header, workspace-state) and exit |
 
-```bash
-nix develop -c ./scripts/aot-train.sh --workspace it/sample-workspace \
-                                      --out .scala3-bsp-semantic-ls/aot-cache.bin
-```
+**Anything else is a usage error** (non-zero exit, message on stderr) — never a
+silent server start. That includes the v1 flags for AOT training and PC-backend
+selection, which were deleted with the Scala core and now parse as unknown
+arguments (the embedded island is the only PC backend).
 
-| Flag          | Default                               | Meaning                          |
-|---------------|---------------------------------------|----------------------------------|
-| `--workspace` | `it/sample-workspace`                 | workspace to train against       |
-| `--out`       | `.scala3-bsp-semantic-ls/aot-cache.bin` | output cache path              |
+`--doctor`/`dump` directories are resolved like the server's workspace root:
+made absolute against the process cwd, then lexically normalized. `dump` on a
+workspace with no store reports `no store at this workspace root` gracefully.
 
-The script (a) builds/reuses the assembly jar, then (b) runs the **JDK-25 two-step**
-with the same runtime flags as the production launcher (they must match — the
-compact-object-header layout and native-access grant are baked into the cache):
-
-```bash
-# 1/2 record  -> writes an AOT configuration to a temp file
-java -XX:AOTMode=record -XX:AOTConfiguration=<tmp> \
-  --enable-native-access=ALL-UNNAMED -XX:+UseCompactObjectHeaders \
-  -jar <assembly.jar> --aot-train <workspace> --in-process-pc [--require-index]
-
-# 2/2 create  -> turns the configuration into the cache file
-java -XX:AOTMode=create -XX:AOTConfiguration=<tmp> -XX:AOTCache=<out> \
-  --enable-native-access=ALL-UNNAMED -XX:+UseCompactObjectHeaders \
-  -jar <assembly.jar> --aot-train <workspace> --in-process-pc [--require-index]
-```
-
-- **Strict vs lenient is chosen by `.bsp` presence.** If `<workspace>/.bsp` exists,
-  the script adds `--require-index` and prints `aot-train: .bsp present -> strict
-  real-BSP training`; the training run then drives a real compile + reindex and
-  **fails (non-zero) unless the SemanticDB index is populated and queryable**
-  (see the strict assertions in §5.3). With no `.bsp`, it degrades to a lenient
-  best-effort warm-up that always exits 0.
-- Training forces `--in-process-pc` so the presentation compiler's classes are
-  recorded into the cache. Production defaults to a **forked** PC in a child JVM,
-  which the cache cannot cover — so the cache warms the main server JVM, not the PC
-  worker.
-- Success prints: `aot-train: AOT cache created: <out> (<N> bytes)`.
-
-### 3.2 Launch with the cache
-
-**Wrapped binary** — set `LS_AOT_CACHE`; the wrapper adds `-XX:AOTCache` for you:
-
-```bash
-LS_AOT_CACHE=.scala3-bsp-semantic-ls/aot-cache.bin ./result/bin/scala3-bsp-semantic-ls
-```
-
-**Raw jar** — pass the flag yourself, matching the training flags:
-
-```bash
-java --enable-native-access=ALL-UNNAMED -XX:+UseCompactObjectHeaders \
-  -XX:AOTCache=.scala3-bsp-semantic-ls/aot-cache.bin \
-  -jar out/core/assembly.dest/out.jar
-```
-
-### 3.3 Verify it took effect
-
-The doctor Runtime section reports the cache from **this JVM's own** `-XX:AOTCache`
-flag plus file existence:
-
-```text
-AOT cache: loaded (<path>)                # flag present, file exists
-AOT cache: missing (no -XX:AOTCache flag) # not enabled
-AOT cache: missing (<path> does not exist)# flag present, wrong/absent path
-```
-
-```bash
-LS_AOT_CACHE=.scala3-bsp-semantic-ls/aot-cache.bin \
-  ./result/bin/scala3-bsp-semantic-ls --doctor /abs/path/to/workspace | grep 'AOT cache:'
-```
-
-> **Cache coupling.** A cache is tied to JDK 25 **and** the exact runtime flags it
-> was trained with. Rebuild the cache after a JDK bump, a flag change, or a server
-> rebuild. A wrong/stale path silently degrades to `missing`, never an error.
+**stdout discipline:** in server mode, stdout carries only framed JSON-RPC
+protocol; all logs and diagnostics go to stderr.
 
 ---
 
@@ -212,8 +189,9 @@ LS_AOT_CACHE=.scala3-bsp-semantic-ls/aot-cache.bin \
 
 ### 4.1 The SemanticDB prerequisite (mandatory)
 
-Workspace-wide answers come **only** from scalac-generated SemanticDB. Every Scala 3
-build target the server indexes **must** be compiled with SemanticDB enabled:
+Workspace-wide answers come **only** from scalac-generated SemanticDB. Every
+Scala 3 build target the server indexes **must** be compiled with SemanticDB
+enabled:
 
 ```text
 -Xsemanticdb                 (alias -Ysemanticdb) — REQUIRED; emits .semanticdb per source
@@ -227,8 +205,8 @@ build target the server indexes **must** be compiled with SemanticDB enabled:
 `.semanticdb` files land at `<targetroot>/META-INF/semanticdb/<source-rel>.semanticdb`,
 where `<targetroot>` defaults to the class-output dir (or `-semanticdb-target:<path>`).
 
-Mill configuration — set it in a shared `ScalaModule` trait (as `it/sample-workspace`
-does):
+Mill configuration — set it in a shared `ScalaModule` trait (as
+`it/sample-workspace` does):
 
 ```scala
 // scalacOptions for every indexable module:
@@ -236,32 +214,31 @@ def scalacOptions = Seq("-Xsemanticdb", "-sourceroot", mill.api.BuildCtx.workspa
 ```
 
 > This is Scala 3 only. `-Xsemanticdb` is built into the Scala 3 compiler (no
-> separate plugin). For sbt the equivalent is enabling SemanticDB and adding
-> `-sourceroot` to `scalacOptions`; only Scala 3 (`3` / `3.x`) targets are indexed —
-> Scala 2 targets are ignored entirely. There is no in-repo sbt example.
+> separate plugin). Only Scala 3 targets are indexed — Scala 2 targets are
+> ignored entirely.
 
-**SemanticDB is a hard requirement, not graceful.** A live Scala 3 target with no
-SemanticDB is an error surfaced two ways:
+**SemanticDB is a hard requirement, not graceful.** A live Scala 3 target with
+no SemanticDB is an error surfaced two ways:
 
-- the doctor prints
-  `SemanticDB coverage: ERROR - N target(s) without SemanticDB (recompile with -Xsemanticdb): <ids>`, and
+- the doctor's BSP section lists it under the SemanticDB-coverage error
+  (`recompile with -Xsemanticdb`), and
 - every document/position request on such a source is rejected with
   `<uri> has no SemanticDB output; every source must be compiled with -Xsemanticdb`
   — there is **no** presentation-compiler fallback.
 
-It does **not** fail boot: the workspace still reaches `Ready` and indexable targets
-still index.
+It does **not** fail boot: the workspace still reaches `Ready` and indexable
+targets still index.
 
-> **Expect a permanent `mill-build` entry in the coverage ERROR.** Mill always
-> exposes its own build definition as a Scala 3 target (`.../mill-build`) compiled
-> without `-Xsemanticdb`, so a clean Mill workspace *always* shows at least
-> `mill-build` under the coverage ERROR. This is normal — only worry about *your*
-> modules appearing there.
+> **Expect a permanent `mill-build` entry in the coverage error.** Mill always
+> exposes its own build definition as a Scala 3 target (`.../mill-build`)
+> compiled without `-Xsemanticdb`, so a clean Mill workspace *always* shows at
+> least `mill-build` there. This is normal — only worry about *your* modules
+> appearing there.
 
 ### 4.2 Install a BSP connection
 
-The server does not run a build itself; it speaks BSP to one. For Mill, install the
-connection once per workspace (writes `.bsp/mill-bsp.json`):
+The server does not run a build itself; it speaks BSP to one. For Mill, install
+the connection once per workspace (writes `.bsp/mill-bsp.json`):
 
 ```bash
 cd /path/to/your/workspace
@@ -269,53 +246,60 @@ mill mill.bsp.BSP/install     # -> .bsp/mill-bsp.json
 mill __.compile               # optional pre-compile to emit SemanticDB up front
 ```
 
-### 4.3 How discovery & launch work
+### 4.3 How discovery & bootstrap work
 
 On the LSP `initialized` notification the server bootstraps asynchronously:
 
-1. **Discover** — scan `<workspaceRoot>/.bsp/*.json`, parse each (Gson), drop files
-   missing `name`/`argv`, sort by BSP server name (ties by file name), pick the
-   first. No usable file → the server still boots BSP-less (see §4.7), it does not
-   crash.
+1. **Discover** — scan `<workspaceRoot>/.bsp/*.json`, parse each, drop files
+   missing `name`/`argv`, sort deterministically by BSP server name (ties by
+   file name), pick the first.
 2. **Launch** — run the picked file's `argv` verbatim as a child process
-   (cwd = workspace root; for Mill this is `mill --bsp`), and talk BSP over its stdio.
-3. **Handshake** — `build/initialize` (languageIds `["scala"]`) → `build/initialized`.
+   (cwd = workspace root; for Mill this is `mill --bsp`), and talk BSP over its
+   stdio.
+3. **Handshake** — `build/initialize` (languageIds `["scala"]`) →
+   `build/initialized`.
 4. **Load model** — `workspace/buildTargets` (filtered to Scala 3) →
-   `buildTarget/sources` + `buildTarget/scalacOptions` (+ best-effort, capability-gated
-   `dependencySources`/`outputPaths`). Compiles go through `buildTarget/compile`.
-5. **Ingest** — parse SemanticDB for indexable targets into the SQLite + postings index.
+   `buildTarget/sources` + `buildTarget/scalacOptions`. Compiles go through
+   `buildTarget/compile`.
+5. **Ingest** — parse SemanticDB for indexable targets into the immutable-segment
+   store under `.scala3-bsp-semantic-ls/` (§4.7).
 
-A server-initiated `buildTarget/didChange` reloads the project model (re-runs load +
-ingest without re-initializing).
+A server-initiated `buildTarget/didChange` reloads the project model over the
+retained session (no rediscovery, no relaunch); a reload failure keeps serving
+the previous ready snapshot.
 
-> **BSP request timeout is 30 s in the interactive server.** The LSP-server connect path
-> uses the default `BspSessionConfig` (`requestTimeout = 30.seconds`). Non-default
-> timeouts elsewhere are the headless `--aot-train` driver's 600 s and the test fixtures'
-> 300 s — so a cold first compile won't time out under `--aot-train` the way it can in an
-> editor session. A very large *first* compile over BSP can exceed the interactive 30 s
-> and surface as a `RequestTimeout`; pre-compiling with `mill __.compile` before starting
-> an editor session avoids the cold-compile spike.
+> **No `.bsp` connection is a bootstrap failure, not a degraded mode.** With no
+> usable connection file the bootstrap fails with `no build server connection
+> found (the no-BSP warm-restart mode is deferred)`. The process stays up:
+> requests answer with typed `workspace is bootstrap failed: …` errors and the
+> doctor still renders, but nothing is served from the persisted index. (v1's
+> BSP-less recovered-index serving was deliberately trimmed in the rewrite —
+> faithful recovered serving needs the target dependency graph, which the
+> persisted segment does not carry.)
+
+> **BSP request timeout is 30 s.** A very large *first* compile over BSP can
+> exceed it and surface as a request-timeout error; pre-compiling with
+> `mill __.compile` before starting an editor session avoids the cold-compile
+> spike.
 
 ### 4.4 Wire the server into an editor
 
-The server is a **generic stdio LSP server** — no editor-specific launcher ships in
-this repo, so integrate it as you would any stdio LSP:
+The server is a **generic stdio LSP server** — no editor-specific launcher
+ships in this repo, so integrate it as you would any stdio LSP:
 
-- **Command:** the wrapped binary `scala3-bsp-semantic-ls` (or `java … -jar
-  out/core/assembly.dest/out.jar`). No CLI args are needed for normal use; append
-  `--forked-pc` (default) or `--in-process-pc` to choose the PC backend, and set
-  `LS_AOT_CACHE` in the environment to enable the cache.
-- **Transport:** stdin = requests, **stdout = framed JSON-RPC only**, stderr = logs.
-  The server redirects its own `System.out` to stderr at startup so stray output can
-  never corrupt the protocol — a client must **not** write to the child's stdout, and
-  must read logs from stderr.
+- **Command:** the wrapped binary `scala3-bsp-semantic-ls` (from
+  `nix build .#default`, a `nix profile install`, or the dev-shell cargo
+  build). No CLI args for normal use.
+- **Transport:** stdin = requests, **stdout = framed JSON-RPC only**, stderr =
+  logs. A client must not write to the child's stdout, and must read logs from
+  stderr.
 - **Language / filetype:** `scala`.
-- **Root:** send `initialize` with `rootUri` pointing at the workspace root (where
-  `.bsp/` lives). If neither `rootUri` nor a `workspaceFolder` is sent, the server
-  roots at its own process cwd — usually the wrong project.
-- **Warm-up:** heavy work runs asynchronously after `initialized`. Until the workspace
-  is `Ready`, requests may return empty results or typed "workspace is …" errors —
-  never crashes. Clients must tolerate this brief warm-up.
+- **Root:** send `initialize` with `rootUri` pointing at the workspace root
+  (where `.bsp/` lives). With no `rootUri`/`workspaceFolder`, bootstrap fails
+  with a `no workspace root` detail rather than guessing.
+- **Warm-up:** heavy work runs asynchronously after `initialized`. Until the
+  workspace is `Ready`, requests return typed "workspace is …" errors — never
+  crashes. Clients must tolerate this brief warm-up.
 
 Illustrative Neovim (`nvim-lspconfig` custom config — adjust paths):
 
@@ -325,7 +309,7 @@ local configs = require("lspconfig.configs")
 if not configs.scala3_bsp_semantic_ls then
   configs.scala3_bsp_semantic_ls = {
     default_config = {
-      cmd = { "scala3-bsp-semantic-ls" },        -- or: java --enable-native-access=ALL-UNNAMED ... -jar out.jar
+      cmd = { "/abs/path/to/result/bin/scala3-bsp-semantic-ls" },
       filetypes = { "scala" },
       root_dir = require("lspconfig.util").root_pattern(".bsp", "build.mill"),
     },
@@ -334,204 +318,220 @@ end
 require("lspconfig").scala3_bsp_semantic_ls.setup({})
 ```
 
-VS Code / Emacs `eglot` / any LSP client work the same way: register a stdio server
-for `scala` whose command is the binary and whose root is the workspace. Register the
-four `scala3SemanticLs.*` commands (§4.6) if your client exposes `workspace/executeCommand`.
+VS Code / Emacs `eglot` / any LSP client work the same way: register a stdio
+server for `scala` whose command is the binary and whose root is the workspace.
 
 ### 4.5 Capabilities advertised
 
-| Advertised                                                                              | Notes                                        |
-|-----------------------------------------------------------------------------------------|----------------------------------------------|
-| Text sync = **Full**                                                                    | whole-document; last change's full text used |
-| Completion (`resolveProvider`, trigger `.`)                                             | served by the presentation compiler          |
-| Hover; SignatureHelp (triggers `(` `,`)                                                 |                                              |
-| Definition; TypeDefinition                                                              |                                              |
-| References                                                                              | whole-repo, from the SemanticDB index        |
-| Rename (with `prepareProvider`)                                                         | cross-file                                   |
-| DocumentHighlight                                                                       |                                              |
-| workspace/symbol                                                                        | FTS + fuzzy over the index                   |
-| executeCommand (4 command IDs — §4.6)                                                   |                                              |
-| **Diagnostics: push-only**                                                              | via `textDocument/publishDiagnostics`; **no** pull `diagnosticProvider` |
+| Advertised                                      | Notes                                        |
+|--------------------------------------------------|----------------------------------------------|
+| Text sync = **Full**                             | whole-document sync                          |
+| Completion (`resolveProvider`, trigger `.`)      | served by the embedded presentation compiler |
+| Hover; SignatureHelp (triggers `(` `,`)          |                                              |
+| Definition; TypeDefinition                       |                                              |
+| References                                       | whole-repo, from the SemanticDB index        |
+| Rename (with `prepareProvider`)                  | cross-file                                   |
+| DocumentHighlight                                |                                              |
+| workspace/symbol                                 | over the index (+ PC-only unsaved symbols)   |
+| executeCommand (3 command IDs — §4.6)            |                                              |
+| **Diagnostics: push-only**                       | BSP `build/publishDiagnostics` is forwarded live as `textDocument/publishDiagnostics` (per-URI merge across targets, per-target reset); **no** pull `diagnosticProvider` |
 
-**Not advertised** (do not enable client-side): semanticTokens, inlayHint, codeAction,
-formatting/rangeFormatting, folding, and pull diagnostics. Diagnostics appear only
-after bootstrap connects to a BSP build and a compile runs.
+**Not advertised** (do not enable client-side): semanticTokens, inlayHint,
+codeAction, formatting/rangeFormatting, folding, and pull diagnostics.
+Diagnostics appear only after bootstrap connects to a BSP build and a compile
+runs.
 
 ### 4.6 Server commands (`workspace/executeCommand`)
 
-| Command ID                       | Effect                                                                          |
-|----------------------------------|---------------------------------------------------------------------------------|
-| `scala3SemanticLs.compile`       | BSP compile of indexable targets → `compile ok (N targets)` / `compile failed: <code>` |
-| `scala3SemanticLs.reindex`       | re-ingest SemanticDB for workspace targets → an `ingest: …` summary             |
-| `scala3SemanticLs.doctor`        | the **live** doctor report (§5.2) — begins with `state: …`                       |
-| `scala3SemanticLs.pcPluginStatus`| render presentation-compiler plugin status                                      |
+| Command ID                  | Effect                                                                          |
+|-----------------------------|----------------------------------------------------------------------------------|
+| `scala3SemanticLs.compile`  | BSP compile of indexable targets → `compile ok (N targets)` / `compile failed: <code>` |
+| `scala3SemanticLs.reindex`  | re-ingest SemanticDB for workspace targets → an `ingest: …` summary             |
+| `scala3SemanticLs.doctor`   | the **live** doctor report (§5.2) — begins with `state: …`; pass `arguments: [{"json": true}]` for the structured object |
 
-An unknown command id is an `InvalidParams` error.
+An unknown command id is an `InvalidParams` error. The v1
+`scala3SemanticLs.pcPluginStatus` command is **deliberately not advertised**
+(the plugin-status inspection is deferred); it is answered as an unknown
+command rather than advertised-and-broken.
 
-### 4.7 Lifecycle & behaviors worth knowing
+### 4.7 The workspace state directory (`.scala3-bsp-semantic-ls/`)
 
-- **Async bootstrap** on `initialized` (daemon thread); `initialize` returns
-  capabilities synchronously.
-- **Re-index triggers:** a debounced (~500 ms) compile + reindex over the saved
-  target's reverse-dependency closure on `textDocument/didSave`, and a model reload
-  on BSP `buildTarget/didChange`. `didChangeConfiguration` and
-  `didChangeWatchedFiles` are **no-ops** — the server does not consume client file
-  watchers.
-- **No-BSP warm restart:** with no `.bsp` connection the server still reaches `Ready`
-  and answers from the recovered persisted index, but **PC is disabled** and only
-  already-indexed sources answer. A compile that the references/rename path needs is a
-  hard failure (the `scala3SemanticLs.compile` command instead returns `compile skipped:
-  no indexable targets`), so fresh references/rename that need a compile cannot run.
-- **Freshness:** SemanticDB is trusted only when its stored MD5 matches the current
-  source bytes. After editing a file you must recompile (save-driven or via the
-  `compile`/`reindex` commands) before index features reflect the change.
-- **Shutdown:** follow the standard LSP `shutdown` then `exit` sequence; `exit`
-  returns process code 0 only if `shutdown` was received first, else 1.
+The server keeps all per-workspace state in one directory under the workspace
+root:
 
-### 4.8 Server CLI reference
+```text
+.scala3-bsp-semantic-ls/
+  manifest.json                  # single commit point: names the active (segment, workspace-state) pair
+  workspace-state-<gen>.bin      # generational binary workspace state (doc epochs + SemanticDB md5s)
+  segments/segment-NNNNNN/       # immutable index segment: the postings files
+                                 # (ref/definition/rename/doc postings) + tables
+  pc-plugins.json                # OPTIONAL, user-authored: PC plugin config (§4.8)
+  config.json                    # OPTIONAL, user-authored: {"javaHome": "..."} override (§2.2)
+```
 
-The server binary (`ls.core.Main`) is primarily the stdio LSP server; it also has a
-few headless modes. Flag dispatch is ordered and short-circuiting
-(`--version` → `--doctor` → `--aot-train` → default LSP server).
+The `manifest.json` / `workspace-state` / `segments` tree is the immutable-
+segment index store that replaced the v1 SQLite database. It is written with an
+atomic tmp+fsync+rename commit protocol, is safe to delete wholesale while the
+server is not running (it is rebuilt on the next bootstrap), and is inspectable
+offline with `dump` (§3). `pc-plugins.json` and `config.json` are user
+configuration — the server only reads them. See
+[index-format.md](index-format.md) for the on-disk format.
 
-| Flag                    | Meaning                                                                                  |
-|-------------------------|------------------------------------------------------------------------------------------|
-| *(none)*                | start the stdio LSP server (default; PC backend defaults to **forked**)                  |
-| `--version`             | print `scala3-bsp-semantic-ls 0.1.0` and exit                                             |
-| `--doctor [<dir>]`      | print the **offline** doctor report for `<dir>` (default `.`) and exit                    |
-| `--aot-train <dir>`     | run the headless AOT-training workload against `<dir>` and exit                           |
-| `--require-index`       | with `--aot-train`: strict real-BSP mode (fail non-zero on an empty/absent index)         |
-| `--skip-pc`             | with `--aot-train --require-index`: skip the version-locked PC completion check           |
-| `--forked-pc`           | run the PC in an isolated child JVM (**production default**; wins if both PC flags given) |
-| `--in-process-pc`       | run the PC in the same JVM (used by AOT training)                                         |
+### 4.8 The PC island and its plugins
 
-> **Value flags take the immediately-following token.** Write `--aot-train <dir>
-> --require-index`, *not* `--aot-train --require-index <dir>` — the latter makes the
-> workspace dir the literal string `--require-index`. `--plugin-config` and
-> `--jfr-preset` are **not** server flags (they belong to the forked PC worker and the
-> benchmark harness respectively).
+The presentation compiler runs on an embedded JVM **inside the server
+process**: on the first PC-backed query the server `dlopen`s
+`<javaHome>/lib/server/libjvm.so`, calls `JNI_CreateJavaVM`, and loads the
+PC-host agent jar as `-javaagent` (its `premain` wires up the FFM boundary).
+The island JVM is launched with `--enable-native-access=ALL-UNNAMED` and
+`-XX:+UseCompactObjectHeaders`, and is handed the workspace root so it loads
+`<workspaceRoot>/.scala3-bsp-semantic-ls/pc-plugins.json` at boot.
+
+A wedged PC query is recovered by the dispatch-generation watchdog (the island
+respawns its dispatch; a generation cap turns repeated wedges into a fatal
+island error) — exercised for real by the `pc-recovery` flake check.
+
+**PC plugin configuration** (`pc-plugins.json` — `compilerPlugins` and
+`servicePluginJars`; JSON schema shipped at
+`share/scala3-bsp-semantic-ls/default-plugin-schema.json`; full contract in
+[plugin-spi.md](plugin-spi.md)):
+
+```json
+{
+  "compilerPlugins": [
+    { "jars": ["/abs/path/to/plugin.jar"], "options": ["myPlugin:key:value"] }
+  ],
+  "servicePluginJars": []
+}
+```
+
+Each `jars` entry becomes a `-Xplugin:<jar>` and each `options` entry a `-P:`
+option on the island's compiler instances. The packaged server ships one such
+plugin at `share/scala3-bsp-semantic-ls/zaozi-pcplugin.jar`: point a
+workspace's `compilerPlugins` at it to make go-to-definition and hover resolve
+zaozi's dynamic `io.field` bundle accesses to the real field declaration (see
+[plugin-spi.md §2.1](plugin-spi.md)). It keys strictly on the zaozi API and is
+inert on every other codebase.
+
+### 4.9 Lifecycle & behaviors worth knowing
+
+- **Async bootstrap** on `initialized`; `initialize` returns capabilities
+  synchronously.
+- **Re-index triggers:** `textDocument/didSave` schedules a debounced (500 ms),
+  single-flight compile-first build job over the saved target's
+  reverse-dependency closure; BSP `buildTarget/didChange` reloads the model.
+  The server consumes only the document notifications
+  (`didOpen`/`didChange`/`didClose`/`didSave`) — it does not consume client
+  file watchers.
+- **Dirty buffers:** open-buffer text is overlaid on PC queries and
+  `workspace/symbol`; index answers still come from the last ingest.
+- **Freshness:** SemanticDB is trusted only when its stored md5 matches the
+  current source bytes. After editing a file you must recompile (save-driven or
+  via the `compile`/`reindex` commands) before index features reflect the
+  change.
+- **Shutdown:** follow the standard LSP `shutdown` then `exit` sequence. A late
+  bootstrap result delivered after `shutdown` is discarded, never resurrected.
+- **Cold start:** there is no warm-up cache; startup is native-binary fast. (A
+  PC-island-only AOT cache remains a possible future option, but nothing in the
+  current tree builds or consumes one.)
 
 ---
 
 ## 5. Manual testing / verification
 
-### 5.1 Quick sanity
+### 5.1 Quick sanity (offline, no JVM)
 
 ```bash
-./result/bin/scala3-bsp-semantic-ls --version               # scala3-bsp-semantic-ls 0.1.0
-./result/bin/scala3-bsp-semantic-ls --doctor /abs/workspace # offline doctor (Runtime + Nix only)
+./result/bin/scala3-bsp-semantic-ls --version                 # scala3-bsp-semantic-ls 0.1.0
+./result/bin/scala3-bsp-semantic-ls --doctor /abs/workspace   # offline doctor report
+./result/bin/scala3-bsp-semantic-ls dump /abs/workspace       # read-only store inspection
 ```
 
-`--doctor` is **offline-only**: it renders real data for the Runtime and Nix sections
-and prints `unavailable: not connected` for every live subsystem, with **no** `state:`
-header. To see live sections you must run the `scala3SemanticLs.doctor` command over a
-connected LSP session (§5.2), or drive the headless smoke (§5.3).
+The offline `--doctor` prints a header
+(`state: offline (--doctor): build server and presentation compiler not
+connected`, plus the workspace path) and renders real data for the **Runtime**,
+**Nix**, and **Store** sections; the live-only sections render
+`unavailable: <reason>`. To see the live sections, run the
+`scala3SemanticLs.doctor` command over a connected LSP session.
 
 ### 5.2 Doctor report reference
 
-The **live** doctor (`scala3SemanticLs.doctor`) begins with `state: ready | not
-ready: … | bootstrap failed: …` and renders eight sections in fixed order, then a
-trailing `Bootstrap:` notes block:
+The doctor renders **seven sections in fixed order** (text and `--json`):
 
 | Section        | Key lines / meaning                                                                                   |
 |----------------|-------------------------------------------------------------------------------------------------------|
-| **Runtime**    | `Java:` ver · `Native access:` · `Compact Object Headers:` · `AOT cache: loaded/missing`              |
-| **Nix**        | `flake detected:` · `mill-ivy-fetcher input:` · `ivy lock:` · `lock status: fresh/stale`              |
-| **BSP**        | `server:` · `targets:` · `Scala 3 targets:` · `SemanticDB coverage: all … / ERROR - …`                |
-| **SemanticDB** | `semanticdb roots:` · per-target root (exists/missing, file count) · fresh/stale/missing docs · `generated source status:` · `stale targets:` |
-| **SQLite**     | `database:` · `WAL:` (`journal_mode=`) · `FTS:` · `manifest generation:` · `documents:` · `symbols:` · `wal size:` |
-| **Postings**   | `active segments:` · per-segment active/superseded · `snapshot id/docs/occurrences:` · `compaction pending:` · `snapshot file: consistent/divergent/missing` |
-| **PC**         | `worker status: forked worker alive / forked worker not running / in-process (no forked worker)` · active/registered targets |
-| **PC Plugins** | `compiler plugins loaded:` · `service plugins loaded:` · `self-test results:` · `disabled plugins:`   |
+| **Runtime**    | `Java:` (read from `$JAVA_HOME/release`, no process launched) · the island's static launch policy (native access, compact object headers) |
+| **Nix**        | `flake detected:` · `mill-ivy-fetcher input:` · `ivy lock:` · `lock status: fresh/stale/unknown` (mtime heuristic; CI owns the authoritative check) |
+| **BSP**        | `server:` (build-server identity) · `targets:` · Scala 3 targets · SemanticDB-coverage errors          |
+| **SemanticDB** | per-target semanticdb root (exists/missing, file count) · doc freshness (fresh/stale/missing) · stale targets |
+| **Store**      | manifest (schema, segment, state generation, docs, symbols) · active segment header · workspace-state — the same facts `dump` prints. Replaced the v1 SQLite section. |
+| **PC**         | `worker status: booted / not booted (cold)` · active/registered targets                                |
+| **PC Plugins** | always `unavailable` — the `pcPluginStatus` inspection is deferred                                     |
 
-Two lines are especially useful for deployment triage: **PC `worker status:`** tells
-you whether the forked PC worker is alive vs in-process, and **`snapshot file:`**
-cross-checks the published snapshot against the SQLite manifest (`divergent` = they
-disagree).
+Gathering is **non-invasive**: the store is opened strictly read-only and the
+PC status is read from `/proc/self/maps` (is libjvm mapped?), so the doctor
+never boots the JVM and never disturbs a live server that owns the same store.
+A cold, index-only session reports `worker status: not booted (cold)` — that is
+the zero-JVM property, not a failure.
 
-### 5.3 Headless end-to-end smoke (`--aot-train --require-index`)
+### 5.3 Real-BSP end-to-end (`scripts/it-real-bsp-rs.sh`)
 
-There is no CLI verb that fires the executeCommands directly, but the strict
-AOT-training driver exercises the **same production code path** end-to-end (compile →
-reindex → workspace/symbol → references → completion) and exits non-zero on any empty
-result — this is the code-supported headless smoke test. (One difference from an editor
-session: the headless driver uses a 600 s BSP timeout, so a cold first compile won't time
-out here.)
-
-```bash
-nix develop -c bash -c '
-  mill --no-daemon core.assembly &&
-  java --enable-native-access=ALL-UNNAMED -XX:+UseCompactObjectHeaders \
-    -jar out/core/assembly.dest/out.jar \
-    --aot-train "$PWD/it/sample-workspace" --require-index'
-```
-
-Strict mode asserts, in order: **compile** succeeds (`compile ok …`), **reindex**
-indexes > 0 docs, a **workspace/symbol** query returns the probed top-level type,
-**references** on it returns locations, and (unless `--skip-pc`) **PC completion**
-returns items. Any failure logs `FAIL: <reason>` and exits 1. Use `--skip-pc` for a
-real repo whose compiler version differs from the bundled 3.8.x PC.
-
-### 5.4 Full manual smoke sequence
+The primary manual/CI end-to-end: drives the whole Rust `ls-server` over the
+framed LSP wire against a **real** Mill BSP server built from
+`it/sample-workspace` — production discovery → mill launch → model load →
+compile → diagnostics → rename-through-compile → teardown — plus the embedded
+presentation-compiler rows, the dispatch-generation recovery row, and the
+zaozi-plugin navigation row. It also asserts the **cold-start zero-JVM
+property** via `/proc/self/maps`: no libjvm is mapped until the first PC query.
 
 ```bash
-# 0. toolchain + unit sanity (gated real-BSP/AOT suites auto-skip here)
-nix develop
-mill __.compile && mill __.test
-
-# 1. package + sanity-check the wrapper
-nix build .#default
-./result/bin/scala3-bsp-semantic-ls --version
-
-# 2. prepare a workspace with SemanticDB + a BSP connection
-cd it/sample-workspace          # or your own -Xsemanticdb -sourceroot project
-mill --no-daemon mill.bsp.BSP/install    # writes .bsp/mill-bsp.json
-mill --no-daemon __.compile              # emit SemanticDB (a/b index; c is a deliberate ERROR)
-cd ../..
-
-# 3a. headless drive of the production path (fast, non-interactive)
-java --enable-native-access=ALL-UNNAMED -XX:+UseCompactObjectHeaders \
-  -jar out/core/assembly.dest/out.jar --aot-train "$PWD/it/sample-workspace" --require-index
-
-# 3b. OR interactive: wire ./result/bin/scala3-bsp-semantic-ls into an editor (§4.4),
-#     open a file, then run the commands and check the doctor:
-#       scala3SemanticLs.compile   -> "compile ok (N targets)"
-#       scala3SemanticLs.reindex   -> "ingest: … docs …"
-#       scala3SemanticLs.doctor    -> "state: ready", coverage line, PC worker status
-#     then try hover / go-to-definition / find-references / rename on a symbol.
+nix develop -c ./scripts/it-real-bsp-rs.sh
 ```
 
-> On the sample workspace, expect `c` **and** `mill-build` in the `SemanticDB
-> coverage: ERROR` line — that is the intended demonstration of the mandatory-SemanticDB
-> policy, not a failure.
+Run it under `nix develop`: the PC rows need `LS_LIBJVM`,
+`PC_HOST_AGENT_JAR`, and `LS_PC_TARGET_CLASSPATH` (the dev shell exports
+them), and the script fails loudly if they are missing rather than silently
+skipping. Set `LS_REAL_BSP_SKIP_PC=1` for an index-only smoke run.
 
-### 5.5 Gated integration scripts
+On the sample workspace, expect module `c` **and** `mill-build` in the
+SemanticDB-coverage error — `c` is the deliberate demonstration of the
+mandatory-SemanticDB policy, not a failure.
 
-These exercise real Mill BSP / AOT and are **skipped** by an ordinary `mill __.test`
-(the suites `assume(enabled)` on their gate env var). Run them via `nix develop -c`:
+### 5.4 Live Mill BSP smoke (`scripts/it-mill-smoke.sh`)
 
-| Script                          | Gate / env                                                         | What it proves · green output                                             |
-|---------------------------------|--------------------------------------------------------------------|---------------------------------------------------------------------------|
-| `./scripts/it-real-bsp.sh`      | sets `LS_REAL_BSP_IT=1`, `LS_REPO_ROOT`                             | 4 real-BSP suites vs a live `mill --bsp` fixture · mill exits 0, 0 failed  |
-| `./scripts/it-aot.sh`           | builds assembly; sets `LS_AOT_IT=1`, `LS_REPO_ROOT`, `LS_AOT_ASSEMBLY_JAR` | AOT training + cached-boot suites · mill exits 0, both pass         |
-| `./scripts/it-zaozi.sh`         | needs `ZAOZI_SRC` + `LS_SQLITE_LIB` (from the dev shell); optional `ZAOZI_PROBE_SYMBOL` | heavy real-repo validation · ends `it-zaozi: OK — the server indexed the full original zaozi` |
-| `./scripts/aot-train.sh`        | (see §3.1)                                                          | builds a real cache · `aot-train: AOT cache created: <out> (<N> bytes)`    |
+A narrower gate on the BSP client layer alone: discovery → launch →
+initialize → project model → compile → a forced diagnostic, against real
+`mill --bsp`:
 
 ```bash
-nix develop -c ./scripts/it-real-bsp.sh
-nix develop -c ./scripts/it-aot.sh
-nix develop -c ./scripts/it-zaozi.sh
+nix develop -c ./scripts/it-mill-smoke.sh
 ```
+
+### 5.5 Flake checks
+
+`nix flake check` runs the whole hermetic suite — Rust
+build/test/clippy/fmt, the offline package build, toolchain/lock hygiene, the
+packaged-CLI check (`--version`/`--doctor`/`dump` offline against the real
+`result/bin` binary), and the **live PC checks**, which boot the production
+island against a real JVM inside the sandbox: `pc-boundary` (register/open/
+completion/hover through the vtable), `pc-recovery` (watchdog recovery through
+a real wedged completion), `pc-definition` (cross-file go-to through the
+symbol-resolver round-trip), `pc-zaozi` (the shipped zaozi plugin steering
+go-to), and `pc-server-definition` (`textDocument/definition` through the real
+ls-server dispatch). The full list with one line each is in
+[nix-build.md §5](nix-build.md).
 
 ### 5.6 Guards
 
 ```bash
 ./scripts/check-docs.sh                             # pure bash; docs/traceability + stale-claim checker
-nix develop -c ./scripts/check-offline-compile.sh   # build resolves entirely from the locked ivy cache
+./scripts/check-audit-inventory.sh                  # coverage-audit accounts for every retained Scala suite
+nix develop -c ./scripts/check-offline-compile.sh   # island build resolves entirely from the locked ivy cache
 nix develop -c ./scripts/check-offline-compile.sh --self-test   # proves the guard rejects an unlocked dep
+nix develop -c ./scripts/check-ivy-lock.sh          # committed ivy lock matches build.mill
 ```
 
-Full CI command set is in [nix-build.md §4](nix-build.md).
+The full CI command set is in [nix-build.md §7](nix-build.md).
 
 ---
 
@@ -540,12 +540,15 @@ Full CI command set is in [nix-build.md §4](nix-build.md).
 | Symptom                                                                    | Cause                                                                 | Fix                                                                                     |
 |----------------------------------------------------------------------------|----------------------------------------------------------------------|----------------------------------------------------------------------------------------|
 | `<uri> has no SemanticDB output; every source must be compiled with -Xsemanticdb` | the file's target is not compiled with `-Xsemanticdb`         | add `-Xsemanticdb -sourceroot <workspaceRoot>` to that module's `scalacOptions`, recompile |
-| A module (or `mill-build`) always in `SemanticDB coverage: ERROR`          | `mill-build` (and any flag-less module) emits no SemanticDB          | expected for `mill-build` — ignore it; for your own modules, add the flags (row above)  |
-| `RequestTimeout` on the first/large compile                                | shipped BSP request timeout is 30 s                                  | pre-compile with `mill __.compile` before the session so the first BSP compile is warm  |
-| SQLite `UnsatisfiedLinkError` / FFM failure at startup                     | `LS_SQLITE_LIB` unset or wrong; missing native-access flag           | use the wrapped binary, or set `LS_SQLITE_LIB=<libsqlite3>` + `--enable-native-access=ALL-UNNAMED` |
+| A module (or `mill-build`) always in the SemanticDB-coverage error          | `mill-build` (and any flag-less module) emits no SemanticDB          | expected for `mill-build` — ignore it; for your own modules, add the flags (row above)  |
+| `workspace is bootstrap failed: no build server connection found …`        | no usable `.bsp/*.json` in the workspace root                        | `mill mill.bsp.BSP/install` in the workspace, then restart the session                  |
+| Request-timeout on the first/large compile                                 | BSP request timeout is 30 s                                          | pre-compile with `mill __.compile` before the session so the first BSP compile is warm  |
+| `no Java home for the PC island: …` on the first completion/hover          | no config/env/baked Java home (e.g. raw cargo binary outside the dev shell) | set `javaHome` in `.scala3-bsp-semantic-ls/config.json`, or `LS_LIBJVM`/`JAVA_HOME`, or use the packaged wrapper (bakes the defaults) |
+| Completion/hover fail but references/rename work                           | the PC island failed to boot (bad javaHome, missing agent jar)       | check stderr for the island boot error; verify `PC_HOST_AGENT_JAR` points at the packaged `share/…/pc-host-agent.jar` |
 | Garbled / failed JSON-RPC in the client                                    | something wrote to the server's stdout, or the client reads logs from stdout | stdout is protocol-only; logs are on **stderr** — do not write to the child's stdout    |
-| Empty results / "workspace is …" right after opening                       | bootstrap still running (async on `initialized`)                    | wait for `Ready` (doctor `state: ready`); clients must tolerate warm-up                 |
-| `AOT cache: missing` despite training                                      | `LS_AOT_CACHE` unset, or `-XX:AOTCache` path wrong                  | set `LS_AOT_CACHE=<path>` (wrapper) / pass `-XX:AOTCache=<path>` (raw jar); verify in doctor |
-| Server roots at the wrong project                                          | client sent no `rootUri`/`workspaceFolder`                          | send `initialize` with `rootUri` = workspace root (where `.bsp/` lives)                  |
+| "workspace is …" errors right after opening                                | bootstrap still running (async on `initialized`)                    | wait for `Ready` (doctor `state: ready`); clients must tolerate warm-up                 |
+| Server exits non-zero immediately with an argument message                 | unknown flag (including the removed v1 flags)                        | the only CLI surface is `--version`, `--doctor [dir] [--json]`, `dump [dir]` (§3)       |
+| Bootstrap fails with `no workspace root in the initialize params`          | client sent no `rootUri`/`workspaceFolder`                          | send `initialize` with `rootUri` = workspace root (where `.bsp/` lives)                  |
 | `error: mill not found on PATH`                                            | ran `./mill` (or a script) outside the dev shell                    | run inside `nix develop`, or prefix commands with `nix develop -c`                       |
-| Offline `package` build / `check-ivy-lock.sh` fails after a dep change     | `nix/ivy-lock.nix` not regenerated                                  | `nix develop -c ./scripts/regen-ivy-lock.sh` and commit the lock                         |
+| Offline island build / `check-ivy-lock.sh` fails after a dep change        | `nix/ivy-lock.nix` not regenerated                                  | `nix develop -c ./scripts/regen-ivy-lock.sh` and commit the lock                         |
+| Zaozi `io.field` go-to lands on `selectDynamic`                            | the zaozi PC plugin is not configured for the workspace              | point `pc-plugins.json` `compilerPlugins` at `share/…/zaozi-pcplugin.jar` (§4.8)        |

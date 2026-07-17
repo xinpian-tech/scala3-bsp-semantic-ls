@@ -1,130 +1,137 @@
-# Nix + Mill Build Contract
+# Nix Build Contract
 
 > Normative contract for toolchain, dependency locking, packaging, and CI.
-> Derived from `plan.md` sections 1.1, 1.2, 15, 16, 18.4 and the real
-> `flake.nix`, `nix/dev-shell.nix`, `nix/package.nix`, `nix/checks.nix`,
-> `scripts/check-ivy-lock.sh`, and `mill` wrapper in this repository.
+> Derived from the real `flake.nix`, `nix/rust.nix`, `nix/package.nix`,
+> `nix/checks.nix`, `nix/dev-shell.nix`, `nix/pc-host-agent.nix`,
+> `nix/zaozi-pcplugin.nix`, `nix/spike-agent.nix`, `nix/ivy-lock.nix`, and the
+> `scripts/` in this repository.
+
+The build is two-tier, mirroring the product (see the v2 decision record,
+plan-rust.md §0): the deployable server is the **crane-built Rust cargo
+workspace** under `crates/`, and Mill builds only the **JVM island artifacts**
+— the PC-host agent jar and the zaozi PC plugin jar — from a locked ivy cache.
 
 ## 1. Toolchain contract
 
 ```text
-Java 25 only            (pkgs.jdk25; the only supported runtime)
-Scala 3.8.4             (pinned in build.mill: Deps.scalaVer)
+Rust (stable, nixpkgs)  crane-built cargo workspace (crates/); vendored offline from Cargo.lock
+Java 25                 (pkgs.jdk25; island-only — the embedded PC island runtime and the mill toolchain)
+Scala 3.8.4             (pinned in build.mill: Deps.scalaVer; the bundled PC version)
 Mill 1.1.2              (pkgs.millVersions.mill_1_1_2 via mill-ivy-fetcher's mill-overlay)
 Nix >= 2.28             (required by mill-ivy-fetcher)
 mill-ivy-fetcher input  (mandatory flake input, pinned in flake.lock)
 ```
 
-Hard rules (plan 1.2):
+Hard rules:
 
 ```text
 1. The project must provide flake.nix and flake.lock.
 2. flake inputs must include: mill-ivy-fetcher.url = "github:Avimitin/mill-ivy-fetcher";
 3. The development environment must be entered via nix develop.
-4. Mill dependencies must be locked into a Nix expression via mill-ivy-fetcher.
-5. CI must run through nix flake check / nix develop / mill.
-6. Local Coursier caches, system JDKs, and system SQLite are never formal build dependencies.
+4. Mill (island) dependencies must be locked into a Nix expression via mill-ivy-fetcher;
+   Rust dependencies are locked by the committed Cargo.lock.
+5. CI must run through nix flake check / nix develop.
+6. Local Coursier caches and system JDKs are never formal build dependencies.
 7. sbt, Maven, and Gradle are not build tools for this project.
 ```
 
-`nix develop` is the only formal entry point for development, building, locking, and
-CI. The `./mill` script at the repo root is a thin launcher only: it `exec`s whatever
-`mill` is on `PATH` and errors out with instructions to enter `nix develop` otherwise.
-It deliberately performs **no** network bootstrap — outside the flake dev shell this
-project does not build.
+`nix develop` is the only formal entry point for development, building,
+locking, and CI. The `./mill` script at the repo root is a thin launcher only:
+it `exec`s whatever `mill` is on `PATH` and errors out with instructions to
+enter `nix develop` otherwise. It deliberately performs **no** network
+bootstrap — outside the flake dev shell this project does not build.
 
 ## 2. The flake as it exists
 
-`flake.nix` (real attribute paths):
+Inputs: `nixpkgs` (nixos-unstable), `flake-utils`, `crane` (builds the Rust
+workspace and supplies the fmt/clippy/test/build checks), `mill-ivy-fetcher`
+(hard requirement; its two overlays provide `pkgs.mill-ivy-fetcher` (the `mif`
+tool), `pkgs.millVersions.*`, and the packaging helpers `ivy-gather` +
+`configure-mill-env-hook`), and `zaozi` (a pinned non-flake source input; the
+real third-party Scala 3 project behind the zaozi plugin validation).
 
-- `inputs.nixpkgs` — `github:NixOS/nixpkgs/nixos-unstable`
-- `inputs.flake-utils` — `github:numtide/flake-utils`
-- `inputs.mill-ivy-fetcher` — `github:Avimitin/mill-ivy-fetcher` (hard requirement)
-- Overlays applied to `pkgs`: `mill-ivy-fetcher.overlays.default` and
-  `mill-ivy-fetcher.overlays.mill-overlay`. These provide `pkgs.mill-ivy-fetcher`
-  (the `mif` tool), `pkgs.millVersions.*`, and the packaging helpers `ivy-gather`
-  and `configure-mill-env-hook` consumed by `nix/package.nix`.
-- `jdk = pkgs.jdk25`; `mill = pkgs.millVersions.mill_1_1_2 or pkgs.mill`.
+Systems are **Linux only by decision**: `flake-utils.lib.eachSystem
+["x86_64-linux" "aarch64-linux"]`. The embedded-libjvm boundary (dlopen +
+`JNI_CreateJavaVM` + `/proc/self/maps` assertions) is exercised and supported
+on Linux exclusively; macOS is explicitly unsupported.
 
-Per-system outputs (via `flake-utils.lib.eachDefaultSystem`):
+Per-system outputs:
 
 | Output | Definition |
 |---|---|
-| `devShells.<system>.default` | `import ./nix/dev-shell.nix { inherit pkgs jdk mill; }` |
-| `checks.<system>.*` | `import ./nix/checks.nix { inherit pkgs jdk mill self; }` |
-| `packages.<system>.default` | `pkgs.callPackage ./nix/package.nix { inherit mill jdk; inherit (pkgs) sqlite; }` |
-| `formatter.<system>` | `pkgs.nixpkgs-fmt` |
+| `devShells.default` | `nix/dev-shell.nix` (§6) |
+| `formatter` | `pkgs.nixpkgs-fmt` |
+| `checks.*` | `nix/checks.nix` + the crane checks + the boundary/package checks (§5) |
+| `packages.default` | `nix/package.nix` — the wrapped Rust server + island jars (§3.1) |
+| `packages.rust-workspace` | the crane-built cargo workspace on its own |
+| `packages.pc-host-agent-jar` | the PC island host agent assembly (`mill pcHost.assembly`) |
+| `packages.zaozi-pcplugin-jar` | the zaozi PC compiler plugin jar (`mill zaoziPcplugin.jar`) |
+| `packages.spike-agent-jar` | the boundary-spike island agent jar (`mill pcHostSpike.assembly`) |
+| `packages.mill`, `packages.mill-ivy-fetcher` | the pinned Mill and `mif` (so `nix shell '.#mill' '.#mill-ivy-fetcher' -c mif run …` works) |
+| `packages.zaozi-src` | the pinned zaozi source with `nix/patches/zaozi-semanticdb.patch` applied |
 
-The flake exports `packages.<system>.mill` and
-`packages.<system>.mill-ivy-fetcher` (used by the lock workflow below), so
-`nix shell '.#mill' '.#mill-ivy-fetcher' -c mif run …` works.
+## 3. The Rust workspace build (`nix/rust.nix`)
 
-### 2.1 Dev shell (`nix/dev-shell.nix`)
+Crane builds the cargo workspace from an exact fileset — `Cargo.toml`,
+`Cargo.lock`, `rustfmt.toml`, and `crates/` — so a Scala/mill change never
+invalidates the Rust derivations. Dependencies are **vendored from the
+committed `Cargo.lock`** (offline/reproducible); `craneLib.buildDepsOnly`
+builds the dependency closure once and every check shares those artifacts. The
+buildable workspace is exposed as `nix build .#rust-workspace`, and the same
+`commonArgs`/`cargoArtifacts` are reused by the live PC checks (§5), which add
+the island boot env plus a scoped test filter on top.
 
-Packages: `jdk` (JDK 25), `mill` (1.1.2), `mill-ivy-fetcher`, `sqlite`, `sqlite.dev`,
-`pkg-config`, `git`, `jq`.
+### 3.1 Package assembly (`nix/package.nix`)
 
-Exported environment variables — these are contract, code may rely on them:
+`nix build .#default` produces:
 
-| Variable | Value | Meaning |
-|---|---|---|
-| `JAVA_HOME` | `${jdk}` | the Nix JDK 25; the only JDK the build may use |
-| `LS_JAVA_VERSION` | `"25"` | asserted by tooling/doctor; the single supported runtime major |
-| `LS_SQLITE_LIB` | `${pkgs.sqlite.out}/lib/libsqlite3<ext>` | absolute path to the Nix-provided SQLite shared library consumed by the `ls-sqlite-ffm` FFM binding. System SQLite is never used. |
+```text
+bin/scala3-bsp-semantic-ls                              # makeWrapper launcher around the crane-built ls-server binary
+share/scala3-bsp-semantic-ls/pc-host-agent.jar          # the mill-built island host agent (-javaagent premain assembly)
+share/scala3-bsp-semantic-ls/zaozi-pcplugin.jar         # the mill-built zaozi PC plugin (scalac -Xplugin)
+share/scala3-bsp-semantic-ls/default-plugin-schema.json # from modules/ls-pc/resources/
+```
 
-(`<ext>` is `pkgs.stdenv.hostPlatform.extensions.sharedLibrary`: `.so` on Linux,
-`.dylib` on macOS.)
+The wrapper bakes the embedded-JVM boot defaults via `--set-default` —
+`JAVA_HOME` (the flake's JDK 25) and `PC_HOST_AGENT_JAR` (the shipped agent
+jar) — so the runtime resolution precedence stays **config > env > nix-baked**:
+a workspace `.scala3-bsp-semantic-ls/config.json` `javaHome` wins, then the
+caller's environment (`LS_LIBJVM` exact-path override, else `JAVA_HOME`), then
+these baked defaults. `libjvm` is located at `<javaHome>/lib/server/libjvm.so`.
+An index-only session never touches any of it: the JVM boots lazily on the
+first presentation-compiler query. `meta.platforms = lib.platforms.linux`.
 
-### 2.2 Checks (`nix/checks.nix`)
+## 4. The island jars & dependency locking
 
-`nix flake check` runs four checks:
+`nix/pc-host-agent.nix`, `nix/zaozi-pcplugin.nix`, and `nix/spike-agent.nix`
+build the three Mill artifacts offline: each takes only `build.mill` +
+`modules/` as source, consumes the fixed-output ivy cache built by
+`ivy-gather ./ivy-lock.nix`, and runs `mill --no-daemon
+pcHost.assembly` / `zaoziPcplugin.jar` / `pcHostSpike.assembly` (`--no-daemon`
+because the daemon path resolves its runner from the network, which the
+sandbox forbids).
 
-| Check attr | What it enforces |
-|---|---|
-| `checks.<system>.java25-toolchain` | `java -version` from the flake toolchain reports major version 25. |
-| `checks.<system>.ivy-lock-present` | `nix/ivy-lock.nix` exists in the flake source and parses as a Nix expression (`nix-instantiate --parse`). |
-| `checks.<system>.mill-ivy-fetcher-input` | `flake.nix` literally pins `mill-ivy-fetcher.url = "github:Avimitin/mill-ivy-fetcher"`. |
-| `checks.<system>.package` | the offline package build (`packages.<system>.default`) succeeds. |
-
-Note: `nix/ivy-lock.nix` is generated (section 3), not handwritten; it is committed
-in the tree and `ivy-lock-present` gates it.
-
-## 3. Dependency locking with mill-ivy-fetcher
-
-`nix/ivy-lock.nix` is the Nix expression of the project's full Ivy/Maven dependency
-closure, generated by the `mif` tool. `nix/package.nix` consumes it via
-`ivy-gather ./ivy-lock.nix` to build a fixed-output dependency cache (`ivyCache`,
-also exposed as `passthru.ivyCache`).
-
-Supported regeneration command (run from the repo root):
+`nix/ivy-lock.nix` is the generated Nix expression of the Maven/ivy dependency
+closure — **now shrunk to the island modules only** (the Mill build's whole
+surface after the rewrite). Supported regeneration command (run from the repo
+root):
 
 ```bash
 nix develop -c ./scripts/regen-ivy-lock.sh
 ```
 
-The script wraps `mif fetch` + `mif codegen` (plan 15.3's `mif run -p . -o
-nix/ivy-lock.nix` in spirit) with three determinism guards that plain
-`mif run` lacks:
+The script wraps `mif fetch` + `mif codegen` with three determinism guards
+that plain `mif run` lacks: (1) Mill's launcher resolves its own runtime
+through the coursier cache derived from java's `user.home` — the script points
+`user.home` at a cold directory and merges launcher downloads into the cache
+`mif codegen` hashes, so a warm host cache cannot silently drop artifacts from
+the lock; (2) a PATH shim forces `mill --no-daemon`; (3) mif is handed a clean
+copy of `build.mill` + `modules/` only, so a stale `out/mill-launcher`
+resolved-classpath file cannot let the launcher skip resolution. The flake
+exports `.#mill` / `.#mill-ivy-fetcher` for the README-style `mif run`
+variant, but prefer the script for the guards above.
 
-1. Mill's launcher resolves its own runtime (`mill-runner-daemon` and
-   friends) through the coursier cache derived from java's `user.home` —
-   *not* `$HOME`/`$COURSIER_CACHE`. On a machine with a warm cache those
-   artifacts would silently not enter the lock and the sandboxed
-   `nix build` would then fail resolving them. The script points
-   `user.home` at a cold directory and merges launcher downloads into the
-   cache `mif codegen` hashes.
-2. The mill daemon does not start reliably inside the project copy mif
-   works on; a PATH shim forces `mill --no-daemon`.
-3. A stale `out/mill-launcher` resolved-classpath file lets the launcher
-   skip resolution entirely, so the script hands mif a clean copy of
-   `build.mill` + `modules/` only.
-
-plan 15.3 also lists the mill-ivy-fetcher README variant
-(`nix shell '.#mill' '.#mill-ivy-fetcher' -c mif run ...`); the flake exports
-the `mill` and `mill-ivy-fetcher` packages it needs, but prefer the script for
-the determinism guards above.
-
-The four lock rules (plan 15.3) — all mandatory:
+The lock rules — all mandatory:
 
 ```text
 1. After changing dependencies in build.mill, nix/ivy-lock.nix must be regenerated.
@@ -133,86 +140,92 @@ The four lock rules (plan 15.3) — all mandatory:
 4. CI must never resolve unlocked dependencies online.
 ```
 
-Rule 3 is implemented by `scripts/check-ivy-lock.sh`: it runs inside `nix develop`
-(needs `mill` + `mif` on PATH), regenerates the lock via
-`scripts/regen-ivy-lock.sh`, and `diff`s the result against the committed
-`nix/ivy-lock.nix`, failing on any drift or if the lock file is missing.
+Rule 3 is `scripts/check-ivy-lock.sh` (regenerates inside `nix develop` and
+diffs against the committed lock, failing on drift or a missing file). Rule 4
+is additionally enforced by the offline-compile guard,
+`scripts/check-offline-compile.sh`: it seeds a temp coursier cache from the
+flake's ivyCache, forces coursier offline under a **cold** cache boundary
+(isolating `HOME`/`XDG_CACHE_HOME`/`user.home`, not just `COURSIER_CACHE`),
+and runs `mill --no-daemon __.compile`; `--self-test` appends a deliberately
+unlocked dependency and requires the offline compile to **fail**, proving the
+guard actually rejects what the lock does not carry.
 
-## 4. CI minimal command set (plan 15.5)
+## 5. Checks (`nix flake check`)
+
+| Check | What it enforces |
+|---|---|
+| `java25-toolchain` | `java -version` from the flake toolchain reports major version 25 |
+| `ivy-lock-present` | `nix/ivy-lock.nix` exists, parses as Nix, and locks a non-trivial artifact set |
+| `mill-ivy-fetcher-input` | `flake.nix` literally pins `mill-ivy-fetcher.url = "github:Avimitin/mill-ivy-fetcher"` |
+| `package` | the full offline `packages.default` build succeeds |
+| `rust-build` | the cargo workspace builds (the crane workspace derivation) |
+| `rust-test` | `cargo test --workspace` (live-JVM tests skip here: no boot env is set) |
+| `rust-clippy` | `cargo clippy --all-targets --workspace -- -D warnings` |
+| `rust-fmt` | `cargo fmt` cleanliness against the committed `rustfmt.toml` |
+| `spike-boundary` | boots the spike island through the crane-built `ls-jvm-spike` binary and drives every boundary scenario (echo / java-throw / rust-panic / timeout / bad-canary) |
+| `pc-host-agent` | the agent jar builds offline and its manifest declares `Premain-Class: ls.pc.host.PcHostAgent` (a valid `-javaagent`) |
+| `package-cli` | the packaged binary works offline: `--version` prints the identity, `--doctor` renders the Store section pre-bootstrap, `dump` reports an absent store gracefully, and both island jars are shipped under `share/` |
+| `pc-boundary` | live `ls-jvm` test: boots the production island against a real JVM and drives register/open/completion/hover through the 15-slot vtable |
+| `pc-recovery` | live dispatch-generation recovery: a real wedged completion is recovered by the watchdog; the generation cap turns into a fatal |
+| `pc-definition` | live cross-file go-to: the full FFM round-trip through the symbol-resolver slot with a real snapshot-backed resolver |
+| `pc-zaozi` | live zaozi navigation: the shipped plugin, loaded through a workspace `pc-plugins.json`, steers go-to on a zaozi dynamic field access |
+| `pc-server-definition` | live `ls-server` test: `textDocument/definition` through the real `CoreHandlers` dispatch into the booted island |
+
+The live PC checks reuse the shared crane artifacts and are handed the boot
+inputs (`LS_LIBJVM`, `PC_HOST_AGENT_JAR`, `LS_PC_TARGET_CLASSPATH`, and for
+`pc-zaozi` also `ZAOZI_PCPLUGIN_JAR`) as derivation env; the target classpath
+is the pinned Scala 3.8.4 standard-library jars, version-matched to the
+compiler bundled in the PC-host assembly.
+
+The hermetic checks never touch a `.bsp/` directory — real-BSP coverage lives
+in the gated scripts (§7): `scripts/it-real-bsp-rs.sh` and
+`scripts/it-mill-smoke.sh` copy `it/sample-workspace` aside and run
+`mill mill.bsp.BSP/install` there to write the real `.bsp/mill-bsp.json` the
+server's production discovery then finds.
+
+## 6. Dev shell (`nix/dev-shell.nix`)
+
+Packages: `jdk` (JDK 25), `mill` (1.1.2), `mill-ivy-fetcher`, `git`, `jq`; the
+Rust toolchain (`rustc`, `cargo`, `clippy`, `rustfmt`, `rust-analyzer`);
+`protobuf` (protoc for the SemanticDB prost codegen), `rust-cbindgen` and
+`jextract` (the boundary-binding generators behind
+`scripts/regen-pc-abi-bindings.sh`, `scripts/regen-pc-host-bindings.sh`, and
+`scripts/regen-spike-bindings.sh` — the generated header/bindings are
+committed, so only regeneration needs them).
+
+Exported environment — contract, code and scripts rely on these:
+
+| Variable | Value | Meaning |
+|---|---|---|
+| `JAVA_HOME` | `${jdk}` | the Nix JDK 25; the only JDK the island build/boot may use |
+| `LS_JAVA_VERSION` | `"25"` | the single supported island runtime major |
+| `RUST_SRC_PATH` | rust stdlib source | rust-analyzer std resolution |
+| `PROTOC` | `${protobuf}/bin/protoc` | SemanticDB prost codegen (`ls-semanticdb`) |
+| `LS_LIBJVM` | `${jdk.home}/lib/server/libjvm.so` | the exact libjvm the embedded island dlopens (on nixpkgs jdk25 it lives under `jdk.home`, not `$JAVA_HOME/lib/server`) |
+| `PC_HOST_AGENT_JAR` | the mill-built agent jar | island boot input for the live PC tests and dev-shell servers |
+| `LS_PC_TARGET_CLASSPATH` | pinned scala-library + scala3-library jars | the classpath live-PC test targets register |
+| `ZAOZI_PCPLUGIN_JAR` | the zaozi plugin jar | lets the live zaozi row run instead of skipping |
+| `ZAOZI_SRC` | the patched zaozi tree | pinned real-repo workspace source for manual validation |
+
+With these set, `cargo test` in the dev shell runs the live embedded-JVM tests
+for real (the same tests skip in the hermetic `rust-test` check, which sets
+none of them).
+
+## 7. CI command set (`.github/workflows/ci.yml`)
 
 ```bash
-nix flake check
-nix develop -c mill __.compile
-nix develop -c mill __.test
-nix develop -c mill bench.smoke
-nix develop -c ./scripts/check-ivy-lock.sh
-./scripts/check-docs.sh
+nix flake check                                  # everything in §5
+nix develop -c mill __.compile                   # the retained island modules (pc, pcHost, pcHostSpike, zaoziPcplugin)
+nix develop -c mill __.test                      # the island test suites
+nix develop -c cargo run -p ls-bench -- --smoke  # bench smoke over the Rust engine
+nix develop -c ./scripts/check-ivy-lock.sh       # lock freshness (rule 3, §4)
+./scripts/check-docs.sh                          # docs/traceability + stale-claim gate
+./scripts/check-audit-inventory.sh               # coverage-audit accounts for every retained suite
+nix develop -c ./scripts/it-real-bsp-rs.sh       # separate job: real-BSP e2e (real mill --bsp, .bsp discovery, embedded-PC rows, cold-start zero-JVM assertion)
 ```
 
-`bench.smoke` is a real Mill command on the `bench` module (see `build.mill`): it
-runs `ls.bench.BenchMain --smoke` on the module's run classpath with
-`--enable-native-access=ALL-UNNAMED`. Nix/Mill test expectations from plan 18.4 that
-these commands must keep true:
-
-```text
-nix flake check passes
-nix develop launches Java 25
-mill compiles under nix develop
-mif lock refresh check passes
-no Ivy dependency resolves outside the nix lock
-the package wrapper uses Java 25
-```
-
-## 5. Package output (`nix/package.nix`)
-
-`nix build .#default` (i.e. `packages.<system>.default`) builds
-`pname = "scala3-bsp-semantic-ls"` from a file set containing only `build.mill` and
-`modules/`, using `mill --no-daemon core.assembly` with the pre-fetched `ivyCache` (no network).
-
-Output layout:
-
-```text
-bin/scala3-bsp-semantic-ls                                        # makeWrapper launcher
-lib/scala3-bsp-semantic-ls/scala3-bsp-semantic-ls.jar             # core.assembly fat jar
-share/scala3-bsp-semantic-ls/default-plugin-schema.json           # from modules/ls-pc/resources/
-```
-
-The wrapper is `makeWrapper ${jdk}/bin/java` with, in order:
-
-| Wrapper setting | Value | Purpose |
-|---|---|---|
-| `--set JAVA_HOME` | the Nix JDK 25 | Java 25 only runtime |
-| `--set-default LS_SQLITE_LIB` | `${sqlite.out}/lib/libsqlite3<ext>` | pins the Nix-provided SQLite for the FFM binding; overridable only via an explicit env var |
-| `--add-flags --enable-native-access=ALL-UNNAMED` | | grants FFM native access — see deviation note below |
-| `--add-flags -XX:+UseCompactObjectHeaders` | | Java 25 Compact Object Headers for object-dense index workloads |
-| `--add-flags "${LS_AOT_CACHE:+-XX:AOTCache=$LS_AOT_CACHE}"` | | opt-in AOT cache: the flag is emitted only when the `LS_AOT_CACHE` env var is set at launch |
-| `--add-flags -jar .../scala3-bsp-semantic-ls.jar` | | runs the assembly |
-
-**Deviation from plan 15.6/16.1**: the plan specifies
-`--enable-native-access=ls.sqlite.ffm` (a JPMS module name). The shipped assembly runs
-on the **class path**, not the module path, so all code lands in the unnamed module
-and native access is granted with `--enable-native-access=ALL-UNNAMED` instead. The
-module-path spelling becomes applicable only if the distribution ever moves to
-`--module-path` with a real `ls.sqlite.ffm` module. Test `forkArgs` in `build.mill`
-use the same `ALL-UNNAMED` spelling.
-
-## 6. Java 25 runtime features used (plan 16)
-
-| Feature | Use in this project | Enablement |
-|---|---|---|
-| FFM API | `ls-sqlite-ffm` binds the SQLite C API (`sqlite3_open_v2`, `sqlite3_prepare_v3`, `sqlite3_bind_*`, `sqlite3_step`, `sqlite3_column_*`, `sqlite3_reset`, `sqlite3_clear_bindings`, `sqlite3_finalize`, `sqlite3_close_v2`) against the library at `LS_SQLITE_LIB` | `--enable-native-access=ALL-UNNAMED` (wrapper and test forkArgs) |
-| MemorySegment mmap | `ls-postings` maps immutable postings segments read-only via `FileChannel.map -> MemorySegment` under a snapshot-owned `Arena` | none beyond JDK 25 |
-| AOT cache | faster cold start / first request | build with `scripts/aot-train.sh --workspace <dir> --out <path>`. When `<dir>/.bsp` exists the training runs the STRICT real-BSP workload (`--require-index`: LSP/BSP initialize, SQLite + snapshot store open, compile + reindex, a SemanticDB-backed workspace/symbol + references query, and a PC completion); with no `.bsp` it runs the lenient no-BSP workload. Training passes `--in-process-pc` (the production PC default is forked; the cache cannot cover the PC's child JVM). The script then runs the JDK-25 `-XX:AOTMode=record`→`create` two-step. Set `LS_AOT_CACHE=<path>` at launch → wrapper adds `-XX:AOTCache=<path>` (default `.scala3-bsp-semantic-ls/aot-cache.bin`); the doctor's Runtime section reports `AOT cache: loaded/missing` |
-| Compact Object Headers | lower heap pressure on the object-dense ingest/query workload | `-XX:+UseCompactObjectHeaders` (always on in the wrapper) |
-| JFR profiling | bench/JFR harness (`bench` module) | JDK 25 built-in |
-
-## 7. Foundation status
-
-Everything the contract above requires is present in the tree:
-
-- `nix/ivy-lock.nix` is generated (`scripts/regen-ivy-lock.sh`) and committed;
-  `checks.ivy-lock-present` and `scripts/check-ivy-lock.sh` gate it.
-- `modules/ls-pc/resources/default-plugin-schema.json` exists and is installed by
-  `nix/package.nix` into `share/`.
-- Flake outputs `.#mill` / `.#mill-ivy-fetcher` are exported (see section 3), so
-  `nix shell '.#mill' '.#mill-ivy-fetcher' -c mif run …` works.
+Expectations these commands must keep true: `nix flake check` passes;
+`nix develop` launches Java 25 and the Rust toolchain; the cargo workspace and
+the island modules compile under `nix develop`; the ivy-lock refresh check
+passes and no ivy dependency resolves outside the nix lock; the package wraps
+the native `ls-server` binary and ships both island jars.

@@ -40,7 +40,7 @@ done < <(grep -oE '\b[A-Z][A-Za-z0-9]*(Suite|Test)\b' "$trace" | sort -u)
 #     breaks the gate, not just a wrong file name.
 mapped=0
 while IFS= read -r line; do
-  f=$(printf '%s\n' "$line" | sed -nE 's/.*`([A-Za-z0-9_./-]+)` :: ".*/\1/p')
+  f=$(printf '%s\n' "$line" | sed -nE 's/.*`([A-Za-z0-9_./-]+\.[a-z]+)` :: ".*/\1/p')
   cse=$(printf '%s\n' "$line" | sed -nE 's/.*:: "(.+)".*/\1/p')
   [ -n "$f" ] && [ -n "$cse" ] || continue
   mapped=$((mapped + 1))
@@ -49,17 +49,21 @@ while IFS= read -r line; do
   elif ! grep -Fq -- "$cse" "$f"; then
     err "case map: case \"${cse}\" not found in ${f}"
   fi
-done < <(grep -E '`[A-Za-z0-9_./-]+` :: "' "$trace")
+done < <(grep -E '`[A-Za-z0-9_./-]+\.[a-z]+` :: "' "$trace")
 [ "$mapped" -ge 10 ] || err "case map has only ${mapped} entries; expected the recovery / matrix / boundary / e2e anchors"
 
 # (4) Stale/false claims from the deleted Scala implementation. Grep everything
 #     under docs/ EXCEPT traceability.md and coverage-audit.md (both document
 #     the evolution old->new by design).
 stale() { # <extended-regex> <why>
+  # Lines that explicitly mark the behavior as gone ("removed", "retired",
+  # "replaced", ...) are historical contrast, not stale claims.
   local hit
-  if hit=$(grep -rniE -- "$1" docs/ --include='*.md' \
+  if hit=$(grep -rniE --include='*.md' -e "$1" docs/ \
       | grep -v '^docs/traceability.md:' \
-      | grep -v '^docs/coverage-audit.md:' | head -1); then
+      | grep -v '^docs/coverage-audit.md:' \
+      | grep -viE 'removed|retired|replac|former|deleted|no longer|there is no' \
+      | head -1); then
     [ -n "$hit" ] && err "stale claim ($2): ${hit}"
   fi
   return 0
@@ -67,7 +71,7 @@ stale() { # <extended-regex> <why>
 stale 'meta\.sqlite' 'the SQLite metadata store was removed (immutable segments + manifest.json + workspace-state)'
 stale 'LS_SQLITE_LIB' 'the SQLite FFM binding was removed with the Scala core'
 stale 'ForkedPcWorker|PcWorkerMain|forked worker' 'the forked PC worker was deleted; the island is embedded in-process'
-stale '\-\-in-process-pc|\-\-forked-pc' 'the PC backend selection flags were removed with the Scala CLI'
+stale '(^|[^-])--(in-process|forked)-pc' 'the PC backend selection flags were removed with the Scala CLI'
 stale 'core\.assembly' 'the Scala server assembly no longer exists; the binary is the crane-built ls-server'
 stale 'AotTrain|aot-train' 'AOT training was deleted with the Scala core'
 stale 'workspace_symbols_fts|fts5' 'FTS5 search was replaced by the deterministic segment-resident search section'

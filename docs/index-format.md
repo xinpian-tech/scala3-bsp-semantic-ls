@@ -352,7 +352,8 @@ mismatch, missing file, unexpected entry name or count.
 ## v2 extension sections (`ls-store`)
 
 These sections replace the former SQLite tables (`targets`, `symbol_metadata`)
-and the FTS5 search index with immutable, mmap-resident, CRC32C-validated files.
+and the removed FTS5 search index with immutable, mmap-resident, CRC32C-validated
+files.
 All fields are little-endian; strings are `(int32 offset, int32 len)` refs into
 a trailing blob, as elsewhere.
 

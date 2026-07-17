@@ -27,23 +27,23 @@ PC is **never for**:
 persistent indexing
 global references truth
 cross-file rename truth
-SQLite writes
-mmap postings writes
+index store writes (segments, manifest, workspace-state)
 ```
 
 A crashing user plugin must never corrupt the main index or take down the main LS.
-In the default forked mode the PC worker is an isolated child JVM: a plugin that
-crashes the worker is killed and respawned (targets/buffers replayed), so the main
-LS survives untouched. The opt-in `--in-process-pc` mode still contains a plugin
-crash at the hook boundary (the plugin is disabled and listed in the doctor), but
-a JVM-fatal fault is only fully isolated in forked mode.
+The presentation compiler runs in the embedded in-process JVM island: a plugin
+crash is contained at the hook boundary (the plugin is disabled with a recorded
+reason and the request completes as identity), and a wedged compiler is recovered
+by the watchdog's escalation ladder (cancel → instance restart → a fresh loaned
+dispatch generation with targets/buffers replayed). A JVM-fatal fault ends the
+process, which the editor restarts against the crash-safe on-disk store — the
+island never writes the persistent index, so no fault can corrupt it.
 
 Plugin boundary (plan 1.4): this project does **not** manage the SemanticDB compiler
 plugin — that belongs to the build tool / BSP server / scalac configuration and the
 user must manage it in the real build. This project only manages **PC plugins**,
-which run inside the PC worker, affect only PC request results, and must not write
-SQLite, must not write mmap postings, and must not change workspace-wide semantic
-truth.
+which run inside the PC island, affect only PC request results, and must not write
+the index store and must not change workspace-wide semantic truth.
 
 ## 2. PC compiler plugins (plan 14.2)
 
@@ -88,8 +88,8 @@ Compiler plugins are configured per workspace in
 ```
 
 Each `jars` entry becomes a `-Xplugin:<jar>` option and each `options` entry a
-`-P:<option>` on the PC worker's compiler instances (the config path is forwarded to
-the forked worker via `--plugin-config`).
+`-P:<option>` on the island's compiler instances (the workspace `pc-plugins.json`
+is read by the island host at target registration).
 
 The packaged server ships one such plugin at
 `share/scala3-bsp-semantic-ls/zaozi-pcplugin.jar` (built by the `zaoziPcplugin` Mill
@@ -162,7 +162,7 @@ via Doctor.
 | workspace symbol | **no** | comes only from the SemanticDB index |
 | whole-repo references | **no** | comes only from SemanticDB/postings |
 | cross-file rename | **no** | PC contributes only `prepareRename` |
-| SQLite / postings writes | **forbidden** | persistent index writes come only from scalac SemanticDB |
+| index store writes | **forbidden** | persistent index writes come only from scalac SemanticDB |
 
 ## 5. PC-only symbols (plan 14.5)
 
@@ -186,7 +186,7 @@ Workspace-wide references and cross-file rename are unavailable for this symbol.
 ```
 
 PC-only symbols surfaced in workspace-symbol dirty-buffer overlays must be labeled as
-PC-only and are never written to SQLite or postings.
+PC-only and are never written to the persistent index store.
 
 ## 6. Boundary statements (plan 23)
 
@@ -206,5 +206,6 @@ scalac SemanticDB provides semantic facts.
 ```
 
 Any PC plugin capability whose effect would survive the PC worker process — a file in
-the index store, a SQLite row, a postings segment, a workspace-wide answer — is out of
+the index store — a postings segment, the manifest, workspace state, a
+workspace-wide answer — is out of
 contract and must be rejected in code review.
