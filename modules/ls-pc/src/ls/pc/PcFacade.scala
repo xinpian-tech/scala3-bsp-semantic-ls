@@ -14,10 +14,10 @@ import org.eclipse.lsp4j.{CompletionItem, CompletionList, Diagnostic, Hover, Ran
   * (`beforeRequest`/`afterCompletion`/`afterHover`/`afterDefinition`/
   * `filterPcDiagnostics`).
   *
-  * PC results are editing-time only and NEVER touch SQLite or mmap postings
-  * (plan 4.3): this class — and the whole `pc` module — has no reference to
-  * the `sqliteFfm`/`postings` modules, so the boundary is enforced
-  * structurally, not by convention.
+  * PC results are editing-time only and NEVER touch the persistent index
+  * store (plan 4.3): this class — and the whole `pc` module — has no
+  * reference to the index/store layers (they live in the Rust host), so the
+  * boundary is enforced structurally, not by convention.
   */
 final class PcFacade(
     val pluginManager: PcPluginManager,
