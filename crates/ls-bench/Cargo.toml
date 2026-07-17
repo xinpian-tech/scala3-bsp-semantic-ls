@@ -1,0 +1,15 @@
+[package]
+name = "ls-bench"
+description = "Benchmark harness over the real storage layer: generates a synthetic SemanticDB corpus, runs the full-generation ingest, and measures the production read paths (references fan-out, workspace-symbol search, symbol-at-cursor), cross-checking every measurement against generated ground truth."
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+ls-engine = { path = "../ls-engine" }
+ls-semanticdb = { path = "../ls-semanticdb" }
+ls-store = { path = "../ls-store" }
