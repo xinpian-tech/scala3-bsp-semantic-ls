@@ -1,5 +1,13 @@
 # Rust port coverage audit
 
+> **Cutover note.** The big-bang deletion has happened: the Scala modules this
+> audit inventories (`ls-core`, `ls-rename`, `ls-sqlite-ffm`, `ls-postings`,
+> `ls-bsp`, `ls-semanticdb`, `ls-index-model`, `ls-doctor`, `ls-bench`, the
+> worker-protocol files of `ls-pc`, and the core-dependent zaozi suites) were
+> deleted after this mapping was verified. Rows for deleted paths are preserved
+> as the port's evidence record; `scripts/check-audit-inventory.sh` now checks
+> the retained island suites only.
+
 This audit maps **every** retained Scala test file under `modules/*/test/` (a
 path-qualified inventory, so duplicate basenames like the two
 `Jdk25GuardSuite.scala` never collapse), plus the §18.1 references/rename

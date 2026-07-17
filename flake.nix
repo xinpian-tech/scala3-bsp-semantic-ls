@@ -12,8 +12,8 @@
     # Hard requirement.
     mill-ivy-fetcher.url = "github:Avimitin/mill-ivy-fetcher";
 
-    # A real third-party Scala 3 project used as a real-repo workspace for the
-    # manual real-BSP validation (scripts/it-zaozi.sh). Pinned source only: it is
+    # A real third-party Scala 3 project kept as a pinned real-repo workspace
+    # for manual validation with any LSP client. Pinned source only: it is
     # built with its OWN flake (native CIRCT/MLIR toolchain). Local modifications
     # are maintained as patches under nix/patches/ (see zaozi-semanticdb.patch).
     zaozi = {
@@ -171,7 +171,7 @@
           "$bin" --doctor ws | tee doctor.txt
           grep -q "Store:" doctor.txt \
             || { echo "--doctor did not render the Store section"; exit 1; }
-          "$bin" dump ws | grep -qi "no store" \
+          "$bin" dump ws | grep -qE "manifest: none|error:" \
             || { echo "dump did not report the absent store"; exit 1; }
           [ -f "${lsPackage}/share/scala3-bsp-semantic-ls/pc-host-agent.jar" ] \
             || { echo "packaged island agent jar missing"; exit 1; }
@@ -193,8 +193,8 @@
 
         # The pinned zaozi source with our patches applied (SemanticDB emission,
         # which our SemanticDB-first server requires). Exposed to the dev shell
-        # as ZAOZI_SRC so scripts/it-zaozi.sh builds a pinned, reproducible tree
-        # instead of an ad-hoc `git clone`.
+        # as ZAOZI_SRC so manual real-repo validation builds a pinned,
+        # reproducible tree instead of an ad-hoc `git clone`.
         zaozi-src = pkgs.applyPatches {
           name = "zaozi-patched-src";
           src = zaozi;

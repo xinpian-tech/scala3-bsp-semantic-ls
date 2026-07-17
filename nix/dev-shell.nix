@@ -7,9 +7,6 @@ pkgs.mkShell {
     jdk
     mill
     mill-ivy-fetcher
-    sqlite
-    sqlite.dev
-    pkg-config
     git
     jq
 
@@ -36,7 +33,7 @@ pkgs.mkShell {
   PROTOC = "${pkgs.protobuf}/bin/protoc";
   # The embedded JVM's libjvm.so, dlopen'd by ls-jvm for the in-process island.
   # On nixpkgs jdk25 it lives under ${jdk.home} (= ${jdk}/lib/openjdk), NOT
-  # $JAVA_HOME/lib/server — expose the exact path (mirrors LS_SQLITE_LIB).
+  # $JAVA_HOME/lib/server — expose the exact path.
   LS_LIBJVM = "${jdk.home}/lib/server/libjvm.so";
 
   # The presentation-compiler boot inputs, so the real-BSP PC rows
@@ -54,12 +51,7 @@ pkgs.mkShell {
   # of skipping. Null when the flake is used without this input.
   ZAOZI_PCPLUGIN_JAR =
     if zaoziPcpluginJar == null then "" else "${zaoziPcpluginJar}/zaozi-pcplugin.jar";
-  # The SQLite shared library consumed by the ls-sqlite-ffm FFM binding.
-  # System SQLite is never used; only the Nix-provided library is a valid
-  # runtime dependency.
-  LS_SQLITE_LIB = "${pkgs.sqlite.out}/lib/libsqlite3${pkgs.stdenv.hostPlatform.extensions.sharedLibrary}";
-
   # Pinned + patched zaozi source (real-repo real-BSP workspace for
-  # scripts/it-zaozi.sh). Null when the flake is used without the zaozi input.
+  # manual real-repo validation). Null when the flake is used without the zaozi input.
   ZAOZI_SRC = if zaozi-src == null then "" else "${zaozi-src}";
 }

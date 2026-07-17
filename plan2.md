@@ -1,5 +1,10 @@
 # plan2.md — scala3-bsp-semantic-ls 完成计划 (TDD Completion Plan)
 
+> **HISTORICAL** — this TDD completion plan closed the gaps of the v1 (Scala)
+> implementation, which was deleted at the v2 rewrite cutover. The v2 plan of
+> record is [plan-rust.md](plan-rust.md); the port's evidence record is
+> docs/coverage-audit.md.
+
 > Status: normative completion plan, derived from the 2026-07-03 adversarial audit
 > Audience: project owner, implementers
 > Relationship to plan.md: plan.md remains the architectural truth. plan2.md is the

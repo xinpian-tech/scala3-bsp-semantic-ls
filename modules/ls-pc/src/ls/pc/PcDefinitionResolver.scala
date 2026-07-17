@@ -23,7 +23,8 @@ import scala.meta.pc.{ParentSymbols, SymbolDocumentation, SymbolSearch, SymbolSe
   *     index-backed resolver.
   *
   * `ls-pc` stays index-free (plan 4.3): only this abstraction lives here; the
-  * index-backed implementation lives in `ls-core`.
+  * index-backed implementation lives in the Rust host (the `symbol_definition`
+  * vtable slot backed by the immutable snapshot).
   */
 trait PcDefinitionResolver:
   /** Definition locations of a SemanticDB symbol (e.g. `pkga/Core#ping().`),

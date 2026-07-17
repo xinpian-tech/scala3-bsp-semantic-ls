@@ -17,7 +17,8 @@ first in workspace order).
 ## Provenance
 
 The sources are transcribed verbatim from the Scala `FixtureWorkspace` fixture
-(`modules/ls-rename/test/src/ls/rename/FixtureWorkspace.scala`). Each target tree
+(formerly `modules/ls-rename/test/src/ls/rename/FixtureWorkspace.scala`; the
+Scala tree was deleted at the rewrite cutover). Each target tree
 was compiled once with pinned **Scala 3.8.4** and `-Xsemanticdb`, sharing one
 `-sourceroot`, mirroring `FixtureWorkspace.compileAll`:
 

@@ -5,7 +5,7 @@
 # compile -> diagnostics -> rename-through-compile -> teardown), plus the real
 # embedded presentation-compiler rows and the dispatch-generation recovery.
 #
-# Mirrors scripts/it-real-bsp.sh (the Scala RealBsp* suites). Gated on
+# The port of the deleted Scala RealBsp* suites. Gated on
 # LS_REAL_BSP_IT=1 and skipped in ordinary test runs, because mill needs a
 # JVM/toolchain the hermetic Nix check sandbox forbids.
 #

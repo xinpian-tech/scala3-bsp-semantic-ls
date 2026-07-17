@@ -10,7 +10,7 @@
 //!
 //! Every numeric contract — SemanticDB kind/property codes, the packing layout,
 //! the reason bit assignments, and the error messages — is ported verbatim from
-//! the Scala `ls.index` package (`modules/ls-index-model`), so this crate is a
+//! the deleted Scala `ls.index` package, so this crate is a
 //! behavior-preserving foundation for the storage and engine layers built on it.
 
 // This crate is pure, safe model logic — no FFI, no unsafe blocks.

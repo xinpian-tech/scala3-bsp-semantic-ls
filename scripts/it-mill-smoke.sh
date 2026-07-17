@@ -4,7 +4,7 @@
 # initialize -> project model -> buildTargets/sources/scalacOptions/compile ->
 # forced diagnostic).
 #
-# Mirrors scripts/it-real-bsp.sh: the smoke is gated on LS_BSP_MILL_SMOKE=1 and
+# Like scripts/it-real-bsp-rs.sh, the smoke is gated (LS_BSP_MILL_SMOKE=1) and
 # skipped in ordinary test runs, because mill needs a JVM/toolchain the hermetic
 # Nix check sandbox forbids.
 #

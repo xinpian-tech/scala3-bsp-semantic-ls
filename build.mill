@@ -5,12 +5,17 @@ package build
 import mill.*
 import mill.scalalib.*
 
+/** The mill build covers the retained JVM presentation-compiler island only:
+  * the PC facade + plugin SPI (`pc`), the embedded-JVM island host agent
+  * (`pcHost`), the boundary-viability spike agent (`pcHostSpike`), and the
+  * zaozi PC navigation plugin (`zaoziPcplugin`). Everything else — the LSP
+  * server, BSP client, SemanticDB ingest, storage, engines, doctor, bench —
+  * is the Rust cargo workspace under crates/.
+  */
 object Deps {
   val scalaVer = "3.8.4"
 
   val lsp4j = mvn"org.eclipse.lsp4j:org.eclipse.lsp4j:0.24.0"
-  val lsp4jJsonrpc = mvn"org.eclipse.lsp4j:org.eclipse.lsp4j.jsonrpc:0.24.0"
-  val bsp4j = mvn"ch.epfl.scala:bsp4j:2.2.0-M2"
   val mtagsInterfaces = mvn"org.scalameta:mtags-interfaces:1.6.7"
   val scala3PresentationCompiler =
     mvn"org.scala-lang:scala3-presentation-compiler_3:$scalaVer"
@@ -18,10 +23,10 @@ object Deps {
   val scala3Compiler = mvn"org.scala-lang::scala3-compiler:$scalaVer"
 }
 
-/** Common configuration for every ls-* module.
+/** Common configuration for every ls-* island module.
   *
   * Java 25 only, Scala 3 only, exactly pinned. Module sources live under
-  * modules/ls-<name> while Mill module names stay short (core, bsp, ...).
+  * modules/ls-<name> while Mill module names stay short.
   */
 trait LsModule extends ScalaModule {
   def dirName: String
@@ -58,92 +63,15 @@ trait LsModule extends ScalaModule {
   }
 }
 
-/** Shared identifier/model layer: stable ids, snapshot ordinals, groups. */
-object indexModel extends LsModule {
-  def dirName = "ls-index-model"
-  object test extends LsTests
-}
-
-/** SemanticDB locator + protobuf wire parser + normalization + groups. */
-object semanticdb extends LsModule {
-  def dirName = "ls-semanticdb"
-  def moduleDeps = Seq(indexModel)
-  object test extends LsTests {
-    // Tests compile fixture sources with the real scalac (-Xsemanticdb) so
-    // parser/normalizer correctness is checked against scalac output.
-    override def mvnDeps = Task { super.mvnDeps() ++ Seq(Deps.scala3Compiler) }
-  }
-}
-
-/** SQLite metadata store over the Java 25 FFM API. */
-object sqliteFfm extends LsModule {
-  def dirName = "ls-sqlite-ffm"
-  def moduleDeps = Seq(indexModel)
-  object test extends LsTests
-}
-
-/** Immutable mmap postings segments + snapshot manager. */
-object postings extends LsModule {
-  def dirName = "ls-postings"
-  def moduleDeps = Seq(indexModel)
-  object test extends LsTests
-}
-
-/** BSP client: discovery, build targets, target graph, semanticdb roots. */
-object bsp extends LsModule {
-  def dirName = "ls-bsp"
-  def moduleDeps = Seq(indexModel)
-  def mvnDeps = Seq(Deps.bsp4j)
-  object test extends LsTests
-}
-
-/** Presentation compiler worker + PC plugin system. */
+/** Presentation compiler facade + PC plugin system (the retained island). */
 object pc extends LsModule {
   def dirName = "ls-pc"
-  def moduleDeps = Seq(indexModel)
   def mvnDeps = Seq(
     Deps.mtagsInterfaces,
     Deps.scala3PresentationCompiler,
     Deps.lsp4j
   )
   object test extends LsTests
-}
-
-/** References + rename engines over snapshot postings. */
-object rename extends LsModule {
-  def dirName = "ls-rename"
-  def moduleDeps = Seq(indexModel, semanticdb, sqliteFfm, postings, bsp)
-  object test extends LsTests {
-    override def mvnDeps = Task { super.mvnDeps() ++ Seq(Deps.scala3Compiler) }
-  }
-}
-
-/** Doctor diagnostics report. */
-object doctor extends LsModule {
-  def dirName = "ls-doctor"
-  def moduleDeps = Seq(indexModel, semanticdb, sqliteFfm, postings, bsp, pc)
-  object test extends LsTests
-}
-
-/** LSP server entry point wiring all layers together. */
-object core extends LsModule {
-  def dirName = "ls-core"
-  def moduleDeps = Seq(indexModel, semanticdb, sqliteFfm, postings, bsp, pc, rename, doctor)
-  def mvnDeps = Seq(Deps.lsp4j, Deps.lsp4jJsonrpc)
-  def mainClass = Some("ls.core.Main")
-
-  // Scala 3 (default -Xmixin-force-forwarders:true) generates forwarders for
-  // lsp4j's annotated Java default methods and COPIES their @JsonRequest /
-  // @JsonNotification annotations; lsp4j's jsonrpc method scan then rejects
-  // the service object with "Duplicate RPC method". Applies to core and its
-  // tests (both implement lsp4j service interfaces in Scala).
-  override def scalacOptions = super.scalacOptions() ++ Seq("-Xmixin-force-forwarders:false")
-  object test extends LsTests {
-    // Reuses the in-process fake BSP server from bsp's tests and generates
-    // real SemanticDB fixtures with scalac for end-to-end LSP tests.
-    def moduleDeps = super.moduleDeps ++ Seq(build.bsp.test)
-    override def mvnDeps = Task { super.mvnDeps() ++ Seq(Deps.scala3Compiler) }
-  }
 }
 
 /** zaozi presentation-compiler navigation plugin.
@@ -167,10 +95,10 @@ object zaoziPcplugin extends ScalaModule {
 
   object test extends ScalaTests with TestModule.Munit {
     def mvnDeps = Seq(Deps.munit, Deps.scala3Compiler)
-    // `core` (with its transitive index stack) backs the cross-file navigation
-    // test: it ingests a compiled library into a real index and wires the
-    // index-backed PC definition resolver, exactly as the server does.
-    override def moduleDeps = super.moduleDeps ++ Seq(pc, core)
+    // The island-internal steering shapes are tested against the live facade
+    // (`pc`); the cross-file vtable navigation is proven by the Rust
+    // `ls-jvm` live_zaozi test over the embedded island.
+    override def moduleDeps = super.moduleDeps ++ Seq(pc)
     def forkArgs = Seq("--enable-native-access=ALL-UNNAMED")
     // Drive the presentation compiler with the freshly built plugin jar loaded
     // via -Xplugin, exactly as pc-plugins.json compilerPlugins would.
@@ -247,25 +175,5 @@ object pcHost extends ScalaModule {
   object test extends ScalaTests with TestModule.Munit {
     def mvnDeps = Seq(Deps.munit)
     def forkArgs = Seq("--enable-native-access=ALL-UNNAMED")
-  }
-}
-
-/** Benchmark + JFR harness. */
-object bench extends LsModule {
-  def dirName = "ls-bench"
-  def moduleDeps = Seq(core)
-  def mainClass = Some("ls.bench.BenchMain")
-  object test extends LsTests
-
-  /** CI smoke benchmark: tiny corpus, asserts the harness itself works. */
-  def smoke() = Task.Command {
-    mill.util.Jvm.callProcess(
-      mainClass = "ls.bench.BenchMain",
-      classPath = runClasspath().map(_.path).toVector,
-      mainArgs = Seq("--smoke"),
-      jvmArgs = Seq("--enable-native-access=ALL-UNNAMED"),
-      cwd = Task.dest
-    )
-    ()
   }
 }

@@ -1,5 +1,14 @@
 # scala3-bsp-semantic-ls 项目 Rationale 与实现计划
 
+> **SUPERSEDED (topology/toolchain)** — 2026-07: the v2 rewrite shipped. The
+> single-process **Rust core + embedded JVM presentation-compiler island**
+> topology, the storage idiom (immutable segments + `manifest.json` +
+> generational workspace-state, **no SQLite**), and the toolchain contract are
+> now normative in [plan-rust.md](plan-rust.md); feature semantics
+> (consistency levels, groups, rename safety, §18.1) remain as specified here
+> and in docs/architecture.md. Module/JVM/AOT/SQLite details below describe the
+> deleted Scala implementation and are historical.
+
 > 状态：设计基线草案  
 > 日期：2026-07-02  
 > 目标读者：项目 owner、核心实现者、后续 contributor  
