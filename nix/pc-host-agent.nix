@@ -58,6 +58,10 @@ stdenvNoCC.mkDerivation {
   dontShrink = true;
   dontPatchELF = true;
 
+  # The locked coursier cache, exposed for the offline-compile guard
+  # (scripts/check-offline-compile.sh seeds its cold cache from it).
+  passthru = { inherit ivyCache; };
+
   meta = {
     description = "Embedded-JVM presentation-compiler island host (-javaagent premain, FFM/jextract).";
     platforms = lib.platforms.linux;

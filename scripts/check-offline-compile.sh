@@ -44,9 +44,16 @@ run_offline_compile() {
   # Seed the temp coursier cache from the flake ivyCache (coursier-cache shaped).
   # Skipped only when a stub compile is provided for the focused guard test.
   if [[ -z "${OFFLINE_COMPILE_CMD:-}" ]]; then
-    local ivy
-    if ! ivy="$(nix build --no-link --print-out-paths "$repo#default.passthru.ivyCache")" \
-      || ! cp -r "$ivy/." "$cache/"; then
+    local ivy src
+    if ! ivy="$(nix build --no-link --print-out-paths "$repo#pc-host-agent-jar.passthru.ivyCache")"; then
+      echo "error: failed to build the flake ivyCache" >&2
+      return 1
+    fi
+    # The ivy-gather derivation roots the coursier tree under cache/ (the
+    # COURSIER_CACHE shape is $out/cache/https/...); seed from that level.
+    src="$ivy"
+    [[ -d "$ivy/cache" ]] && src="$ivy/cache"
+    if ! cp -r "$src/." "$cache/"; then
       echo "error: failed to seed the offline coursier cache from the flake ivyCache" >&2
       return 1
     fi

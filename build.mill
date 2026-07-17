@@ -23,12 +23,25 @@ object Deps {
   val scala3Compiler = mvn"org.scala-lang::scala3-compiler:$scalaVer"
 }
 
+/** lsp4j declares gson as the range [2.9.1,3.0); range resolution needs remote
+  * maven-metadata and breaks the offline Nix build, so every module (test
+  * modules included — they resolve their own classpaths) pins it.
+  */
+trait GsonPinned extends JavaModule {
+  override def mapDependencies = Task.Anon { (d: coursier.Dependency) =>
+    if d.module.organization.value == "com.google.code.gson"
+      && d.module.name.value == "gson"
+    then d.withVersion("2.13.2")
+    else d
+  }
+}
+
 /** Common configuration for every ls-* island module.
   *
   * Java 25 only, Scala 3 only, exactly pinned. Module sources live under
   * modules/ls-<name> while Mill module names stay short.
   */
-trait LsModule extends ScalaModule {
+trait LsModule extends ScalaModule with GsonPinned {
   def dirName: String
   override def moduleDir = super.moduleDir / os.up / "modules" / dirName
 
@@ -40,15 +53,6 @@ trait LsModule extends ScalaModule {
     Task.env.get("JAVA_HOME").map(p => PathRef(os.Path(p), quick = true))
   }
 
-  // lsp4j declares gson as the range [2.9.1,3.0); range resolution needs
-  // remote maven-metadata and breaks the offline Nix build, so pin it.
-  override def mapDependencies = Task.Anon { (d: coursier.Dependency) =>
-    if d.module.organization.value == "com.google.code.gson"
-      && d.module.name.value == "gson"
-    then d.withVersion("2.13.2")
-    else d
-  }
-
   def scalacOptions = Seq(
     "-deprecation",
     "-feature",
@@ -57,7 +61,7 @@ trait LsModule extends ScalaModule {
 
   def javacOptions = Seq("--release", "25")
 
-  trait LsTests extends ScalaTests with TestModule.Munit {
+  trait LsTests extends ScalaTests with TestModule.Munit with GsonPinned {
     def mvnDeps = Seq(Deps.munit)
     def forkArgs = Seq("--enable-native-access=ALL-UNNAMED")
   }
@@ -93,7 +97,7 @@ object zaoziPcplugin extends ScalaModule {
   def mvnDeps = Seq(Deps.scala3Compiler)
   def scalacOptions = Seq("-deprecation", "-feature", "-unchecked")
 
-  object test extends ScalaTests with TestModule.Munit {
+  object test extends ScalaTests with TestModule.Munit with GsonPinned {
     def mvnDeps = Seq(Deps.munit, Deps.scala3Compiler)
     // The island-internal steering shapes are tested against the live facade
     // (`pc`); the cross-file vtable navigation is proven by the Rust
@@ -142,7 +146,7 @@ object pcHostSpike extends ScalaModule {
   * whose `premain` fires inside `JNI_CreateJavaVM`; the Rust `ls-jvm` crate
   * loads it to reach the presentation compiler over the flat C ABI.
   */
-object pcHost extends ScalaModule {
+object pcHost extends ScalaModule with GsonPinned {
   override def moduleDir = super.moduleDir / os.up / "modules" / "ls-pc-host"
   def scalaVersion = Deps.scalaVer
 
@@ -150,15 +154,6 @@ object pcHost extends ScalaModule {
   // its result types, and transitively for the resolved LSP4J carrier surface
   // the boundary translates to/from the flat wire form.
   def moduleDeps = Seq(pc)
-
-  // lsp4j declares gson as the range [2.9.1,3.0); range resolution needs remote
-  // maven-metadata and breaks the offline Nix build, so pin it (as LsModule does).
-  override def mapDependencies = Task.Anon { (d: coursier.Dependency) =>
-    if d.module.organization.value == "com.google.code.gson"
-      && d.module.name.value == "gson"
-    then d.withVersion("2.13.2")
-    else d
-  }
 
   override def javaHome = Task {
     Task.env.get("JAVA_HOME").map(p => PathRef(os.Path(p), quick = true))
@@ -172,7 +167,7 @@ object pcHost extends ScalaModule {
     super.manifest().add("Premain-Class" -> "ls.pc.host.PcHostAgent")
   }
 
-  object test extends ScalaTests with TestModule.Munit {
+  object test extends ScalaTests with TestModule.Munit with GsonPinned {
     def mvnDeps = Seq(Deps.munit)
     def forkArgs = Seq("--enable-native-access=ALL-UNNAMED")
   }

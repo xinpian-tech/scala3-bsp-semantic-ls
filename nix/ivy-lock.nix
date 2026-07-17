@@ -1693,13 +1693,6 @@ in
     installPath = "https/repo1.maven.org/maven2/com/google/errorprone/error_prone_annotations/2.41.0";
   };
 
-  "com.google.errorprone_error_prone_annotations-2.48.0" = fetchMaven {
-    name = "com.google.errorprone_error_prone_annotations-2.48.0";
-    urls = [ "https://repo1.maven.org/maven2/com/google/errorprone/error_prone_annotations/2.48.0/error_prone_annotations-2.48.0.jar" "https://repo1.maven.org/maven2/com/google/errorprone/error_prone_annotations/2.48.0/error_prone_annotations-2.48.0.pom" ];
-    hash = "sha256-E+w81eDfq1mAB89koOOzpbSLZsxVxobuhm3RjTKBXUI=";
-    installPath = "https/repo1.maven.org/maven2/com/google/errorprone/error_prone_annotations/2.48.0";
-  };
-
   "com.google.errorprone_error_prone_parent-2.26.1" = fetchMaven {
     name = "com.google.errorprone_error_prone_parent-2.26.1";
     urls = [ "https://repo1.maven.org/maven2/com/google/errorprone/error_prone_parent/2.26.1/error_prone_parent-2.26.1.pom" ];
@@ -1712,13 +1705,6 @@ in
     urls = [ "https://repo1.maven.org/maven2/com/google/errorprone/error_prone_parent/2.41.0/error_prone_parent-2.41.0.pom" ];
     hash = "sha256-wefFIBCjvUfqdaGh1inO6L3MQMqWkSRp2rE8kotNxm4=";
     installPath = "https/repo1.maven.org/maven2/com/google/errorprone/error_prone_parent/2.41.0";
-  };
-
-  "com.google.errorprone_error_prone_parent-2.48.0" = fetchMaven {
-    name = "com.google.errorprone_error_prone_parent-2.48.0";
-    urls = [ "https://repo1.maven.org/maven2/com/google/errorprone/error_prone_parent/2.48.0/error_prone_parent-2.48.0.pom" ];
-    hash = "sha256-87PA23AqH/vFdVGcp7FEVsOPBhCHkzTop/Zq5nSSg4A=";
-    installPath = "https/repo1.maven.org/maven2/com/google/errorprone/error_prone_parent/2.48.0";
   };
 
   "com.google.guava_failureaccess-1.0.1" = fetchMaven {
@@ -2519,25 +2505,11 @@ in
     installPath = "https/repo1.maven.org/maven2/com/google/code/gson/gson/2.13.2";
   };
 
-  "com.google.code.gson_gson-2.14.0" = fetchMaven {
-    name = "com.google.code.gson_gson-2.14.0";
-    urls = [ "https://repo1.maven.org/maven2/com/google/code/gson/gson/2.14.0/gson-2.14.0.jar" "https://repo1.maven.org/maven2/com/google/code/gson/gson/2.14.0/gson-2.14.0.pom" ];
-    hash = "sha256-mMitao1rH6uQcQyQzQODNncaGGZn6yCnWe58+8ney9w=";
-    installPath = "https/repo1.maven.org/maven2/com/google/code/gson/gson/2.14.0";
-  };
-
   "com.google.code.gson_gson-parent-2.13.2" = fetchMaven {
     name = "com.google.code.gson_gson-parent-2.13.2";
     urls = [ "https://repo1.maven.org/maven2/com/google/code/gson/gson-parent/2.13.2/gson-parent-2.13.2.pom" ];
     hash = "sha256-prNnb7pxMO5rzfYPJBbCZm0I8nanL4ZhAJita6s0ksM=";
     installPath = "https/repo1.maven.org/maven2/com/google/code/gson/gson-parent/2.13.2";
-  };
-
-  "com.google.code.gson_gson-parent-2.14.0" = fetchMaven {
-    name = "com.google.code.gson_gson-parent-2.14.0";
-    urls = [ "https://repo1.maven.org/maven2/com/google/code/gson/gson-parent/2.14.0/gson-parent-2.14.0.pom" ];
-    hash = "sha256-JComYptdVe/jkSdDlMAbmjJLov2T9ggfj8a9icwA87k=";
-    installPath = "https/repo1.maven.org/maven2/com/google/code/gson/gson-parent/2.14.0";
   };
 
   "io.github.alexarchambault.native-terminal_native-terminal-no-ffm-0.0.9.1" = fetchMaven {
