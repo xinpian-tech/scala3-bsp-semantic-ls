@@ -30,7 +30,7 @@ use ls_jvm::{
 };
 use ls_pc_abi::payloads::{
     origin, CompletionItem, CompletionList, DefinitionResult, HoverResult, LocationsResult,
-    MethodHitsResult, PrepareRenameResult, Rng, SignatureHelp, TargetConfig,
+    MethodHitsResult, PluginStatus, PrepareRenameResult, Rng, SignatureHelp, TargetConfig,
 };
 use serde_json::Value;
 
@@ -84,6 +84,45 @@ pub struct PcDefLocation {
 pub struct PcDefinition {
     pub symbol: String,
     pub locations: Vec<PcDefLocation>,
+}
+
+/// One compiler plugin's status (the island's `CompilerPluginStatus`) — the
+/// seam's own type so the trait and its fakes do not depend on the ABI carrier
+/// crate.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PcCompilerPluginStatus {
+    pub jars: Vec<String>,
+    pub options: Vec<String>,
+    pub loaded: bool,
+    pub detail: String,
+}
+
+/// One service plugin's status (the island's `ServicePluginStatus`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PcServicePluginStatus {
+    pub id: String,
+    pub source: String,
+    pub enabled: bool,
+    pub self_test_ok: bool,
+    pub self_test_detail: String,
+}
+
+/// A plugin the island disabled, with the reason (the island's `DisabledPlugin`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PcDisabledPlugin {
+    pub id: String,
+    pub reason: String,
+}
+
+/// The island's plugin-status report (the Scala `PcFacade.pluginStatus` /
+/// `PcPluginStatusReport`): the compiler plugins, the service plugins, and the
+/// disabled plugins — the seam's mirror of the ABI `PluginStatus` carrier, so
+/// the doctor and the `pcPluginStatus` command consume an ABI-free shape.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PcPluginStatusReport {
+    pub compiler_plugins: Vec<PcCompilerPluginStatus>,
+    pub service_plugins: Vec<PcServicePluginStatus>,
+    pub disabled: Vec<PcDisabledPlugin>,
 }
 
 /// The presentation-compiler capability the ready services own. The document
@@ -161,6 +200,16 @@ pub trait PcQueryService: Send + Sync {
         Vec::new()
     }
 
+    /// The island's plugin-status report (the Scala `s.pc.pluginStatus`), for
+    /// the doctor `PC Plugins` section and the `pcPluginStatus` command.
+    /// `None` when there is no BOOTED island to ask — the inspection never
+    /// boots the JVM (the pre-boot invariant lives in the production
+    /// implementation), so a cold island reads as `None`, not as a boot.
+    /// Default `None`: a services bundle with no PC island has no report.
+    fn plugin_status(&self) -> Option<PcPluginStatusReport> {
+        None
+    }
+
     /// Resolve (enrich) an LSP completion `item` — carrying SemanticDB `symbol`,
     /// against the presentation compiler for `target_id` — returning the enriched
     /// item as LSP JSON. Degrades to the original `item` unchanged on any
@@ -223,17 +272,27 @@ pub fn pc_options(scalac_options: &[String]) -> Vec<String> {
     out
 }
 
-/// The booted-island dispatch seam: the one operation the outer mirror needs
-/// from the `ls-jvm` [`Supervisor`]. A trait so the status-aware mirror logic is
+/// The booted-island dispatch seam: the operations the outer mirror needs
+/// from the `ls-jvm` [`Supervisor`] — the dispatch-lane `request` plus the
+/// control-lane `plugin_status`. A trait so the status-aware mirror logic is
 /// testable with a fake that returns `Ok`/`RequestTimeout`/`Backend` outcomes
-/// without a live JVM.
+/// (and queued status bytes) without a live JVM.
 trait PcDriver: Send {
     fn request(&mut self, request: PcRequest) -> Result<Vec<u8>, PcError>;
+
+    /// The raw encoded `PluginStatus` reply, fetched over the control lane
+    /// (worker 1) so it answers even while the dispatch lane is busy. `Err`
+    /// carries the vtable status.
+    fn plugin_status(&mut self) -> Result<Vec<u8>, i32>;
 }
 
 impl PcDriver for Supervisor<VtableBackend> {
     fn request(&mut self, request: PcRequest) -> Result<Vec<u8>, PcError> {
         Supervisor::request(self, request)
+    }
+
+    fn plugin_status(&mut self) -> Result<Vec<u8>, i32> {
+        Supervisor::plugin_status(self)
     }
 }
 
@@ -552,6 +611,19 @@ impl PcQueryService for IslandPcService {
         ids
     }
 
+    fn plugin_status(&self) -> Option<PcPluginStatusReport> {
+        let mut guard = self.state.lock().expect("pc island state mutex");
+        let state = &mut *guard;
+        // THE pre-boot invariant, kept in this one place: a plugin-status
+        // inspection of a still-cold island answers `None` and NEVER takes the
+        // boot path — only a PC query boots the island. The doctor and the
+        // `pcPluginStatus` command derive their "cold" wording from this `None`.
+        let driver = state.driver.as_mut()?;
+        let reply = driver.plugin_status().ok()?;
+        let status = PluginStatus::decode(&reply).ok()?;
+        Some(plugin_status_report_of(status))
+    }
+
     fn resolve_completion_item(&self, target_id: &str, symbol: &str, item: &Value) -> Value {
         // Re-encode the item the client echoed back into the flat carrier the
         // island decodes; a carrier that will not encode degrades to the item.
@@ -849,6 +921,41 @@ fn pc_def_origin_of(ordinal: u32) -> PcDefOrigin {
     }
 }
 
+/// ABI `PluginStatus` carrier -> the seam's [`PcPluginStatusReport`].
+fn plugin_status_report_of(status: PluginStatus) -> PcPluginStatusReport {
+    PcPluginStatusReport {
+        compiler_plugins: status
+            .compiler_plugins
+            .into_iter()
+            .map(|p| PcCompilerPluginStatus {
+                jars: p.jars,
+                options: p.options,
+                loaded: p.loaded,
+                detail: p.detail,
+            })
+            .collect(),
+        service_plugins: status
+            .service_plugins
+            .into_iter()
+            .map(|p| PcServicePluginStatus {
+                id: p.id,
+                source: p.source,
+                enabled: p.enabled,
+                self_test_ok: p.self_test_ok,
+                self_test_detail: p.self_test_detail,
+            })
+            .collect(),
+        disabled: status
+            .disabled
+            .into_iter()
+            .map(|p| PcDisabledPlugin {
+                id: p.id,
+                reason: p.reason,
+            })
+            .collect(),
+    }
+}
+
 fn pc_definition_of(result: DefinitionResult) -> PcDefinition {
     PcDefinition {
         symbol: result.symbol,
@@ -1023,11 +1130,13 @@ mod tests {
         }
     }
 
-    /// A fake booted-island driver that returns queued lifecycle outcomes and
-    /// counts the forwards it received, so the status-aware mirror discipline is
-    /// exercised without a live JVM.
+    /// A fake booted-island driver that returns queued lifecycle outcomes (and
+    /// queued control-lane plugin-status replies) and counts the forwards it
+    /// received, so the status-aware mirror discipline is exercised without a
+    /// live JVM.
     struct FakeDriver {
         outcomes: VecDeque<Result<Vec<u8>, PcError>>,
+        status: VecDeque<Result<Vec<u8>, i32>>,
         calls: Arc<AtomicUsize>,
     }
 
@@ -1037,10 +1146,18 @@ mod tests {
             (
                 FakeDriver {
                     outcomes: outcomes.into(),
+                    status: VecDeque::new(),
                     calls: calls.clone(),
                 },
                 calls,
             )
+        }
+
+        /// Queue control-lane plugin-status replies (raw encoded bytes or a
+        /// vtable status).
+        fn with_status(mut self, status: Vec<Result<Vec<u8>, i32>>) -> FakeDriver {
+            self.status = status.into();
+            self
         }
     }
 
@@ -1048,6 +1165,11 @@ mod tests {
         fn request(&mut self, _request: PcRequest) -> Result<Vec<u8>, PcError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.outcomes.pop_front().unwrap_or(Ok(Vec::new()))
+        }
+
+        fn plugin_status(&mut self) -> Result<Vec<u8>, i32> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.status.pop_front().unwrap_or(Err(-1))
         }
     }
 
@@ -1064,6 +1186,23 @@ mod tests {
             empty_search_resolver(),
         );
         let (driver, calls) = FakeDriver::new(outcomes);
+        pc.state.lock().unwrap().driver = Some(Box::new(driver));
+        (pc, calls)
+    }
+
+    /// Like [`booted`], with queued control-lane plugin-status replies.
+    fn booted_with_status(
+        target: &str,
+        status: Vec<Result<Vec<u8>, i32>>,
+    ) -> (IslandPcService, Arc<AtomicUsize>) {
+        let pc = IslandPcService::new(
+            PathBuf::from("/ws"),
+            vec![target_config(target)],
+            empty_resolver(),
+            empty_search_resolver(),
+        );
+        let (driver, calls) = FakeDriver::new(Vec::new());
+        let driver = driver.with_status(status);
         pc.state.lock().unwrap().driver = Some(Box::new(driver));
         (pc, calls)
     }
@@ -1438,5 +1577,85 @@ mod tests {
         // A backend error degrades to the original item, unchanged.
         let (pc, _calls) = booted("t", vec![Err(PcError::Backend(-1))]);
         assert_eq!(pc.resolve_completion_item("t", "s", &item), item);
+    }
+
+    // THE pre-boot invariant: a plugin-status inspection of a still-cold island
+    // answers `None` and never takes the boot path — only a PC query boots.
+    #[test]
+    fn plugin_status_on_a_cold_service_is_none_and_never_boots() {
+        let pc = IslandPcService::new(
+            PathBuf::from("/ws"),
+            vec![target_config("t")],
+            empty_resolver(),
+            empty_search_resolver(),
+        );
+        assert_eq!(pc.plugin_status(), None);
+        assert!(
+            !pc.is_booted(),
+            "a plugin-status inspection must never boot the island"
+        );
+    }
+
+    // A booted plugin-status fetch decodes the control-lane `PluginStatus`
+    // carrier into the seam report, field for field.
+    #[test]
+    fn a_booted_plugin_status_decodes_the_seam_report() {
+        let reply = PluginStatus {
+            compiler_plugins: vec![ls_pc_abi::payloads::CompilerPlugin {
+                jars: vec!["/plugins/zaozi.jar".to_string()],
+                options: vec!["-P:zaozi:on".to_string()],
+                loaded: true,
+                detail: "ok".to_string(),
+            }],
+            service_plugins: vec![ls_pc_abi::payloads::ServicePlugin {
+                id: "zaozi.nav".to_string(),
+                source: "workspace pc-plugins.json".to_string(),
+                enabled: true,
+                self_test_ok: false,
+                self_test_detail: "self-test failed: boom".to_string(),
+            }],
+            disabled: vec![ls_pc_abi::payloads::DisabledPlugin {
+                id: "old.plugin".to_string(),
+                reason: "disabled by config".to_string(),
+            }],
+        }
+        .encode()
+        .expect("encode plugin status");
+
+        let (pc, _calls) = booted_with_status("t", vec![Ok(reply)]);
+        assert_eq!(
+            pc.plugin_status(),
+            Some(PcPluginStatusReport {
+                compiler_plugins: vec![PcCompilerPluginStatus {
+                    jars: vec!["/plugins/zaozi.jar".to_string()],
+                    options: vec!["-P:zaozi:on".to_string()],
+                    loaded: true,
+                    detail: "ok".to_string(),
+                }],
+                service_plugins: vec![PcServicePluginStatus {
+                    id: "zaozi.nav".to_string(),
+                    source: "workspace pc-plugins.json".to_string(),
+                    enabled: true,
+                    self_test_ok: false,
+                    self_test_detail: "self-test failed: boom".to_string(),
+                }],
+                disabled: vec![PcDisabledPlugin {
+                    id: "old.plugin".to_string(),
+                    reason: "disabled by config".to_string(),
+                }],
+            })
+        );
+    }
+
+    // A control-lane error (vtable status) and an undecodable reply both degrade
+    // to `None` — no panic across the seam, the caller renders its cold/typed
+    // wording.
+    #[test]
+    fn a_failed_plugin_status_degrades_to_none() {
+        let (pc, _calls) = booted_with_status("t", vec![Err(-7)]);
+        assert_eq!(pc.plugin_status(), None);
+
+        let (pc, _calls) = booted_with_status("t", vec![Ok(vec![0xde, 0xad])]);
+        assert_eq!(pc.plugin_status(), None);
     }
 }

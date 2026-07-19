@@ -49,7 +49,9 @@ pub use lifecycle::{
 // non-invasive "is the embedded island mapped into this process?" check.
 pub use ls_jvm::libjvm_mapped;
 pub use pc::{
-    pc_options, IslandPcService, PcLocation, PcQueryService, SearchMethodsResolver, SymbolResolver,
+    pc_options, IslandPcService, PcCompilerPluginStatus, PcDisabledPlugin, PcLocation,
+    PcPluginStatusReport, PcQueryService, PcServicePluginStatus, SearchMethodsResolver,
+    SymbolResolver,
 };
 pub use protocol::{Diagnostic, DiagnosticCode, Position, PublishDiagnosticsParams, Range};
 pub use server::{serve, Bootstrap, Handlers, OutputSink, RequestContext, ServerCore};

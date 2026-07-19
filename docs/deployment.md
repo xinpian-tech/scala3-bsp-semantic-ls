@@ -348,11 +348,9 @@ runs.
 | `scala3SemanticLs.compile`  | BSP compile of indexable targets → `compile ok (N targets)` / `compile failed: <code>` |
 | `scala3SemanticLs.reindex`  | re-ingest SemanticDB for workspace targets → an `ingest: …` summary             |
 | `scala3SemanticLs.doctor`   | the **live** doctor report (§5.2) — begins with `state: …`; pass `arguments: [{"json": true}]` for the structured object |
+| `scala3SemanticLs.pcPluginStatus` | the PC island's plugin report (compiler plugins, service plugins + self-tests, disabled plugins); pass `arguments: [{"json": true}]` for the structured object. A **cold** island answers the typed `pc plugin status unavailable: PC island not booted (cold); …` status — the inspection never boots the JVM |
 
-An unknown command id is an `InvalidParams` error. The v1
-`scala3SemanticLs.pcPluginStatus` command is **deliberately not advertised**
-(the plugin-status inspection is deferred); it is answered as an unknown
-command rather than advertised-and-broken.
+An unknown command id is an `InvalidParams` error.
 
 ### 4.7 The workspace state directory (`.scala3-bsp-semantic-ls/`)
 
@@ -466,11 +464,13 @@ The doctor renders **seven sections in fixed order** (text and `--json`):
 | **SemanticDB** | per-target semanticdb root (exists/missing, file count) · doc freshness (fresh/stale/missing) · stale targets |
 | **Store**      | manifest (schema, segment, state generation, docs, symbols) · active segment header · workspace-state — the same facts `dump` prints. Replaced the v1 SQLite section. |
 | **PC**         | `worker status: booted / not booted (cold)` · active/registered targets                                |
-| **PC Plugins** | always `unavailable` — the `pcPluginStatus` inspection is deferred                                     |
+| **PC Plugins** | the booted island's plugin report (compiler plugins loaded, service plugins + self-tests, disabled plugins with reasons); `unavailable: PC island not booted (cold); …` until the first PC query boots the island |
 
-Gathering is **non-invasive**: the store is opened strictly read-only and the
-PC status is read from `/proc/self/maps` (is libjvm mapped?), so the doctor
-never boots the JVM and never disturbs a live server that owns the same store.
+Gathering is **non-invasive**: the store is opened strictly read-only, the
+PC status is read from `/proc/self/maps` (is libjvm mapped?), and the PC-plugin
+report is fetched only from an **already-booted** island (over its control
+lane), so the doctor never boots the JVM and never disturbs a live server that
+owns the same store.
 A cold, index-only session reports `worker status: not booted (cold)` — that is
 the zero-JVM property, not a failure.
 

@@ -265,15 +265,18 @@ them); the island retains lsp4j **internally only** as the presentation
 compiler's carrier types, converted to flat ABI payloads before anything
 crosses the boundary.
 
-The capability surface is unchanged from v1 with two recorded trims, deferred
-rather than silently dropped: the `pcPluginStatus` executeCommand (the doctor
-renders its section `unavailable` with the deferral reason; the command answers
-as unknown rather than advertised-and-broken) and the no-BSP warm-restart mode
-over a recovered index (bootstrap fails cleanly: the persisted segment carries
-no target dependency graph, and a permissive fallback would answer references
-across unrelated identically-named symbols). `documentHighlight` is retained.
+The capability surface is unchanged from v1 with one recorded trim, deferred
+rather than silently dropped: the no-BSP warm-restart mode over a recovered
+index (bootstrap fails cleanly: the persisted segment carries no target
+dependency graph, and a permissive fallback would answer references across
+unrelated identically-named symbols). `documentHighlight` is retained, and the
+`pcPluginStatus` executeCommand is implemented over the island's flat-ABI
+`plugin_status` control-lane slot — a still-cold island answers a typed
+"not booted (cold)" status (the inspection never boots the JVM), and the
+doctor's `PC Plugins` section renders the live report once the island boots.
 The executeCommand set is `scala3SemanticLs.doctor` | `scala3SemanticLs.reindex`
-| `scala3SemanticLs.compile`. The CLI is `--version`, `--doctor [dir] [--json]`,
+| `scala3SemanticLs.compile` | `scala3SemanticLs.pcPluginStatus`. The CLI is
+`--version`, `--doctor [dir] [--json]`,
 and `dump [dir]` — the read-only store inspector that replaces ad-hoc `sqlite3`
 poking of the removed metadata store; the PC-backend selection flags are gone.
 

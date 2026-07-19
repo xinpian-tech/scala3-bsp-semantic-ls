@@ -147,7 +147,8 @@ fn capabilities_and_the_real_bsp_handshake() {
         json!([
             "scala3SemanticLs.doctor",
             "scala3SemanticLs.reindex",
-            "scala3SemanticLs.compile"
+            "scala3SemanticLs.compile",
+            "scala3SemanticLs.pcPluginStatus"
         ])
     );
     assert!(

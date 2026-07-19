@@ -41,6 +41,7 @@ SERVER_BIN = os.environ.get(
 DOCTOR = "scala3SemanticLs.doctor"
 COMPILE = "scala3SemanticLs.compile"
 REINDEX = "scala3SemanticLs.reindex"
+PC_PLUGIN_STATUS = "scala3SemanticLs.pcPluginStatus"
 
 CORE = "a/src/pkga/Core.scala"
 ITEM = "a/src/pkga/Item.scala"

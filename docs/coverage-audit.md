@@ -69,11 +69,11 @@ retained test-file path appears here.
 | modules/ls-core/test/src/ls/core/BootstrapJanitorSuite.scala | PORTED | `ls-store/tests/store.rs::open_readonly_recovers_without_creating_or_cleaning` (+ `assert_no_tmp_debris`) |
 | modules/ls-core/test/src/ls/core/BootstrapRecoverySuite.scala | PORTED | `ls-server/tests/bootstrap.rs::no_bsp_recovered_index_*`; `ls-store/tests/store.rs::{torn_state_tmp_recovers_old,crash_after_state_before_manifest_recovers_old,state_generation_mismatch_rejected}` |
 | modules/ls-core/test/src/ls/core/BuildTargetsChangeBufferingSuite.scala | PORTED | `ls-server/tests/bootstrap.rs::a_build_target_change_*` |
-| modules/ls-core/test/src/ls/core/CapabilitiesSuite.scala | PORTED | `ls-server/src/capabilities.rs` tests; `server_surface.rs` (incl. absence of `pcPluginStatus`) |
+| modules/ls-core/test/src/ls/core/CapabilitiesSuite.scala | PORTED | `ls-server/src/capabilities.rs` tests; `server_surface.rs` (incl. the advertised `pcPluginStatus`) |
 | modules/ls-core/test/src/ls/core/DiagnosticRouterSuite.scala | PORTED | `ls-server/src/diagnostics.rs` tests; `fake_bsp_e2e.rs::compile_error_diagnostics_are_published_to_the_client` |
 | modules/ls-core/test/src/ls/core/DoctorCommandSuite.scala | PORTED | `ls-server/tests/server_surface.rs::execute_command_doctor_renders_text_and_json` |
 | modules/ls-core/test/src/ls/core/E2eSupport.scala | SUPPORT | fake-BSP e2e helpers |
-| modules/ls-core/test/src/ls/core/ExecuteCommandSuite.scala | PORTED | `ls-server/tests/server_surface.rs::execute_command_reindex_compile_and_unknown` (`pcPluginStatus` trimmed — DEC-1) |
+| modules/ls-core/test/src/ls/core/ExecuteCommandSuite.scala | PORTED | `ls-server/tests/server_surface.rs::execute_command_reindex_compile_and_unknown` + `advertised_execute_commands_are_exactly_the_routed_ones` (`pcPluginStatus` implemented; wire round-trip in `ls-server/tests/pc_wire.rs`) |
 | modules/ls-core/test/src/ls/core/IndexPcDefinitionResolverSuite.scala | PORTED | `ls-engine/tests/engine.rs::symbol_definition_*`; `ls-jvm/tests/live_definition.rs` |
 | modules/ls-core/test/src/ls/core/LsEndToEndTest.scala | PORTED | `ls-server/tests/fake_bsp_e2e.rs`, `bootstrap.rs`, `server_surface.rs` |
 | modules/ls-core/test/src/ls/core/LspConvertSuite.scala | PORTED | `ls-server/src/convert.rs` tests |
@@ -197,5 +197,5 @@ No other mandatory behavior lacks a proving Rust test.
 
 - Reconcile `docs/traceability.md` (stale Scala-era doc: old AC-1..AC-20 numbering, SQLite ACs).
 - Port the bench smoke (`BenchSuite`/`OfflineCompileGuardSuite`).
-- Record the DEC-1/DEC-2 deferral notes (`pcPluginStatus`, no-BSP warm restart) in the cutover docs; both must stay absent from the advertised surface.
+- Record the DEC-1/DEC-2 deferral notes in the cutover docs. (`pcPluginStatus` has since been implemented and advertised — the trim latitude was not used; the no-BSP warm-restart deferral note stands and stays absent from the advertised surface.)
 - The deletion sweep of the retained Scala modules (incl. `ls-sqlite-ffm`, the forked-worker files, `AotTrain`).

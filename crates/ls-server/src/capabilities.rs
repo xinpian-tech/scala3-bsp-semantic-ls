@@ -13,20 +13,25 @@ use serde::Serialize;
 pub const SERVER_NAME: &str = "scala3-bsp-semantic-ls";
 pub const SERVER_VERSION: &str = "0.1.0";
 
-/// The executeCommand identifiers the server advertises and handles.
-///
-/// The `pcPluginStatus` command is intentionally omitted: it reports the
-/// presentation-compiler plugin state, which needs the embedded PC island, so it
-/// is left off the advertised surface and answered as an unknown command rather
-/// than advertised-and-broken.
+/// The executeCommand identifiers the server advertises and handles — the v1
+/// set (`Commands.all`), `pcPluginStatus` included: it reports the embedded PC
+/// island's plugin state, answering a typed "not booted (cold)" status while
+/// the island is still cold (the inspection never boots the JVM).
 pub mod commands {
     pub const DOCTOR: &str = "scala3SemanticLs.doctor";
     pub const REINDEX: &str = "scala3SemanticLs.reindex";
     pub const COMPILE: &str = "scala3SemanticLs.compile";
+    pub const PC_PLUGIN_STATUS: &str = "scala3SemanticLs.pcPluginStatus";
 
-    /// Every advertised command, in the order the client sees them.
+    /// Every advertised command, in the order the client sees them (the Scala
+    /// `Commands.all`).
     pub fn all() -> Vec<String> {
-        vec![DOCTOR.to_string(), REINDEX.to_string(), COMPILE.to_string()]
+        vec![
+            DOCTOR.to_string(),
+            REINDEX.to_string(),
+            COMPILE.to_string(),
+            PC_PLUGIN_STATUS.to_string(),
+        ]
     }
 }
 
@@ -178,9 +183,10 @@ mod tests {
         for command in commands::all() {
             assert!(json.contains(&format!("\"{command}\"")), "{json}");
         }
-        assert_eq!(commands::all().len(), 3);
-        // The presentation-compiler plugin-status command is not advertised.
-        assert!(!json.contains("scala3SemanticLs.pcPluginStatus"), "{json}");
+        assert_eq!(commands::all().len(), 4);
+        // The presentation-compiler plugin-status command is advertised (and
+        // routed — the server_surface routed-set probe pins the round trip).
+        assert!(json.contains("scala3SemanticLs.pcPluginStatus"), "{json}");
     }
 
     #[test]

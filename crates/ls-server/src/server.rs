@@ -576,10 +576,9 @@ fn ready_handle<S>(
 }
 
 /// Dispatches `workspace/executeCommand` as ScalaLs does: the doctor report
-/// renders in any state from the context; reindex/compile run through the
-/// services when ready and otherwise answer a typed "unavailable" status string;
-/// an unknown command (including the un-advertised pcPluginStatus) is an
-/// invalid-params error.
+/// renders in any state from the context; reindex/compile/pcPluginStatus run
+/// through the services when ready and otherwise answer a typed "unavailable"
+/// status string; an unknown command is an invalid-params error.
 fn execute_command<S>(
     core: &ServerCore<S>,
     handlers: &impl Handlers<S>,
@@ -603,6 +602,10 @@ fn execute_command<S>(
         Some(commands::REINDEX) => unavailable("reindex"),
         Some(commands::COMPILE) if ready => ready_handle(core, handlers, request),
         Some(commands::COMPILE) => unavailable("compile"),
+        Some(commands::PC_PLUGIN_STATUS) if ready => ready_handle(core, handlers, request),
+        // The Scala pre-ready answer: `pc plugin status unavailable: workspace
+        // is <status>` (ready-but-cold is the services' typed cold answer).
+        Some(commands::PC_PLUGIN_STATUS) => unavailable("pc plugin status"),
         // A missing command is `null` in the Scala `ExecuteCommandParams`, so its
         // unknown-command message interpolates the string "null"; a present but
         // unknown command uses its own text.
@@ -1509,7 +1512,7 @@ mod tests {
                 )),
                 // No `command` field: Scala's null getCommand renders "null".
                 frame(request(4, "workspace/executeCommand", json!({}))),
-                // The un-advertised pcPluginStatus is an unknown command.
+                // pcPluginStatus pre-ready: the typed unavailable status answer.
                 frame(request(
                     5,
                     "workspace/executeCommand",
@@ -1529,10 +1532,10 @@ mod tests {
             "unknown command 'bogus.command'"
         );
         assert_eq!(out[3]["error"]["message"], "unknown command 'null'");
-        assert_eq!(out[4]["error"]["code"], error_codes::INVALID_PARAMS);
         assert_eq!(
-            out[4]["error"]["message"],
-            "unknown command 'scala3SemanticLs.pcPluginStatus'"
+            out[4]["result"],
+            "pc plugin status unavailable: workspace is not ready: \
+             waiting for the initialized notification"
         );
     }
 

@@ -8,8 +8,9 @@
 //! impl. It wires the ready methods that the engine + retained build compiler
 //! answer without the PC island — `references`, `documentHighlight`,
 //! `workspace/symbol`, `prepareRename`, `rename` (the FreshRequired compile
-//! ladder), and the `scala3SemanticLs.reindex` and `scala3SemanticLs.compile`
-//! executeCommand actions — over the engine's [`ReferencesEngine`] /
+//! ladder), and the `scala3SemanticLs.reindex`, `scala3SemanticLs.compile`,
+//! and `scala3SemanticLs.pcPluginStatus` executeCommand actions — over the
+//! engine's [`ReferencesEngine`] /
 //! [`DocumentHighlightService`] / workspace-symbol resolver / [`RenameEngine`]
 //! and the retained build compiler, each gated (where the source applies it) by
 //! `requireSemanticdb`, converting SemanticDB coordinates and URIs to the LSP
@@ -45,7 +46,7 @@ use crate::doctor::{
 };
 use crate::documents::DocumentStore;
 use crate::jsonrpc::{error_codes, RequestId, Response, ResponseError};
-use crate::pc::{PcLocation, PcQueryService};
+use crate::pc::{PcLocation, PcPluginStatusReport, PcQueryService};
 use crate::pc_overlay::{PcOnlySymbol, PcOverlayInner};
 use crate::protocol::Position;
 use crate::server::{Handlers, RequestContext};
@@ -195,11 +196,14 @@ impl CoreServices {
 
     /// The live doctor report for a ready workspace (the Scala
     /// `DoctorCommand.input`): `Runtime`/`Nix`/`Store` from the host, workspace
-    /// files, and read-only store, plus the live `BSP`/`SemanticDB`/`PC` sections
-    /// gathered from the ingested workspace targets and the PC config. Fully
-    /// non-invasive — the `PC` worker status reads `/proc/self/maps`, so the
-    /// report never boots the embedded JVM. `PC Plugins` is `unavailable` (the
-    /// `pcPluginStatus` inspection is not ported).
+    /// files, and read-only store, plus the live `BSP`/`SemanticDB`/`PC`/`PC
+    /// Plugins` sections gathered from the ingested workspace targets, the PC
+    /// config, and the booted island's plugin report. Fully non-invasive — the
+    /// `PC` worker status reads `/proc/self/maps` and the plugin report is
+    /// fetched only from an ALREADY-BOOTED island (`plugin_status()` answers
+    /// `None` for a cold one; the pre-boot invariant lives in
+    /// `IslandPcService::plugin_status`), so the report never boots the
+    /// embedded JVM.
     pub fn doctor_report(&self) -> DoctorReport {
         let root = self.workspace_root.as_deref();
         // A ready workspace loaded a build model, so BSP + SemanticDB are always
@@ -224,6 +228,14 @@ impl CoreServices {
             },
             registered_targets: registered,
         });
+        // The plugin report exists only over a booted island's control lane:
+        // `plugin_status()` never boots (mirroring how the `PC` section reads
+        // cold from `ls_jvm::libjvm_mapped()`), so a `None` renders the typed
+        // cold reason and the report stays boot-free.
+        let pc_plugins = match self.pc.plugin_status() {
+            Some(report) => SectionState::Available(PcPluginsSection::of(report)),
+            None => SectionState::Unavailable(PcPluginsSection::COLD.to_string()),
+        };
         DoctorReport {
             runtime: RuntimeSection::gather(root.unwrap_or_else(|| Path::new("."))),
             nix: NixSection::gather(root.unwrap_or_else(|| Path::new("."))),
@@ -231,7 +243,7 @@ impl CoreServices {
             semanticdb,
             store: StoreSection::gather(root),
             pc,
-            pc_plugins: SectionState::Unavailable(PcPluginsSection::DEFERRED.to_string()),
+            pc_plugins,
         }
     }
 
@@ -795,15 +807,105 @@ pub fn pc_locations_to_lsp(locations: &[PcLocation]) -> Vec<Location> {
 
 /// `workspace/executeCommand` for the ready-path commands the message loop
 /// routes here. `reindex` re-ingests over the retained workspace; `compile`
-/// compiles the indexable targets through the retained build compiler.
-/// (`doctor` and unknown / pre-ready commands are handled before this point.)
+/// compiles the indexable targets through the retained build compiler;
+/// `pcPluginStatus` reports the island's plugin state (typed cold answer while
+/// the island has not booted). (`doctor` and unknown / pre-ready commands are
+/// handled before this point.)
 fn execute_command(id: RequestId, services: &CoreServices, params: &Value) -> Response {
     match params.get("command").and_then(Value::as_str) {
         Some(commands::REINDEX) => Response::success(id, Value::String(reindex(services))),
         Some(commands::COMPILE) => Response::success(id, Value::String(compile(services))),
+        Some(commands::PC_PLUGIN_STATUS) => {
+            Response::success(id, plugin_status_result(services, params))
+        }
         Some(other) => not_implemented(id, other),
         None => not_implemented(id, "workspace/executeCommand"),
     }
+}
+
+/// `scala3SemanticLs.pcPluginStatus`: the island's plugin-status report as a
+/// standalone command (the Scala `PcStatusRender.render(s.pc.pluginStatus)`).
+/// A still-cold island answers the typed cold status WITHOUT booting — the
+/// pre-boot invariant lives in `IslandPcService::plugin_status`, this arm only
+/// words its `None`. A booted island renders the text summary by default, or
+/// the structured `{compilerPlugins, servicePlugins, disabled}` object with the
+/// doctor's `arguments: [{"json": true}]` convention.
+fn plugin_status_result(services: &CoreServices, params: &Value) -> Value {
+    let Some(report) = services.pc.plugin_status() else {
+        return Value::String(format!(
+            "pc plugin status unavailable: {}",
+            PcPluginsSection::COLD
+        ));
+    };
+    if json_requested(params) {
+        PcPluginsSection::of(report).render_json()
+    } else {
+        Value::String(plugin_status_text(&report))
+    }
+}
+
+/// Whether an executeCommand asked for JSON output — `arguments: [{"json":
+/// true}]`, the doctor's argument convention (`server::doctor_json_requested`
+/// over the same params shape).
+fn json_requested(params: &Value) -> bool {
+    params
+        .get("arguments")
+        .and_then(Value::as_array)
+        .and_then(|args| args.first())
+        .and_then(|arg| arg.get("json"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// Ports the Scala `PcStatusRender.render` byte-for-byte: the compiler plugins
+/// (jars -> loaded/detail), the service plugins (id/source/status/self-test),
+/// and the disabled plugins with reasons, as one newline-joined summary.
+fn plugin_status_text(report: &PcPluginStatusReport) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    if report.compiler_plugins.is_empty() {
+        lines.push("compiler plugins: none".to_string());
+    } else {
+        lines.push(format!(
+            "compiler plugins: {}",
+            report.compiler_plugins.len()
+        ));
+        for c in &report.compiler_plugins {
+            let jars = if c.jars.is_empty() {
+                "(no jars)".to_string()
+            } else {
+                c.jars.join(", ")
+            };
+            let outcome = if c.loaded {
+                "loaded"
+            } else {
+                c.detail.as_str()
+            };
+            lines.push(format!("  {jars}: {outcome}"));
+        }
+    }
+    if report.service_plugins.is_empty() {
+        lines.push("service plugins: none".to_string());
+    } else {
+        lines.push(format!("service plugins: {}", report.service_plugins.len()));
+        for p in &report.service_plugins {
+            let status = if p.enabled { "enabled" } else { "disabled" };
+            let self_test = if p.self_test_ok {
+                "self-test ok"
+            } else {
+                p.self_test_detail.as_str()
+            };
+            lines.push(format!("  {} ({}): {status}, {self_test}", p.id, p.source));
+        }
+    }
+    if report.disabled.is_empty() {
+        lines.push("disabled plugins: none".to_string());
+    } else {
+        lines.push(format!("disabled plugins: {}", report.disabled.len()));
+        for d in &report.disabled {
+            lines.push(format!("  {}: {}", d.id, d.reason));
+        }
+    }
+    lines.join("\n")
 }
 
 /// `scala3SemanticLs.compile`: compile the ingested workspace's indexable targets
@@ -1066,6 +1168,8 @@ mod tests {
         signature_help: Value,
         registered: bool,
         resolved: Option<Value>,
+        /// The canned plugin-status report; `None` reads as a cold island.
+        plugin_status: Option<PcPluginStatusReport>,
         /// Counts `on_config_changed` calls (shared so the test observes them
         /// after the fake moves into the services bundle).
         config_changes: Arc<std::sync::atomic::AtomicUsize>,
@@ -1098,6 +1202,9 @@ mod tests {
         }
         fn resolve_completion_item(&self, _t: &str, _s: &str, item: &Value) -> Value {
             self.resolved.clone().unwrap_or_else(|| item.clone())
+        }
+        fn plugin_status(&self) -> Option<PcPluginStatusReport> {
+            self.plugin_status.clone()
         }
         fn on_config_changed(&self) {
             self.config_changes
@@ -1767,6 +1874,111 @@ mod tests {
         let value = serde_json::to_value(execute_command(RequestId::Number(1), &services, &params))
             .unwrap();
         assert_eq!(value["result"], "compile skipped: no indexable targets");
+    }
+
+    fn sample_plugin_report() -> PcPluginStatusReport {
+        use crate::pc::{PcCompilerPluginStatus, PcDisabledPlugin, PcServicePluginStatus};
+        PcPluginStatusReport {
+            compiler_plugins: vec![PcCompilerPluginStatus {
+                jars: vec!["/plugins/zaozi.jar".to_string()],
+                options: vec!["-P:zaozi:on".to_string()],
+                loaded: true,
+                detail: "ok".to_string(),
+            }],
+            service_plugins: vec![PcServicePluginStatus {
+                id: "zaozi.nav".to_string(),
+                source: "workspace pc-plugins.json".to_string(),
+                enabled: true,
+                self_test_ok: true,
+                self_test_detail: "ok".to_string(),
+            }],
+            disabled: vec![PcDisabledPlugin {
+                id: "old.plugin".to_string(),
+                reason: "disabled by config".to_string(),
+            }],
+        }
+    }
+
+    // pcPluginStatus over a ready-but-cold island answers the typed cold status
+    // (a success string), never a boot and never an error.
+    #[test]
+    fn pc_plugin_status_over_a_cold_island_is_the_typed_cold_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let services = unindexed_services(dir.path());
+        let params = json!({ "command": "scala3SemanticLs.pcPluginStatus" });
+        let value = serde_json::to_value(execute_command(RequestId::Number(1), &services, &params))
+            .unwrap();
+        assert_eq!(
+            value["result"],
+            format!("pc plugin status unavailable: {}", PcPluginsSection::COLD)
+        );
+    }
+
+    // pcPluginStatus over a booted island renders the PcStatusRender text
+    // summary by default and the structured object with the doctor's
+    // `arguments: [{"json": true}]` convention.
+    #[test]
+    fn pc_plugin_status_renders_the_text_summary_and_the_json_object() {
+        let dir = tempfile::tempdir().unwrap();
+        let services = services_with_pc(
+            dir.path(),
+            FakePc {
+                plugin_status: Some(sample_plugin_report()),
+                ..FakePc::default()
+            },
+        );
+
+        let params = json!({ "command": "scala3SemanticLs.pcPluginStatus" });
+        let value = serde_json::to_value(execute_command(RequestId::Number(1), &services, &params))
+            .unwrap();
+        let text = value["result"].as_str().expect("text summary");
+        assert!(text.contains("compiler plugins: 1"), "{text}");
+        assert!(text.contains("  /plugins/zaozi.jar: loaded"), "{text}");
+        assert!(
+            text.contains("  zaozi.nav (workspace pc-plugins.json): enabled, self-test ok"),
+            "{text}"
+        );
+        assert!(text.contains("disabled plugins: 1"), "{text}");
+        assert!(text.contains("  old.plugin: disabled by config"), "{text}");
+
+        let params = json!({
+            "command": "scala3SemanticLs.pcPluginStatus",
+            "arguments": [{ "json": true }]
+        });
+        let value = serde_json::to_value(execute_command(RequestId::Number(2), &services, &params))
+            .unwrap();
+        let report = &value["result"];
+        assert_eq!(report["compilerPlugins"][0]["loaded"], true);
+        assert_eq!(report["servicePlugins"][0]["id"], "zaozi.nav");
+        assert_eq!(report["disabled"][0]["reason"], "disabled by config");
+    }
+
+    // The doctor report's `PC Plugins` section mirrors the plugin-status seam:
+    // a report renders Available, a cold `None` renders the typed cold reason —
+    // and gathering never boots (the fake would panic if it could).
+    #[test]
+    fn doctor_report_pc_plugins_follows_the_plugin_status_seam() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let cold = unindexed_services(dir.path());
+        match cold.doctor_report().pc_plugins {
+            SectionState::Unavailable(reason) => assert_eq!(reason, PcPluginsSection::COLD),
+            SectionState::Available(_) => panic!("a cold island must render unavailable"),
+        }
+
+        let booted = services_with_pc(
+            dir.path(),
+            FakePc {
+                plugin_status: Some(sample_plugin_report()),
+                ..FakePc::default()
+            },
+        );
+        match booted.doctor_report().pc_plugins {
+            SectionState::Available(section) => {
+                assert_eq!(section.service_plugins[0].id, "zaozi.nav");
+            }
+            SectionState::Unavailable(reason) => panic!("expected the live report, got {reason}"),
+        }
     }
 
     // A URI the live model does not own via an indexable target is NoSemanticdb,

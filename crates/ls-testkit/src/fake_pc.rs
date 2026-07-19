@@ -14,7 +14,10 @@ use serde_json::{json, Value};
 
 use ls_pc_abi::payloads::TargetConfig;
 use ls_server::bootstrap::PcServiceFactory;
-use ls_server::pc::{PcDefLocation, PcDefOrigin, PcDefinition, PcSpan};
+use ls_server::pc::{
+    PcCompilerPluginStatus, PcDefLocation, PcDefOrigin, PcDefinition, PcDisabledPlugin,
+    PcPluginStatusReport, PcServicePluginStatus, PcSpan,
+};
 use ls_server::{PcLocation, PcQueryService, SearchMethodsResolver, SymbolResolver};
 
 /// The symbol every fake result carries; resolve gates key off `data.symbol`.
@@ -199,5 +202,32 @@ impl PcQueryService for FakePcService {
         let mut registered = self.registered.lock().unwrap();
         registered.clear();
         registered.extend(targets.into_iter().map(|t| t.bsp_id));
+    }
+
+    /// A canned plugin-status report, so the `pcPluginStatus` executeCommand
+    /// round-trip (and the doctor's `PC Plugins` section) is wire-testable
+    /// without a JVM. Deterministic: one loaded compiler plugin, one enabled
+    /// service plugin passing its self-test, one disabled plugin.
+    fn plugin_status(&self) -> Option<PcPluginStatusReport> {
+        self.record("plugin_status".to_string());
+        Some(PcPluginStatusReport {
+            compiler_plugins: vec![PcCompilerPluginStatus {
+                jars: vec!["/plugins/fake-plugin.jar".to_string()],
+                options: vec!["-P:fake:on".to_string()],
+                loaded: true,
+                detail: "ok".to_string(),
+            }],
+            service_plugins: vec![PcServicePluginStatus {
+                id: "fake.nav".to_string(),
+                source: "builtin".to_string(),
+                enabled: true,
+                self_test_ok: true,
+                self_test_detail: "ok".to_string(),
+            }],
+            disabled: vec![PcDisabledPlugin {
+                id: "fake.disabled".to_string(),
+                reason: "disabled by config".to_string(),
+            }],
+        })
     }
 }

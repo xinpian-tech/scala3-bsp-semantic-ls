@@ -208,7 +208,8 @@ fn initialize_advertises_exactly_the_implemented_capability_set() {
         json!([
             "scala3SemanticLs.doctor",
             "scala3SemanticLs.reindex",
-            "scala3SemanticLs.compile"
+            "scala3SemanticLs.compile",
+            "scala3SemanticLs.pcPluginStatus"
         ])
     );
 
@@ -216,16 +217,17 @@ fn initialize_advertises_exactly_the_implemented_capability_set() {
     assert!(caps.get("semanticTokensProvider").is_none(), "{caps}");
     assert!(caps.get("inlayHintProvider").is_none(), "{caps}");
     let commands = caps["executeCommandProvider"]["commands"].to_string();
-    assert!(!commands.contains("pcPluginStatus"), "{commands}");
+    assert!(commands.contains("pcPluginStatus"), "{commands}");
 
     let info = &by_id(&out, 1)["result"]["serverInfo"];
     assert_eq!(info["name"], "scala3-bsp-semantic-ls");
     assert_eq!(info["version"], "0.1.0");
 }
 
-// Every advertised executeCommand routes to a real action (not unknown-command),
-// and the trimmed pcPluginStatus is treated as unknown — advertised set ==
-// routed set.
+// Every advertised executeCommand routes to a real action (not unknown-command)
+// — advertised set == routed set. pcPluginStatus routes to the plugin-status
+// arm: these sessions never issue a PC query, so the island is cold and the
+// answer is the typed cold status (a success string, never unknown-command).
 #[test]
 fn advertised_execute_commands_are_exactly_the_routed_ones() {
     let store = tempfile::tempdir().unwrap();
@@ -250,24 +252,18 @@ fn advertised_execute_commands_are_exactly_the_routed_ones() {
         input.concat(),
     );
 
-    // The three advertised commands succeed.
-    for id in [2, 3, 4] {
+    // Every advertised command answers a result.
+    for id in [2, 3, 4, 5] {
         assert!(
             by_id(&out, id).get("result").is_some(),
             "command id {id} should route: {:?}",
             by_id(&out, id)
         );
     }
-    // The trimmed command is unknown — not advertised, not routed.
-    let plugin = by_id(&out, 5);
-    assert!(plugin.get("result").is_none(), "{plugin}");
-    assert!(
-        plugin["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("unknown command 'scala3SemanticLs.pcPluginStatus'"),
-        "{plugin}"
-    );
+    // The plugin-status answer over the never-booted island is the typed cold
+    // status, not an error and not a boot.
+    let plugin = by_id(&out, 5)["result"].as_str().unwrap().to_string();
+    assert!(plugin.contains("PC island not booted (cold)"), "{plugin}");
 }
 
 // --- pre-ready fallbacks then ready resolution --------------------------------

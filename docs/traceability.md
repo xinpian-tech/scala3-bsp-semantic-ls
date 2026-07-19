@@ -66,12 +66,22 @@ Selected load-bearing cases, mechanically checked (`file` :: "case substring"):
 Deviations the rewrite's decision process ratified; recorded here so the docs
 and the plan stay reconciled.
 
-1. **`pcPluginStatus` command — deferred (trim latitude).** Not advertised, not
-   handled (an unknown-command error, asserted by
-   `crates/ls-server/tests/server_surface.rs`); the doctor's `PC Plugins`
-   section reports the deferral reason instead of live plugin status
-   (`crates/ls-server/src/doctor.rs`). The `doctor`/`reindex`/`compile`
-   commands remain mandatory and implemented.
+1. **`pcPluginStatus` command — implemented (trim latitude not used).**
+   Advertised as the fourth executeCommand and routed end-to-end: the island's
+   `PcFacade.pluginStatus` report crosses the flat-ABI `plugin_status`
+   control-lane slot into the seam's `PcPluginStatusReport`
+   (`crates/ls-server/src/pc.rs`), rendered as the Scala `PcStatusRender` text
+   summary or the structured `{compilerPlugins, servicePlugins, disabled}`
+   object with the doctor's `{"json": true}` argument. The inspection NEVER
+   boots the island: a ready-but-cold island answers a typed
+   "PC island not booted (cold)" status, and the doctor's `PC Plugins` section
+   renders the live report once booted, the same cold reason before
+   (`crates/ls-server/src/doctor.rs`). Proven by
+   `crates/ls-server/tests/server_surface.rs` (advertised set == routed set),
+   `crates/ls-server/tests/pc_wire.rs` (the wire round-trip over the fake PC),
+   `crates/ls-jvm/tests/live_boundary.rs` (the live control-lane fetch), and
+   `it/lsp-blackbox/test_robustness.py` (the ready-but-cold typed answer over
+   real stdio).
 2. **No-BSP warm-restart mode — deferred (trim latitude).** A workspace with a
    recovered on-disk index but no usable `.bsp` connection reaches a typed
    failed bootstrap ("the no-BSP warm-restart mode is deferred"), never a

@@ -9,7 +9,14 @@ hand-rolled serde layer fails loudly in a client this repo did not write.
 
 from lsprotocol import types
 
-from conftest import COMPILE, DOCTOR, REINDEX, await_ready, execute
+from conftest import (
+    COMPILE,
+    DOCTOR,
+    PC_PLUGIN_STATUS,
+    REINDEX,
+    await_ready,
+    execute,
+)
 
 
 async def test_initialize_advertises_the_exact_capability_surface(client):
@@ -28,7 +35,12 @@ async def test_initialize_advertises_the_exact_capability_surface(client):
     assert caps.rename_provider.prepare_provider is True
     assert caps.document_highlight_provider is True
     assert caps.workspace_symbol_provider is True
-    assert list(caps.execute_command_provider.commands) == [DOCTOR, REINDEX, COMPILE]
+    assert list(caps.execute_command_provider.commands) == [
+        DOCTOR,
+        REINDEX,
+        COMPILE,
+        PC_PLUGIN_STATUS,
+    ]
 
     # Deliberately absent: not implemented, so never advertised.
     assert caps.semantic_tokens_provider is None
@@ -51,3 +63,14 @@ async def test_doctor_flags_the_semanticdb_less_target(client):
     report = await execute(client, DOCTOR)
     assert "fixture-nosdb" in report
     assert "without SemanticDB" in report
+
+
+async def test_doctor_reports_the_cold_pc_plugins_reason(client):
+    """A blackbox session never issues a PC query, so the island stays cold and
+    the doctor's `PC Plugins` section carries the typed cold reason — gathered
+    without booting the JVM."""
+    await await_ready(client)
+    report = await execute(client, DOCTOR)
+    assert "PC Plugins:" in report
+    assert "unavailable: PC island not booted (cold)" in report
+    assert "reported after the first PC query boots it" in report

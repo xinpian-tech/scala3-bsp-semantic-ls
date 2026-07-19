@@ -8,14 +8,21 @@
 //! failed, ready). `Runtime`, `Nix`, and `Store` are always gathered (host +
 //! filesystem + read-only store); the live-only `BSP`, `SemanticDB`, `PC`, and
 //! `PC Plugins` sections render `unavailable: <reason>` when there is no ready
-//! bundle. Gathering is NON-INVASIVE: it reads the host, the workspace files,
-//! the on-disk store (`Store::open_readonly`), and the embedded island's STATIC
-//! launch config + `/proc/self/maps` — it never boots the JVM, so an index-only
-//! session inspects itself with zero JVM in the process.
+//! bundle (and `PC Plugins` additionally renders the cold reason while the
+//! island has not booted — its report exists only over a booted island's
+//! control lane). Gathering is NON-INVASIVE: it reads the host, the workspace
+//! files, the on-disk store (`Store::open_readonly`), the embedded island's
+//! STATIC launch config + `/proc/self/maps`, and (for `PC Plugins`) only an
+//! already-booted island — it never boots the JVM, so an index-only session
+//! inspects itself with zero JVM in the process.
 
 use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
+
+use crate::pc::{
+    PcCompilerPluginStatus, PcDisabledPlugin, PcPluginStatusReport, PcServicePluginStatus,
+};
 
 /// The doctor list-rendering cap (the Scala `Doctor.ListCap`).
 const LIST_CAP: usize = 20;
@@ -123,9 +130,41 @@ pub struct PcSection {
     pub registered_targets: Vec<String>,
 }
 
-/// `PC Plugins`: the `pcPluginStatus` inspection is not ported. Always rendered
-/// `unavailable` with the deferral reason, never omitted.
-pub struct PcPluginsSection;
+/// `PC Plugins`: the island's plugin-status report (the Scala doctor's
+/// `PcPluginsSection`, gathered verbatim from `PcPluginStatusReport`): compiler
+/// plugins loaded, service plugins loaded, self-test results, and disabled
+/// plugins with reasons. Available only over a BOOTED island (the report
+/// crosses the flat-ABI `plugin_status` control-lane slot); a still-cold island
+/// renders `unavailable` with [`PcPluginsSection::COLD`], never a boot.
+pub struct PcPluginsSection {
+    pub compiler_plugins: Vec<PcCompilerPluginStatus>,
+    pub service_plugins: Vec<PcServicePluginStatus>,
+    pub disabled: Vec<PcDisabledPlugin>,
+}
+
+impl PcPluginsSection {
+    /// The ready-but-cold reason: the report exists only once the island boots,
+    /// and the doctor (like the plugin-status seam it reads) never boots it.
+    pub const COLD: &'static str =
+        "PC island not booted (cold); reported after the first PC query boots it";
+
+    /// The section, taken verbatim from the seam's plugin-status report (the
+    /// Scala `PcPluginsSection.gather`).
+    pub fn of(report: PcPluginStatusReport) -> PcPluginsSection {
+        PcPluginsSection {
+            compiler_plugins: report.compiler_plugins,
+            service_plugins: report.service_plugins,
+            disabled: report.disabled,
+        }
+    }
+
+    /// The structured `{compilerPlugins, servicePlugins, disabled}` object —
+    /// the doctor's `pcPlugins` JSON section, also the `pcPluginStatus`
+    /// command's `{"json": true}` result.
+    pub fn render_json(&self) -> Value {
+        pc_plugins_json(self)
+    }
+}
 
 /// The whole doctor report: seven sections in fixed render order.
 pub struct DoctorReport {
@@ -150,7 +189,7 @@ impl DoctorReport {
             semanticdb: SectionState::Unavailable("no BSP connection".to_string()),
             store: StoreSection::gather(Some(workspace_root)),
             pc: SectionState::Unavailable("no BSP connection".to_string()),
-            pc_plugins: SectionState::Unavailable(PcPluginsSection::DEFERRED.to_string()),
+            pc_plugins: SectionState::Unavailable("no BSP connection".to_string()),
         }
     }
 
@@ -165,7 +204,7 @@ impl DoctorReport {
             section_of("SemanticDB", &self.semanticdb, semanticdb_lines),
             section("Store", store_lines(&self.store)),
             section_of("PC", &self.pc, pc_lines),
-            section_of("PC Plugins", &self.pc_plugins, |_| Vec::new()),
+            section_of("PC Plugins", &self.pc_plugins, pc_plugins_lines),
         ];
         sections.join("\n")
     }
@@ -182,7 +221,7 @@ impl DoctorReport {
             "semanticdb": state_json(&self.semanticdb, semanticdb_json),
             "store": store_json(&self.store),
             "pc": state_json(&self.pc, pc_json),
-            "pcPlugins": state_json(&self.pc_plugins, |_| json!({})),
+            "pcPlugins": state_json(&self.pc_plugins, pc_plugins_json),
         })
     }
 }
@@ -316,6 +355,61 @@ fn pc_lines(p: &PcSection) -> Vec<String> {
     ]
 }
 
+/// Ports the Scala `Doctor.pcPluginsLines`: compiler plugins loaded (per-plugin
+/// jars + detail), service plugins loaded (per-plugin id/source/enabled), the
+/// self-test results, and the disabled plugins with reasons. Nested facts are
+/// indented one more level than the section's own `key: value` lines.
+fn pc_plugins_lines(p: &PcPluginsSection) -> Vec<String> {
+    let indent = "  ";
+    let compiler_loaded = p.compiler_plugins.iter().filter(|c| c.loaded).count();
+    let mut lines = vec![format!(
+        "compiler plugins loaded: {compiler_loaded} of {}",
+        p.compiler_plugins.len()
+    )];
+    for c in &p.compiler_plugins {
+        let jars = if c.jars.is_empty() {
+            "(no jars)".to_string()
+        } else {
+            c.jars.join(", ")
+        };
+        lines.push(format!("{indent}{jars}: {}", c.detail));
+    }
+    let service_enabled = p.service_plugins.iter().filter(|s| s.enabled).count();
+    lines.push(format!(
+        "service plugins loaded: {service_enabled} of {}",
+        p.service_plugins.len()
+    ));
+    for s in &p.service_plugins {
+        let status = if s.enabled { "enabled" } else { "disabled" };
+        lines.push(format!("{indent}{} ({}): {status}", s.id, s.source));
+    }
+    lines.push("self-test results:".to_string());
+    if p.service_plugins.is_empty() {
+        lines.push(format!("{indent}none"));
+    } else {
+        for s in &p.service_plugins {
+            let outcome = if s.self_test_ok {
+                "ok"
+            } else {
+                s.self_test_detail.as_str()
+            };
+            lines.push(format!("{indent}{}: {outcome}", s.id));
+        }
+    }
+    lines.push(format!(
+        "disabled plugins: {}",
+        if p.disabled.is_empty() {
+            "none".to_string()
+        } else {
+            p.disabled.len().to_string()
+        }
+    ));
+    for d in &p.disabled {
+        lines.push(format!("{indent}{}: {}", d.id, d.reason));
+    }
+    lines
+}
+
 fn yes_no(b: bool) -> &'static str {
     if b {
         "yes"
@@ -429,6 +523,46 @@ fn pc_json(p: &PcSection) -> Value {
         "workerStatus": p.worker_status,
         "activeTargets": p.active_targets,
         "registeredTargets": p.registered_targets,
+    })
+}
+
+/// Ports the Scala `Doctor.pcPluginsJson`: the
+/// `{compilerPlugins, servicePlugins, disabled}` object.
+fn pc_plugins_json(p: &PcPluginsSection) -> Value {
+    let compiler: Vec<Value> = p
+        .compiler_plugins
+        .iter()
+        .map(|c| {
+            json!({
+                "jars": c.jars,
+                "options": c.options,
+                "loaded": c.loaded,
+                "detail": c.detail,
+            })
+        })
+        .collect();
+    let service: Vec<Value> = p
+        .service_plugins
+        .iter()
+        .map(|s| {
+            json!({
+                "id": s.id,
+                "source": s.source,
+                "enabled": s.enabled,
+                "selfTestOk": s.self_test_ok,
+                "selfTestDetail": s.self_test_detail,
+            })
+        })
+        .collect();
+    let disabled: Vec<Value> = p
+        .disabled
+        .iter()
+        .map(|d| json!({ "id": d.id, "reason": d.reason }))
+        .collect();
+    json!({
+        "compilerPlugins": compiler,
+        "servicePlugins": service,
+        "disabled": disabled,
     })
 }
 
@@ -570,13 +704,6 @@ impl StoreSection {
     }
 }
 
-impl PcPluginsSection {
-    /// The deferral reason for the `PC Plugins` section: the `pcPluginStatus`
-    /// command and its plugin-status inspection infrastructure are not ported.
-    pub const DEFERRED: &'static str =
-        "pcPluginStatus is not ported: plugin-status inspection is unavailable";
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -623,7 +750,33 @@ mod tests {
                 active_targets: Vec::new(),
                 registered_targets: vec!["a".to_string()],
             }),
-            pc_plugins: SectionState::Unavailable(PcPluginsSection::DEFERRED.to_string()),
+            pc_plugins: SectionState::Available(PcPluginsSection {
+                compiler_plugins: vec![
+                    PcCompilerPluginStatus {
+                        jars: vec!["/plugins/zaozi.jar".to_string()],
+                        options: vec!["-P:zaozi:on".to_string()],
+                        loaded: true,
+                        detail: "ok".to_string(),
+                    },
+                    PcCompilerPluginStatus {
+                        jars: Vec::new(),
+                        options: Vec::new(),
+                        loaded: false,
+                        detail: "self-test failed: no jars configured".to_string(),
+                    },
+                ],
+                service_plugins: vec![PcServicePluginStatus {
+                    id: "zaozi.nav".to_string(),
+                    source: "workspace pc-plugins.json".to_string(),
+                    enabled: true,
+                    self_test_ok: true,
+                    self_test_detail: "ok".to_string(),
+                }],
+                disabled: vec![PcDisabledPlugin {
+                    id: "old.plugin".to_string(),
+                    reason: "disabled by config".to_string(),
+                }],
+            }),
         }
     }
 
@@ -666,6 +819,70 @@ mod tests {
         assert!(text.contains("  active targets: none"), "{text}");
     }
 
+    // The Available `PC Plugins` section renders the Scala doctor's fact lines:
+    // loaded counts, per-plugin jar/detail and id/source/status lines, the
+    // self-test results, and the disabled plugins with reasons.
+    #[test]
+    fn text_renders_the_pc_plugins_report_facts() {
+        let text = sample_ready().render_text();
+        assert!(text.contains("  compiler plugins loaded: 1 of 2"), "{text}");
+        assert!(text.contains("    /plugins/zaozi.jar: ok"), "{text}");
+        assert!(
+            text.contains("    (no jars): self-test failed: no jars configured"),
+            "{text}"
+        );
+        assert!(text.contains("  service plugins loaded: 1 of 1"), "{text}");
+        assert!(
+            text.contains("    zaozi.nav (workspace pc-plugins.json): enabled"),
+            "{text}"
+        );
+        assert!(text.contains("  self-test results:"), "{text}");
+        assert!(text.contains("    zaozi.nav: ok"), "{text}");
+        assert!(text.contains("  disabled plugins: 1"), "{text}");
+        assert!(
+            text.contains("    old.plugin: disabled by config"),
+            "{text}"
+        );
+    }
+
+    // The `pcPlugins` JSON section carries the structured
+    // `{compilerPlugins, servicePlugins, disabled}` shape, camelCase keys.
+    #[test]
+    fn json_renders_the_pc_plugins_report_shape() {
+        let value = sample_ready().render_json();
+        let plugins = &value["pcPlugins"];
+        assert_eq!(
+            plugins["compilerPlugins"][0]["jars"][0],
+            "/plugins/zaozi.jar"
+        );
+        assert_eq!(plugins["compilerPlugins"][0]["options"][0], "-P:zaozi:on");
+        assert_eq!(plugins["compilerPlugins"][0]["loaded"], true);
+        assert_eq!(plugins["compilerPlugins"][1]["loaded"], false);
+        assert_eq!(plugins["servicePlugins"][0]["id"], "zaozi.nav");
+        assert_eq!(plugins["servicePlugins"][0]["selfTestOk"], true);
+        assert_eq!(plugins["servicePlugins"][0]["selfTestDetail"], "ok");
+        assert_eq!(plugins["disabled"][0]["id"], "old.plugin");
+        assert_eq!(plugins["disabled"][0]["reason"], "disabled by config");
+    }
+
+    // The ready-but-cold reason names the cold island and how the report becomes
+    // available; the section renders it as `unavailable: <reason>`, never a boot.
+    #[test]
+    fn a_cold_pc_plugins_section_renders_the_cold_reason() {
+        let mut report = sample_ready();
+        report.pc_plugins = SectionState::Unavailable(PcPluginsSection::COLD.to_string());
+        let text = report.render_text();
+        assert!(
+            text.contains(
+                "PC Plugins:\n  unavailable: PC island not booted (cold); \
+                 reported after the first PC query boots it"
+            ),
+            "{text}"
+        );
+        let value = report.render_json();
+        assert_eq!(value["pcPlugins"]["unavailable"], PcPluginsSection::COLD);
+    }
+
     #[test]
     fn unavailable_sections_render_the_reason_not_omitted() {
         let root = std::path::Path::new("/nonexistent-doctor-root");
@@ -683,7 +900,10 @@ mod tests {
             text.contains("PC:\n  unavailable: no BSP connection"),
             "{text}"
         );
-        assert!(text.contains("PC Plugins:\n  unavailable:"), "{text}");
+        assert!(
+            text.contains("PC Plugins:\n  unavailable: no BSP connection"),
+            "{text}"
+        );
         // Store still renders (its facts line for a missing root).
         assert!(text.contains("Store:"), "{text}");
     }
@@ -715,7 +935,7 @@ mod tests {
         let root = std::path::Path::new("/nonexistent-doctor-root");
         let value = DoctorReport::offline(root).render_json();
         assert_eq!(value["bsp"]["unavailable"], "no BSP connection");
-        assert!(value["pcPlugins"]["unavailable"].is_string());
+        assert_eq!(value["pcPlugins"]["unavailable"], "no BSP connection");
         // A valid, serializable JSON object.
         assert!(serde_json::to_string(&value).is_ok());
     }

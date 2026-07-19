@@ -184,3 +184,61 @@ fn pc_queries_on_a_no_semanticdb_source_stay_hard_errors() {
     );
     client.shutdown();
 }
+
+// The `scala3SemanticLs.pcPluginStatus` executeCommand round-trips through the
+// REAL serve loop to the injected PC service's plugin report: the text summary
+// by default, the structured `{compilerPlugins, servicePlugins, disabled}`
+// object with the doctor's `{"json": true}` argument convention — JVM-free.
+#[test]
+fn the_pc_plugin_status_command_round_trips_over_the_wire() {
+    let (mut client, pc) = boot();
+    client.initialize();
+    client.await_ready();
+
+    let text = client.result(
+        "workspace/executeCommand",
+        json!({ "command": "scala3SemanticLs.pcPluginStatus" }),
+    );
+    let text = text.as_str().expect("a text summary");
+    assert!(text.contains("compiler plugins: 1"), "{text}");
+    assert!(
+        text.contains("  /plugins/fake-plugin.jar: loaded"),
+        "{text}"
+    );
+    assert!(
+        text.contains("  fake.nav (builtin): enabled, self-test ok"),
+        "{text}"
+    );
+    assert!(text.contains("disabled plugins: 1"), "{text}");
+    assert!(
+        text.contains("  fake.disabled: disabled by config"),
+        "{text}"
+    );
+
+    let report = client.result(
+        "workspace/executeCommand",
+        json!({
+            "command": "scala3SemanticLs.pcPluginStatus",
+            "arguments": [{ "json": true }]
+        }),
+    );
+    assert_eq!(
+        report["compilerPlugins"][0]["jars"][0],
+        "/plugins/fake-plugin.jar"
+    );
+    assert_eq!(report["compilerPlugins"][0]["loaded"], true);
+    assert_eq!(report["servicePlugins"][0]["id"], "fake.nav");
+    assert_eq!(report["servicePlugins"][0]["selfTestOk"], true);
+    assert_eq!(report["disabled"][0]["reason"], "disabled by config");
+
+    assert!(
+        pc.calls().iter().any(|c| c == "plugin_status"),
+        "the command must reach the PC service's plugin_status: {:?}",
+        pc.calls()
+    );
+    assert!(
+        !ls_server::libjvm_mapped(),
+        "the pcPluginStatus round-trip must stay JVM-free with the injected fake"
+    );
+    client.shutdown();
+}
