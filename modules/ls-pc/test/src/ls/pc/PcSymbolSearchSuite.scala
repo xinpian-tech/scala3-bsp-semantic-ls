@@ -74,3 +74,75 @@ class PcSymbolSearchSuite extends munit.FunSuite:
       search.definition("scala/package.List.", java.net.URI.create("file:///x.scala")).size(),
       0
     )
+
+  // --- searchMethods / search seam (workspace + classpath symbol search) -----
+
+  private final class RecordingVisitor extends scala.meta.pc.SymbolSearchVisitor:
+    val workspaceSymbols =
+      scala.collection.mutable.ArrayBuffer.empty[(java.nio.file.Path, String, org.eclipse.lsp4j.SymbolKind, Range)]
+    val classfiles = scala.collection.mutable.ArrayBuffer.empty[(String, String)]
+    def shouldVisitPackage(pkg: String): Boolean = true
+    def visitClassfile(pkg: String, filename: String): Int =
+      classfiles += ((pkg, filename)); 1
+    def visitWorkspaceSymbol(
+        path: java.nio.file.Path,
+        symbol: String,
+        kind: org.eclipse.lsp4j.SymbolKind,
+        range: Range
+    ): Int =
+      workspaceSymbols += ((path, symbol, kind, range)); 1
+    def isCancelled: Boolean = false
+
+  test("searchMethods forwards resolver hits to the visitor and reports COMPLETE"):
+    val range = new Range(new Position(1, 6), new Position(1, 10))
+    val hit = WorkspaceMethodHit(
+      "file:///ls-pc-test/Ext.scala",
+      "example/enrichments.incr().",
+      org.eclipse.lsp4j.SymbolKind.Method.getValue,
+      range
+    )
+    val seen = new AtomicReference[(String, String)]()
+    val resolver = new PcDefinitionResolver:
+      def definition(semanticdbSymbol: String, fromFileUri: String): Vector[Location] =
+        Vector.empty
+      override def searchMethods(query: String, buildTargetIdentifier: String): Vector[WorkspaceMethodHit] =
+        seen.set((query, buildTargetIdentifier))
+        Vector(hit)
+    val visitor = new RecordingVisitor
+    val result = new IndexBackedSymbolSearch(resolver).searchMethods("incr", "aTarget", visitor)
+    assertEquals(result, scala.meta.pc.SymbolSearch.Result.COMPLETE)
+    assertEquals(seen.get(), ("incr", "aTarget"))
+    assertEquals(visitor.workspaceSymbols.size, 1)
+    val (path, symbol, kind, visitedRange) = visitor.workspaceSymbols.head
+    assert(path.endsWith("Ext.scala"), s"unexpected path: $path")
+    assertEquals(symbol, "example/enrichments.incr().")
+    assertEquals(kind, org.eclipse.lsp4j.SymbolKind.Method)
+    assertEquals(visitedRange, range)
+
+  test("a throwing searchMethods resolver still reports COMPLETE"):
+    val resolver = new PcDefinitionResolver:
+      def definition(semanticdbSymbol: String, fromFileUri: String): Vector[Location] =
+        Vector.empty
+      override def searchMethods(query: String, buildTargetIdentifier: String): Vector[WorkspaceMethodHit] =
+        throw new RuntimeException("boom: intentional resolver crash")
+    val result =
+      new IndexBackedSymbolSearch(resolver).searchMethods("x", "t", new RecordingVisitor)
+    assertEquals(result, scala.meta.pc.SymbolSearch.Result.COMPLETE)
+
+  test("classpath search visits scala-library classfiles for a scope query"):
+    val search = new IndexBackedSymbolSearch(PcDefinitionResolver.Empty, SharedPc.libraryClasspath)
+    val visitor = new RecordingVisitor
+    search.search("ListBuffe", "aTarget", visitor)
+    assert(
+      visitor.classfiles.exists { case (pkg, file) =>
+        pkg.contains("scala/collection/mutable") && file.startsWith("ListBuffer")
+      },
+      s"scala.collection.mutable.ListBuffer not visited: ${visitor.classfiles}"
+    )
+
+  test("the default resolver searchMethods answers empty (previous no-op behavior)"):
+    val visitor = new RecordingVisitor
+    val result =
+      new IndexBackedSymbolSearch(PcDefinitionResolver.Empty).searchMethods("any", "t", visitor)
+    assertEquals(result, scala.meta.pc.SymbolSearch.Result.COMPLETE)
+    assert(visitor.workspaceSymbols.isEmpty)

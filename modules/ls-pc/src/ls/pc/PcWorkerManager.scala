@@ -95,6 +95,17 @@ final class PcWorkerManager(
   private val scheduler: ScheduledExecutorService =
     Executors.newSingleThreadScheduledExecutor(daemonFactory("ls-pc-scheduler"))
 
+  /** [[IndexBackedSymbolSearch]] per distinct classpath: its lazy classpath
+    * index is expensive to build, so it must survive LRU eviction / timeout
+    * re-creation of PC instances and be shared by targets with an identical
+    * classpath.
+    */
+  private val symbolSearches =
+    new java.util.concurrent.ConcurrentHashMap[Vector[Path], IndexBackedSymbolSearch]
+
+  private def symbolSearchFor(classpath: Vector[Path]): IndexBackedSymbolSearch =
+    symbolSearches.computeIfAbsent(classpath, cp => new IndexBackedSymbolSearch(resolver, cp))
+
   /** Get the live instance for `config.bspId`, creating (or recreating, if the
     * config changed) it as needed. May evict + shut down the least recently
     * used instance when over the cap.
@@ -196,9 +207,10 @@ final class PcWorkerManager(
     var base: scala.meta.pc.PresentationCompiler = new dotty.tools.pc.ScalaPresentationCompiler()
       .withExecutorService(executor)
       .withScheduledExecutorService(scheduler)
-      // Cross-file go-to: the PC delegates a definition whose symbol is not in
-      // the open buffer to SymbolSearch.definition; route it to the resolver.
-      .withSearch(new IndexBackedSymbolSearch(resolver))
+      // SymbolSearch seam: cross-file go-to routes to the resolver, scope-mode
+      // classpath completion runs over this target's classpath, member-mode
+      // workspace extension-method discovery routes to resolver.searchMethods.
+      .withSearch(symbolSearchFor(config.classpath))
     settings.workspaceRoot.foreach(root => base = base.withWorkspace(root))
     val underlying =
       base.newInstance(config.bspId, config.classpath.asJava, options.asJava, sourcePathSupplier)

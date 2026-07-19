@@ -1,12 +1,29 @@
 package ls.pc
 
 import java.net.URI
+import java.nio.file.Path
 import java.util.Optional
 
 import scala.util.control.NonFatal
 
-import org.eclipse.lsp4j.Location
+import org.eclipse.lsp4j.{Location, Range, SymbolKind}
+import scala.meta.internal.metals.{ClasspathSearch, ExcludedPackagesHandler, WorkspaceSymbolQuery}
 import scala.meta.pc.{ParentSymbols, SymbolDocumentation, SymbolSearch, SymbolSearchVisitor}
+
+/** One workspace extension-method / implicit-class-member hit answered through
+  * the [[PcDefinitionResolver.searchMethods]] seam.
+  *
+  * Deliberately lsp4j-light and ABI-encodable (strings + ints + a plain
+  * range): `kind` is the raw lsp4j [[SymbolKind]] value, and
+  * `semanticdbSymbol` is the SemanticDB string the PC resolves back to a
+  * compiler symbol (`CompilerSearchVisitor.visitWorkspaceSymbol`).
+  */
+final case class WorkspaceMethodHit(
+    fileUri: String,
+    semanticdbSymbol: String,
+    kind: Int,
+    range: Range
+)
 
 /** Cross-file definition lookup for the presentation compiler.
   *
@@ -33,6 +50,15 @@ trait PcDefinitionResolver:
     */
   def definition(semanticdbSymbol: String, fromFileUri: String): Vector[Location]
 
+  /** Workspace extension methods / implicit-class members whose display name
+    * matches `query` (member-mode completion: the PC asks through
+    * `SymbolSearch.searchMethods` for out-of-scope candidates and filters them
+    * by receiver type itself). Must never throw; the default answers empty so
+    * index-less embedders keep the previous no-hit behavior.
+    */
+  def searchMethods(query: String, buildTargetIdentifier: String): Vector[WorkspaceMethodHit] =
+    Vector.empty
+
 object PcDefinitionResolver:
   /** Default no-op resolver: cross-file definition stays empty, exactly the
     * behavior of the PC's built-in `EmptySymbolSearch`.
@@ -41,12 +67,32 @@ object PcDefinitionResolver:
     def definition(semanticdbSymbol: String, fromFileUri: String): Vector[Location] =
       Vector.empty
 
-/** [[SymbolSearch]] adapter over a [[PcDefinitionResolver]]: implements ONLY
-  * `definition` and no-ops the rest exactly like the PC's default
-  * `EmptySymbolSearch` (empty list / COMPLETE / empty Optional), so wiring it
-  * changes nothing but cross-file go-to.
+/** [[SymbolSearch]] adapter over a [[PcDefinitionResolver]] plus the target's
+  * classpath:
+  *
+  *   - `definition` routes to the resolver (cross-file go-to);
+  *   - `search` (scope-mode completion of unimported classes/objects) runs the
+  *     PC-vendored `scala.meta.internal.metals.ClasspathSearch` over
+  *     `classpath` — a pure island-local lookup, no index involved;
+  *   - `searchMethods` (member-mode workspace extension-method discovery)
+  *     forwards the resolver's [[WorkspaceMethodHit]]s to the visitor;
+  *   - documentation stays empty like the PC's `EmptySymbolSearch`.
+  *
+  * The classpath index is built lazily on first `search` and is expensive:
+  * construct one instance per distinct classpath and reuse it
+  * ([[PcWorkerManager]] caches instances across PC re-creations). Never
+  * throws; every failure degrades to the empty/COMPLETE answer.
   */
-final class IndexBackedSymbolSearch(resolver: PcDefinitionResolver) extends SymbolSearch:
+final class IndexBackedSymbolSearch(
+    resolver: PcDefinitionResolver,
+    classpath: Vector[Path] = Vector.empty
+) extends SymbolSearch:
+
+  private lazy val classpathSearch: ClasspathSearch =
+    try
+      if classpath.isEmpty then ClasspathSearch.empty
+      else ClasspathSearch.fromClasspath(classpath, ExcludedPackagesHandler.default)
+    catch case NonFatal(_) => ClasspathSearch.empty
 
   override def definition(symbol: String, sourceUri: URI): java.util.List[Location] =
     try
@@ -69,10 +115,32 @@ final class IndexBackedSymbolSearch(resolver: PcDefinitionResolver) extends Symb
       query: String,
       buildTargetIdentifier: String,
       visitor: SymbolSearchVisitor
-  ): SymbolSearch.Result = SymbolSearch.Result.COMPLETE
+  ): SymbolSearch.Result =
+    try
+      if query == null || query.isEmpty then SymbolSearch.Result.COMPLETE
+      else classpathSearch.search(WorkspaceSymbolQuery.exact(query), visitor)._1
+    catch case NonFatal(_) => SymbolSearch.Result.COMPLETE
 
   override def searchMethods(
       query: String,
       buildTargetIdentifier: String,
       visitor: SymbolSearchVisitor
-  ): SymbolSearch.Result = SymbolSearch.Result.COMPLETE
+  ): SymbolSearch.Result =
+    try
+      val hits = resolver.searchMethods(
+        if query == null then "" else query,
+        if buildTargetIdentifier == null then "" else buildTargetIdentifier
+      )
+      hits.foreach { hit =>
+        // a malformed single hit (bad uri / kind value) must not lose the rest
+        try
+          visitor.visitWorkspaceSymbol(
+            Path.of(URI(hit.fileUri)),
+            hit.semanticdbSymbol,
+            SymbolKind.forValue(hit.kind),
+            hit.range
+          )
+        catch case NonFatal(_) => ()
+      }
+      SymbolSearch.Result.COMPLETE
+    catch case NonFatal(_) => SymbolSearch.Result.COMPLETE

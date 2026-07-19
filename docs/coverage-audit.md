@@ -107,7 +107,7 @@ retained test-file path appears here.
 | modules/ls-pc/test/src/ls/pc/PluginManagerSuite.scala | ISLAND | plugin SPI/loading unchanged in the island (AC-6.5); the loaded-plugin path is exercised at the boundary by `ls-jvm/tests/live_zaozi.rs` |
 | modules/ls-pc/test/src/ls/pc/Utf16TextSuite.scala | ISLAND | UTF-16 conversion unchanged in the island (AC-6.5); exercised via live PC positions in `ls-jvm/tests/live_boundary.rs` + `ls-pc-abi` position payloads |
 | modules/ls-pc/test/src/ls/pc/WorkerProtocolSuite.scala | NON-PORT | forked-worker wire protocol deleted; the vtable protocol is `ls-pc-abi/tests/roundtrip.rs`, `fuzz.rs`, `boundary.rs` |
-| modules/ls-pc/test/src/ls/pc/corpus/CorpusPc.scala | SUPPORT | ported-corpus fixtures: plugin-free shared facade + dotty `MockEntries` definition map on the `PcDefinitionResolver` seam (see NOTICE.md) |
+| modules/ls-pc/test/src/ls/pc/corpus/CorpusPc.scala | SUPPORT | ported-corpus fixtures: plugin-free shared facade + dotty `MockEntries` definition map and a `TestingWorkspaceSearch`-style workspace-method registry on the `PcDefinitionResolver` seam (see NOTICE.md) |
 | modules/ls-pc/test/src/ls/pc/corpus/CorpusHarness.scala | SUPPORT | ported-corpus harness: dotty `BasePCSuite`/`Base*Suite` check DSL re-homed onto `PcFacade` + munit (see NOTICE.md) |
 | modules/ls-pc/test/src/ls/pc/corpus/CompletionCorpusSuite.scala | CORPUS | island-only: completion cases ported from scala3 3.8.4 `tests/completion/CompletionSuite.scala`; exercises the live facade in `mill pc.test` |
 | modules/ls-pc/test/src/ls/pc/corpus/CompletionExtensionCorpusSuite.scala | CORPUS | island-only: extension-method completion cases from scala3 3.8.4 `tests/completion/CompletionExtensionSuite.scala` |

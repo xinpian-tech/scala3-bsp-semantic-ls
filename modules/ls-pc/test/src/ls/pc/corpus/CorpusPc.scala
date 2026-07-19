@@ -3,6 +3,8 @@ package ls.pc.corpus
 import java.nio.file.{Files, Path}
 import java.util.concurrent.atomic.AtomicInteger
 
+import scala.collection.concurrent.TrieMap
+
 import ls.pc.{
   PcDefinitionResolver,
   PcFacade,
@@ -10,9 +12,11 @@ import ls.pc.{
   PcPluginManager,
   PcSettings,
   PcTargetConfig,
-  SharedPc
+  SharedPc,
+  WorkspaceMethodHit
 }
-import org.eclipse.lsp4j.{Location, Position, Range}
+import org.eclipse.lsp4j.{Location, Position, Range, SymbolKind}
+import scala.meta.internal.metals.Fuzzy
 
 /** Shared plugin-free presentation-compiler facade for the ported test corpus.
   *
@@ -20,8 +24,10 @@ import org.eclipse.lsp4j.{Location, Position, Range}
   * suite, see [[CorpusSuiteBase]]) assert exact completion/hover/signature
   * output, so they must NOT share [[ls.pc.SharedPc]]'s facade: its
   * marker/augment test plugins append items and locations to every result.
-  * This facade registers no plugins and wires the dotty-tests `MockEntries`
-  * cross-file definition map into our [[PcDefinitionResolver]] seam.
+  * This facade registers no plugins and wires two dotty-tests mocks into our
+  * [[PcDefinitionResolver]] seam: the `MockEntries` cross-file definition map
+  * (definition) and a `TestingWorkspaceSearch`-style per-buffer workspace
+  * method registry (searchMethods).
   */
 object CorpusPc:
 
@@ -73,15 +79,61 @@ object CorpusPc:
     mockLocation("java/lang/String#", "String.java"),
   )
 
+  /** One workspace method a corpus case declares for the searchMethods seam:
+    * the semanticdb symbol is hand-derived from the case source exactly as
+    * dotty's `TestingWorkspaceSearch` symbol collector would emit it (the
+    * upstream harness indexes the test source itself), and the definition
+    * range/uri are resolved against the case's own buffer at [[openBuffer]].
+    */
+  final case class WorkspaceMethod(
+      displayName: String,
+      semanticdbSymbol: String,
+      kind: Int = SymbolKind.Method.getValue
+  )
+
+  /** Live registry backing [[MockResolver.searchMethods]], keyed by the buffer
+    * uri that seeded it (seeded in [[openBuffer]], cleared in [[closeBuffer]]).
+    */
+  private val workspaceMethods =
+    TrieMap.empty[String, Vector[(String, WorkspaceMethodHit)]]
+
+  /** Range of `name` at its definition site (`def`/`val`/`var`/`class name`)
+    * in `text`; the corpus registers real definition coordinates even though
+    * the PC's `CompilerSearchVisitor` re-resolves hits purely by symbol.
+    */
+  private def definitionRange(text: String, name: String): Range =
+    val matcher = java.util.regex.Pattern
+      .compile("(?:def|val|var|class)\\s+" + java.util.regex.Pattern.quote(name) + "\\b")
+      .matcher(text)
+    if !matcher.find() then Range(Position(0, 0), Position(0, 0))
+    else
+      def toPos(offset: Int): Position =
+        val before = text.substring(0, offset)
+        val line = before.count(_ == '\n')
+        Position(line, offset - (before.lastIndexOf('\n') + 1))
+      Range(toPos(matcher.end() - name.length), toPos(matcher.end()))
+
   /** Cross-file lookups the PC delegates to `SymbolSearch.definition` reach
     * this resolver with the SemanticDB symbol string; answer from the mock
-    * map exactly like dotty's `MockSymbolSearch.definition`.
+    * map exactly like dotty's `MockSymbolSearch.definition`. `searchMethods`
+    * answers from the per-buffer registry with dotty's
+    * `TestingWorkspaceSearch` matching semantics (the vendored
+    * `Fuzzy.matches`: query is a — camel-hump aware — prefix of the display
+    * name; an empty query matches everything).
     */
   object MockResolver extends PcDefinitionResolver:
     def definition(semanticdbSymbol: String, fromFileUri: String): Vector[Location] =
       // Return fresh copies: the definition renderer mutates nothing, but the
       // facade result is shared across concurrent suites.
       mockDefinitions.getOrElse(semanticdbSymbol, Vector.empty)
+
+    override def searchMethods(
+        query: String,
+        buildTargetIdentifier: String
+    ): Vector[WorkspaceMethodHit] =
+      workspaceMethods.values.toVector.flatten.collect {
+        case (name, hit) if Fuzzy.matches(query, name) => hit
+      }
 
   lazy val facade: PcFacade =
     val pm = new PcPluginManager(PcPluginInitContext(None, generatedSourcesRoot))
@@ -102,9 +154,33 @@ object CorpusPc:
 
   /** Open a fresh dirty buffer on the corpus facade; the returned uri ends in
     * `filename` so filename-sensitive PC behavior matches the dotty harness
-    * (which always compiles `A.scala` / `Hover.scala`).
+    * (which always compiles `A.scala` / `Hover.scala`). `methods` seeds the
+    * searchMethods registry with hits pointing into this very buffer,
+    * mirroring dotty's harness, whose `TestingWorkspaceSearch` indexes the
+    * case source itself; close with [[closeBuffer]] to unregister them.
     */
-  def openBuffer(text: String, filename: String = "A.scala"): String =
+  def openBuffer(
+      text: String,
+      filename: String = "A.scala",
+      methods: Seq[WorkspaceMethod] = Nil
+  ): String =
     val uri = s"file:///ls-pc-corpus/${counter.incrementAndGet()}/$filename"
+    if methods.nonEmpty then
+      workspaceMethods.put(
+        uri,
+        methods.iterator.map { m =>
+          m.displayName -> WorkspaceMethodHit(
+            uri,
+            m.semanticdbSymbol,
+            m.kind,
+            definitionRange(text, m.displayName)
+          )
+        }.toVector
+      )
     facade.didOpen(targetId, uri, text)
     uri
+
+  /** Close a corpus buffer and drop any workspace methods it registered. */
+  def closeBuffer(uri: String): Unit =
+    workspaceMethods.remove(uri)
+    facade.didClose(uri)

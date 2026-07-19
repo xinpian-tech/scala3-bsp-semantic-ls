@@ -5,24 +5,246 @@
  * Copyright 2002-2026 EPFL and Lightbend, Inc. dba Akka
  * Licensed under the Apache License, Version 2.0:
  *   http://www.apache.org/licenses/LICENSE-2.0
- * Modifications: re-homed onto the ls.pc facade munit harness.
- *
- * Curation note: most of the upstream suite exercises DISCOVERY of
- * out-of-scope extension methods, which the PC delegates to
- * `SymbolSearch.searchMethods` (a workspace/classpath index seam). Our facade
- * deliberately no-ops that seam (`IndexBackedSymbolSearch` implements only
- * `definition`), so those cases are not portable and were dropped: simple,
- * simple-old-syntax, simple2, filter-by-type, filter-by-type-subtype,
- * simple-edit-suffix, directly-in-pkg1, nested-pkg, implicit-val-var, and
- * name-conflict (even an imported extension resolves through the seam). The
- * retained case resolves the extension through the companion object's
- * implicit scope, which the compiler completes natively; lexically-scoped
- * extension completion is covered by `extension-definition-type-variable-
- * inference` in CompletionCorpusSuite.
+ * Modifications: re-homed onto the ls.pc facade munit harness. Upstream's
+ * `TestingWorkspaceSearch` indexes the case source itself and answers the
+ * PC's `SymbolSearch.searchMethods` from it; here each discovery case seeds
+ * the equivalent hits (hand-derived SemanticDB symbols of its own extension
+ * methods / implicit-class members) into the corpus resolver's workspace
+ * method registry, which serves them through the `PcDefinitionResolver.
+ * searchMethods` seam.
  */
 package ls.pc.corpus
 
+import ls.pc.corpus.CorpusPc.WorkspaceMethod
+import org.eclipse.lsp4j.SymbolKind
+
 class CompletionExtensionCorpusSuite extends CorpusCompletionHarness:
+
+  check(
+    "simple",
+    """|package example
+       |
+       |object enrichments:
+       |  extension (num: Int)
+       |    def incr: Int = num + 1
+       |
+       |def main = 100.inc@@
+       |""".stripMargin,
+    """|incr: Int (extension)
+       |asInstanceOf[X0]: X0
+       |isInstanceOf[X0]: Boolean
+       |""".stripMargin,
+    workspaceMethods = Seq(
+      WorkspaceMethod("incr", "example/enrichments.incr().")
+    )
+  )
+
+  check(
+    "simple-old-syntax",
+    """package example
+      |
+      |object Test:
+      |  implicit class TestOps(a: Int):
+      |    def testOps(b: Int): String = ???
+      |
+      |def main = 100.test@@
+      |""".stripMargin,
+    """testOps(b: Int): String (implicit)
+      |""".stripMargin,
+    topLines = Some(1),
+    workspaceMethods = Seq(
+      WorkspaceMethod("TestOps", "example/Test.TestOps#", SymbolKind.Class.getValue),
+      WorkspaceMethod("testOps", "example/Test.TestOps#testOps().")
+    )
+  )
+
+  check(
+    "simple2",
+    """|package example
+       |
+       |object enrichments:
+       |  extension (num: Int)
+       |    def incr: Int = num + 1
+       |
+       |def main = 100.i@@
+       |""".stripMargin,
+    """|incr: Int (extension)
+       |""".stripMargin,
+    filter = _.contains("(extension)"),
+    workspaceMethods = Seq(
+      WorkspaceMethod("incr", "example/enrichments.incr().")
+    )
+  )
+
+  check(
+    "filter-by-type",
+    """|package example
+       |
+       |object enrichments:
+       |  extension (num: Int)
+       |    def incr: Int = num + 1
+       |  extension (str: String)
+       |    def identity: String = str
+       |
+       |def main = "foo".i@@
+       |""".stripMargin,
+    """|identity: String (extension)
+       |""".stripMargin, // incr won't be available
+    filter = _.contains("(extension)"),
+    workspaceMethods = Seq(
+      WorkspaceMethod("incr", "example/enrichments.incr()."),
+      WorkspaceMethod("identity", "example/enrichments.identity().")
+    )
+  )
+
+  check(
+    "filter-by-type-subtype",
+    """|package example
+       |
+       |class A
+       |class B extends A
+       |
+       |object enrichments:
+       |  extension (a: A)
+       |    def doSomething: A = a
+       |
+       |def main = (new B).do@@
+       |""".stripMargin,
+    """|doSomething: A (extension)
+       |""".stripMargin,
+    filter = _.contains("(extension)"),
+    workspaceMethods = Seq(
+      WorkspaceMethod("doSomething", "example/enrichments.doSomething().")
+    )
+  )
+
+  checkEdit(
+    "simple-edit-suffix",
+    """|package example
+       |
+       |object enrichments:
+       |  extension (num: Int)
+       |    def plus(other: Int): Int = num + other
+       |
+       |def main = 100.pl@@
+       |""".stripMargin,
+    """|package example
+       |
+       |import example.enrichments.plus
+       |
+       |object enrichments:
+       |  extension (num: Int)
+       |    def plus(other: Int): Int = num + other
+       |
+       |def main = 100.plus($0)
+       |""".stripMargin,
+    workspaceMethods = Seq(
+      WorkspaceMethod("plus", "example/enrichments.plus().")
+    )
+  )
+
+  check(
+    "directly-in-pkg1",
+    """|
+       |package example:
+       |  extension (num: Int)
+       |    def incr: Int = num + 1
+       |
+       |package example2:
+       |  def main = 100.inc@@
+       |""".stripMargin,
+    """|incr: Int (extension)
+       |asInstanceOf[X0]: X0
+       |isInstanceOf[X0]: Boolean
+       |""".stripMargin,
+    workspaceMethods = Seq(
+      WorkspaceMethod("incr", "example/A$package.incr().")
+    )
+  )
+
+  check(
+    "nested-pkg",
+    """|package a:  // some comment
+       |  package c:
+       |    extension (num: Int)
+       |        def increment2 = num + 2
+       |  extension (num: Int)
+       |    def increment = num + 1
+       |
+       |
+       |package b:
+       |  def main: Unit = 123.incre@@
+       |""".stripMargin,
+    """|increment: Int (extension)
+       |increment2: Int (extension)
+       |""".stripMargin,
+    workspaceMethods = Seq(
+      WorkspaceMethod("increment2", "a/c/A$package.increment2()."),
+      WorkspaceMethod("increment", "a/A$package.increment().")
+    )
+  )
+
+  checkEdit(
+    "name-conflict",
+    """
+      |package example
+      |
+      |import example.enrichments.*
+      |
+      |object enrichments:
+      |  extension (num: Int)
+      |    def plus(other: Int): Int = num + other
+      |
+      |def main = {
+      |  val plus = 100.plus(19)
+      |  val y = 19.pl@@
+      |}
+      |""".stripMargin,
+    """
+      |package example
+      |
+      |import example.enrichments.*
+      |
+      |object enrichments:
+      |  extension (num: Int)
+      |    def plus(other: Int): Int = num + other
+      |
+      |def main = {
+      |  val plus = 100.plus(19)
+      |  val y = 19.plus($0)
+      |}
+      |""".stripMargin,
+    workspaceMethods = Seq(
+      WorkspaceMethod("plus", "example/enrichments.plus().")
+    )
+  )
+
+  check(
+    "implicit-val-var",
+    """|package example
+       |
+       |object Test:
+       |  implicit class TestOps(val testArg: Int):
+       |    var testVar: Int = 42
+       |    val testVal: Int = 42
+       |    def testOps(b: Int): String = ???
+       |
+       |def main = 100.test@@
+       |""".stripMargin,
+    """|testArg: Int (implicit)
+       |testVal: Int (implicit)
+       |testVar: Int (implicit)
+       |testOps(b: Int): String (implicit)
+       |""".stripMargin,
+    topLines = Some(4),
+    workspaceMethods = Seq(
+      WorkspaceMethod("TestOps", "example/Test.TestOps#", SymbolKind.Class.getValue),
+      WorkspaceMethod("testArg", "example/Test.TestOps#testArg.", SymbolKind.Field.getValue),
+      WorkspaceMethod("testVar", "example/Test.TestOps#testVar.", SymbolKind.Variable.getValue),
+      WorkspaceMethod("testVal", "example/Test.TestOps#testVal.", SymbolKind.Field.getValue),
+      WorkspaceMethod("testOps", "example/Test.TestOps#testOps().")
+    )
+  )
 
   check(
     "extension-for-case-class",

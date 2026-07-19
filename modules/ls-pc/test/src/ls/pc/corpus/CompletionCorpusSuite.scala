@@ -6,9 +6,10 @@
  * Licensed under the Apache License, Version 2.0:
  *   http://www.apache.org/licenses/LICENSE-2.0
  * Modifications: re-homed onto the ls.pc facade munit harness; curated
- * Scala-3-syntax subset. Cases relying on classpath/workspace symbol search
- * are trimmed to the compiler-provided completions (our facade wires no
- * classpath search).
+ * Scala-3-syntax subset. Classpath-search completion items come from the
+ * island's real `SymbolSearch.search` (the PC-vendored ClasspathSearch over
+ * the corpus target's scala-library classpath, matching upstream's
+ * `BuildInfo.ideTestsDependencyClasspath`).
  */
 package ls.pc.corpus
 
@@ -91,12 +92,10 @@ class CompletionCorpusSuite extends CorpusCompletionHarness:
     "TTT[K <: Int] = [V] =>> Map[K, V]"
   )
 
-  // The upstream cases expect a second, classpath-search-provided line
-  // ("Found - scala.collection.Searching"); our facade wires no classpath
-  // search, so only the compiler-provided first line is asserted.
   private val extensionResult =
     """|Foo test
-       |""".stripMargin
+       |Found - scala.collection.Searching
+       """.stripMargin
 
   check(
     "extension-definition-scope",
@@ -105,7 +104,17 @@ class CompletionCorpusSuite extends CorpusCompletionHarness:
        |  extension (x: Fo@@)
        |""".stripMargin,
     extensionResult,
-    topLines = Some(1)
+    topLines = Some(2)
+  )
+
+  check(
+    "extension-definition-symbol-search",
+    """|object T:
+       |  extension (x: ListBuffe@@)
+       |""".stripMargin,
+    """|ListBuffer[A] - scala.collection.mutable
+       |ListBuffer - scala.collection.mutable
+       |""".stripMargin
   )
 
   check(
@@ -115,7 +124,7 @@ class CompletionCorpusSuite extends CorpusCompletionHarness:
        |  extension [A <: Fo@@]
        |""".stripMargin,
     extensionResult,
-    topLines = Some(1)
+    topLines = Some(2)
   )
 
   check(
@@ -125,7 +134,7 @@ class CompletionCorpusSuite extends CorpusCompletionHarness:
        |  extension (using Fo@@)
        |""".stripMargin,
     extensionResult,
-    topLines = Some(1)
+    topLines = Some(2)
   )
 
   check(
@@ -135,7 +144,7 @@ class CompletionCorpusSuite extends CorpusCompletionHarness:
        |  extension (x: Int)(using Fo@@)
        |""".stripMargin,
     extensionResult,
-    topLines = Some(1)
+    topLines = Some(2)
   )
 
   check(
@@ -145,7 +154,7 @@ class CompletionCorpusSuite extends CorpusCompletionHarness:
        |  extension (using Fo@@)(x: Int)(using Foo)
        |""".stripMargin,
     extensionResult,
-    topLines = Some(1)
+    topLines = Some(2)
   )
 
   check(
@@ -155,7 +164,7 @@ class CompletionCorpusSuite extends CorpusCompletionHarness:
        |  extension (using Foo)(x: Int)(using Fo@@)
        |""".stripMargin,
     extensionResult,
-    topLines = Some(1)
+    topLines = Some(2)
   )
 
   check(
@@ -165,7 +174,7 @@ class CompletionCorpusSuite extends CorpusCompletionHarness:
        |  extension [A](x: Fo@@)
        |""".stripMargin,
     extensionResult,
-    topLines = Some(1)
+    topLines = Some(2)
   )
 
   check(
@@ -175,7 +184,7 @@ class CompletionCorpusSuite extends CorpusCompletionHarness:
        |  extension [A](using Fo@@)(x: Int)
        |""".stripMargin,
     extensionResult,
-    topLines = Some(1)
+    topLines = Some(2)
   )
 
   check(
@@ -185,7 +194,7 @@ class CompletionCorpusSuite extends CorpusCompletionHarness:
        |  extension [A](using Foo)(x: Fo@@)
        |""".stripMargin,
     extensionResult,
-    topLines = Some(1)
+    topLines = Some(2)
   )
 
   check(
@@ -195,7 +204,7 @@ class CompletionCorpusSuite extends CorpusCompletionHarness:
        |  extension [A](using Foo)(x: Fo@@)(using Foo)
        |""".stripMargin,
     extensionResult,
-    topLines = Some(1)
+    topLines = Some(2)
   )
 
   check(

@@ -188,9 +188,13 @@ abstract class CorpusSuiteBase extends munit.FunSuite:
   */
 abstract class CorpusCompletionHarness extends CorpusSuiteBase:
 
-  protected def getItems(original: String, filename: String = "A.scala"): Seq[CompletionItem] =
+  protected def getItems(
+      original: String,
+      filename: String = "A.scala",
+      workspaceMethods: Seq[CorpusPc.WorkspaceMethod] = Nil
+  ): Seq[CompletionItem] =
     val (code, offset) = params(original)
-    val uri = CorpusPc.openBuffer(code, filename)
+    val uri = CorpusPc.openBuffer(code, filename, workspaceMethods)
     try
       val (line, col) = offsetToLsp(code, offset)
       val result = CorpusPc.facade.completion(uri, line, col)
@@ -202,7 +206,7 @@ abstract class CorpusCompletionHarness extends CorpusSuiteBase:
             case None => item
         }
         .sortBy(item => Option(item.getSortText).getOrElse(item.getLabel))
-    finally CorpusPc.facade.didClose(uri)
+    finally CorpusPc.closeBuffer(uri)
 
   /** Dotty `TestCompletions.getFullyQualifiedLabel`. */
   def fullyQualifiedLabel(item: CompletionItem): String =
@@ -223,13 +227,14 @@ abstract class CorpusCompletionHarness extends CorpusSuiteBase:
       includeDetail: Boolean = true,
       filename: String = "A.scala",
       filter: String => Boolean = _ => true,
-      enablePackageWrap: Boolean = true
+      enablePackageWrap: Boolean = true,
+      workspaceMethods: Seq[CorpusPc.WorkspaceMethod] = Nil
   )(implicit loc: munit.Location): Unit =
     test(name) {
       val withPkg =
         if original.contains("package") || !enablePackageWrap then original
         else s"package test\n$original"
-      val baseItems = getItems(withPkg, filename)
+      val baseItems = getItems(withPkg, filename, workspaceMethods)
       val items = topLines match
         case Some(top) => baseItems.take(top)
         case None => baseItems
@@ -285,10 +290,12 @@ abstract class CorpusCompletionHarness extends CorpusSuiteBase:
       filter: String => Boolean = _ => true,
       command: Option[String] = None,
       itemIndex: Int = 0,
-      filename: String = "A.scala"
+      filename: String = "A.scala",
+      workspaceMethods: Seq[CorpusPc.WorkspaceMethod] = Nil
   )(implicit loc: munit.Location): Unit =
     test(name) {
-      val items = getItems(original, filename).filter(item => filter(item.getLabel))
+      val items = getItems(original, filename, workspaceMethods)
+        .filter(item => filter(item.getLabel))
       assert(items.nonEmpty, "Obtained empty completions, can't check for edits.")
       if assertSingleItem && items.length != 1 then
         fail(
