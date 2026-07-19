@@ -12,6 +12,7 @@ from conftest import (
     ITEM,
     await_ready,
     doc_position,
+    source_text,
     source_uri,
 )
 
@@ -84,6 +85,64 @@ async def test_rename_surfaces_a_bsp_compile_failure(client_failing_compile):
             types.RenameParams(**at, new_name="Renamed")
         )
     assert "buildTarget/compile failed" in str(excinfo.value)
+
+
+async def test_a_ranged_did_change_dirties_the_buffer_and_rename_rejects_it(client):
+    """Incremental sync end to end: didOpen with the on-disk text, then a RANGED
+    didChange — the server's buffer diverges from disk exactly as edited, so
+    rename answers the typed dirty-buffer rejection; a second ranged edit that
+    reverts the first restores byte-equality with disk and rename succeeds
+    (an off-by-one in the server-side edit application would keep it dirty)."""
+    await await_ready(client)
+    uri = source_uri(ITEM)
+    client.text_document_did_open(
+        types.DidOpenTextDocumentParams(
+            text_document=types.TextDocumentItem(
+                uri=uri, language_id="scala", version=1, text=source_text(ITEM)
+            )
+        )
+    )
+    at = doc_position(ITEM, "Item")
+
+    def ranged_change(version, start, end, text):
+        client.text_document_did_change(
+            types.DidChangeTextDocumentParams(
+                text_document=types.VersionedTextDocumentIdentifier(
+                    uri=uri, version=version
+                ),
+                content_changes=[
+                    types.TextDocumentContentChangePartial(
+                        range=types.Range(start=start, end=end), text=text
+                    )
+                ],
+            )
+        )
+
+    # Insert a line at the top: the buffer now diverges from disk.
+    ranged_change(
+        2,
+        types.Position(line=0, character=0),
+        types.Position(line=0, character=0),
+        "// dirty\n",
+    )
+    with pytest.raises(Exception) as excinfo:
+        await client.text_document_rename_async(
+            types.RenameParams(**at, new_name="Renamed")
+        )
+    assert "has unsaved changes" in str(excinfo.value)
+
+    # Delete exactly the inserted line: the buffer is byte-identical to disk
+    # again, so the same rename now yields a WorkspaceEdit.
+    ranged_change(
+        3,
+        types.Position(line=0, character=0),
+        types.Position(line=1, character=0),
+        "",
+    )
+    edit = await client.text_document_rename_async(
+        types.RenameParams(**at, new_name="Renamed")
+    )
+    assert edit is not None and edit.changes, "clean-again buffer must rename"
 
 
 async def test_an_unsaved_top_level_symbol_is_pc_only(client):

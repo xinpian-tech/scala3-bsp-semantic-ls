@@ -311,6 +311,34 @@ impl WireClient {
         );
     }
 
+    /// A RANGED `didChange` (incremental sync): one contentChanges event whose
+    /// UTF-16 `[start, end)` range replaces that span with `text`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn did_change_range_uri(
+        &mut self,
+        uri: &str,
+        start_line: u32,
+        start_char: u32,
+        end_line: u32,
+        end_char: u32,
+        text: &str,
+        version: i64,
+    ) {
+        self.notify(
+            "textDocument/didChange",
+            json!({
+                "textDocument": {"uri": uri, "version": version},
+                "contentChanges": [{
+                    "range": {
+                        "start": {"line": start_line, "character": start_char},
+                        "end": {"line": end_line, "character": end_char},
+                    },
+                    "text": text,
+                }],
+            }),
+        );
+    }
+
     pub fn did_close(&mut self, rel: &str) {
         self.notify(
             "textDocument/didClose",

@@ -185,7 +185,8 @@ fn initialize_advertises_exactly_the_implemented_capability_set() {
     );
     let caps = &by_id(&out, 1)["result"]["capabilities"];
 
-    assert_eq!(caps["textDocumentSync"], 1);
+    assert_eq!(caps["textDocumentSync"], 2);
+    assert_eq!(caps["positionEncoding"], "utf-16");
     assert_eq!(caps["completionProvider"]["resolveProvider"], true);
     assert_eq!(
         caps["completionProvider"]["triggerCharacters"],

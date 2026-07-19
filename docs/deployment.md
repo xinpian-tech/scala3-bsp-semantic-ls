@@ -325,7 +325,7 @@ server for `scala` whose command is the binary and whose root is the workspace.
 
 | Advertised                                      | Notes                                        |
 |--------------------------------------------------|----------------------------------------------|
-| Text sync = **Full**                             | whole-document sync                          |
+| Text sync = **Incremental**                      | ranged `contentChanges` folded server-side; `positionEncoding: utf-16` advertised |
 | Completion (`resolveProvider`, trigger `.`)      | served by the embedded presentation compiler |
 | Hover; SignatureHelp (triggers `(` `,`)          |                                              |
 | Definition; TypeDefinition                       |                                              |

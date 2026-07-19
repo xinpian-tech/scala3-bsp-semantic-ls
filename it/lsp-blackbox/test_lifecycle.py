@@ -16,7 +16,8 @@ async def test_initialize_advertises_the_exact_capability_surface(client):
     result = client.init_result
     caps = result.capabilities
 
-    assert caps.text_document_sync == types.TextDocumentSyncKind.Full
+    assert caps.text_document_sync == types.TextDocumentSyncKind.Incremental
+    assert caps.position_encoding == types.PositionEncodingKind.Utf16
     assert caps.completion_provider.resolve_provider is True
     assert list(caps.completion_provider.trigger_characters) == ["."]
     assert caps.hover_provider is True

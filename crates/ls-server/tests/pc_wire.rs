@@ -130,11 +130,23 @@ fn the_document_lifecycle_mirrors_into_the_pc_service() {
     // processes messages in order) has applied the lifecycle notifications.
     let fence =
         json!({ "textDocument": { "uri": uri }, "position": { "line": 0, "character": 0 } });
-    let _ = client.result("textDocument/hover", fence);
+    let _ = client.result("textDocument/hover", fence.clone());
     assert_eq!(
         pc.mirrored_text(&uri).as_deref(),
         Some(changed.as_str()),
         "didChange must replace the mirrored text"
+    );
+
+    // A RANGED didChange (incremental sync): the server folds the event into
+    // its buffer and the PC seam still receives the FULL post-edit text.
+    // Line 6 of `changed` is "class Extra"; replace its name span [6..11).
+    let tweaked = changed.replace("class Extra", "class Tweaked");
+    client.did_change_range_uri(&uri, 6, 6, 6, 11, "Tweaked", 3);
+    let _ = client.result("textDocument/hover", fence);
+    assert_eq!(
+        pc.mirrored_text(&uri).as_deref(),
+        Some(tweaked.as_str()),
+        "a ranged didChange must mirror the full post-edit text into the PC"
     );
 
     client.notify(

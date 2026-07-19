@@ -1,6 +1,8 @@
 //! The advertised server capabilities and `initialize` result. The set is
-//! exactly the server's implemented surface: full text sync; completion (trigger
-//! `.`, resolve); hover; signature help (triggers `(`, `,`); definition;
+//! exactly the server's implemented surface: incremental text sync (with the
+//! explicit `utf-16` position encoding, the LSP default the server assumes
+//! everywhere); completion (trigger `.`, resolve); hover; signature help
+//! (triggers `(`, `,`); definition;
 //! type-definition; references; rename (prepare); document highlight; workspace
 //! symbol; and the execute-command set. `semanticTokens` and `inlayHint` are
 //! deliberately absent.
@@ -59,8 +61,12 @@ pub struct ExecuteCommandOptions {
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ServerCapabilities {
-    /// `1` == full document sync (`TextDocumentSyncKind.Full`).
+    /// `2` == incremental sync (`TextDocumentSyncKind.Incremental`): didChange
+    /// carries ranged `contentChanges` the server folds into its buffer.
     pub text_document_sync: u32,
+    /// `"utf-16"`, the LSP default, advertised explicitly (additive LSP 3.17
+    /// field): every position the server reads or writes is in UTF-16 units.
+    pub position_encoding: String,
     pub completion_provider: CompletionOptions,
     pub hover_provider: bool,
     pub signature_help_provider: SignatureHelpOptions,
@@ -89,7 +95,8 @@ pub struct InitializeResult {
 /// Builds the exact capability set the server implements.
 pub fn server_capabilities() -> ServerCapabilities {
     ServerCapabilities {
-        text_document_sync: 1,
+        text_document_sync: 2,
+        position_encoding: "utf-16".to_string(),
         completion_provider: CompletionOptions {
             resolve_provider: true,
             trigger_characters: vec![".".to_string()],
@@ -156,8 +163,13 @@ mod tests {
     }
 
     #[test]
-    fn registers_full_text_document_sync() {
-        assert!(initialize_json().contains("\"textDocumentSync\":1"));
+    fn registers_incremental_text_document_sync() {
+        assert!(initialize_json().contains("\"textDocumentSync\":2"));
+    }
+
+    #[test]
+    fn advertises_the_utf16_position_encoding() {
+        assert!(initialize_json().contains("\"positionEncoding\":\"utf-16\""));
     }
 
     #[test]

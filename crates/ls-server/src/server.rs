@@ -31,7 +31,7 @@ use ls_index_model::uri::{normalize, normalize_uri, uri_to_path};
 
 use crate::capabilities::{commands, initialize_result, InitializeResult};
 use crate::doctor::DoctorReport;
-use crate::documents::DocumentStore;
+use crate::documents::{ContentChange, DocumentStore};
 use crate::jsonrpc::{
     error_codes, parse_incoming, read_frame, write_frame, Incoming, Notification, Request,
     RequestId, Response, ResponseError,
@@ -98,7 +98,9 @@ pub trait Handlers<S> {
     /// normalized.
     fn on_did_open(&self, _services: &S, _uri: &str, _text: &str) {}
 
-    /// An open buffer's text changed (full-text sync). `uri` is normalized.
+    /// An open buffer's text changed. `text` is the FULL post-edit document —
+    /// the loop folds the incremental `contentChanges` events into the store
+    /// before this hook, so the seam stays full-text. `uri` is normalized.
     fn on_did_change(&self, _services: &S, _uri: &str, _text: &str) {}
 
     /// A buffer was closed (already dropped from the document store). `uri` is
@@ -244,18 +246,35 @@ impl<S> ServerCore<S> {
         let (Some(uri), Some(text)) = (document_uri(params), document_text(params)) else {
             return;
         };
-        self.docs.open(&uri, &text);
+        self.docs
+            .open_versioned(&uri, &text, document_version(params).unwrap_or(0));
         if let Some(services) = self.state.ready() {
             handlers.on_did_open(services, &uri, &text);
         }
     }
 
     fn did_change(&self, handlers: &impl Handlers<S>, params: &Value) {
-        // Full-text sync: the last content change carries the whole document.
-        let (Some(uri), Some(text)) = (document_uri(params), last_change_text(params)) else {
+        // Incremental sync: fold the contentChanges event list onto the buffer
+        // and forward the FULL post-edit text (the downstream seam is full-text).
+        let Some(uri) = document_uri(params) else {
             return;
         };
-        self.docs.change(&uri, &text);
+        let Some(changes) = content_changes(params) else {
+            eprintln!("ls-server: ignoring a didChange with unparseable contentChanges for {uri}");
+            return;
+        };
+        if changes.is_empty() {
+            return;
+        }
+        let Some(text) = self
+            .docs
+            .apply_changes(&uri, document_version(params), &changes)
+        else {
+            eprintln!(
+                "ls-server: dropping a ranged didChange for {uri}: the buffer was never opened"
+            );
+            return;
+        };
         if let Some(services) = self.state.ready() {
             handlers.on_did_change(services, &uri, &text);
         }
@@ -746,16 +765,14 @@ fn document_text(params: &Value) -> Option<String> {
     )
 }
 
-fn last_change_text(params: &Value) -> Option<String> {
-    Some(
-        params
-            .get("contentChanges")?
-            .as_array()?
-            .last()?
-            .get("text")?
-            .as_str()?
-            .to_string(),
-    )
+fn document_version(params: &Value) -> Option<i64> {
+    params.get("textDocument")?.get("version")?.as_i64()
+}
+
+/// The typed `contentChanges` event list (ranged and/or whole-document items).
+/// `None` when the field is missing or any item fails to parse.
+fn content_changes(params: &Value) -> Option<Vec<ContentChange>> {
+    serde_json::from_value(params.get("contentChanges")?.clone()).ok()
 }
 
 #[cfg(test)]
@@ -1548,25 +1565,60 @@ mod tests {
     }
 
     #[test]
-    fn did_change_full_sync_takes_the_last_change_and_did_close_drops_the_buffer() {
+    fn did_change_folds_the_event_list_and_did_close_drops_the_buffer() {
         let core: ServerCore<FakeServices> = ServerCore::new();
         core.did_open(
             &EchoHandlers,
-            &json!({ "textDocument": { "uri": "file:///a", "text": "v1" } }),
+            &json!({ "textDocument": { "uri": "file:///a", "version": 1, "text": "v1" } }),
         );
+        assert_eq!(core.docs.version("file:///a"), Some(1));
+        // A rangeless full replace followed by a ranged event addressing the
+        // replaced text — the fold applies them in order.
         core.did_change(
             &EchoHandlers,
             &json!({
-                "textDocument": { "uri": "file:///a" },
-                "contentChanges": [ { "text": "stale" }, { "text": "v2" } ]
+                "textDocument": { "uri": "file:///a", "version": 2 },
+                "contentChanges": [
+                    { "text": "stale" },
+                    { "text": "v2" },
+                    {
+                        "range": {
+                            "start": { "line": 0, "character": 2 },
+                            "end": { "line": 0, "character": 2 }
+                        },
+                        "text": ".1"
+                    }
+                ]
             }),
         );
-        assert_eq!(core.docs.text("file:///a").as_deref(), Some("v2"));
+        assert_eq!(core.docs.text("file:///a").as_deref(), Some("v2.1"));
+        assert_eq!(core.docs.version("file:///a"), Some(2));
         core.did_close(
             &EchoHandlers,
             &json!({ "textDocument": { "uri": "file:///a" } }),
         );
         assert!(!core.docs.is_open("file:///a"));
+    }
+
+    // A ranged didChange for a buffer that was never opened has no base text to
+    // edit: it is dropped (with a stderr log), never mis-applied.
+    #[test]
+    fn a_ranged_did_change_for_a_never_opened_buffer_is_dropped() {
+        let core: ServerCore<FakeServices> = ServerCore::new();
+        core.did_change(
+            &EchoHandlers,
+            &json!({
+                "textDocument": { "uri": "file:///never-opened", "version": 1 },
+                "contentChanges": [{
+                    "range": {
+                        "start": { "line": 0, "character": 0 },
+                        "end": { "line": 0, "character": 0 }
+                    },
+                    "text": "X"
+                }]
+            }),
+        );
+        assert!(!core.docs.is_open("file:///never-opened"));
     }
 
     #[test]
