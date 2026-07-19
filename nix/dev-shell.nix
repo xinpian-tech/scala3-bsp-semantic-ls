@@ -1,6 +1,6 @@
 { pkgs, jdk, mill, zaozi-src ? null
 , pcHostAgentJar ? null, scalaLibraryJar ? null, scala3LibraryJar ? null
-, zaoziPcpluginJar ? null }:
+, zaoziPcpluginJar ? null, pythonEnv ? null }:
 
 pkgs.mkShell {
   packages = with pkgs; [
@@ -23,7 +23,7 @@ pkgs.mkShell {
     # jextract generates the Java/Scala FFM bindings from the cbindgen C-ABI
     # header (island boundary); used by the ls-pc-host island + the boundary spike.
     jextract
-  ];
+  ] ++ pkgs.lib.optional (pythonEnv != null) pythonEnv;
 
   JAVA_HOME = "${jdk}";
   LS_JAVA_VERSION = "25";

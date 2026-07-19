@@ -43,6 +43,11 @@
         craneLib = crane.mkLib pkgs;
         rust = import ./nix/rust.nix { inherit pkgs craneLib; };
 
+        # The Python toolchain for the black-box LSP test layer: pytest-lsp
+        # (spawns the real binary over stdio) + lsp-devtools (traffic
+        # record/inspect for interactive debugging).
+        pythonTools = import ./nix/python-tools.nix { inherit pkgs; };
+
         # Embedded-JVM boundary spike: the mill-built island agent jar plus an
         # end-to-end check that boots the JVM through the crane-built spike binary
         # and drives every boundary scenario (echo / containment / timeout /
@@ -180,6 +185,20 @@
           touch $out
         '';
 
+        # The black-box LSP suite: pytest-lsp (an independent client this repo
+        # did not write) spawns the crane-built ls-server binary over REAL stdio
+        # against the scriptable Python fake BSP server, which advertises the
+        # committed ls-engine SemanticDB fixture corpus — hermetic (no mill, no
+        # JVM, no network), so it runs inside `nix flake check`.
+        lsp-blackbox-check = pkgs.runCommand "check-lsp-blackbox"
+          { nativeBuildInputs = [ pythonTools.pythonEnv ]; } ''
+          export LS_SERVER_BIN="${rust.package}/bin/ls-server"
+          export HOME="$TMPDIR"
+          cd "$TMPDIR"
+          pytest "${self}/it/lsp-blackbox" -v
+          touch $out
+        '';
+
         pc-host-agent-check = pkgs.runCommand "check-pc-host-agent"
           { nativeBuildInputs = [ jdk ]; } ''
           jar="${pcHostAgentJar}/pc-host-agent.jar"
@@ -205,6 +224,7 @@
         devShells.default = import ./nix/dev-shell.nix {
           inherit pkgs jdk mill zaozi-src;
           inherit pcHostAgentJar scalaLibraryJar scala3LibraryJar zaoziPcpluginJar;
+          inherit (pythonTools) pythonEnv;
         };
 
         formatter = pkgs.nixpkgs-fmt;
@@ -215,6 +235,7 @@
           spike-boundary = spike-boundary-check;
           pc-host-agent = pc-host-agent-check;
           package-cli = package-cli-check;
+          lsp-blackbox = lsp-blackbox-check;
           pc-boundary = pc-boundary-check;
           pc-recovery = pc-recovery-check;
           pc-definition = pc-definition-check;
