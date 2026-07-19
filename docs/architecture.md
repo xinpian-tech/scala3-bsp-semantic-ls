@@ -257,13 +257,29 @@ postings are always one generation and can never disagree about the world.
 
 ### 3.4 Protocol stack and server surface
 
-Both protocol stacks are hand-rolled, synchronous Rust: `Content-Length`
-framing plus the request/notification/response model over `serde_json`
-(`ls-server::jsonrpc` for LSP, `ls-bsp` for the BSP client). Neither lsp4j nor
-bsp4j exists in the server (their eviction/forwarder workarounds went with
-them); the island retains lsp4j **internally only** as the presentation
-compiler's carrier types, converted to flat ABI payloads before anything
-crosses the boundary.
+Both protocol stacks are hand-rolled Rust: `Content-Length` framing plus the
+request/notification/response model over `serde_json` (`ls-server::jsonrpc`
+for LSP, `ls-bsp` for the BSP client). Neither lsp4j nor bsp4j exists in the
+server (their eviction/forwarder workarounds went with them); the island
+retains lsp4j **internally only** as the presentation compiler's carrier
+types, converted to flat ABI payloads before anything crosses the boundary.
+
+The LSP message loop (`ls-server::server::serve`) is a scoped reader thread
+plus a single dispatch thread. The reader parses frames in order into an
+in-process queue and intercepts `$/cancelRequest` into a bounded cancel set
+(never enqueued), so a cancel is seen even while dispatch is deep in a slow
+request — e.g. a cold-boot PC completion — with typed-ahead requests queued
+behind it. Dispatch stays strictly single-threaded: the ready services, the
+per-turn bootstrap/reload polling, and the shutdown/exit semantics are
+unchanged from the synchronous loop. A queued request whose id was cancelled
+answers `RequestCancelled` (−32800) without dispatching; an in-flight request
+runs to completion and answers normally (spec-legal); `initialize` and
+`shutdown` are never cancelled; a cancel for an unknown or already-answered id
+is inert. (rust-analyzer's `lsp-server` scaffold was evaluated for reuse; its
+`Connection` owns the transport and its `ReqQueue` tracks in-flight requests
+for concurrent handlers — neither fits the borrowed-reader/serial-dispatch
+architecture, so only its reader-thread discipline — stop after forwarding
+`exit` — and the −32800 answer were borrowed conceptually.)
 
 The capability surface is unchanged from v1 with one recorded trim, deferred
 rather than silently dropped: the no-BSP warm-restart mode over a recovered

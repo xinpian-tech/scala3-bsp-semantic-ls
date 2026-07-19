@@ -185,6 +185,87 @@ fn pc_queries_on_a_no_semanticdb_source_stay_hard_errors() {
     client.shutdown();
 }
 
+// `$/cancelRequest` for a QUEUED request over the wire: completion 1 is held in
+// flight at the fake PC while completion 2 (and a didChange behind it) queue on
+// the serve loop; the reader thread intercepts the cancel for 2 even though
+// dispatch is busy. Releasing 1 answers 1 normally and 2 with −32800 WITHOUT
+// the PC ever seeing 2, and the notification queued after the cancelled request
+// is still processed in order.
+#[test]
+fn a_cancelled_queued_completion_answers_request_cancelled_over_the_wire() {
+    use std::sync::Barrier;
+    use std::time::{Duration, Instant};
+
+    let (mut client, pc) = boot();
+    client.initialize();
+    client.await_ready();
+
+    let uri = core_uri();
+    client.did_open_uri(&uri, DIRTY);
+    let (line, character) = position_of(DIRTY, "ping", 0);
+    let at = json!({ "textDocument": { "uri": uri }, "position": { "line": line, "character": character } });
+
+    // Hold the next completion in flight at the fake PC (a one-shot gate).
+    let gate = Arc::new(Barrier::new(2));
+    pc.gate_method("completion", Arc::clone(&gate));
+    let first = client.send_request_no_wait("textDocument/completion", at.clone());
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !pc.calls().iter().any(|c| c.starts_with("completion")) {
+        assert!(
+            Instant::now() < deadline,
+            "completion 1 never reached the PC"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+
+    // Queue completion 2 behind the blocked dispatch, a didChange behind it,
+    // then cancel 2 and wait for the reader thread to intercept the cancel
+    // before releasing 1 (the deterministic fence).
+    let second = client.send_request_no_wait("textDocument/completion", at.clone());
+    let retagged = DIRTY.replace("class Core", "class Retagged");
+    client.did_change_uri(&uri, &retagged);
+    client.cancel(second);
+    client.await_cancel_registered(second);
+    gate.wait();
+
+    let first_response = client.await_response(first);
+    assert!(
+        first_response.get("error").is_none(),
+        "completion 1 answers normally: {first_response}"
+    );
+    assert_eq!(
+        first_response["result"]["items"][0]["label"],
+        format!("fakeItem@{line}:{character}")
+    );
+    let second_response = client.await_response(second);
+    assert_eq!(
+        second_response["error"]["code"],
+        ls_server::jsonrpc::error_codes::REQUEST_CANCELLED,
+        "{second_response}"
+    );
+    assert_eq!(second_response["error"]["message"], "request cancelled");
+
+    // The PC saw exactly one completion — the cancelled request was answered
+    // without dispatching — and the didChange queued AFTER it still mirrored in
+    // order (a hover fences the loop past the notification).
+    let _ = client.result("textDocument/hover", at);
+    assert_eq!(
+        pc.calls()
+            .iter()
+            .filter(|c| c.starts_with("completion"))
+            .count(),
+        1,
+        "the cancelled completion must never reach the PC: {:?}",
+        pc.calls()
+    );
+    assert_eq!(
+        pc.mirrored_text(&uri).as_deref(),
+        Some(retagged.as_str()),
+        "the notification behind the cancelled request still applied in order"
+    );
+    client.shutdown();
+}
+
 // The `scala3SemanticLs.pcPluginStatus` executeCommand round-trips through the
 // REAL serve loop to the injected PC service's plugin report: the text summary
 // by default, the structured `{compilerPlugins, servicePlugins, disabled}`

@@ -5,20 +5,23 @@
 //! [`WireClient::spawn_binary`] spawns a real server binary and drives it over
 //! its actual stdin/stdout — the editor's-eye view.
 
+use std::collections::HashSet;
 use std::io::{BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
 use ls_bsp::uri::path_to_uri;
-use ls_server::{read_frame, serve, Bootstrap, CoreHandlers, CoreServices, OutputSink, ServerCore};
+use ls_server::{
+    read_frame, serve, Bootstrap, CoreHandlers, CoreServices, OutputSink, RequestId, ServerCore,
+};
 
 pub const DOCTOR: &str = "scala3SemanticLs.doctor";
 pub const COMPILE: &str = "scala3SemanticLs.compile";
@@ -31,6 +34,10 @@ pub const REINDEX: &str = "scala3SemanticLs.reindex";
 pub struct WireParts {
     pub sink: Arc<OutputSink<UnixStream>>,
     pub reload_flag: Arc<AtomicBool>,
+    /// The serve loop's cancel-set handle (`$/cancelRequest` interception), so a
+    /// suite can wait until a cancel has provably been intercepted before
+    /// releasing a gated in-flight request.
+    pub cancel_handle: Arc<Mutex<HashSet<RequestId>>>,
 }
 
 /// An interactive client on the framed LSP wire: requests block on their
@@ -45,6 +52,9 @@ pub struct WireClient {
     serve_thread: Option<JoinHandle<()>>,
     reader_thread: Option<JoinHandle<()>>,
     child: Option<Child>,
+    /// The in-process serve loop's cancel-set handle (`None` for a spawned
+    /// binary, whose internals are not observable).
+    cancel_handle: Option<Arc<Mutex<HashSet<RequestId>>>>,
     /// Fixtures the session depends on for its lifetime (e.g. the fake BSP
     /// server handle owning the temp workspace); dropped with the client.
     _keepalive: Option<Box<dyn std::any::Any + Send>>,
@@ -80,9 +90,11 @@ impl WireClient {
 
         let mut core = ServerCore::new();
         let sink = Arc::new(OutputSink::new(server_write));
+        let cancel_handle = core.cancel_handle();
         let parts = WireParts {
             sink: Arc::clone(&sink),
             reload_flag: core.reload_flag(),
+            cancel_handle: Arc::clone(&cancel_handle),
         };
         let (ws, keepalive, bootstrap) = build(&parts);
         let serve_thread = thread::spawn(move || {
@@ -106,6 +118,7 @@ impl WireClient {
             serve_thread: Some(serve_thread),
             reader_thread: Some(reader_thread),
             child: None,
+            cancel_handle: Some(cancel_handle),
             _keepalive: Some(Box::new(keepalive)),
         }
     }
@@ -131,6 +144,7 @@ impl WireClient {
             serve_thread: None,
             reader_thread: Some(reader_thread),
             child: Some(child),
+            cancel_handle: None,
             _keepalive: None,
         }
     }
@@ -146,10 +160,51 @@ impl WireClient {
     /// Send a request and block until its response (by id) arrives, buffering
     /// any notifications seen in the meantime.
     pub fn request(&mut self, method: &str, params: Value) -> Value {
+        let id = self.send_request_no_wait(method, params);
+        self.await_response_for(id, method)
+    }
+
+    /// Send a request WITHOUT waiting for its response; returns the id, for
+    /// [`WireClient::await_response`] (or [`WireClient::cancel`]) later.
+    pub fn send_request_no_wait(&mut self, method: &str, params: Value) -> i64 {
         let id = self.next_id;
         self.next_id += 1;
         self.send_frame(&json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}));
+        id
+    }
 
+    /// Send a `$/cancelRequest` notification for a previously sent request id.
+    pub fn cancel(&mut self, id: i64) {
+        self.notify("$/cancelRequest", json!({ "id": id }));
+    }
+
+    /// In-process sessions only: block until the serve loop's reader thread has
+    /// intercepted the `$/cancelRequest` for `id` — the deterministic fence
+    /// between sending a cancel and releasing a gated in-flight request. (The
+    /// entry is consumed at dispatch, so fence BEFORE the cancelled request's
+    /// turn comes.)
+    pub fn await_cancel_registered(&self, id: i64) {
+        let handle = self
+            .cancel_handle
+            .as_ref()
+            .expect("cancel introspection needs an in-process session");
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !handle.lock().unwrap().contains(&RequestId::Number(id)) {
+            assert!(
+                Instant::now() < deadline,
+                "the cancel for id {id} was never intercepted"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    /// Block until the response for an already-sent request id arrives,
+    /// buffering any notifications seen in the meantime.
+    pub fn await_response(&mut self, id: i64) -> Value {
+        self.await_response_for(id, "request")
+    }
+
+    fn await_response_for(&mut self, id: i64, method: &str) -> Value {
         let deadline = Instant::now() + Duration::from_secs(600);
         loop {
             if let Some(pos) = self

@@ -8,7 +8,7 @@
 //! registered-target gate behave like the island's outer mirror.
 
 use std::collections::{BTreeSet, HashMap};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Barrier, Mutex};
 
 use serde_json::{json, Value};
 
@@ -30,6 +30,13 @@ pub struct FakePcService {
     registered: Mutex<BTreeSet<String>>,
     /// Every trait call, in order — suites assert lifecycle routing over this.
     log: Mutex<Vec<String>>,
+    /// One-shot method gates ([`FakePcService::gate_method`]): the next call of
+    /// a gated method logs itself, then blocks on the barrier (and the gate is
+    /// consumed) — so a wire suite can hold one request in flight on the serve
+    /// loop while later frames queue behind it. One-shot on purpose: a request
+    /// that should have been cancelled but wrongly reaches the PC answers
+    /// normally (a clean assertion failure) instead of deadlocking the suite.
+    gates: Mutex<HashMap<String, Arc<Barrier>>>,
 }
 
 impl FakePcService {
@@ -67,8 +74,21 @@ impl FakePcService {
             .map(|(_, text)| text.clone())
     }
 
+    /// Arm a one-shot gate on `method` (a call-log method name, e.g.
+    /// `"completion"`): the next such call blocks on the barrier AFTER logging
+    /// itself, so the suite can poll [`FakePcService::calls`] to learn the call
+    /// is in flight, do its work, then release via `gate.wait()`.
+    pub fn gate_method(&self, method: &str, gate: Arc<Barrier>) {
+        self.gates.lock().unwrap().insert(method.to_string(), gate);
+    }
+
     fn record(&self, call: String) {
-        self.log.lock().unwrap().push(call);
+        self.log.lock().unwrap().push(call.clone());
+        let method = call.split(' ').next().unwrap_or_default().to_string();
+        let gate = self.gates.lock().unwrap().remove(&method);
+        if let Some(gate) = gate {
+            gate.wait();
+        }
     }
 }
 

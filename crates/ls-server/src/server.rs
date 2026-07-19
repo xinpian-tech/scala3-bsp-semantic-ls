@@ -17,7 +17,36 @@
 //! workspace stays `NotReady` (so pre-ready requests are served concurrently with
 //! the per-method fallbacks), and the loop adopts Ready/Failed and replays the
 //! open buffers ([`Bootstrap::replay`]) when the worker completes.
+//!
+//! # The reader thread and `$/cancelRequest`
+//!
+//! [`serve`] is a scoped reader thread plus the single dispatch loop. The reader
+//! reads and parses frames IN ORDER and forwards them over an in-process queue —
+//! except `$/cancelRequest`, which it intercepts into the shared cancel set
+//! (never enqueued), so a cancel is visible even while dispatch is deep in a slow
+//! request (e.g. a cold-boot PC completion) with typed-ahead requests queued
+//! behind it. Dispatch stays single-threaded on the loop thread — the ready
+//! services, the per-turn `poll_bootstrap`/`poll_reload`, and the shutdown/exit
+//! semantics keep every single-threaded invariant. When a request's turn comes
+//! and its id is in the cancel set, it answers `REQUEST_CANCELLED` (−32800)
+//! without dispatching; an in-flight request runs to completion and answers
+//! normally (spec-legal); `initialize`/`shutdown` are never cancelled. A cancel
+//! for an unknown or already-answered id is inert, and the set is capped
+//! defensively ([`CANCEL_SET_CAP`]).
+//!
+//! Upstream note: rust-analyzer's `lsp-server` crate was evaluated first. Its
+//! `Connection` owns the process transport (stdio/socket + crossbeam channels +
+//! its own message model), which would replace the `&mut impl BufRead` /
+//! [`OutputSink`] seams this crate's in-process tests and the shared
+//! diagnostics sink are built on — full adoption declined as too invasive. Its
+//! `ReqQueue` registers IN-FLIGHT requests for concurrent handlers; with
+//! strictly serial dispatch nothing is ever in flight elsewhere, so it reduces
+//! to a map-as-set with no leverage. What IS borrowed conceptually: the reader
+//! thread's shape — forward in order, stop after forwarding `exit` so the loop
+//! can end without waiting for the client to close the pipe (its `stdio.rs`)
+//! — and the −32800 answer for a cancelled pending request (its `req_queue.rs`).
 
+use std::collections::HashSet;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -33,8 +62,8 @@ use crate::capabilities::{commands, initialize_result, InitializeResult};
 use crate::doctor::DoctorReport;
 use crate::documents::{ContentChange, DocumentStore};
 use crate::jsonrpc::{
-    error_codes, parse_incoming, read_frame, write_frame, Incoming, Notification, Request,
-    RequestId, Response, ResponseError,
+    cancel_request_id, error_codes, parse_incoming, read_frame, write_frame, Incoming,
+    Notification, Request, RequestId, Response, ResponseError,
 };
 use crate::lifecycle::{pre_ready_outcome, require_ready, Method, PreReadyOutcome, WorkspaceState};
 use crate::protocol::PublishDiagnosticsParams;
@@ -185,6 +214,14 @@ pub struct ServerCore<S> {
     /// is the only state shared with the reader thread — the reload itself runs on
     /// the loop, so the ready services stay single-threaded.
     reload_requested: Arc<AtomicBool>,
+    /// The ids the client asked to cancel (`$/cancelRequest`), intercepted by
+    /// [`serve`]'s input reader thread BEFORE the message queue and drained at
+    /// dispatch: a request whose id is here when its turn comes answers
+    /// `REQUEST_CANCELLED` without dispatching. Shared with the reader thread
+    /// the way `reload_requested` is shared with the BSP reader; bounded by
+    /// [`CANCEL_SET_CAP`]. A stale entry (an unknown or already-answered id) is
+    /// inert.
+    cancelled: Arc<Mutex<HashSet<RequestId>>>,
     /// The in-flight bootstrap worker's result channel, set when `initialized`
     /// spawns the worker and cleared when its result is adopted. While it is
     /// `Some`, the workspace stays `NotReady` and pre-ready fallbacks are served;
@@ -205,6 +242,7 @@ impl<S> ServerCore<S> {
             shutting_down: false,
             initialized: false,
             reload_requested: Arc::new(AtomicBool::new(false)),
+            cancelled: Arc::new(Mutex::new(HashSet::new())),
             bootstrap_rx: None,
             bootstrap_handle: None,
         }
@@ -214,6 +252,13 @@ impl<S> ServerCore<S> {
     /// set from the BSP reader thread when the server reports a target change.
     pub fn reload_flag(&self) -> Arc<AtomicBool> {
         self.reload_requested.clone()
+    }
+
+    /// A handle to the cancel set, for a test to observe when the reader thread
+    /// has intercepted a `$/cancelRequest` (the deterministic fence between
+    /// sending a cancel and releasing a gated in-flight request).
+    pub fn cancel_handle(&self) -> Arc<Mutex<HashSet<RequestId>>> {
+        self.cancelled.clone()
     }
 
     /// Handles `initialize`: records the workspace root and, unless the workspace
@@ -321,9 +366,83 @@ enum Flow {
     Stop,
 }
 
+/// The defensive bound on the cancel set: at this size the set is cleared (with
+/// a log line) before the next insert. Dropping stale cancels is safe — a lost
+/// cancel only means the request answers normally, which is spec-legal.
+const CANCEL_SET_CAP: usize = 1024;
+
+/// What the reader thread forwards to the dispatch loop: a parsed frame (or its
+/// parse error, answered with a null-id error frame) or the read error that
+/// ended the input.
+enum Inbound {
+    Frame(Result<Incoming, ResponseError>),
+    ReadError(io::Error),
+}
+
+/// The scoped input reader: reads and parses frames IN ORDER, forwarding each
+/// over the channel — except `$/cancelRequest`, which is intercepted into the
+/// shared cancel set and never enqueued. Ends at EOF (closing the channel), on
+/// a read error (forwarded), or after forwarding `exit` — so `serve` returns
+/// promptly on `exit` without waiting for the client to close the pipe (the
+/// same discipline as `lsp-server`'s stdio reader thread).
+fn read_loop(
+    reader: &mut (impl BufRead + Send),
+    tx: mpsc::Sender<Inbound>,
+    cancelled: &Mutex<HashSet<RequestId>>,
+) {
+    loop {
+        let body = match read_frame(reader) {
+            Ok(Some(body)) => body,
+            Ok(None) => return,
+            Err(error) => {
+                let _ = tx.send(Inbound::ReadError(error));
+                return;
+            }
+        };
+        let parsed = parse_incoming(&body);
+        if let Ok(Incoming::Notification(note)) = &parsed {
+            if note.method == "$/cancelRequest" {
+                record_cancel(cancelled, &note.params);
+                continue;
+            }
+        }
+        let is_exit = matches!(&parsed, Ok(Incoming::Notification(note)) if note.method == "exit");
+        if tx.send(Inbound::Frame(parsed)).is_err() || is_exit {
+            return;
+        }
+    }
+}
+
+/// Records a `$/cancelRequest` target id into the cancel set, enforcing the
+/// defensive cap. A cancel without a usable id is inert (logged).
+fn record_cancel(cancelled: &Mutex<HashSet<RequestId>>, params: &Value) {
+    let Some(id) = cancel_request_id(params) else {
+        eprintln!("ls-server: ignoring a $/cancelRequest without a usable id: {params}");
+        return;
+    };
+    let mut set = cancelled.lock().unwrap();
+    if set.len() >= CANCEL_SET_CAP {
+        eprintln!(
+            "ls-server: the cancel set reached {CANCEL_SET_CAP} stale entries; clearing it \
+             (a dropped cancel only means that request answers normally)"
+        );
+        set.clear();
+    }
+    set.insert(id);
+}
+
+/// Check-and-remove the request's id from the cancel set. `true` means the
+/// request was cancelled while queued and must answer `REQUEST_CANCELLED`
+/// without dispatching. `initialize` and `shutdown` are never cancelled
+/// (spec + lifecycle safety) — a cancel naming them is consumed but ignored.
+fn cancelled_before_dispatch<S>(core: &ServerCore<S>, request: &Request) -> bool {
+    let was_cancelled = core.cancelled.lock().unwrap().remove(&request.id);
+    was_cancelled && !matches!(request.method.as_str(), "initialize" | "shutdown")
+}
+
 /// Runs the stdio server loop until `exit` or a clean end of input.
 pub fn serve<S, B, W>(
-    reader: &mut impl BufRead,
+    reader: &mut (impl BufRead + Send),
     sink: &OutputSink<W>,
     core: &mut ServerCore<S>,
     handlers: &impl Handlers<S>,
@@ -338,35 +457,54 @@ where
     // reader thread (see the live model source's `on_diagnostics`); the loop only
     // writes request responses, and the shared lock keeps the two serialized.
     let bootstrap = Arc::new(bootstrap);
+    let cancel_stash = Arc::clone(&core.cancelled);
     let mut exiting = false;
-    while let Some(body) = read_frame(reader)? {
-        // At the top of each turn, adopt a completed async bootstrap and then drain
-        // a build-target reload, so the message just read sees the freshest state.
-        poll_bootstrap(core, &*bootstrap);
-        poll_reload(core, &*bootstrap);
-        match parse_incoming(&body) {
-            Ok(Incoming::Request(request)) => {
-                let response = dispatch_request(core, handlers, request);
-                sink.send(&response)?;
-            }
-            Ok(Incoming::Notification(note)) => {
-                if let Flow::Stop = dispatch_notification(core, handlers, &bootstrap, note) {
-                    exiting = true;
-                    break;
+    // The scope keeps `serve`'s borrowed-reader signature: the reader thread
+    // borrows `reader` for the scope's lifetime and is joined before `serve`
+    // returns (it ends at EOF, on a read error, or after forwarding `exit`).
+    thread::scope(|scope| -> io::Result<()> {
+        let (tx, rx) = mpsc::channel();
+        scope.spawn(move || read_loop(reader, tx, &cancel_stash));
+        for inbound in rx {
+            // At the top of each turn, adopt a completed async bootstrap and then
+            // drain a build-target reload, so the message sees the freshest state.
+            poll_bootstrap(core, &*bootstrap);
+            poll_reload(core, &*bootstrap);
+            match inbound {
+                Inbound::Frame(Ok(Incoming::Request(request))) => {
+                    let response = if cancelled_before_dispatch(core, &request) {
+                        // Cancelled while queued: answered without dispatching —
+                        // the handlers never see the request.
+                        Response::failure(
+                            request.id,
+                            ResponseError::new(error_codes::REQUEST_CANCELLED, "request cancelled"),
+                        )
+                    } else {
+                        dispatch_request(core, handlers, request)
+                    };
+                    sink.send(&response)?;
                 }
+                Inbound::Frame(Ok(Incoming::Notification(note))) => {
+                    if let Flow::Stop = dispatch_notification(core, handlers, &bootstrap, note) {
+                        exiting = true;
+                        break;
+                    }
+                }
+                Inbound::Frame(Ok(Incoming::Response(response))) => {
+                    // An inbound client response (a reply to a server-to-client
+                    // request): the server has no such request in flight yet, so it
+                    // is consumed and dropped — never answered with an error frame.
+                    eprintln!(
+                        "ls-server: ignoring a client response with no matching request (id: {:?})",
+                        response.id
+                    );
+                }
+                Inbound::Frame(Err(error)) => sink.send(&null_id_error(&error))?,
+                Inbound::ReadError(error) => return Err(error),
             }
-            Ok(Incoming::Response(response)) => {
-                // An inbound client response (a reply to a server-to-client
-                // request): the server has no such request in flight yet, so it
-                // is consumed and dropped — never answered with an error frame.
-                eprintln!(
-                    "ls-server: ignoring a client response with no matching request (id: {:?})",
-                    response.id
-                );
-            }
-            Err(error) => sink.send(&null_id_error(&error))?,
         }
-    }
+        Ok(())
+    })?;
     if exiting || core.shutting_down {
         // `exit`, or a shutting-down server: detach any in-flight worker and return
         // promptly — a late result must neither resurrect the shut-down state nor
@@ -1834,5 +1972,294 @@ mod tests {
         assert_eq!(drive(true), vec!["svc".to_string()]);
         // Not ready (failed bootstrap): the notification is ignored.
         assert!(drive(false).is_empty());
+    }
+
+    // The `$/cancelRequest` core contract: request A is held in flight in the
+    // handler while B queues behind it and the reader thread intercepts
+    // cancel(B); releasing A answers A normally and B with −32800 WITHOUT the
+    // handler ever seeing B, and the matched cancel entry is pruned.
+    #[test]
+    fn a_cancelled_queued_request_answers_request_cancelled_without_dispatch() {
+        use std::time::{Duration, Instant};
+
+        struct GatedHandlers {
+            gate: Arc<std::sync::Barrier>,
+            seen: Arc<Mutex<Vec<RequestId>>>,
+        }
+        impl Handlers<FakeServices> for GatedHandlers {
+            fn handle(&self, cx: RequestContext<'_, FakeServices>) -> Response {
+                self.seen.lock().unwrap().push(cx.request.id.clone());
+                if cx.request.id == RequestId::Number(2) {
+                    // Hold request 2 in flight until the test releases it.
+                    self.gate.wait();
+                }
+                Response::success(cx.request.id.clone(), json!({ "served": true }))
+            }
+        }
+
+        let mut core: ServerCore<FakeServices> = ServerCore::new();
+        let cancel_handle = core.cancel_handle();
+        let gate = Arc::new(std::sync::Barrier::new(2));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let handlers = GatedHandlers {
+            gate: Arc::clone(&gate),
+            seen: Arc::clone(&seen),
+        };
+
+        // Pass 1 (on the test thread): reach Ready across the initialized boundary.
+        let mut pre = Cursor::new(
+            [
+                frame(request(1, "initialize", json!({}))),
+                frame(notification("initialized", json!({}))),
+            ]
+            .concat(),
+        );
+        let sink = OutputSink::new(Vec::new());
+        serve(
+            &mut pre,
+            &sink,
+            &mut core,
+            &handlers,
+            FixedBootstrap(ready("svc")),
+        )
+        .unwrap();
+        assert!(core.state.is_ready());
+
+        // Pass 2 (spawned): A(2) blocks in the handler while B(3) queues behind
+        // it and the cancel for B sits after both on the wire.
+        let worker = thread::spawn(move || {
+            let mut input = Cursor::new(
+                [
+                    frame(request(2, "textDocument/references", json!({}))),
+                    frame(request(3, "textDocument/references", json!({}))),
+                    frame(notification("$/cancelRequest", json!({ "id": 3 }))),
+                    frame(notification("exit", json!({}))),
+                ]
+                .concat(),
+            );
+            let sink = OutputSink::new(Vec::new());
+            serve(
+                &mut input,
+                &sink,
+                &mut core,
+                &handlers,
+                FixedBootstrap(ready("svc")),
+            )
+            .unwrap();
+            responses(sink.written())
+        });
+
+        // The deterministic fence: wait until the reader thread has intercepted
+        // the cancel (it reads ahead of the blocked dispatch), then release A.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !cancel_handle
+            .lock()
+            .unwrap()
+            .contains(&RequestId::Number(3))
+        {
+            assert!(
+                Instant::now() < deadline,
+                "the cancel was never intercepted"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        gate.wait();
+        let out = worker.join().unwrap();
+
+        let a = out.iter().find(|r| r["id"] == 2).expect("a response for 2");
+        assert_eq!(a["result"], json!({ "served": true }), "A answers normally");
+        let b = out.iter().find(|r| r["id"] == 3).expect("a response for 3");
+        assert_eq!(b["error"]["code"], error_codes::REQUEST_CANCELLED, "{b}");
+        assert_eq!(b["error"]["message"], "request cancelled");
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![RequestId::Number(2)],
+            "the handler never saw the cancelled request"
+        );
+        assert!(
+            !cancel_handle
+                .lock()
+                .unwrap()
+                .contains(&RequestId::Number(3)),
+            "the matched cancel entry is pruned"
+        );
+    }
+
+    // A cancel for an id the server never saw is inert: every surrounding
+    // request answers normally and the loop stays serviceable.
+    #[test]
+    fn a_cancel_for_an_unknown_id_is_inert() {
+        let (core, out) = run(
+            vec![
+                frame(request(1, "initialize", json!({}))),
+                frame(notification("$/cancelRequest", json!({ "id": 99 }))),
+                frame(request(2, "textDocument/hover", json!({}))),
+                frame(request(3, "shutdown", json!({}))),
+                frame(notification("exit", json!({}))),
+            ],
+            ready("unused"),
+        );
+        assert_eq!(out.len(), 3, "{out:?}");
+        assert!(out.iter().all(|r| r.get("error").is_none()), "{out:?}");
+        assert_eq!(out[1]["id"], 2);
+        assert_eq!(out[2]["result"], Value::Null);
+        assert!(core.shutting_down, "the loop reached shutdown/exit");
+    }
+
+    // A cancel that arrives AFTER its request was answered is inert: it parks in
+    // the set (pruned only on a match or at the cap) and later requests with
+    // other ids answer normally.
+    #[test]
+    fn a_cancel_arriving_after_the_response_is_inert() {
+        let mut core: ServerCore<FakeServices> = ServerCore::new();
+        let bootstrap = ready("unused");
+        // Pass 1: hover(2) is answered.
+        let out1 = serve_frames(
+            &mut core,
+            &[
+                frame(request(1, "initialize", json!({}))),
+                frame(request(2, "textDocument/hover", json!({}))),
+            ],
+            &bootstrap,
+        );
+        assert_eq!(out1[1]["id"], 2);
+        // Pass 2: the late cancel for the already-answered id 2.
+        let out2 = serve_frames(
+            &mut core,
+            &[
+                frame(notification("$/cancelRequest", json!({ "id": 2 }))),
+                frame(request(3, "textDocument/hover", json!({}))),
+                frame(notification("exit", json!({}))),
+            ],
+            &bootstrap,
+        );
+        assert_eq!(out2[0]["id"], 3);
+        assert!(out2[0].get("error").is_none(), "{:?}", out2[0]);
+        assert!(
+            core.cancel_handle()
+                .lock()
+                .unwrap()
+                .contains(&RequestId::Number(2)),
+            "the unmatched entry stays parked"
+        );
+    }
+
+    // `initialize` and `shutdown` are never cancelled: a cancel entry naming
+    // them is consumed but ignored, and both answer normally.
+    #[test]
+    fn a_cancel_for_initialize_or_shutdown_is_ignored_and_they_still_answer() {
+        let mut core: ServerCore<FakeServices> = ServerCore::new();
+        // Seed the set as if the reader intercepted cancels for both ids before
+        // their turn came (deterministic — no reader race).
+        core.cancel_handle()
+            .lock()
+            .unwrap()
+            .extend([RequestId::Number(1), RequestId::Number(2)]);
+        let out = serve_frames(
+            &mut core,
+            &[
+                frame(request(1, "initialize", json!({}))),
+                frame(request(2, "shutdown", json!({}))),
+                frame(notification("exit", json!({}))),
+            ],
+            &ready("unused"),
+        );
+        assert!(
+            out[0].get("error").is_none(),
+            "initialize is never cancelled: {:?}",
+            out[0]
+        );
+        assert!(out[0]["result"]["capabilities"].is_object());
+        assert_eq!(
+            out[1]["result"],
+            Value::Null,
+            "shutdown is never cancelled: {:?}",
+            out[1]
+        );
+        assert!(core.shutting_down);
+        assert!(
+            core.cancel_handle().lock().unwrap().is_empty(),
+            "the ignored entries are still pruned"
+        );
+    }
+
+    // A string-id cancel cancels the matching string-id request (both id shapes
+    // flow through RequestId). Pass 1 ends at EOF, which joins the reader
+    // thread, so the intercepted cancel is provably parked before pass 2.
+    #[test]
+    fn a_string_id_cancel_cancels_the_matching_string_id_request() {
+        let mut core: ServerCore<FakeServices> = ServerCore::new();
+        let bootstrap = ready("unused");
+        let out1 = serve_frames(
+            &mut core,
+            &[
+                frame(request(1, "initialize", json!({}))),
+                frame(notification("$/cancelRequest", json!({ "id": "q-1" }))),
+            ],
+            &bootstrap,
+        );
+        assert_eq!(out1.len(), 1, "the cancel itself is never answered");
+        assert!(core
+            .cancel_handle()
+            .lock()
+            .unwrap()
+            .contains(&RequestId::String("q-1".to_string())));
+        let out2 = serve_frames(
+            &mut core,
+            &[
+                frame(json!({
+                    "jsonrpc": "2.0",
+                    "id": "q-1",
+                    "method": "textDocument/hover",
+                    "params": {}
+                })),
+                frame(notification("exit", json!({}))),
+            ],
+            &bootstrap,
+        );
+        assert_eq!(out2[0]["id"], "q-1");
+        assert_eq!(out2[0]["error"]["code"], error_codes::REQUEST_CANCELLED);
+        assert_eq!(out2[0]["error"]["message"], "request cancelled");
+    }
+
+    // The defensive bound: at the cap the set is cleared (dropping stale
+    // cancels is safe — the requests just answer normally) and the newest
+    // cancel is kept. A cancel without a usable id changes nothing.
+    #[test]
+    fn the_cancel_set_is_capped_and_a_malformed_cancel_is_inert() {
+        let cancelled = Mutex::new(HashSet::new());
+        record_cancel(&cancelled, &json!({}));
+        record_cancel(&cancelled, &json!({ "id": null }));
+        assert!(cancelled.lock().unwrap().is_empty());
+        for i in 0..CANCEL_SET_CAP as i64 {
+            record_cancel(&cancelled, &json!({ "id": i }));
+        }
+        assert_eq!(cancelled.lock().unwrap().len(), CANCEL_SET_CAP);
+        record_cancel(&cancelled, &json!({ "id": "overflow" }));
+        let set = cancelled.lock().unwrap();
+        assert_eq!(set.len(), 1, "the full set is cleared before the insert");
+        assert!(set.contains(&RequestId::String("overflow".to_string())));
+    }
+
+    // A stream that ends mid-frame is still a read error that ends `serve`
+    // (after the replies for the frames before it were written).
+    #[test]
+    fn a_truncated_frame_mid_stream_is_a_read_error_after_earlier_replies() {
+        let mut input = frame(request(1, "initialize", json!({})));
+        input.extend_from_slice(b"Content-Length: 50\r\n\r\n{\"truncated\":");
+        let mut reader = Cursor::new(input);
+        let mut core: ServerCore<FakeServices> = ServerCore::new();
+        let sink = OutputSink::new(Vec::new());
+        let error = serve(
+            &mut reader,
+            &sink,
+            &mut core,
+            &EchoHandlers,
+            FixedBootstrap(ready("unused")),
+        )
+        .expect_err("a truncated frame ends serve with the read error");
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+        let out = responses(sink.written());
+        assert_eq!(out[0]["id"], 1, "the earlier reply still landed: {out:?}");
     }
 }

@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// A JSON-RPC request id: an integer or a string (LSP permits either).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum RequestId {
     Number(i64),
@@ -29,6 +29,9 @@ pub mod error_codes {
     /// LSP `RequestFailed`: a request that failed for a known reason (the
     /// not-ready gate for references/rename returns this).
     pub const REQUEST_FAILED: i64 = -32803;
+    /// LSP `RequestCancelled`: the client cancelled the request with
+    /// `$/cancelRequest` before it was dispatched.
+    pub const REQUEST_CANCELLED: i64 = -32800;
 }
 
 /// The error object of a failed JSON-RPC response.
@@ -213,6 +216,13 @@ pub fn parse_incoming(body: &[u8]) -> Result<Incoming, ResponseError> {
     }
 }
 
+/// The target id of a `$/cancelRequest` notification's params (`{id: number |
+/// string}`), or `None` when the params carry no such id (a malformed cancel is
+/// inert, per the spec's "ignore unknown cancels" posture).
+pub fn cancel_request_id(params: &Value) -> Option<RequestId> {
+    serde_json::from_value(params.get("id")?.clone()).ok()
+}
+
 /// Writes one framed message to `writer` with LSP `Content-Length` framing.
 pub fn write_frame(writer: &mut impl Write, message: &impl Serialize) -> io::Result<()> {
     let body = serde_json::to_vec(message).map_err(io::Error::other)?;
@@ -340,6 +350,31 @@ mod tests {
     fn invalid_json_is_a_parse_error() {
         let err = parse_incoming(b"not json").unwrap_err();
         assert_eq!(err.code, error_codes::PARSE_ERROR);
+    }
+
+    // The `$/cancelRequest` params carry `{id: number | string}`; both shapes
+    // parse to the matching RequestId, and anything else is `None` (inert).
+    #[test]
+    fn cancel_request_id_parses_number_and_string_ids() {
+        assert_eq!(
+            cancel_request_id(&json!({ "id": 7 })),
+            Some(RequestId::Number(7))
+        );
+        assert_eq!(
+            cancel_request_id(&json!({ "id": "req-7" })),
+            Some(RequestId::String("req-7".to_string()))
+        );
+        assert_eq!(cancel_request_id(&json!({ "id": null })), None);
+        assert_eq!(cancel_request_id(&json!({ "id": 1.5 })), None);
+        assert_eq!(cancel_request_id(&json!({})), None);
+        assert_eq!(cancel_request_id(&Value::Null), None);
+    }
+
+    // The LSP RequestCancelled code the loop answers for a cancelled queued
+    // request — pinned so the wire contract cannot drift.
+    #[test]
+    fn request_cancelled_is_the_lsp_error_code() {
+        assert_eq!(error_codes::REQUEST_CANCELLED, -32800);
     }
 
     #[test]

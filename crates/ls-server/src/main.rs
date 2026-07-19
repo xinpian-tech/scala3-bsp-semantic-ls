@@ -78,11 +78,12 @@ fn offline_doctor_report(root: &Path, json: bool) -> String {
 }
 
 /// Runs the stdio JSON-RPC server: the live-BSP bootstrap on `initialized`, the
-/// production handlers for ready requests. stdin/stdout are locked for the
-/// process lifetime; stdout carries only protocol frames.
+/// production handlers for ready requests. stdout carries only protocol frames.
+/// stdin is wrapped unlocked: `serve`'s scoped reader thread needs a `Send`
+/// reader, and a `StdinLock` guard is not `Send` (nothing else reads stdin, so
+/// the lock buys nothing here).
 fn serve_stdio() {
-    let stdin = io::stdin();
-    let mut reader = BufReader::new(stdin.lock());
+    let mut reader = BufReader::new(io::stdin());
     // The output sink is shared: the message loop writes request responses and the
     // BSP session's reader thread writes `textDocument/publishDiagnostics` through
     // the one lock, so a diagnostic reaches the editor immediately even while the
