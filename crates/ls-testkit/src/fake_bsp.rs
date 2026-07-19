@@ -52,6 +52,13 @@ impl CompileScript {
 pub struct FakeBuildServer {
     sources_root: PathBuf,
     nosdb_source: PathBuf,
+    /// The directory the advertised `out-{a,b,c}` targetroots live under —
+    /// the committed fixture corpus by default. A suite that must WRITE into a
+    /// targetroot (e.g. drop a new `.semanticdb` and fire a watched-files
+    /// event) points this at a temp copy via
+    /// [`FakeBuildServer::set_targetroot_base`], keeping the committed corpus
+    /// read-only.
+    targetroot_base: Mutex<PathBuf>,
     pub initialize_received: AtomicBool,
     pub initialized_notified: AtomicBool,
     pub shutdown_requested: AtomicBool,
@@ -70,6 +77,7 @@ impl FakeBuildServer {
         FakeBuildServer {
             sources_root: sources_root(),
             nosdb_source,
+            targetroot_base: Mutex::new(fixtures_root()),
             initialize_received: AtomicBool::new(false),
             initialized_notified: AtomicBool::new(false),
             shutdown_requested: AtomicBool::new(false),
@@ -83,6 +91,12 @@ impl FakeBuildServer {
     /// Advertise a restricted initial target set (for reload scenarios).
     pub fn set_targets(&self, targets: Vec<Value>) {
         *self.current_targets.lock().unwrap() = targets;
+    }
+
+    /// Point the advertised `out-*` targetroots at a different base directory
+    /// (a temp copy of the corpus), for suites that must write into one.
+    pub fn set_targetroot_base(&self, base: PathBuf) {
+        *self.targetroot_base.lock().unwrap() = base;
     }
 
     /// Queue the fake's reaction to the next compile.
@@ -195,15 +209,14 @@ impl FakeBuildServer {
 
     fn scalac_option_item(&self, name: &str) -> Value {
         // The three indexable targets point their SemanticDB targetroot at the
-        // committed `out-<x>` dir (absolute, so it resolves regardless of the BSP
-        // workspace root) and their sourceroot at the fixture `sources` dir.
+        // `out-<x>` dir under the targetroot base (the committed corpus by
+        // default; absolute, so it resolves regardless of the BSP workspace
+        // root) and their sourceroot at the fixture `sources` dir.
+        let base = self.targetroot_base.lock().unwrap().clone();
         let sdb = |out: &str| {
             vec![
                 "-Xsemanticdb".to_string(),
-                format!(
-                    "-semanticdb-target:{}",
-                    fixtures_root().join(out).to_string_lossy()
-                ),
+                format!("-semanticdb-target:{}", base.join(out).to_string_lossy()),
                 "-sourceroot".to_string(),
                 self.sources_root.to_string_lossy().into_owned(),
             ]

@@ -58,7 +58,7 @@ use serde_json::{json, Value};
 
 use ls_index_model::uri::{normalize, normalize_uri, uri_to_path};
 
-use crate::capabilities::{commands, initialize_result, InitializeResult};
+use crate::capabilities::{commands, initialize_result, watch_globs, InitializeResult};
 use crate::doctor::DoctorReport;
 use crate::documents::{ContentChange, DocumentStore};
 use crate::jsonrpc::{
@@ -93,6 +93,16 @@ pub trait Bootstrap<S> {
     fn reload(&self, old: S, _documents: &Arc<DocumentStore>) -> WorkspaceState<S> {
         WorkspaceState::Ready(old)
     }
+}
+
+/// One `workspace/didChangeWatchedFiles` event: the changed file's URI as the
+/// client sent it. The LSP `type` field (created/changed/deleted) is dropped at
+/// the parse boundary on purpose — every server reaction (reingest, config
+/// re-read, log) is change-type agnostic, so carrying it would only invite an
+/// untested branch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WatchedFileEvent {
+    pub uri: String,
 }
 
 /// The context a ready-path handler receives: the request plus everything the
@@ -148,6 +158,15 @@ pub trait Handlers<S> {
     /// source — the hook only lets the ready services re-read that file.
     /// Default no-op.
     fn on_did_change_configuration(&self, _services: &S) {}
+
+    /// `workspace/didChangeWatchedFiles` arrived while ready: the client-side
+    /// file watcher (registered dynamically after `initialized`) reported
+    /// changes. `changes` is the parsed, non-empty event list. The production
+    /// impl filters the URIs against the registered globs
+    /// ([`crate::capabilities::watch_globs`]) and reacts per class; default
+    /// no-op (a fake needs no watcher reactions). Pre-ready events never reach
+    /// this hook — the bootstrap ingest reads the current files anyway.
+    fn on_watched_files(&self, _services: &S, _changes: &[WatchedFileEvent]) {}
 
     /// The live doctor report for a ready workspace (the `Runtime`/`Nix`/`Store`
     /// plus the live `BSP`/`SemanticDB`/`PC` sections). `None` when this handler
@@ -222,6 +241,20 @@ pub struct ServerCore<S> {
     /// [`CANCEL_SET_CAP`]. A stale entry (an unknown or already-answered id) is
     /// inert.
     cancelled: Arc<Mutex<HashSet<RequestId>>>,
+    /// Whether the client's `initialize` advertised
+    /// `workspace.didChangeWatchedFiles.dynamicRegistration` — the server's
+    /// FIRST client-capability read, kept a narrow typed flag rather than a
+    /// general capability model. Gates the one `client/registerCapability`
+    /// request sent after `initialized`.
+    watched_files_dynamic_registration: bool,
+    /// Whether the watched-files registration request was already sent, so a
+    /// repeated `initialized` cannot re-register.
+    watched_files_registered: bool,
+    /// The next server-side request id ordinal. Server-to-client requests use
+    /// the STRING id space `"ls-server/<n>"`, disjoint by construction from any
+    /// id this server ever answers (client requests own their own id space, and
+    /// the prefix keeps even a string-id client from colliding).
+    next_server_request_id: u64,
     /// The in-flight bootstrap worker's result channel, set when `initialized`
     /// spawns the worker and cleared when its result is adopted. While it is
     /// `Some`, the workspace stays `NotReady` and pre-ready fallbacks are served;
@@ -243,6 +276,9 @@ impl<S> ServerCore<S> {
             initialized: false,
             reload_requested: Arc::new(AtomicBool::new(false)),
             cancelled: Arc::new(Mutex::new(HashSet::new())),
+            watched_files_dynamic_registration: false,
+            watched_files_registered: false,
+            next_server_request_id: 0,
             bootstrap_rx: None,
             bootstrap_handle: None,
         }
@@ -261,11 +297,28 @@ impl<S> ServerCore<S> {
         self.cancelled.clone()
     }
 
-    /// Handles `initialize`: records the workspace root and, unless the workspace
-    /// is already ready, moves to `NotReady("waiting for the initialized
+    /// Whether the client can dynamically register
+    /// `workspace/didChangeWatchedFiles` (read from `initialize`). Without it no
+    /// registration is sent and the manual reindex command stays the fallback.
+    pub fn supports_watched_files_registration(&self) -> bool {
+        self.watched_files_dynamic_registration
+    }
+
+    /// Allocate the next server-to-client request id from the server-side
+    /// STRING id space (`"ls-server/1"`, `"ls-server/2"`, …), which can never
+    /// collide with a client request id.
+    fn allocate_server_request_id(&mut self) -> RequestId {
+        self.next_server_request_id += 1;
+        RequestId::String(format!("ls-server/{}", self.next_server_request_id))
+    }
+
+    /// Handles `initialize`: records the workspace root and the watched-files
+    /// dynamic-registration client capability and, unless the workspace is
+    /// already ready, moves to `NotReady("waiting for the initialized
     /// notification")`. Returns the capability surface.
     pub fn initialize(&mut self, params: &Value) -> InitializeResult {
         self.workspace_root = root_from_params(params);
+        self.watched_files_dynamic_registration = watched_files_dynamic_registration(params);
         self.initialized = true;
         if !self.state.is_ready() {
             self.state = WorkspaceState::NotReady {
@@ -351,6 +404,21 @@ impl<S> ServerCore<S> {
         if let Some(services) = self.state.ready() {
             handlers.on_did_save(services, &uri);
         }
+    }
+
+    /// `workspace/didChangeWatchedFiles`: forward the parsed event list to the
+    /// handlers' hook when the workspace is ready. Before ready the events drop
+    /// silently — the bootstrap ingest sees the current files, so nothing is
+    /// lost. Malformed or empty `changes` are inert.
+    fn did_change_watched_files(&self, handlers: &impl Handlers<S>, params: &Value) {
+        let Some(services) = self.state.ready() else {
+            return;
+        };
+        let changes = watched_file_events(params);
+        if changes.is_empty() {
+            return;
+        }
+        handlers.on_watched_files(services, &changes);
     }
 }
 
@@ -485,19 +553,30 @@ where
                     sink.send(&response)?;
                 }
                 Inbound::Frame(Ok(Incoming::Notification(note))) => {
+                    let was_initialized = note.method == "initialized";
                     if let Flow::Stop = dispatch_notification(core, handlers, &bootstrap, note) {
                         exiting = true;
                         break;
                     }
+                    // After `initialized`, register the watched-files client
+                    // watcher when the client supports dynamic registration
+                    // (fire-and-forget; the response is consumed below).
+                    if was_initialized {
+                        register_watched_files(core, sink)?;
+                    }
                 }
                 Inbound::Frame(Ok(Incoming::Response(response))) => {
                     // An inbound client response (a reply to a server-to-client
-                    // request): the server has no such request in flight yet, so it
-                    // is consumed and dropped — never answered with an error frame.
-                    eprintln!(
-                        "ls-server: ignoring a client response with no matching request (id: {:?})",
-                        response.id
-                    );
+                    // request). Every request this server issues is
+                    // fire-and-forget (`client/registerCapability`), so there is
+                    // nothing to correlate: a success is consumed silently, an
+                    // error is logged — never answered with an error frame.
+                    if let Some(error) = &response.error {
+                        eprintln!(
+                            "ls-server: a client response reported an error (id: {:?}): {error}",
+                            response.id
+                        );
+                    }
                 }
                 Inbound::Frame(Err(error)) => sink.send(&null_id_error(&error))?,
                 Inbound::ReadError(error) => return Err(error),
@@ -523,6 +602,72 @@ where
 /// request (so no id is available to correlate the reply).
 fn null_id_error(error: &ResponseError) -> Value {
     json!({ "jsonrpc": "2.0", "id": Value::Null, "error": error })
+}
+
+/// After `initialized`: when the client advertised
+/// `workspace.didChangeWatchedFiles.dynamicRegistration`, send ONE
+/// `client/registerCapability` server-to-client REQUEST registering the
+/// [`watch_globs`] watchers. Fire-and-forget: the id comes from the server-side
+/// `"ls-server/<n>"` string id space (never colliding with client ids) and the
+/// client's reply is consumed by the `Incoming::Response` arm without
+/// correlation. No capability → no request — the manual
+/// `scala3SemanticLs.reindex` command stays the fallback.
+fn register_watched_files<S, W: Write>(
+    core: &mut ServerCore<S>,
+    sink: &OutputSink<W>,
+) -> io::Result<()> {
+    if !core.watched_files_dynamic_registration || core.watched_files_registered {
+        return Ok(());
+    }
+    core.watched_files_registered = true;
+    let id = core.allocate_server_request_id();
+    let watchers: Vec<Value> = watch_globs::all()
+        .iter()
+        .map(|glob| json!({ "globPattern": glob }))
+        .collect();
+    sink.send(&json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "client/registerCapability",
+        "params": {
+            "registrations": [{
+                "id": "workspace/didChangeWatchedFiles",
+                "method": "workspace/didChangeWatchedFiles",
+                "registerOptions": { "watchers": watchers },
+            }],
+        },
+    }))
+}
+
+/// The typed event list of a `workspace/didChangeWatchedFiles` notification's
+/// params (`{changes: [{uri, type}]}`). Items without a string `uri` are
+/// dropped; a missing/malformed `changes` is the empty list (inert).
+fn watched_file_events(params: &Value) -> Vec<WatchedFileEvent> {
+    params
+        .get("changes")
+        .and_then(Value::as_array)
+        .map(|changes| {
+            changes
+                .iter()
+                .filter_map(|change| change.get("uri").and_then(Value::as_str))
+                .map(|uri| WatchedFileEvent {
+                    uri: uri.to_string(),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Whether `initialize` params advertise
+/// `workspace.didChangeWatchedFiles.dynamicRegistration == true`.
+fn watched_files_dynamic_registration(params: &Value) -> bool {
+    params
+        .get("capabilities")
+        .and_then(|capabilities| capabilities.get("workspace"))
+        .and_then(|workspace| workspace.get("didChangeWatchedFiles"))
+        .and_then(|watched| watched.get("dynamicRegistration"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
 }
 
 /// Spawns the bootstrap worker on `initialized`: one worker per session (a second
@@ -828,6 +973,10 @@ where
                 handlers.on_did_change_configuration(services);
             }
         }
+        // Client-watched file events (the dynamic registration sent after
+        // `initialized`). Pre-ready they drop silently — the bootstrap ingest
+        // reads the current files.
+        "workspace/didChangeWatchedFiles" => core.did_change_watched_files(handlers, &note.params),
         // Any other notification (including `$/setTrace`) is ignored.
         _ => {}
     }
@@ -1908,6 +2057,186 @@ mod tests {
         assert_eq!(out[1]["id"], 2);
         assert!(out.iter().all(|m| m.get("error").is_none()), "{out:?}");
         assert!(core.shutting_down, "the loop continued past the responses");
+    }
+
+    // initialize advertising `workspace.didChangeWatchedFiles.dynamicRegistration`
+    // makes the server send EXACTLY ONE `client/registerCapability` request after
+    // `initialized` — a server-side string id ("ls-server/1", the id space that
+    // can never collide with client ids) registering the three watcher globs —
+    // and the client's reply is consumed without an error frame (the full
+    // fire-and-forget round trip). A repeated `initialized` must not re-register.
+    #[test]
+    fn watched_files_registration_round_trips_once_with_the_three_globs() {
+        let (core, out) = run(
+            vec![
+                frame(request(
+                    1,
+                    "initialize",
+                    json!({
+                        "rootUri": "file:///ws",
+                        "capabilities": {
+                            "workspace": {
+                                "didChangeWatchedFiles": { "dynamicRegistration": true }
+                            }
+                        },
+                    }),
+                )),
+                frame(notification("initialized", json!({}))),
+                // The client's reply to the fire-and-forget registration.
+                frame(json!({ "jsonrpc": "2.0", "id": "ls-server/1", "result": null })),
+                // A second initialized must not send a second registration.
+                frame(notification("initialized", json!({}))),
+                frame(request(2, "shutdown", json!({}))),
+                frame(notification("exit", json!({}))),
+            ],
+            ready("svc"),
+        );
+
+        let registrations: Vec<&Value> = out
+            .iter()
+            .filter(|m| m["method"] == "client/registerCapability")
+            .collect();
+        assert_eq!(registrations.len(), 1, "{out:?}");
+        let registration = registrations[0];
+        // The server-side id space: a string id no client request can collide with.
+        assert_eq!(registration["id"], "ls-server/1", "{registration}");
+        assert_eq!(
+            registration["params"],
+            json!({
+                "registrations": [{
+                    "id": "workspace/didChangeWatchedFiles",
+                    "method": "workspace/didChangeWatchedFiles",
+                    "registerOptions": {
+                        "watchers": [
+                            { "globPattern": "**/*.semanticdb" },
+                            { "globPattern": "**/.scala3-bsp-semantic-ls/config.json" },
+                            { "globPattern": "**/.bsp/*.json" },
+                        ]
+                    },
+                }]
+            }),
+            "{registration}"
+        );
+        // Exactly initialize response + registration request + shutdown response:
+        // the client's reply produced no frame, and no error frame appeared.
+        assert_eq!(out.len(), 3, "{out:?}");
+        assert!(out.iter().all(|m| m.get("error").is_none()), "{out:?}");
+        assert!(core.shutting_down, "the loop continued past the reply");
+        assert!(core.supports_watched_files_registration());
+    }
+
+    // Without the client capability (absent, or explicitly false) no
+    // registration request is ever sent — the manual reindex command stays the
+    // only reingest trigger for out-of-editor builds.
+    #[test]
+    fn no_watched_files_capability_sends_no_registration() {
+        for params in [
+            json!({ "rootUri": "file:///ws" }),
+            json!({ "rootUri": "file:///ws", "capabilities": {} }),
+            json!({
+                "rootUri": "file:///ws",
+                "capabilities": {
+                    "workspace": { "didChangeWatchedFiles": { "dynamicRegistration": false } }
+                },
+            }),
+        ] {
+            let (core, out) = run(
+                vec![
+                    frame(request(1, "initialize", params.clone())),
+                    frame(notification("initialized", json!({}))),
+                    frame(notification("exit", json!({}))),
+                ],
+                ready("svc"),
+            );
+            assert!(
+                out.iter()
+                    .all(|m| m["method"] != "client/registerCapability"),
+                "{params}: {out:?}"
+            );
+            assert!(!core.supports_watched_files_registration(), "{params}");
+        }
+    }
+
+    // `workspace/didChangeWatchedFiles` reaches the handlers' hook with the
+    // parsed event list only when the workspace is ready; pre-ready (and empty
+    // or malformed `changes`) events drop silently.
+    #[test]
+    fn watched_files_events_forward_to_the_hook_only_when_ready() {
+        use std::sync::Mutex;
+
+        #[derive(Default)]
+        struct WatchRecordingHandlers {
+            batches: Mutex<Vec<Vec<String>>>,
+        }
+        impl Handlers<FakeServices> for WatchRecordingHandlers {
+            fn handle(&self, cx: RequestContext<'_, FakeServices>) -> Response {
+                Response::success(cx.request.id.clone(), Value::Null)
+            }
+            fn on_watched_files(&self, _services: &FakeServices, changes: &[WatchedFileEvent]) {
+                self.batches
+                    .lock()
+                    .unwrap()
+                    .push(changes.iter().map(|c| c.uri.clone()).collect());
+            }
+        }
+
+        let drive = |ready_state: bool| {
+            let bootstrap_state = if ready_state {
+                ready("svc")
+            } else {
+                WorkspaceState::Failed {
+                    detail: "no build server".to_string(),
+                }
+            };
+            let mut core = ServerCore::new();
+            let handlers = WatchRecordingHandlers::default();
+            let pre = [
+                frame(request(1, "initialize", json!({ "rootUri": "file:///ws" }))),
+                frame(notification("initialized", json!({}))),
+            ]
+            .concat();
+            let post = [
+                frame(notification(
+                    "workspace/didChangeWatchedFiles",
+                    json!({ "changes": [
+                        { "uri": "file:///ws/out/A.scala.semanticdb", "type": 1 },
+                        { "uri": "file:///ws/.bsp/mill.json", "type": 2 },
+                    ] }),
+                )),
+                // Empty and malformed change lists are inert — no hook call.
+                frame(notification(
+                    "workspace/didChangeWatchedFiles",
+                    json!({ "changes": [] }),
+                )),
+                frame(notification("workspace/didChangeWatchedFiles", json!({}))),
+                frame(notification("exit", json!({}))),
+            ]
+            .concat();
+            for group in [pre, post] {
+                let mut reader = Cursor::new(group);
+                let sink = OutputSink::new(Vec::new());
+                serve(
+                    &mut reader,
+                    &sink,
+                    &mut core,
+                    &handlers,
+                    FixedBootstrap(bootstrap_state.clone()),
+                )
+                .unwrap();
+            }
+            handlers.batches.into_inner().unwrap()
+        };
+
+        // Ready: one hook call carrying the parsed batch, in order.
+        assert_eq!(
+            drive(true),
+            vec![vec![
+                "file:///ws/out/A.scala.semanticdb".to_string(),
+                "file:///ws/.bsp/mill.json".to_string(),
+            ]]
+        );
+        // Not ready (failed bootstrap): events drop silently.
+        assert!(drive(false).is_empty());
     }
 
     // `workspace/didChangeConfiguration` reaches the handlers' hook only when the

@@ -53,10 +53,36 @@ if not at then
   fail("token '" .. token .. "' not found in " .. rel)
 end
 
+-- Watched-files probe setup. Neovim on Linux does NOT advertise
+-- `workspace.didChangeWatchedFiles.dynamicRegistration` by default (0.10+
+-- disables it because the Linux watch backends are too limited — see
+-- runtime protocol.lua), so the server would send no registration; force the
+-- capability on and wrap the `client/registerCapability` handler to record the
+-- watched-files registration before delegating to Neovim's REAL default
+-- handler (which parses the globs via vim.glob.to_lpeg and starts its
+-- watchfunc) — so acceptance below is nvim's own, not a stub's. Event FIRING is
+-- not asserted here: headless-Linux watch backends poll unreliably; the
+-- event -> reingest flow is proven by the in-process wire suite.
+local capabilities = vim.lsp.protocol.make_client_capabilities()
+capabilities.workspace.didChangeWatchedFiles.dynamicRegistration = true
+local watched_registrations = {}
+local default_register_handler = vim.lsp.handlers["client/registerCapability"]
+
 local client_id = vim.lsp.start({
   name = "scala3-bsp-semantic-ls",
   cmd = { bin },
   root_dir = ws,
+  capabilities = capabilities,
+  handlers = {
+    ["client/registerCapability"] = function(err, params, ctx)
+      for _, reg in ipairs((params and params.registrations) or {}) do
+        if reg.method == "workspace/didChangeWatchedFiles" then
+          table.insert(watched_registrations, reg)
+        end
+      end
+      return default_register_handler(err, params, ctx)
+    end,
+  },
 }, { bufnr = buf })
 if not client_id then
   fail("vim.lsp.start did not return a client id")
@@ -69,6 +95,30 @@ end, 200) then
   fail("LSP initialize did not complete")
 end
 pass("initialize handshake (capabilities: " .. tostring(client.server_capabilities ~= nil) .. ")")
+
+-- The server registers its watched-files globs right after `initialized`
+-- (fire-and-forget client/registerCapability); nvim's default handler accepted
+-- it above, so the registration must be observable with the three globs.
+if not vim.wait(30000, function()
+  return #watched_registrations > 0
+end, 200) then
+  fail("no workspace/didChangeWatchedFiles registration arrived after initialized")
+end
+local watchers = (watched_registrations[1].registerOptions or {}).watchers or {}
+local globs = {}
+for _, watcher in ipairs(watchers) do
+  globs[watcher.globPattern] = true
+end
+for _, expected in ipairs({
+  "**/*.semanticdb",
+  "**/.scala3-bsp-semantic-ls/config.json",
+  "**/.bsp/*.json",
+}) do
+  if not globs[expected] then
+    fail("watched-files registration is missing glob '" .. expected .. "': " .. vim.inspect(watchers))
+  end
+end
+pass("didChangeWatchedFiles registration accepted by nvim (3 globs)")
 
 local function request(method, params, timeout)
   local response, err = client:request_sync(method, params, timeout or 60000, buf)

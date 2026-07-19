@@ -58,6 +58,26 @@ pub fn build_target(name: &str, deps: &[&str]) -> Value {
     })
 }
 
+/// Recursively copy a committed corpus subtree (e.g. the `out-a` targetroot)
+/// to `dest`, for suites that must WRITE into a targetroot (watched-files
+/// reingest) while the committed corpus stays read-only.
+pub fn copy_corpus_dir(name: &str, dest: &std::path::Path) {
+    copy_dir(&fixtures_root().join(name), dest);
+}
+
+fn copy_dir(src: &std::path::Path, dest: &std::path::Path) {
+    std::fs::create_dir_all(dest).expect("create corpus copy dir");
+    for entry in std::fs::read_dir(src).expect("read corpus dir") {
+        let entry = entry.expect("corpus dir entry");
+        let target = dest.join(entry.file_name());
+        if entry.file_type().expect("corpus entry type").is_dir() {
+            copy_dir(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), &target).expect("copy corpus file");
+        }
+    }
+}
+
 /// The full advertised corpus: three indexable targets plus the SemanticDB-less one.
 pub fn default_targets() -> Vec<Value> {
     vec![

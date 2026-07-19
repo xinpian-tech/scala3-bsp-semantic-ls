@@ -295,6 +295,12 @@ The executeCommand set is `scala3SemanticLs.doctor` | `scala3SemanticLs.reindex`
 `--version`, `--doctor [dir] [--json]`,
 and `dump [dir]` — the read-only store inspector that replaces ad-hoc `sqlite3`
 poking of the removed metadata store; the PC-backend selection flags are gone.
+One capability is registered dynamically: when the client's `initialize`
+advertises `workspace.didChangeWatchedFiles.dynamicRegistration` — the
+server's only client-capability read, a narrow typed flag rather than a
+general capability model — the server registers three client-side file
+watchers after `initialized` (the reingest-triggers paragraph in §5.2 has the
+globs and reactions).
 
 ## 4. Query orchestrator: three paths, three consistency levels
 
@@ -363,6 +369,33 @@ drops to zero.
  9. The old generation retires; the janitor deletes its segment directory and
     state file only after its snapshot Arc fully drops.
 ```
+
+**Reingest triggers.** Every (re)ingest is the same full rescan; only the
+trigger differs: (1) the bootstrap ingest on `initialized`; (2)
+`textDocument/didSave` — the debounced, single-flight build job compiles the
+saved file's reverse-dependency closure, then reingests
+(`crates/ls-server/src/build_scheduler.rs`); (3) a RawSemanticDBPath answer
+that could not heal inline schedules a reindex-only job on the same scheduler;
+(4) `buildTarget/didChange` from the build server reloads the model over the
+retained session and reingests; (5) the explicit `scala3SemanticLs.reindex`
+command; (6) client-watched files. For (6): when the client's `initialize`
+advertises `workspace.didChangeWatchedFiles.dynamicRegistration`, the server
+sends ONE fire-and-forget `client/registerCapability` request after
+`initialized` (its id from the server-side `"ls-server/<n>"` string id space,
+disjoint from client ids; the reply is consumed uncorrelated) registering
+three watchers: `**/*.semanticdb`, `**/.scala3-bsp-semantic-ls/config.json`,
+and `**/.bsp/*.json`. A watched `.semanticdb` change — a build that ran
+outside the editor — schedules the same debounced reindex-only job; a
+`config.json` change nudges the PC island to re-read its configuration (the
+didChangeConfiguration path); a `.bsp/*.json` change is only logged
+("restart the server to reconnect" — re-bootstrapping a live session in place
+is out of scope by decision). The event filter is the upstream ripgrep-family
+`globset` matcher compiled once over the SAME registered globs
+(`crates/ls-server/src/services.rs` over
+`crates/ls-server/src/capabilities.rs::watch_globs`), so watched and reacted
+globs cannot drift. Without the capability no registration is sent and the
+manual reindex command stays the fallback; pre-ready watched events drop
+silently — the bootstrap ingest reads the current files anyway.
 
 A reader can never observe a partially written generation: a segment directory
 under `segments/` is complete by construction (step 5), and the pair becomes

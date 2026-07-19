@@ -7,9 +7,13 @@ fresh temp dir carrying a `.bsp/fake-bsp.json` that points at `fake_bsp.py`, so
 the server's own BSP discovery spawns the scriptable fake build server, which
 advertises the committed `ls-engine` SemanticDB fixture corpus.
 
-Three sessions: `client` (plain, every compile succeeds), `client_diags`
+Four sessions: `client` (plain, every compile succeeds), `client_diags`
 (first compile publishes one error on Core.scala, second publishes a clean
-reset), `client_failing_compile` (the next compile fails with statusCode 2).
+reset), `client_failing_compile` (the next compile fails with statusCode 2),
+and `client_watching` (advertises `workspace.didChangeWatchedFiles.
+dynamicRegistration` and answers the server's `client/registerCapability`
+request, recording the registrations — pytest-lsp's default client has no
+handler for that server-to-client request, so the factory registers one).
 """
 
 from __future__ import annotations
@@ -144,13 +148,43 @@ def make_workspace(script: dict | None) -> Path:
 # --- session helpers ----------------------------------------------------------
 
 
-async def _start(lsp_client: LanguageClient, script: dict | None = None) -> Path:
+WATCHING_CAPABILITIES = types.ClientCapabilities(
+    workspace=types.WorkspaceClientCapabilities(
+        did_change_watched_files=types.DidChangeWatchedFilesClientCapabilities(
+            dynamic_registration=True
+        )
+    )
+)
+
+
+def make_watching_client() -> LanguageClient:
+    """A LanguageClient that answers `client/registerCapability` (recording the
+    registrations) — the server sends it as a fire-and-forget request right
+    after `initialized` when the watched-files capability is advertised."""
+    client = pytest_lsp.make_test_lsp_client()
+    client.registrations = []
+    client.registrations_received = asyncio.Event()
+
+    @client.feature(types.CLIENT_REGISTER_CAPABILITY)
+    def _register_capability(client: LanguageClient, params: types.RegistrationParams):
+        client.registrations.extend(params.registrations)
+        client.registrations_received.set()
+        return None
+
+    return client
+
+
+async def _start(
+    lsp_client: LanguageClient,
+    script: dict | None = None,
+    capabilities: types.ClientCapabilities | None = None,
+) -> Path:
     ws = make_workspace(script)
     lsp_client.init_result = await lsp_client.initialize_session(
         types.InitializeParams(
             process_id=None,
             root_uri=ws.as_uri(),
-            capabilities=types.ClientCapabilities(),
+            capabilities=capabilities or types.ClientCapabilities(),
         )
     )
     lsp_client.workspace = ws
@@ -243,5 +277,16 @@ async def client_diags(lsp_client: LanguageClient):
 @pytest_lsp.fixture(config=ClientServerConfig(server_command=[SERVER_BIN]))
 async def client_failing_compile(lsp_client: LanguageClient):
     ws = await _start(lsp_client, FAILING_COMPILE_SCRIPT)
+    yield
+    await _stop(lsp_client, ws)
+
+
+@pytest_lsp.fixture(
+    config=ClientServerConfig(
+        server_command=[SERVER_BIN], client_factory=make_watching_client
+    )
+)
+async def client_watching(lsp_client: LanguageClient):
+    ws = await _start(lsp_client, capabilities=WATCHING_CAPABILITIES)
     yield
     await _stop(lsp_client, ws)

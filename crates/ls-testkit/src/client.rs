@@ -266,12 +266,50 @@ impl WireClient {
     }
 
     pub fn initialize(&mut self) {
+        self.initialize_with_capabilities(json!({}));
+    }
+
+    /// `initialize` + `initialized` advertising the given client `capabilities`
+    /// (e.g. `workspace.didChangeWatchedFiles.dynamicRegistration` so the server
+    /// sends its watched-files registration).
+    pub fn initialize_with_capabilities(&mut self, capabilities: Value) {
         let root = path_to_uri(&self.ws);
         self.result(
             "initialize",
-            json!({"processId": null, "rootUri": root, "capabilities": {}}),
+            json!({"processId": null, "rootUri": root, "capabilities": capabilities}),
         );
         self.notify("initialized", json!({}));
+    }
+
+    /// Block until a server-to-client REQUEST with the given method arrives
+    /// (buffering everything else) and return the whole message (`id` +
+    /// `params`). Reply with [`WireClient::respond`].
+    pub fn await_server_request(&mut self, method: &str) -> Value {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            if let Some(pos) = self.pending.iter().position(|m| {
+                m.get("method").and_then(Value::as_str) == Some(method) && m.get("id").is_some()
+            }) {
+                return self.pending.remove(pos);
+            }
+            let now = Instant::now();
+            assert!(now < deadline, "timeout awaiting server request {method}");
+            match self.inbound.recv_timeout(deadline - now) {
+                Ok(message) => self.pending.push(message),
+                Err(RecvTimeoutError::Timeout) => {
+                    panic!("timeout awaiting server request {method}")
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    panic!("server closed awaiting server request {method}")
+                }
+            }
+        }
+    }
+
+    /// Reply to a server-to-client request: a success response frame carrying
+    /// the request's own `id` (number or string) and `result`.
+    pub fn respond(&mut self, id: Value, result: Value) {
+        self.send_frame(&json!({"jsonrpc": "2.0", "id": id, "result": result}));
     }
 
     pub fn execute_command(&mut self, command: &str) -> String {

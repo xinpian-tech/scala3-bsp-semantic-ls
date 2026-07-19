@@ -34,11 +34,11 @@ use ls_engine::{
     CompileOutcome, CompileService, DocHighlight, DocumentHighlightService, IngestReport,
     QueryOrchestrator, ReferencesEngine, ReferencesResult, RenameEngine, WorkspaceSymbolEntry,
 };
-use ls_index_model::uri::normalize_uri;
+use ls_index_model::uri::{normalize_uri, uri_to_path};
 use ls_index_model::{LsError, Span};
 
 use crate::build_scheduler::BuildScheduler;
-use crate::capabilities::commands;
+use crate::capabilities::{commands, watch_globs};
 use crate::convert::{self, DocumentHighlight, Location, SymbolKind, WorkspaceSymbol};
 use crate::doctor::{
     DoctorReport, DoctorTargets, NixSection, PcPluginsSection, PcSection, RuntimeSection,
@@ -49,7 +49,7 @@ use crate::jsonrpc::{error_codes, RequestId, Response, ResponseError};
 use crate::pc::{PcLocation, PcPluginStatusReport, PcQueryService};
 use crate::pc_overlay::{PcOnlySymbol, PcOverlayInner};
 use crate::protocol::Position;
-use crate::server::{Handlers, RequestContext};
+use crate::server::{Handlers, RequestContext, WatchedFileEvent};
 use crate::workspace_uris::WorkspaceUris;
 
 /// The ready-services bundle owned by [`WorkspaceState::Ready`](crate::WorkspaceState::Ready):
@@ -416,6 +416,46 @@ impl Handlers<CoreServices> for CoreHandlers {
         services.pc.on_config_changed();
     }
 
+    /// Client-watched file events, filtered against the SAME globs the server
+    /// registered ([`watch_globs`], compiled once into a [`globset::GlobSet`]).
+    /// The batch coalesces per class — one reaction per notification, and the
+    /// scheduler's debounce coalesces bursts of notifications further:
+    /// `.semanticdb` (any change type) schedules the debounced reindex-only
+    /// background job; the workspace `config.json` nudges the PC island to
+    /// re-read its config (the didChangeConfiguration path); a `.bsp/*.json`
+    /// change only logs — reconnecting the live BSP session in place is out of
+    /// scope by decision, restart the server to reconnect. Unmatched URIs (a
+    /// client may batch unrelated events) do nothing.
+    fn on_watched_files(&self, services: &CoreServices, changes: &[WatchedFileEvent]) {
+        let mut reindex = false;
+        let mut config_changed = false;
+        let mut bsp_changed = false;
+        for change in changes {
+            let Ok(path) = uri_to_path(&change.uri) else {
+                continue;
+            };
+            for glob in watch_glob_set().matches(&path) {
+                match glob {
+                    WATCH_GLOB_SEMANTICDB => reindex = true,
+                    WATCH_GLOB_CONFIG => config_changed = true,
+                    _ => bsp_changed = true,
+                }
+            }
+        }
+        if reindex {
+            services.schedule_reindex();
+        }
+        if config_changed {
+            services.pc.on_config_changed();
+        }
+        if bsp_changed {
+            eprintln!(
+                "scala3-bsp-semantic-ls: build connection files (.bsp/*.json) changed; \
+                 restart the server to reconnect"
+            );
+        }
+    }
+
     fn doctor(
         &self,
         services: &CoreServices,
@@ -423,6 +463,31 @@ impl Handlers<CoreServices> for CoreHandlers {
     ) -> Option<DoctorReport> {
         Some(services.doctor_report())
     }
+}
+
+/// The [`watch_glob_set`] indices, in [`watch_globs::all`] order.
+const WATCH_GLOB_SEMANTICDB: usize = 0;
+const WATCH_GLOB_CONFIG: usize = 1;
+
+/// The registered watcher globs compiled into one [`globset::GlobSet`] (built
+/// lazily, once per process — the upstream ripgrep-family matcher, not a
+/// hand-rolled glob). `literal_separator` keeps `*` within one path segment
+/// (LSP glob semantics: `*` never crosses `/`, `**` matches any depth), so
+/// `**/.bsp/*.json` matches only direct children of a `.bsp` directory.
+fn watch_glob_set() -> &'static globset::GlobSet {
+    static SET: std::sync::OnceLock<globset::GlobSet> = std::sync::OnceLock::new();
+    SET.get_or_init(|| {
+        let mut builder = globset::GlobSetBuilder::new();
+        for pattern in watch_globs::all() {
+            builder.add(
+                globset::GlobBuilder::new(pattern)
+                    .literal_separator(true)
+                    .build()
+                    .expect("the registered watch glob parses"),
+            );
+        }
+        builder.build().expect("the watch glob set compiles")
+    })
 }
 
 /// `textDocument/references`: resolve the cursor symbol over the index and return
@@ -1231,6 +1296,132 @@ mod tests {
             config_changes.load(std::sync::atomic::Ordering::SeqCst),
             1,
             "the handlers must forward the config change to the PC service"
+        );
+    }
+
+    // The compiled watch-glob set classifies each registered event class by
+    // index and rejects near-misses: LSP glob semantics (`*` within one
+    // segment, `**` any depth) via globset's literal_separator.
+    #[test]
+    fn the_watch_glob_set_classifies_each_event_class() {
+        let matches = |path: &str| watch_glob_set().matches(std::path::Path::new(path));
+        assert_eq!(
+            matches("/ws/out/META-INF/semanticdb/a/Core.scala.semanticdb"),
+            vec![WATCH_GLOB_SEMANTICDB]
+        );
+        assert_eq!(
+            matches("/ws/.scala3-bsp-semantic-ls/config.json"),
+            vec![WATCH_GLOB_CONFIG]
+        );
+        assert_eq!(matches("/ws/.bsp/mill-bsp.json"), vec![2]);
+        assert!(matches("/ws/src/Main.scala").is_empty());
+        // Not the workspace config: config.json outside .scala3-bsp-semantic-ls.
+        assert!(matches("/ws/config.json").is_empty());
+        // `*` stays within one segment: nested .bsp json is not a connection file.
+        assert!(matches("/ws/.bsp/nested/x.json").is_empty());
+    }
+
+    // A watched `.semanticdb` event schedules the debounced reindex-only
+    // background job (the BuildScheduler coalesces bursts) and leaves the PC
+    // config untouched.
+    #[test]
+    fn a_watched_semanticdb_event_schedules_the_background_reindex() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_changes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let services = services_with_pc(
+            dir.path(),
+            FakePc {
+                config_changes: config_changes.clone(),
+                ..FakePc::default()
+            },
+        )
+        .with_scheduler_debounce(std::time::Duration::from_millis(2));
+
+        let uri = path_to_uri(
+            &dir.path()
+                .join("out/META-INF/semanticdb/A.scala.semanticdb"),
+        );
+        CoreHandlers.on_watched_files(&services, &[WatchedFileEvent { uri }]);
+        assert_eq!(
+            services.wait_for_reindex(1, std::time::Duration::from_secs(5)),
+            1,
+            "the semanticdb event must drain one background reingest"
+        );
+        assert_eq!(
+            config_changes.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a semanticdb event must not touch the PC config"
+        );
+    }
+
+    // A watched workspace-config event nudges the PC island to re-read
+    // config.json (the didChangeConfiguration path) and schedules no reingest.
+    #[test]
+    fn a_watched_config_event_nudges_the_pc_and_schedules_no_reindex() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_changes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let services = services_with_pc(
+            dir.path(),
+            FakePc {
+                config_changes: config_changes.clone(),
+                ..FakePc::default()
+            },
+        )
+        .with_scheduler_debounce(std::time::Duration::from_millis(2));
+
+        let uri = path_to_uri(&dir.path().join(".scala3-bsp-semantic-ls/config.json"));
+        CoreHandlers.on_watched_files(&services, &[WatchedFileEvent { uri }]);
+        assert_eq!(
+            config_changes.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the config event must reach PcQueryService::on_config_changed"
+        );
+        assert_eq!(
+            services.wait_for_reindex(1, std::time::Duration::from_millis(60)),
+            0,
+            "a config event must not schedule a reingest"
+        );
+    }
+
+    // `.bsp/*.json` events only log (restart to reconnect — the warm re-bootstrap
+    // is out of scope), and unrelated URIs do nothing at all.
+    #[test]
+    fn watched_bsp_and_unrelated_events_neither_reindex_nor_touch_the_pc() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_changes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let services = services_with_pc(
+            dir.path(),
+            FakePc {
+                config_changes: config_changes.clone(),
+                ..FakePc::default()
+            },
+        )
+        .with_scheduler_debounce(std::time::Duration::from_millis(2));
+
+        CoreHandlers.on_watched_files(
+            &services,
+            &[
+                WatchedFileEvent {
+                    uri: path_to_uri(&dir.path().join(".bsp/mill-bsp.json")),
+                },
+                WatchedFileEvent {
+                    uri: path_to_uri(&dir.path().join("src/Main.scala")),
+                },
+                // An unparseable URI is skipped, never a panic.
+                WatchedFileEvent {
+                    uri: "untitled:Untitled-1".to_string(),
+                },
+            ],
+        );
+        assert_eq!(
+            services.wait_for_reindex(1, std::time::Duration::from_millis(60)),
+            0,
+            ".bsp/unrelated events must not schedule a reingest"
+        );
+        assert_eq!(
+            config_changes.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            ".bsp/unrelated events must not touch the PC config"
         );
     }
 

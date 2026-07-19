@@ -217,6 +217,12 @@ impl PcQueryService for FakePcService {
         enriched
     }
 
+    fn on_config_changed(&self) {
+        // Recorded so a wire suite can assert the watched-config nudge reached
+        // the PC seam (the default impl is a no-op).
+        self.record("on_config_changed".to_string());
+    }
+
     fn reconfigure_targets(&self, targets: Vec<TargetConfig>) {
         self.record(format!("reconfigure_targets ({})", targets.len()));
         let mut registered = self.registered.lock().unwrap();

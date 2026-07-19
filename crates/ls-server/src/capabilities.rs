@@ -35,6 +35,30 @@ pub mod commands {
     }
 }
 
+/// The glob patterns the server registers for client-side file watching
+/// (`workspace/didChangeWatchedFiles` dynamic registration, sent after
+/// `initialized` when the client advertised
+/// `workspace.didChangeWatchedFiles.dynamicRegistration`). One source of truth:
+/// the registration payload (`server::serve`) and the event filter
+/// (`services::CoreHandlers::on_watched_files`) both read these, so the globs
+/// the client watches and the globs the server reacts to cannot drift apart.
+pub mod watch_globs {
+    /// Freshly compiled SemanticDB output anywhere under the workspace — the
+    /// out-of-editor reingest trigger (a build ran outside a didSave).
+    pub const SEMANTICDB: &str = "**/*.semanticdb";
+    /// The workspace configuration file; a change nudges the PC island to
+    /// re-read it (`PcQueryService::on_config_changed`).
+    pub const CONFIG: &str = "**/.scala3-bsp-semantic-ls/config.json";
+    /// BSP connection files; a change is only logged (reconnecting a live
+    /// session in place is out of scope — restart the server).
+    pub const BSP: &str = "**/.bsp/*.json";
+
+    /// The registered globs, in registration (and filter-index) order.
+    pub fn all() -> [&'static str; 3] {
+        [SEMANTICDB, CONFIG, BSP]
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CompletionOptions {
@@ -187,6 +211,20 @@ mod tests {
         // The presentation-compiler plugin-status command is advertised (and
         // routed — the server_surface routed-set probe pins the round trip).
         assert!(json.contains("scala3SemanticLs.pcPluginStatus"), "{json}");
+    }
+
+    // The registered watcher globs — one source of truth for the registration
+    // payload and the event filter — pinned so neither side can drift.
+    #[test]
+    fn the_watch_globs_are_exactly_the_registered_three() {
+        assert_eq!(
+            watch_globs::all(),
+            [
+                "**/*.semanticdb",
+                "**/.scala3-bsp-semantic-ls/config.json",
+                "**/.bsp/*.json",
+            ]
+        );
     }
 
     #[test]
