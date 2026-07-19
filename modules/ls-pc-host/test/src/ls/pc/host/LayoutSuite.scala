@@ -23,9 +23,9 @@ import ls.pc.host.boundary.{
   */
 class LayoutSuite extends munit.FunSuite:
 
-  // The value of `ls_pc_abi::LAYOUT_CANARY` (FNV-1a over the 50 ordered layout
+  // The value of `ls_pc_abi::LAYOUT_CANARY` (FNV-1a over the 51 ordered layout
   // facts). If the Rust ABI changes, regenerate the bindings and update this.
-  private val RustLayoutCanary: Long = 0x4ce2542b95034221L
+  private val RustLayoutCanary: Long = 0x9e1bfa41f279e689L
 
   test("string/buffer argument structs are two pointer-sized words"):
     assertEquals(LsStr.sizeof(), 16L)
@@ -59,8 +59,8 @@ class LayoutSuite extends munit.FunSuite:
     assertEquals(LocationRecord.`origin$offset`(), 24L)
     assertEquals(LocationRecord.sizeof(), 28L)
 
-  test("rust vtable is eight 8-byte slots in the contract order"):
-    assertEquals(RustVtable.sizeof(), 64L)
+  test("rust vtable is nine 8-byte slots in the contract order"):
+    assertEquals(RustVtable.sizeof(), 72L)
     assertEquals(RustVtable.`abi_version$offset`(), 0L)
     assertEquals(RustVtable.`layout_canary$offset`(), 8L)
     assertEquals(RustVtable.`alloc$offset`(), 16L)
@@ -69,6 +69,7 @@ class LayoutSuite extends munit.FunSuite:
     assertEquals(RustVtable.`register_pc_vtable$offset`(), 40L)
     assertEquals(RustVtable.`pc_dispatch_loop$offset`(), 48L)
     assertEquals(RustVtable.`symbol_definition$offset`(), 56L)
+    assertEquals(RustVtable.`search_methods$offset`(), 64L)
 
   test("pc vtable is abi_version then 15 slots in the contract order"):
     assertEquals(PcVtable.sizeof(), 128L)
@@ -89,8 +90,8 @@ class LayoutSuite extends munit.FunSuite:
     assertEquals(PcVtable.`shutdown$offset`(), 112L)
     assertEquals(PcVtable.`spawn_dispatch$offset`(), 120L)
 
-  test("the fact list is exactly the 50 the Rust side hashes"):
-    assertEquals(LayoutCanary.facts().length, 50)
+  test("the fact list is exactly the 51 the Rust side hashes"):
+    assertEquals(LayoutCanary.facts().length, 51)
 
   test("recomputed canary equals the Rust LAYOUT_CANARY"):
     assertEquals(LayoutCanary.compute(), RustLayoutCanary)

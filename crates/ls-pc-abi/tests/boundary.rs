@@ -15,8 +15,9 @@ use ls_pc_abi::abi::{
 };
 use ls_pc_abi::payloads::{
     origin, CompilerPlugin, CompletionItem, CompletionList, DefinitionResult, DisabledPlugin,
-    Documentation, HoverResult, Location, LocationsResult, PluginStatus, PrepareRenameResult,
-    ResolveParams, Rng, ServicePlugin, SignatureHelp, SignatureInfo,
+    Documentation, HoverResult, Location, LocationsResult, MethodHit, MethodHitsResult,
+    PluginStatus, PrepareRenameResult, ResolveParams, Rng, ServicePlugin, SignatureHelp,
+    SignatureInfo,
 };
 use ls_pc_abi::{
     compute_layout_canary, memory, LsBuf, LsStr, PcVtable, RustVtable, ABI_VERSION, LAYOUT_CANARY,
@@ -307,6 +308,24 @@ unsafe extern "C" fn stub_symbol_definition(
     }
 }
 
+unsafe extern "C" fn stub_search_methods(query: LsStr, target: LsStr, out: *mut LsBuf) -> i32 {
+    let payload = MethodHitsResult {
+        hits: vec![MethodHit {
+            uri: format!("file:///methods/{}.scala", unsafe { read_ls_str(target) }),
+            symbol: format!("pkg/Ops.{}().", unsafe { read_ls_str(query) }),
+            kind: 3,
+            range: Rng::default(),
+        }],
+    }
+    .encode()
+    .unwrap();
+    if unsafe { memory::write_response(&payload, out) } {
+        STATUS_OK
+    } else {
+        STATUS_ALLOC
+    }
+}
+
 fn build_rust_vtable() -> RustVtable {
     RustVtable {
         abi_version: ABI_VERSION,
@@ -317,6 +336,7 @@ fn build_rust_vtable() -> RustVtable {
         register_pc_vtable: stub_register_pc_vtable,
         pc_dispatch_loop: stub_pc_dispatch_loop,
         symbol_definition: stub_symbol_definition,
+        search_methods: stub_search_methods,
     }
 }
 
@@ -325,7 +345,7 @@ fn build_rust_vtable() -> RustVtable {
 #[test]
 fn vtable_layouts_match_the_canary_contract() {
     assert_eq!(size_of::<PcVtable>(), 128);
-    assert_eq!(size_of::<RustVtable>(), 64);
+    assert_eq!(size_of::<RustVtable>(), 72);
     assert_eq!(LAYOUT_CANARY, compute_layout_canary());
     assert_ne!(LAYOUT_CANARY, 0);
     assert_eq!(ABI_VERSION, 1);
@@ -448,6 +468,19 @@ fn boundary_calls_round_trip_and_free_without_leaking() {
             .unwrap()
             .locations
             .is_empty());
+        unsafe { (rust.free)(out.ptr, out.len) };
+
+        // search_methods callback through the Rust vtable — the query/target
+        // arguments marshal through the slot and the hits decode back.
+        let mut out = empty_buf();
+        assert_eq!(
+            unsafe { (rust.search_methods)(ls_str("incr"), ls_str("root/t"), &mut out) },
+            STATUS_OK
+        );
+        let hits = MethodHitsResult::decode(unsafe { as_slice(&out) }).unwrap();
+        assert_eq!(hits.hits[0].symbol, "pkg/Ops.incr().");
+        assert_eq!(hits.hits[0].uri, "file:///methods/root/t.scala");
+        assert_eq!(hits.hits[0].kind, 3);
         unsafe { (rust.free)(out.ptr, out.len) };
 
         // Lifecycle ops carry no payload.

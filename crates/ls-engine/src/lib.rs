@@ -21,7 +21,8 @@ pub use highlight::{DocHighlight, DocumentHighlightService, HighlightKind};
 pub use ingest::{ingest, IngestReport, SemanticdbFileError};
 pub use ls_semanticdb::DocFacts;
 pub use orchestrator::{
-    current_thread_label, CursorSymbol, QueryOrchestrator, ResolutionSource, WorkspaceSymbolEntry,
+    current_thread_label, CursorSymbol, MethodHit, QueryOrchestrator, ResolutionSource,
+    WorkspaceSymbolEntry,
 };
 pub use overlay::{DirtyBufferOverlay, NoopOverlay, OverlayHit};
 pub use references::{ReferenceHit, ReferencesEngine, ReferencesResult};

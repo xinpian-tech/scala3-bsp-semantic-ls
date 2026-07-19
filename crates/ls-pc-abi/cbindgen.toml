@@ -27,6 +27,7 @@ include = [
     "RegisterPcVtableFn",
     "PcDispatchLoopFn",
     "SymbolDefinitionFn",
+    "SearchMethodsFn",
     "PcRequestFn",
     "PcUriFn",
     "PcQueryFn",

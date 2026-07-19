@@ -3,8 +3,16 @@ package ls.pc.host
 import java.lang.foreign.{Arena, MemorySegment, ValueLayout}
 import java.nio.charset.StandardCharsets.UTF_8
 
-import ls.pc.PcDefinitionResolver
-import ls.pc.host.boundary.{boundary_h, FreeFn, LsBuf, LsStr, RustVtable, SymbolDefinitionFn}
+import ls.pc.{PcDefinitionResolver, WorkspaceMethodHit}
+import ls.pc.host.boundary.{
+  boundary_h,
+  FreeFn,
+  LsBuf,
+  LsStr,
+  RustVtable,
+  SearchMethodsFn,
+  SymbolDefinitionFn
+}
 import ls.pc.host.codec.Payloads
 import org.eclipse.lsp4j.{Location, Position, Range}
 
@@ -60,6 +68,49 @@ final class PcHostDefinitionResolver(vtable: MemorySegment, log: String => Unit)
           Vector.empty
       finally arena.close()
 
+  /** Downcalls the Rust `search_methods` vtable slot: the presentation
+    * compiler asks (through `SymbolSearch.searchMethods`, member-mode
+    * workspace extension-method discovery) for the workspace methods matching
+    * `query`; this marshals `(query, buildTargetIdentifier)` across the FFM
+    * boundary, and Rust answers from the immutable index snapshot
+    * (forward-closure pruned by the requesting PC target). Same memory and
+    * containment discipline as [[definition]]: the Rust-owned response buffer
+    * is copied out and freed through the vtable `free` slot, and any failure
+    * answers empty (the [[PcDefinitionResolver.searchMethods]] default).
+    */
+  override def searchMethods(
+      query: String,
+      buildTargetIdentifier: String
+  ): Vector[WorkspaceMethodHit] =
+    val arena = Arena.ofConfined()
+    try
+      val out = LsBuf.allocate(arena)
+      val status = SearchMethodsFn.invoke(
+        RustVtable.search_methods(vtable),
+        lsStr(arena, if query == null then "" else query),
+        lsStr(arena, if buildTargetIdentifier == null then "" else buildTargetIdentifier),
+        out
+      )
+      if status != boundary_h.STATUS_OK() then Vector.empty
+      else
+        val ptr = LsBuf.ptr(out)
+        val len = LsBuf.len(out)
+        try
+          // Copy the payload out of Rust memory and decode it.
+          val bytes = readResponse(ptr, len)
+          if bytes.isEmpty then Vector.empty
+          else Payloads.MethodHitsResult.decode(bytes).hits.iterator.map(toHit).toVector
+        finally
+          // Always hand a non-null Rust-owned buffer back — even if the copy or
+          // decode above threw — passing the raw 32-bit length so `free`
+          // matches the original `alloc` size (mirrors [[definition]]).
+          if ptr.address() != 0 then FreeFn.invoke(RustVtable.free(vtable), ptr, len)
+    catch
+      case t: Throwable =>
+        log(s"search_methods downcall failed: $t")
+        Vector.empty
+    finally arena.close()
+
   /** Fills a borrowed `LsStr` (UTF-8, no NUL) in `arena`. An empty string is a
     * null pointer with zero length.
     */
@@ -84,5 +135,14 @@ final class PcHostDefinitionResolver(vtable: MemorySegment, log: String => Unit)
     val r = loc.range
     Location(
       loc.uri,
+      Range(Position(r.startLine, r.startCharacter), Position(r.endLine, r.endCharacter))
+    )
+
+  private def toHit(hit: Payloads.MethodHit): WorkspaceMethodHit =
+    val r = hit.range
+    WorkspaceMethodHit(
+      hit.uri,
+      hit.symbol,
+      hit.kind,
       Range(Position(r.startLine, r.startCharacter), Position(r.endLine, r.endCharacter))
     )

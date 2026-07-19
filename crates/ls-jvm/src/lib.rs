@@ -34,7 +34,7 @@ use std::time::{Duration, Instant};
 
 use ls_pc_abi::abi::{LsBuf, LsStr};
 use ls_pc_abi::memory::{abi_alloc, abi_free, write_response};
-use ls_pc_abi::payloads::LocationsResult;
+use ls_pc_abi::payloads::{LocationsResult, MethodHitsResult};
 use ls_pc_abi::{
     PcVtable, RustVtable, ABI_VERSION, LAYOUT_CANARY, STATUS_ABI_MISMATCH, STATUS_ALLOC,
     STATUS_BAD_ARG, STATUS_INTERNAL, STATUS_OK, STATUS_PANIC,
@@ -83,6 +83,23 @@ static SYMBOL_DEFINITION_RESOLVER: OnceLock<Box<SymbolDefinitionResolver>> = Onc
 /// answers an empty locations buffer.
 pub fn install_symbol_definition_resolver(resolver: Box<SymbolDefinitionResolver>) {
     let _ = SYMBOL_DEFINITION_RESOLVER.set(resolver);
+}
+
+/// The island's workspace method search resolver: `(query, bsp_target_id) ->
+/// method hits`. This is the read-only, snapshot-backed callback behind the PC
+/// `SymbolSearch.searchMethods` seam (member-mode workspace extension-method
+/// discovery); the server installs one over the immutable index snapshot before
+/// boot, next to the [`SymbolDefinitionResolver`].
+pub type SearchMethodsResolver = dyn Fn(&str, &str) -> MethodHitsResult + Send + Sync;
+
+static SEARCH_METHODS_RESOLVER: OnceLock<Box<SearchMethodsResolver>> = OnceLock::new();
+
+/// Install the resolver the island downcalls for workspace method search.
+/// Idempotent per process, exactly like
+/// [`install_symbol_definition_resolver`]. Without one, the callback answers an
+/// empty method-hits buffer.
+pub fn install_search_methods_resolver(resolver: Box<SearchMethodsResolver>) {
+    let _ = SEARCH_METHODS_RESOLVER.set(resolver);
 }
 
 fn rendezvous() -> &'static Rendezvous {
@@ -159,6 +176,32 @@ unsafe extern "C" fn vt_symbol_definition(symbol: LsStr, from_uri: LsStr, out: *
             SYMBOL_DEFINITION_RESOLVER.get().map(|r| r.as_ref()),
             &symbol,
             &from_uri,
+            out,
+        )
+    }) {
+        Ok(status) => status,
+        Err(_) => STATUS_PANIC,
+    }
+}
+
+/// Index-backed workspace method search callback. Decodes the incoming query +
+/// requesting build-target id, runs the installed resolver (an empty response
+/// when none is wired), and writes an encoded `MethodHitsResult` into `out`.
+/// Rust owns the response buffer; the island frees it through the `free` slot.
+unsafe extern "C" fn vt_search_methods(query: LsStr, bsp_target_id: LsStr, out: *mut LsBuf) -> i32 {
+    match std::panic::catch_unwind(|| {
+        let query = match read_utf8_strict(query.ptr, query.len) {
+            Ok(s) => s,
+            Err(status) => return status,
+        };
+        let bsp_target_id = match read_utf8_strict(bsp_target_id.ptr, bsp_target_id.len) {
+            Ok(s) => s,
+            Err(status) => return status,
+        };
+        run_search_resolver(
+            SEARCH_METHODS_RESOLVER.get().map(|r| r.as_ref()),
+            &query,
+            &bsp_target_id,
             out,
         )
     }) {
@@ -278,6 +321,46 @@ fn run_resolver(
     }
 }
 
+/// Runs the search-methods resolver (if any) and writes an encoded
+/// `MethodHitsResult` into `out`, with the same containment contract as
+/// [`run_resolver`]: a missing resolver answers empty hits, a panicking
+/// resolver is contained to `STATUS_PANIC`, a null `out` is `STATUS_BAD_ARG`,
+/// and an allocation failure is `STATUS_ALLOC`. Split out so the containment
+/// contract is unit-tested without booting a JVM.
+fn run_search_resolver(
+    resolver: Option<&SearchMethodsResolver>,
+    query: &str,
+    bsp_target_id: &str,
+    out: *mut LsBuf,
+) -> i32 {
+    if out.is_null() {
+        return STATUS_BAD_ARG;
+    }
+    let result = match resolver {
+        None => MethodHitsResult { hits: Vec::new() },
+        Some(resolve) => {
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                resolve(query, bsp_target_id)
+            })) {
+                Ok(result) => result,
+                Err(_) => return STATUS_PANIC,
+            }
+        }
+    };
+    let payload = match result.encode() {
+        Ok(bytes) => bytes,
+        // A response too large to represent in the ABI is an internal failure,
+        // not a truncated buffer handed across the boundary.
+        Err(_) => return STATUS_INTERNAL,
+    };
+    // SAFETY: `out` is a valid writable `LsBuf` for the call (checked non-null).
+    if unsafe { write_response(&payload, out) } {
+        STATUS_OK
+    } else {
+        STATUS_ALLOC
+    }
+}
+
 fn read_utf8(ptr: *const u8, len: u32) -> String {
     if ptr.is_null() || len == 0 {
         return String::new();
@@ -289,8 +372,9 @@ fn read_utf8(ptr: *const u8, len: u32) -> String {
 
 /// Like [`read_utf8`] but rejects a null pointer paired with a positive length
 /// (a malformed borrowed string) as `STATUS_BAD_ARG` rather than silently
-/// treating it as empty. Used for the `symbol_definition` arguments, which must
-/// be well-formed; the lenient [`read_utf8`] stays for best-effort log capture.
+/// treating it as empty. Used for the `symbol_definition` and `search_methods`
+/// arguments, which must be well-formed; the lenient [`read_utf8`] stays for
+/// best-effort log capture.
 /// This mirrors the island-side `readLsStr`, which rejects the same shape.
 fn read_utf8_strict(ptr: *const u8, len: u32) -> Result<String, i32> {
     if len != 0 && ptr.is_null() {
@@ -311,6 +395,7 @@ static RUST_VTABLE: RustVtable = RustVtable {
     register_pc_vtable: vt_register_pc_vtable,
     pc_dispatch_loop: vt_pc_dispatch_loop,
     symbol_definition: vt_symbol_definition,
+    search_methods: vt_search_methods,
 };
 
 // ---------------------------------------------------------------------------
@@ -425,6 +510,27 @@ mod tests {
             read_utf8_strict(b.as_ptr(), b.len() as u32),
             Ok("pkg/A#".to_string())
         );
+    }
+
+    #[test]
+    fn vt_search_methods_rejects_a_null_argument_pointer() {
+        // Same containment contract as the definition slot: a borrowed argument
+        // with a null pointer + positive length maps to a typed bad-arg status.
+        let mut out = LsBuf {
+            ptr: std::ptr::null_mut(),
+            len: 0,
+        };
+        let bad = LsStr {
+            ptr: std::ptr::null(),
+            len: 5,
+        };
+        let empty = LsStr {
+            ptr: std::ptr::null(),
+            len: 0,
+        };
+        // SAFETY: `out` is a valid writable LsBuf; the args are borrowed structs.
+        let status = unsafe { vt_search_methods(bad, empty, std::ptr::addr_of_mut!(out)) };
+        assert_eq!(status, STATUS_BAD_ARG);
     }
 
     #[test]
@@ -598,6 +704,109 @@ mod tests {
             ls_pc_abi::memory::live_allocations(),
             before,
             "the response buffer is freed"
+        );
+    }
+
+    fn decode_hits_out(out: &LsBuf) -> MethodHitsResult {
+        let bytes = if out.ptr.is_null() || out.len == 0 {
+            Vec::new()
+        } else {
+            // SAFETY: a successful `write_response` left `ptr`/`len` valid.
+            unsafe { std::slice::from_raw_parts(out.ptr, out.len as usize).to_vec() }
+        };
+        MethodHitsResult::decode(&bytes).expect("decode method hits")
+    }
+
+    #[test]
+    fn run_search_resolver_rejects_null_out_and_answers_empty_without_a_resolver() {
+        assert_eq!(
+            run_search_resolver(None, "incr", "root/t", std::ptr::null_mut()),
+            STATUS_BAD_ARG
+        );
+        let mut out = LsBuf {
+            ptr: std::ptr::dangling_mut::<u8>(),
+            len: 7,
+        };
+        assert_eq!(
+            run_search_resolver(None, "incr", "root/t", std::ptr::addr_of_mut!(out)),
+            STATUS_OK
+        );
+        // With no resolver the response is a decodable empty method-hits buffer.
+        assert!(decode_hits_out(&out).hits.is_empty());
+        free_out(&mut out);
+    }
+
+    #[test]
+    fn run_search_resolver_writes_the_resolved_hits_and_frees_clean() {
+        use ls_pc_abi::payloads::{MethodHit, Rng};
+
+        let seen = Arc::new(Mutex::new(None));
+        let captured = seen.clone();
+        let resolver: Box<SearchMethodsResolver> = Box::new(move |query: &str, target: &str| {
+            *captured.lock().unwrap() = Some((query.to_string(), target.to_string()));
+            MethodHitsResult {
+                hits: vec![MethodHit {
+                    uri: "file:///w/Enrichments.scala".to_string(),
+                    symbol: "a/b/A$package.incr().".to_string(),
+                    kind: 3,
+                    range: Rng {
+                        start_line: 1,
+                        start_character: 6,
+                        end_line: 1,
+                        end_character: 10,
+                    },
+                }],
+            }
+        });
+
+        let before = ls_pc_abi::memory::live_allocations();
+        let mut out = LsBuf {
+            ptr: std::ptr::null_mut(),
+            len: 0,
+        };
+        assert_eq!(
+            run_search_resolver(
+                Some(resolver.as_ref()),
+                "incr",
+                "root/t",
+                std::ptr::addr_of_mut!(out),
+            ),
+            STATUS_OK
+        );
+        // The resolver saw exactly the decoded arguments.
+        assert_eq!(
+            *seen.lock().unwrap(),
+            Some(("incr".to_string(), "root/t".to_string()))
+        );
+        let decoded = decode_hits_out(&out);
+        assert_eq!(decoded.hits.len(), 1);
+        assert_eq!(decoded.hits[0].symbol, "a/b/A$package.incr().");
+        assert_eq!(decoded.hits[0].kind, 3);
+        assert_eq!(decoded.hits[0].range.start_character, 6);
+        free_out(&mut out);
+        assert_eq!(
+            ls_pc_abi::memory::live_allocations(),
+            before,
+            "the response buffer is freed"
+        );
+    }
+
+    #[test]
+    fn run_search_resolver_contains_a_panicking_resolver() {
+        let resolver: Box<SearchMethodsResolver> =
+            Box::new(|_: &str, _: &str| panic!("boom in the search resolver"));
+        let mut out = LsBuf {
+            ptr: std::ptr::dangling_mut::<u8>(),
+            len: 9,
+        };
+        assert_eq!(
+            run_search_resolver(
+                Some(resolver.as_ref()),
+                "q",
+                "t",
+                std::ptr::addr_of_mut!(out),
+            ),
+            STATUS_PANIC
         );
     }
 

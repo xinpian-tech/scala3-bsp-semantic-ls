@@ -25,7 +25,7 @@ import ls.pc.host.boundary.{
   */
 object LayoutCanary:
   // FNV-1a (64-bit). Must stay byte-for-byte identical to the Rust side: the
-  // same 50 layout facts, in the same order, each hashed as 8 little-endian
+  // same 51 layout facts, in the same order, each hashed as 8 little-endian
   // bytes.
   private val FnvOffset: Long = 0xcbf29ce484222325L
   private val FnvPrime: Long = 0x100000001b3L
@@ -77,6 +77,7 @@ object LayoutCanary:
       RustVtable.`register_pc_vtable$offset`(),
       RustVtable.`pc_dispatch_loop$offset`(),
       RustVtable.`symbol_definition$offset`(),
+      RustVtable.`search_methods$offset`(),
       // PC vtable: size + every slot offset.
       PcVtable.sizeof(),
       PcVtable.`abi_version$offset`(),

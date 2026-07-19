@@ -134,6 +134,22 @@ class CodecSuite extends munit.FunSuite:
   test("an empty locations list round-trips"):
     parity("locations_empty", LocationsResult(Seq.empty), _.encode(), LocationsResult.decode)
 
+  test("search_methods hits round-trip"):
+    parity(
+      "method_hits",
+      MethodHitsResult(
+        Seq(MethodHit("file:///E.scala", "a/b/A$package.incr().", 3, Rng(1, 6, 1, 10)))
+      ),
+      _.encode(),
+      MethodHitsResult.decode
+    )
+
+  test("an empty method-hits list round-trips"):
+    parity("method_hits_empty", MethodHitsResult(Seq.empty), _.encode(), MethodHitsResult.decode)
+
+  test("a method-hits buffer is not decodable as locations (distinct kinds)"):
+    intercept[CodecException](LocationsResult.decode(golden("method_hits")))
+
   test("prepare-rename with a range round-trips"):
     parity(
       "prepare_rename_some",

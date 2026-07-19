@@ -212,11 +212,15 @@ Every function returns an `i32` status; every Java upcall body is wrapped
 independently recomputed layout canary are checked at registration; `cbindgen`
 regenerates `boundary.h` and jextract generates the island's Java bindings from
 it, so drift is a boot refusal, not a corrupt call. The Rust vtable carries
-`alloc`, `free`, `log`, `register_pc_vtable`, `pc_dispatch_loop`, and
-`symbol_definition` — the index-backed cross-file go-to-definition callback,
-which reads **only** the immutable snapshot (the index writer is unreachable
-from island threads by construction) and scopes results to the requesting
-target's forward dependency closure. The PC vtable is the 15-op surface:
+`alloc`, `free`, `log`, `register_pc_vtable`, `pc_dispatch_loop`,
+`symbol_definition` — the index-backed cross-file go-to-definition callback —
+and `search_methods` — the index-backed workspace method search behind the PC
+`SymbolSearch.searchMethods` seam (member-mode extension-method / implicit-
+class-member discovery). Both index callbacks read **only** the immutable
+snapshot (the index writer is unreachable from island threads by construction)
+and scope results to the requesting target's forward dependency closure
+(`symbol_definition` locates the target by the buffer uri; `search_methods` is
+handed the PC target id directly). The PC vtable is the 15-op surface:
 `register_target, did_open, did_change, did_close, completion,
 completion_resolve, hover, signature_help, definition, type_definition,
 prepare_rename, plugin_status, restart_instances, shutdown, spawn_dispatch`.

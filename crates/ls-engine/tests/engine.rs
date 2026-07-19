@@ -555,6 +555,164 @@ fn symbol_definition_normalizes_dotdot_spellings_in_from_uri() {
     assert_eq!(locs[0].uri, file_uri(&core_s, "c/S.scala"));
 }
 
+/// The workspace method-search fixture, ALL targets sharing ONE sourceroot (the
+/// mill layout, where prefix-depth attribution ties): `core` defines the two
+/// extension-method shapes — a package-object method `a/b/A$package.incr().`
+/// (with a stored SemanticDB kind) and object methods `pkg/Ops.deco().`
+/// (occurrence-only, no symbol info) and `pkg/Ops.myDeco().` (stored MACRO
+/// kind) — plus a non-method class `pkg/C#`; `app` depends on `core`; `dup` is
+/// DISCONNECTED and also defines an `incr` method (`hid/Hid.incr().`).
+fn build_methods_workspace(dir: &TempDir) -> (Arc<WorkspaceTargets>, PathBuf) {
+    let core_t = dir.sub("coretarget");
+    let app_t = dir.sub("apptarget");
+    let dup_t = dir.sub("duptarget");
+    let src = dir.sub("sharedsrc");
+    write_doc(
+        &core_t,
+        &src,
+        &DocFixture::new(
+            "c/Enrich.scala",
+            "extension (n: Int)\n  def incr: Int = n + 1\nobject Ops:\n  def deco: Int = 0\n  def myDeco: Int = 1\nclass C\n",
+        )
+        .symbol(sym("a/b/A$package.incr().", KIND_METHOD, 0, "incr"))
+        .symbol(sym("pkg/Ops.myDeco().", 6, 0, "myDeco"))
+        .symbol(sym("pkg/C#", KIND_CLASS, 0, "C"))
+        .occurrence(occ(rng(1, 6, 1, 10), "a/b/A$package.incr().", DEFINITION))
+        .occurrence(occ(rng(3, 6, 3, 10), "pkg/Ops.deco().", DEFINITION))
+        .occurrence(occ(rng(4, 6, 4, 12), "pkg/Ops.myDeco().", DEFINITION))
+        .occurrence(occ(rng(5, 6, 5, 7), "pkg/C#", DEFINITION)),
+    );
+    write_doc(
+        &app_t,
+        &src,
+        &DocFixture::new("a/Use.scala", "val u = Ops.deco\n").occurrence(occ(
+            rng(0, 12, 0, 16),
+            "pkg/Ops.deco().",
+            REFERENCE,
+        )),
+    );
+    write_doc(
+        &dup_t,
+        &src,
+        &DocFixture::new("d/Hidden.scala", "object Hid:\n  def incr: Int = 2\n")
+            .symbol(sym("hid/Hid.incr().", KIND_METHOD, 0, "incr"))
+            .occurrence(occ(rng(1, 6, 1, 10), "hid/Hid.incr().", DEFINITION)),
+    );
+    let ws = WorkspaceTargets::new(vec![
+        TargetSpec::new("core", core_t, src.clone()),
+        TargetSpec::new("app", app_t, src.clone()).with_deps(vec!["core".to_string()]),
+        TargetSpec::new("dup", dup_t, src.clone()),
+    ]);
+    (Arc::new(ws), src)
+}
+
+#[test]
+fn search_methods_resolves_extension_method_shapes_with_kind_and_def_span() {
+    let dir = TempDir::new("searchmethods");
+    let (ws, src) = build_methods_workspace(&dir);
+    let orch = orchestrator(&dir, ws);
+
+    // Package-object extension method: prefix query, stored METHOD kind, and
+    // the exact definition span absolutized under the target's sourceroot.
+    let hits = orch.search_methods("inc", "app");
+    assert_eq!(hits.len(), 1, "app sees only core's incr: {hits:?}");
+    assert_eq!(hits[0].symbol, "a/b/A$package.incr().");
+    assert_eq!(hits[0].uri, file_uri(&src, "c/Enrich.scala"));
+    assert_eq!(hits[0].kind, 3);
+    assert_eq!(hits[0].span, Span::new(1, 6, 1, 10));
+
+    // Object method with NO stored symbol info: the descriptor still names it
+    // and the kind falls back to the SemanticDB METHOD constant.
+    let hits = orch.search_methods("deco", "app");
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].symbol, "pkg/Ops.deco().");
+    assert_eq!(hits[0].kind, 3);
+    assert_eq!(hits[0].span, Span::new(3, 6, 3, 10));
+
+    // A stored non-zero kind is carried through (MACRO = 6).
+    let hits = orch.search_methods("myDeco", "app");
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].symbol, "pkg/Ops.myDeco().");
+    assert_eq!(hits[0].kind, 6);
+
+    // A non-method symbol never surfaces, even on an exact-name query.
+    assert!(orch.search_methods("C", "app").is_empty());
+}
+
+#[test]
+fn search_methods_matches_camel_humps_case_sensitively() {
+    let dir = TempDir::new("searchhump");
+    let (ws, _src) = build_methods_workspace(&dir);
+    let orch = orchestrator(&dir, ws);
+
+    // Camel-hump: an uppercase query char jumps to the matching hump.
+    let hits = orch.search_methods("mD", "app");
+    assert_eq!(hits.len(), 1, "mD hump-matches myDeco: {hits:?}");
+    assert_eq!(hits[0].symbol, "pkg/Ops.myDeco().");
+    // An uppercase-led query may skip the leading lowercase run.
+    let hits = orch.search_methods("Deco", "app");
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].symbol, "pkg/Ops.myDeco().");
+
+    // Case-sensitive: a lowercase query is exact, not a hump jump (the metals
+    // `Fuzzy.matches` lowercase rule), and a wrong prefix never matches.
+    assert!(orch.search_methods("md", "app").is_empty());
+    assert!(orch.search_methods("Incr", "app").is_empty());
+    assert!(orch.search_methods("xinc", "app").is_empty());
+}
+
+#[test]
+fn search_methods_prunes_to_the_forward_closure_under_a_shared_sourceroot() {
+    let dir = TempDir::new("searchclosure");
+    let (ws, src) = build_methods_workspace(&dir);
+    let orch = orchestrator(&dir, ws);
+
+    // Every target shares ONE sourceroot, so pruning must attribute each
+    // definition by its doc's target row, not by sourceroot prefix: from `app`
+    // (core in its forward closure) the disconnected `dup` incr is pruned...
+    let hits = orch.search_methods("incr", "app");
+    assert_eq!(hits.len(), 1, "app must not see dup's incr: {hits:?}");
+    assert_eq!(hits[0].symbol, "a/b/A$package.incr().");
+
+    // ...from `dup` only its own incr is visible...
+    let hits = orch.search_methods("incr", "dup");
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].symbol, "hid/Hid.incr().");
+    assert_eq!(hits[0].uri, file_uri(&src, "d/Hidden.scala"));
+
+    // ...and an empty or unknown target id answers unscoped (both hits).
+    for target in ["", "ghost"] {
+        let hits = orch.search_methods("incr", target);
+        let symbols: Vec<&str> = hits.iter().map(|h| h.symbol.as_str()).collect();
+        assert_eq!(
+            symbols,
+            vec!["a/b/A$package.incr().", "hid/Hid.incr()."],
+            "target '{target}' must be unscoped"
+        );
+    }
+}
+
+#[test]
+fn search_methods_empty_query_matches_all_visible_methods() {
+    let dir = TempDir::new("searchempty");
+    let (ws, _src) = build_methods_workspace(&dir);
+    let orch = orchestrator(&dir, ws);
+
+    // An empty query matches every method the requesting target can see (the
+    // `Fuzzy.matches` empty-query rule) — still closure-pruned, still no
+    // non-method symbols.
+    let hits = orch.search_methods("", "app");
+    let symbols: Vec<&str> = hits.iter().map(|h| h.symbol.as_str()).collect();
+    assert_eq!(
+        symbols,
+        vec![
+            "a/b/A$package.incr().",
+            "pkg/Ops.deco().",
+            "pkg/Ops.myDeco().",
+        ]
+    );
+}
+
 #[test]
 fn no_semanticdb_source_returns_hard_error() {
     let dir = TempDir::new("nosdb");
@@ -812,8 +970,16 @@ fn symbol_definition_resolves_a_companion_object_in_a_multi_segment_package() {
         )
         .symbol(sym("me/jiuyang/decoder/BitSet#", KIND_TRAIT, 0, "BitSet"))
         .symbol(sym("me/jiuyang/decoder/BitSet.", KIND_OBJECT, 0, "BitSet"))
-        .occurrence(occ(rng(1, 6, 1, 12), "me/jiuyang/decoder/BitSet#", DEFINITION))
-        .occurrence(occ(rng(2, 7, 2, 13), "me/jiuyang/decoder/BitSet.", DEFINITION)),
+        .occurrence(occ(
+            rng(1, 6, 1, 12),
+            "me/jiuyang/decoder/BitSet#",
+            DEFINITION,
+        ))
+        .occurrence(occ(
+            rng(2, 7, 2, 13),
+            "me/jiuyang/decoder/BitSet.",
+            DEFINITION,
+        )),
     );
     write_doc(
         &t,
@@ -822,7 +988,11 @@ fn symbol_definition_resolves_a_companion_object_in_a_multi_segment_package() {
             "decoder/TruthTable.scala",
             "package me.jiuyang.decoder\nval x = BitSet\n",
         )
-        .occurrence(occ(rng(1, 8, 1, 14), "me/jiuyang/decoder/BitSet.", REFERENCE)),
+        .occurrence(occ(
+            rng(1, 8, 1, 14),
+            "me/jiuyang/decoder/BitSet.",
+            REFERENCE,
+        )),
     );
     let ws = WorkspaceTargets::new(vec![TargetSpec::new("decoder", t, s.clone())]);
     let orch = orchestrator(&dir, Arc::new(ws));
@@ -831,7 +1001,11 @@ fn symbol_definition_resolves_a_companion_object_in_a_multi_segment_package() {
         "me/jiuyang/decoder/BitSet.",
         &file_uri(&s, "decoder/TruthTable.scala"),
     );
-    assert_eq!(locs.len(), 1, "the object definition must resolve: {locs:?}");
+    assert_eq!(
+        locs.len(),
+        1,
+        "the object definition must resolve: {locs:?}"
+    );
     assert_eq!(locs[0].uri, file_uri(&s, "decoder/BitSet.scala"));
     assert_eq!(locs[0].span, Span::new(2, 7, 2, 13));
 
@@ -840,7 +1014,11 @@ fn symbol_definition_resolves_a_companion_object_in_a_multi_segment_package() {
         "me/jiuyang/decoder/BitSet#",
         &file_uri(&s, "decoder/TruthTable.scala"),
     );
-    assert_eq!(trait_locs.len(), 1, "the trait definition must resolve: {trait_locs:?}");
+    assert_eq!(
+        trait_locs.len(),
+        1,
+        "the trait definition must resolve: {trait_locs:?}"
+    );
     assert_eq!(trait_locs[0].span, Span::new(1, 6, 1, 12));
 }
 
@@ -861,13 +1039,20 @@ fn symbol_definition_resolves_a_plain_object_symbol() {
     write_doc(
         &t,
         &s,
-        &DocFixture::new("u/U.scala", "package pkg\nval y = O\n")
-            .occurrence(occ(rng(1, 8, 1, 9), "pkg/O.", REFERENCE)),
+        &DocFixture::new("u/U.scala", "package pkg\nval y = O\n").occurrence(occ(
+            rng(1, 8, 1, 9),
+            "pkg/O.",
+            REFERENCE,
+        )),
     );
     let ws = WorkspaceTargets::new(vec![TargetSpec::new("app", t, s.clone())]);
     let orch = orchestrator(&dir, Arc::new(ws));
     let locs = orch.symbol_definition("pkg/O.", &file_uri(&s, "u/U.scala"));
-    assert_eq!(locs.len(), 1, "a plain object definition must resolve: {locs:?}");
+    assert_eq!(
+        locs.len(),
+        1,
+        "a plain object definition must resolve: {locs:?}"
+    );
     assert_eq!(locs[0].uri, file_uri(&s, "o/O.scala"));
 }
 
@@ -932,5 +1117,9 @@ fn symbol_definition_attributes_the_buffer_by_doc_row_under_a_shared_sourceroot(
 
     // And from the defining buffer itself (same-target cross-file).
     let same = orch.symbol_definition("pkg/B.", &file_uri(&s, "decoder/src/BitSet.scala"));
-    assert_eq!(same.len(), 1, "same-target lookup must survive the tie: {same:?}");
+    assert_eq!(
+        same.len(),
+        1,
+        "same-target lookup must survive the tie: {same:?}"
+    );
 }

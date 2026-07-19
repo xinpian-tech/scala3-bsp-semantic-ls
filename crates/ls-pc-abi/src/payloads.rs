@@ -26,6 +26,7 @@ const KIND_DEFINITION: u32 = 10;
 const KIND_PREPARE_RENAME: u32 = 11;
 const KIND_PLUGIN_STATUS: u32 = 12;
 const KIND_LOCATIONS: u32 = 13;
+const KIND_METHOD_HITS: u32 = 14;
 
 /// `DefinitionOrigin` ordinals (mirrors the Scala `enum DefinitionOrigin`).
 pub mod origin {
@@ -1105,6 +1106,68 @@ impl LocationsResult {
         }
         r.finish()?;
         Ok(LocationsResult { locations })
+    }
+}
+
+/// One workspace method hit of the `search_methods` callback: the defining
+/// `file://` uri, the SemanticDB symbol string the PC resolves back to a
+/// compiler symbol, the SemanticDB kind code, and the definition span.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MethodHit {
+    pub uri: String,
+    pub symbol: String,
+    pub kind: i32,
+    pub range: Rng,
+}
+
+impl MethodHit {
+    fn write(&self, w: &mut Writer) {
+        w.str(&self.uri);
+        w.str(&self.symbol);
+        w.i32(self.kind);
+        self.range.write(w);
+    }
+
+    fn read(r: &mut Reader) -> Result<MethodHit, AbiError> {
+        let uri = r.str()?;
+        let symbol = r.str()?;
+        let kind = r.i32()?;
+        let range = Rng::read(r)?;
+        Ok(MethodHit {
+            uri,
+            symbol,
+            kind,
+            range,
+        })
+    }
+}
+
+/// The `search_methods` callback response: workspace method hits only (mirrors
+/// [`LocationsResult`]'s shape for the definition callback).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MethodHitsResult {
+    pub hits: Vec<MethodHit>,
+}
+
+impl MethodHitsResult {
+    pub fn encode(&self) -> Result<Vec<u8>, AbiError> {
+        let mut w = Writer::new();
+        w.count(self.hits.len());
+        for hit in &self.hits {
+            hit.write(&mut w);
+        }
+        w.finish(KIND_METHOD_HITS)
+    }
+
+    pub fn decode(buf: &[u8]) -> Result<MethodHitsResult, AbiError> {
+        let mut r = Reader::new(buf, KIND_METHOD_HITS)?;
+        let count = r.count()?;
+        let mut hits = Vec::with_capacity(count);
+        for _ in 0..count {
+            hits.push(MethodHit::read(&mut r)?);
+        }
+        r.finish()?;
+        Ok(MethodHitsResult { hits })
     }
 }
 

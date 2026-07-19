@@ -15,7 +15,7 @@ use serde_json::{json, Value};
 use ls_pc_abi::payloads::TargetConfig;
 use ls_server::bootstrap::PcServiceFactory;
 use ls_server::pc::{PcDefLocation, PcDefOrigin, PcDefinition, PcSpan};
-use ls_server::{PcLocation, PcQueryService, SymbolResolver};
+use ls_server::{PcLocation, PcQueryService, SearchMethodsResolver, SymbolResolver};
 
 /// The symbol every fake result carries; resolve gates key off `data.symbol`.
 pub const FAKE_SYMBOL: &str = "fake/Symbol#";
@@ -39,7 +39,10 @@ impl FakePcService {
     /// suite keeps a handle for assertions while the server uses it live.
     pub fn factory(this: Arc<FakePcService>) -> PcServiceFactory {
         Arc::new(
-            move |_root, targets: Vec<TargetConfig>, _resolver: Box<SymbolResolver>| {
+            move |_root,
+                  targets: Vec<TargetConfig>,
+                  _resolver: Box<SymbolResolver>,
+                  _search_resolver: Box<SearchMethodsResolver>| {
                 let mut registered = this.registered.lock().unwrap();
                 registered.clear();
                 registered.extend(targets.iter().map(|t| t.bsp_id.clone()));

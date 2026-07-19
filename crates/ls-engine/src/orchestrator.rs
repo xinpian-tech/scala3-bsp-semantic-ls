@@ -40,6 +40,19 @@ pub struct WorkspaceSymbolEntry {
     pub location: Loc,
 }
 
+/// A workspace method-search hit resolved to what the PC `SymbolSearch.
+/// searchMethods` visitor needs: the defining absolute `file://` uri, the raw
+/// SemanticDB symbol string (the PC resolves it back to a compiler symbol), the
+/// SemanticDB kind code, and the definition span. The engine-side carrier
+/// behind the island's `search_methods` callback.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MethodHit {
+    pub uri: String,
+    pub symbol: String,
+    pub kind: i32,
+    pub span: Span,
+}
+
 /// Where a cursor resolution came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ResolutionSource {
@@ -646,6 +659,98 @@ impl QueryOrchestrator {
         dedupe_and_sort_locs(out)
     }
 
+    /// Index-backed workspace method search for the presentation compiler (the
+    /// callback behind `SymbolSearch.searchMethods`, member-mode workspace
+    /// extension-method / implicit-class-member discovery): every snapshot
+    /// symbol whose SemanticDB descriptor is a METHOD and whose display name
+    /// matches `query` (the metals `Fuzzy.matches` name semantics: an empty
+    /// query matches all, else a case-sensitive prefix / camel-hump
+    /// subsequence), resolved to its DEFINITION occurrences exactly like
+    /// [`QueryOrchestrator::symbol_definition`]'s def-group scan.
+    ///
+    /// Visibility: the PC hands its own build-target id, so hits are pruned to
+    /// the FORWARD dependency closure of `bsp_target_id` (what that target can
+    /// SEE); an empty or unknown target id answers unscoped. Recall matters
+    /// more than precision here — the compiler re-filters every candidate for
+    /// receiver-type applicability — so the matcher is conservative but the
+    /// candidate set is never the whole index for a non-empty query.
+    ///
+    /// Never panics; reads only the immutable snapshot and the workspace
+    /// graph, so it is safe on PC callback threads.
+    pub fn search_methods(&self, query: &str, bsp_target_id: &str) -> Vec<MethodHit> {
+        let Some(snap) = self.current_snapshot() else {
+            return Vec::new();
+        };
+        let seg = snap.segment();
+        // The bsp ids the requesting target can see, or None (unscoped): the
+        // forward closure is empty exactly when the id is unknown to the graph.
+        let allowed: Option<HashSet<String>> = if bsp_target_id.is_empty() {
+            None
+        } else {
+            self.workspace()
+                .map(|ws| ws.forward_dependency_closure(bsp_target_id))
+                .filter(|closure| !closure.is_empty())
+        };
+        let mut out: Vec<MethodHit> = Vec::new();
+        for ord in 0..seg.symbol_count() as u32 {
+            let (raw, local_doc) = symbol_encoding::decode(seg.semantic_symbol_of(ord));
+            // Only global method-descriptor symbols are workspace-discoverable.
+            if local_doc.is_some() {
+                continue;
+            }
+            let display = match ls_semanticdb::symbols::descriptor_of(&raw) {
+                Some(ls_semanticdb::symbols::Descriptor::Method(name, _)) => name,
+                _ => continue,
+            };
+            if !fuzzy_matches_name(query, &display) {
+                continue;
+            }
+            let ref_group = seg.symbol_view(ord).ref_group_ord;
+            if ref_group < 0 {
+                continue;
+            }
+            let meta_kind = seg.symbol_meta(ord).kind;
+            // SemanticDB kind from the symbol meta when stored; the grammar
+            // already proved a method descriptor, so default to METHOD (3).
+            let kind = if meta_kind != 0 { meta_kind } else { 3 };
+            seg.scan_def_group(ref_group as u32, &mut |rec: GroupRecord| {
+                if rec.target_ord < 0 {
+                    return;
+                }
+                let ps = rec.packed_start as u32;
+                let pe = rec.packed_end as u32;
+                let sl = Span::unpack_line(ps);
+                let sc = Span::unpack_char(ps);
+                let doc_ord = rec.doc_ord as u32;
+                // Keep only occurrences that define EXACTLY `ord`, not the
+                // other members of its ref group (the same exactness filter as
+                // `symbol_definition`).
+                if seg.symbol_at(doc_ord, sl, sc).map(|h| h.symbol_ord) != Some(ord as i32) {
+                    return;
+                }
+                let meta = seg.target_meta(rec.target_ord as u32);
+                let visible = allowed
+                    .as_ref()
+                    .map(|ids| ids.contains(&meta.bsp_id))
+                    .unwrap_or(true);
+                if !visible {
+                    return;
+                }
+                let span = Span::new(sl, sc, Span::unpack_line(pe), Span::unpack_char(pe));
+                // Absolute source path = sourceroot / sdb-uri, emitted as a
+                // percent-encoded `file://` uri (as `symbol_definition` does).
+                let abs = uri::normalize(&Path::new(&meta.sourceroot).join(seg.uri_of(doc_ord)));
+                out.push(MethodHit {
+                    uri: uri::path_to_uri(&abs),
+                    symbol: raw.clone(),
+                    kind,
+                    span,
+                });
+            });
+        }
+        dedupe_and_sort_method_hits(out)
+    }
+
     /// Forward dependency closure (bsp ids) of the target owning `from_uri`,
     /// found by its deepest containing sourceroot, or `None` when no target owns
     /// the buffer (definitions are then unscoped). Reads only the immutable
@@ -700,6 +805,81 @@ impl QueryOrchestrator {
             .map(|(t, _)| t)?;
         Some(ws.forward_dependency_closure(&spec.bsp_id))
     }
+}
+
+/// Whether `query` matches the method display `name` under the metals
+/// `Fuzzy.matches` single-name semantics (the PC's member-completion query is a
+/// plain identifier, so only the main-name comparison of `Fuzzy.matchesName`
+/// applies): an EMPTY query matches everything; otherwise a case-sensitive
+/// scan where an UPPERCASE query char may skip ahead to the next matching
+/// symbol char (camel-hump matching, e.g. `mE` matches `myExt`), a lowercase
+/// mismatch backtracks to the last uppercase anchor, and a plain
+/// case-sensitive prefix always matches. Conservative on purpose: the
+/// compiler re-filters every hit for applicability, so over-matching is safe
+/// while a whole-index answer for a non-empty query is not.
+fn fuzzy_matches_name(query: &str, name: &str) -> bool {
+    if query.is_empty() {
+        return true;
+    }
+    let q: Vec<char> = query.chars().collect();
+    let s: Vec<char> = name.chars().collect();
+    // A faithful port of `Fuzzy.matchesName`'s loop: `(ql, sl)` are the last
+    // (query, symbol) indices where an uppercase query char aligned, the
+    // backtrack anchor for a later lowercase mismatch.
+    let (mut qa, mut ql) = (0usize, None::<usize>);
+    let (mut sa, mut sl) = (0usize, None::<usize>);
+    loop {
+        if qa >= q.len() {
+            return true;
+        }
+        if sa >= s.len() {
+            return false;
+        }
+        let qq = q[qa];
+        let ss = s[sa];
+        if qq == ss {
+            if qq.is_uppercase() {
+                ql = Some(qa);
+            }
+            if ss.is_uppercase() {
+                sl = Some(sa);
+            }
+            qa += 1;
+            sa += 1;
+        } else if qq.is_lowercase() {
+            // Backtrack to the anchors (the aligned uppercase pair) + 1; with
+            // no anchor the lowercase query char must match in place.
+            match (ql, sl) {
+                (Some(qanchor), Some(sanchor)) => {
+                    qa = qanchor;
+                    sa = sanchor + 1;
+                    ql = None;
+                    sl = None;
+                }
+                _ => return false,
+            }
+        } else {
+            // An uppercase (or non-letter) query char skips symbol chars until
+            // it aligns — the camel-hump jump.
+            sa += 1;
+        }
+    }
+}
+
+/// Dedupe by (symbol, uri, span) and sort the same way — a stable order for
+/// the PC visitor and tests (mirrors [`dedupe_and_sort_locs`]).
+fn dedupe_and_sort_method_hits(mut hits: Vec<MethodHit>) -> Vec<MethodHit> {
+    hits.sort_by(|a, b| {
+        a.symbol
+            .cmp(&b.symbol)
+            .then(a.uri.cmp(&b.uri))
+            .then(a.span.start_line.cmp(&b.span.start_line))
+            .then(a.span.start_char.cmp(&b.span.start_char))
+            .then(a.span.end_line.cmp(&b.span.end_line))
+            .then(a.span.end_char.cmp(&b.span.end_char))
+    });
+    hits.dedup_by(|a, b| a.symbol == b.symbol && a.uri == b.uri && a.span == b.span);
+    hits
 }
 
 /// Dedupe by (uri, span) and sort by (uri, start, end) — a stable order for

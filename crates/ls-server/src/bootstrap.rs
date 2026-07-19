@@ -24,17 +24,20 @@ use ls_bsp::{
     ProjectModelLoader,
 };
 use ls_engine::{
-    CompileOutcome, CompileService, DocFacts, QueryOrchestrator, TargetSpec, WorkspaceTargets,
+    CompileOutcome, CompileService, DocFacts, MethodHit, QueryOrchestrator, TargetSpec,
+    WorkspaceTargets,
 };
 use ls_index_model::uri::normalize_uri;
 use ls_index_model::Loc;
-use ls_pc_abi::payloads::{origin, LocationsResult, Rng, TargetConfig};
+use ls_pc_abi::payloads::{origin, LocationsResult, MethodHitsResult, Rng, TargetConfig};
 use ls_store::Store;
 
 use crate::doctor::DoctorTargets;
 use crate::documents::DocumentStore;
 use crate::lifecycle::WorkspaceState;
-use crate::pc::{pc_options, IslandPcService, PcQueryService, SymbolResolver};
+use crate::pc::{
+    pc_options, IslandPcService, PcQueryService, SearchMethodsResolver, SymbolResolver,
+};
 use crate::pc_overlay::PcOverlay;
 use crate::server::Bootstrap;
 use crate::services::{BuildCompiler, CoreServices, UnavailableCompiler};
@@ -183,6 +186,28 @@ fn locations_result(locations: Vec<Loc>) -> LocationsResult {
     }
 }
 
+/// Index method-search hits -> the ABI `MethodHitsResult` the island's
+/// `search_methods` resolver returns. The engine already emits absolute
+/// `file://` URIs and raw SemanticDB symbols.
+fn method_hits_result(hits: Vec<MethodHit>) -> MethodHitsResult {
+    MethodHitsResult {
+        hits: hits
+            .into_iter()
+            .map(|hit| ls_pc_abi::payloads::MethodHit {
+                uri: hit.uri,
+                symbol: hit.symbol,
+                kind: hit.kind,
+                range: Rng {
+                    start_line: hit.span.start_line,
+                    start_character: hit.span.start_char,
+                    end_line: hit.span.end_line,
+                    end_character: hit.span.end_char,
+                },
+            })
+            .collect(),
+    }
+}
+
 fn path_string(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
@@ -261,14 +286,20 @@ pub struct IndexBootstrap<M> {
 }
 
 /// Builds the ready bundle's PC capability from the workspace root, the model's
-/// PC target registrations, and the index-backed cross-file symbol resolver.
-/// The default factory ([`IndexBootstrap::new`]) stands up the production
-/// embedded-island service; tests inject a JVM-free fake through
-/// [`IndexBootstrap::with_pc`] so the PC-backed wire surface (completion, hover,
-/// signature help, the definition family) runs through the real serve loop
-/// without booting a JVM.
+/// PC target registrations, and the index-backed resolvers (the cross-file
+/// `symbol_definition` resolver plus the `search_methods` workspace
+/// method-search resolver). The default factory ([`IndexBootstrap::new`])
+/// stands up the production embedded-island service; tests inject a JVM-free
+/// fake through [`IndexBootstrap::with_pc`] so the PC-backed wire surface
+/// (completion, hover, signature help, the definition family) runs through the
+/// real serve loop without booting a JVM.
 pub type PcServiceFactory = Arc<
-    dyn Fn(PathBuf, Vec<TargetConfig>, Box<SymbolResolver>) -> Arc<dyn PcQueryService>
+    dyn Fn(
+            PathBuf,
+            Vec<TargetConfig>,
+            Box<SymbolResolver>,
+            Box<SearchMethodsResolver>,
+        ) -> Arc<dyn PcQueryService>
         + Send
         + Sync,
 >;
@@ -277,8 +308,13 @@ impl<M: ModelSource> IndexBootstrap<M> {
     pub fn new(model_source: M) -> Self {
         Self::with_pc(
             model_source,
-            Arc::new(|root, targets, resolver| {
-                Arc::new(IslandPcService::new(root, targets, resolver)) as Arc<dyn PcQueryService>
+            Arc::new(|root, targets, resolver, search_resolver| {
+                Arc::new(IslandPcService::new(
+                    root,
+                    targets,
+                    resolver,
+                    search_resolver,
+                )) as Arc<dyn PcQueryService>
             }),
         )
     }
@@ -368,8 +404,22 @@ impl<M: ModelSource> IndexBootstrap<M> {
         let resolver: Box<SymbolResolver> = Box::new(move |symbol: &str, from_uri: &str| {
             locations_result(resolver_orchestrator.symbol_definition(symbol, from_uri))
         });
-        let pc: Arc<dyn PcQueryService> =
-            (self.pc_factory)(workspace_root.to_path_buf(), pc_targets, resolver);
+        // The workspace method-search resolver the PC island calls for
+        // member-mode extension-method discovery (`SymbolSearch.searchMethods`):
+        // it answers from the global index, pruned to the forward closure of the
+        // requesting PC target — the second resolver closure next to
+        // `symbol_definition`.
+        let search_orchestrator = orchestrator.clone();
+        let search_resolver: Box<SearchMethodsResolver> =
+            Box::new(move |query: &str, bsp_target_id: &str| {
+                method_hits_result(search_orchestrator.search_methods(query, bsp_target_id))
+            });
+        let pc: Arc<dyn PcQueryService> = (self.pc_factory)(
+            workspace_root.to_path_buf(),
+            pc_targets,
+            resolver,
+            search_resolver,
+        );
         Ok(CoreServices::new(
             orchestrator,
             uris,

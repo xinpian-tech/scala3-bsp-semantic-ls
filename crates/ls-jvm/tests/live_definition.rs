@@ -1,7 +1,6 @@
-//! Live cross-file `symbol_definition` integration: boots the PRODUCTION island
-//! with a REAL snapshot-backed resolver (`QueryOrchestrator::symbol_definition`
-//! over a two-target index) installed, and proves the go-to-definition callback
-//! over the REAL embedded-JVM boundary:
+//! Live cross-file `symbol_definition` + `search_methods` integration: boots
+//! the PRODUCTION island with REAL snapshot-backed resolvers installed, and
+//! proves both index callbacks over the REAL embedded-JVM boundary:
 //!   * forward-closure pruning is asserted directly on the same orchestrator the
 //!     island calls (a buffer in `app` reaches `core`'s definition, never the
 //!     disconnected `dup` target's duplicate of the same symbol string);
@@ -9,11 +8,20 @@
 //!     library symbol (`List`), routes through `SymbolSearch.definition` → the
 //!     Scala `PcHostDefinitionResolver` → the Rust `symbol_definition` slot →
 //!     the installed resolver, and the resolver's location comes back as the PC
-//!     definition result — the full round-trip across FFM.
+//!     definition result — the full round-trip across FFM;
+//!   * a REAL member completion (`s.myEx` on a `String` receiver) discovers a
+//!     workspace extension method ONLY reachable through `SymbolSearch.
+//!     searchMethods` → the Rust `search_methods` slot → the installed search
+//!     resolver, whose canned hit names an extension method defined in a second
+//!     source on the target's source path (mirroring how the dotty PC tests
+//!     structure extension discovery through `TestingWorkspaceSearch`), and the
+//!     extension item comes back in the completion list.
 //!
 //! Env-gated exactly like the live sweep (`LS_LIBJVM` + `PC_HOST_AGENT_JAR` +
 //! `LS_PC_TARGET_CLASSPATH`); skips cleanly when unset. A separate test binary
-//! because only one JVM can boot per process.
+//! because only one JVM can boot per process — which is also why the search-
+//! methods completion leg runs inside the same `#[test]` as the definition leg
+//! rather than as a second test racing it for the one island.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -24,8 +32,13 @@ use ls_engine::{QueryOrchestrator, TargetSpec, WorkspaceTargets};
 use ls_index_model::{Loc, Span};
 use ls_jvm::backend::VtableBackend;
 use ls_jvm::watchdog::{PcRequest, QueryKind, Supervisor};
-use ls_jvm::{boot_island, install_symbol_definition_resolver, IslandConfig};
-use ls_pc_abi::payloads::{origin, DefinitionResult, Location, Rng, TargetConfig};
+use ls_jvm::{
+    boot_island, install_search_methods_resolver, install_symbol_definition_resolver, IslandConfig,
+};
+use ls_pc_abi::payloads::{
+    origin, CompletionList, DefinitionResult, Location, MethodHit, MethodHitsResult, Rng,
+    TargetConfig,
+};
 use ls_semanticdb::{md5, SdbDocument, SdbOccurrence, SdbRange, SdbSymbolInfo};
 use ls_store::Store;
 
@@ -40,6 +53,20 @@ const SOURCE: &str = "object SearchBuffer:\n  val xs = List(1, 2)\n";
 const SENTINEL_URI: &str = "file:///resolved-by-index/Elsewhere.scala";
 // The symbol defined in the synthetic two-target index (forward-closure proof).
 const PROBE_SYMBOL: &str = "pkg/Probe#";
+
+// ---- the search_methods completion leg -------------------------------------
+// A second PC target whose buffer completes `s.myEx` on a String receiver; the
+// extension method is NOT in scope, so the completion can only surface it
+// through `SymbolSearch.searchMethods` → the `search_methods` vtable slot.
+const EXT_TARGET_ID: &str = "ext-target";
+const EXT_BUFFER_URI: &str = "file:///live/ext/Use.scala";
+const EXT_BUFFER_SOURCE: &str = "object X:\n  val s = \"\"\n  val r = s.myEx\n";
+// The second source the canned hit points at (on the target's source path, the
+// island-side analogue of dotty's `TestingWorkspaceSearch` indexing the case
+// source): a package-object extension method on String.
+const EXT_SOURCE: &str =
+    "package livex\n\nobject enrichments:\n  extension (s: String)\n    def myExt: Int = s.length\n";
+const EXT_SYMBOL: &str = "livex/enrichments.myExt().";
 
 // ---- minimal SemanticDB protobuf encoder (subset the ingest parser reads) ----
 
@@ -303,6 +330,38 @@ fn live_symbol_definition_prunes_and_round_trips_over_the_boundary() {
         }
     }));
 
+    // The extension source the search resolver's canned hit points at, written
+    // under a source dir the ext target hands the PC as its source path.
+    let ext_src_dir = workspace.join("extsrc");
+    fs::create_dir_all(ext_src_dir.join("livex")).expect("create ext source dir");
+    let ext_source_path = ext_src_dir.join("livex/Enrichments.scala");
+    fs::write(&ext_source_path, EXT_SOURCE).expect("write ext source");
+    let ext_source_uri = format!("file://{}", ext_source_path.to_str().unwrap());
+
+    // Install the search_methods resolver (the second index callback) before
+    // boot, next to symbol_definition: it records the PC's query/target and
+    // answers the canned extension-method hit (`myExt` at its real name range
+    // in the second source).
+    let searched = Arc::new(Mutex::new(None::<(String, String)>));
+    let searched_cb = searched.clone();
+    let hit_uri = ext_source_uri.clone();
+    install_search_methods_resolver(Box::new(move |query: &str, target: &str| {
+        *searched_cb.lock().unwrap() = Some((query.to_string(), target.to_string()));
+        MethodHitsResult {
+            hits: vec![MethodHit {
+                uri: hit_uri.clone(),
+                symbol: EXT_SYMBOL.to_string(),
+                kind: 3,
+                range: Rng {
+                    start_line: 4,
+                    start_character: 8,
+                    end_line: 4,
+                    end_character: 13,
+                },
+            }],
+        }
+    }));
+
     let config = IslandConfig {
         libjvm: &env.libjvm,
         agent_jar: &env.agent_jar,
@@ -374,4 +433,61 @@ fn live_symbol_definition_prunes_and_round_trips_over_the_boundary() {
         "unexpected cross-file symbol: {symbol}"
     );
     assert_eq!(from_uri, BUFFER_URI);
+
+    // ---- search_methods: a REAL completion discovers a workspace extension
+    // method only reachable through the `search_methods` slot. ----
+    sup.request(PcRequest::RegisterTarget {
+        id: EXT_TARGET_ID.to_string(),
+        config: TargetConfig {
+            bsp_id: EXT_TARGET_ID.to_string(),
+            scala_version: "3.8.4".to_string(),
+            classpath: env.classpath.clone(),
+            scalac_options: vec![],
+            source_dirs: vec![ext_src_dir.to_str().unwrap().to_string()],
+        },
+    })
+    .expect("register ext target");
+    sup.request(PcRequest::DidOpen {
+        target_id: EXT_TARGET_ID.to_string(),
+        uri: EXT_BUFFER_URI.to_string(),
+        text: EXT_BUFFER_SOURCE.to_string(),
+    })
+    .expect("did_open ext buffer");
+
+    // Completion after `s.myEx` (line 2): the receiver is a String and `myExt`
+    // is not in scope, so the item can only come from searchMethods.
+    let allocs_before = ls_pc_abi::memory::live_allocations();
+    let reply = sup
+        .request(PcRequest::Query {
+            kind: QueryKind::Completion,
+            uri: EXT_BUFFER_URI.to_string(),
+            line: 2,
+            character: "  val r = s.myEx".len() as u32,
+        })
+        .expect("completion query");
+    let list = CompletionList::decode(&reply).expect("decode completion list");
+    assert_eq!(
+        ls_pc_abi::memory::live_allocations(),
+        allocs_before,
+        "the search_methods response buffer must be freed by the island resolver"
+    );
+
+    // The PC consulted the search resolver with the member query and the
+    // requesting PC target id — the downcall carried the exact arguments.
+    let (query, target) = searched
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("the PC consulted the search_methods resolver for the member completion");
+    assert_eq!(query, "myEx");
+    assert_eq!(target, EXT_TARGET_ID);
+
+    // The canned hit's extension method came back as a completion item: the
+    // compiler resolved the SemanticDB symbol from the second source and kept
+    // it applicable to the String receiver.
+    let labels: Vec<&str> = list.items.iter().map(|i| i.label.as_str()).collect();
+    assert!(
+        labels.iter().any(|l| l.starts_with("myExt")),
+        "the workspace extension method must reach the completion list: {labels:?}"
+    );
 }

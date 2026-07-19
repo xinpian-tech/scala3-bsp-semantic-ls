@@ -55,6 +55,7 @@ jextract --output "$module/src" -I "$glibc_inc" -t ls.pc.host.boundary \
   --include-typedef RegisterPcVtableFn \
   --include-typedef PcDispatchLoopFn \
   --include-typedef SymbolDefinitionFn \
+  --include-typedef SearchMethodsFn \
   "$crate/boundary.h"
 
 echo "==> generated:"

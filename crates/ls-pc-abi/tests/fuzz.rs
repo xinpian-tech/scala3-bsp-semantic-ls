@@ -6,8 +6,8 @@
 use ls_pc_abi::codec::{Reader, Writer, MAGIC};
 use ls_pc_abi::payloads::{
     CompletionItem, CompletionList, DefinitionResult, DidChangeParams, DidOpenParams, HoverResult,
-    LocationsResult, PluginStatus, PositionParams, PrepareRenameResult, ResolveParams,
-    SignatureHelp, TargetConfig,
+    LocationsResult, MethodHitsResult, PluginStatus, PositionParams, PrepareRenameResult,
+    ResolveParams, SignatureHelp, TargetConfig,
 };
 use proptest::prelude::*;
 
@@ -28,6 +28,7 @@ fn decode_all(bytes: &[u8]) {
     let _ = PrepareRenameResult::decode(bytes);
     let _ = PluginStatus::decode(bytes);
     let _ = LocationsResult::decode(bytes);
+    let _ = MethodHitsResult::decode(bytes);
 }
 
 fn bare_item(label: &str) -> CompletionItem {

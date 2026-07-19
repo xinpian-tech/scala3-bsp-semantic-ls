@@ -154,6 +154,11 @@ typedef void (*PcDispatchLoopFn)(int32_t worker_index);
 // the requesting buffer `from_uri`) into a locations response written to `out`.
 typedef int32_t (*SymbolDefinitionFn)(struct LsStr symbol, struct LsStr from_uri, struct LsBuf *out);
 
+// Index-backed workspace method search callback (the PC `SymbolSearch.
+// searchMethods` seam): resolves `query` (with the requesting build target
+// `bsp_target_id`) into a method-hits response written to `out`.
+typedef int32_t (*SearchMethodsFn)(struct LsStr query, struct LsStr bsp_target_id, struct LsBuf *out);
+
 // The Rust vtable handed to the premain. The island mirrors this layout
 // through jextract-generated FFM bindings; `layout_canary` is recomputed
 // independently and a mismatch refuses registration.
@@ -166,6 +171,7 @@ typedef struct RustVtable {
     RegisterPcVtableFn register_pc_vtable;
     PcDispatchLoopFn pc_dispatch_loop;
     SymbolDefinitionFn symbol_definition;
+    SearchMethodsFn search_methods;
 } RustVtable;
 
 

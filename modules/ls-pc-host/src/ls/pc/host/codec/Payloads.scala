@@ -8,9 +8,10 @@ import ls.pc.host.codec.Codec.{Reader, Writer}
   * the island consumes (`register_target`/`did_open`/`did_change`/position/
   * resolve), the carrier-free responses it produces (`hover`/`definition`/
   * `type_definition`/`prepare_rename`/`plugin_status` and the
-  * `symbol_definition` callback), and the LSP4J-carrier responses
-  * (`completion`/`completion_resolve`/`signature_help`) at the resolved LSP4J
-  * 1.0.0 field surface. All 13 payload kinds are implemented below.
+  * `symbol_definition`/`search_methods` callbacks), and the LSP4J-carrier
+  * responses (`completion`/`completion_resolve`/`signature_help`) at the
+  * resolved LSP4J 1.0.0 field surface. All 14 payload kinds are implemented
+  * below.
   */
 object Payloads:
   // Payload kinds (the envelope tag; a decode against the wrong kind is rejected).
@@ -27,6 +28,7 @@ object Payloads:
   val KindPrepareRename: Int = 11
   val KindPluginStatus: Int = 12
   val KindLocations: Int = 13
+  val KindMethodHits: Int = 14
 
   /** `DefinitionOrigin` ordinals (mirror the Scala `enum DefinitionOrigin`). */
   object Origin:
@@ -294,6 +296,48 @@ object Payloads:
         i += 1
       r.finish()
       LocationsResult(locations.result())
+
+  /** One workspace method hit of the `search_methods` callback: the defining
+    * `file://` uri, the SemanticDB symbol string, the SemanticDB kind code, and
+    * the definition span.
+    */
+  final case class MethodHit(uri: String, symbol: String, kind: Int, range: Rng)
+
+  object MethodHit:
+    def write(w: Writer, h: MethodHit): Unit =
+      w.str(h.uri)
+      w.str(h.symbol)
+      w.i32(h.kind)
+      Rng.write(w, h.range)
+
+    def read(r: Reader): MethodHit =
+      val uri = r.str()
+      val symbol = r.str()
+      val kind = r.i32()
+      val range = Rng.read(r)
+      MethodHit(uri, symbol, kind, range)
+
+  /** The `search_methods` callback response: workspace method hits only
+    * (mirrors [[LocationsResult]]'s shape for the definition callback).
+    */
+  final case class MethodHitsResult(hits: Seq[MethodHit]):
+    def encode(): Array[Byte] =
+      val w = Writer()
+      w.u32(hits.length)
+      hits.foreach(MethodHit.write(w, _))
+      w.finish(KindMethodHits)
+
+  object MethodHitsResult:
+    def decode(buf: Array[Byte]): MethodHitsResult =
+      val r = Reader(buf, KindMethodHits)
+      val n = r.count()
+      val hits = Vector.newBuilder[MethodHit]
+      var i = 0
+      while i < n do
+        hits += MethodHit.read(r)
+        i += 1
+      r.finish()
+      MethodHitsResult(hits.result())
 
   /** A prepare-rename response: `None` when the symbol is not PC-renameable. */
   final case class PrepareRenameResult(range: Option[Rng]):

@@ -104,6 +104,11 @@ pub type PcDispatchLoopFn = unsafe extern "C" fn(worker_index: i32);
 /// the requesting buffer `from_uri`) into a locations response written to `out`.
 pub type SymbolDefinitionFn =
     unsafe extern "C" fn(symbol: LsStr, from_uri: LsStr, out: *mut LsBuf) -> i32;
+/// Index-backed workspace method search callback (the PC `SymbolSearch.
+/// searchMethods` seam): resolves `query` (with the requesting build target
+/// `bsp_target_id`) into a method-hits response written to `out`.
+pub type SearchMethodsFn =
+    unsafe extern "C" fn(query: LsStr, bsp_target_id: LsStr, out: *mut LsBuf) -> i32;
 
 /// The Rust vtable handed to the premain. The island mirrors this layout
 /// through jextract-generated FFM bindings; `layout_canary` is recomputed
@@ -118,6 +123,7 @@ pub struct RustVtable {
     pub register_pc_vtable: RegisterPcVtableFn,
     pub pc_dispatch_loop: PcDispatchLoopFn,
     pub symbol_definition: SymbolDefinitionFn,
+    pub search_methods: SearchMethodsFn,
 }
 
 // ---------------------------------------------------------------------------
@@ -206,8 +212,8 @@ const _: () = {
     assert!(offset_of!(LocationRecord, range) == 8);
     assert!(offset_of!(LocationRecord, origin) == 24);
 
-    // RustVtable: two u64 + 6 fn pointers; assert every slot offset.
-    assert!(size_of::<RustVtable>() == 64);
+    // RustVtable: two u64 + 7 fn pointers; assert every slot offset.
+    assert!(size_of::<RustVtable>() == 72);
     assert!(offset_of!(RustVtable, abi_version) == 0);
     assert!(offset_of!(RustVtable, layout_canary) == 8);
     assert!(offset_of!(RustVtable, alloc) == 16);
@@ -216,6 +222,7 @@ const _: () = {
     assert!(offset_of!(RustVtable, register_pc_vtable) == 40);
     assert!(offset_of!(RustVtable, pc_dispatch_loop) == 48);
     assert!(offset_of!(RustVtable, symbol_definition) == 56);
+    assert!(offset_of!(RustVtable, search_methods) == 64);
 
     // PcVtable: one u64 + 15 fn pointers; assert every slot offset.
     assert!(size_of::<PcVtable>() == 128);

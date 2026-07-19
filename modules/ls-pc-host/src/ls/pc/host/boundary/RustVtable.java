@@ -23,6 +23,7 @@ import static java.lang.foreign.MemoryLayout.PathElement.*;
  *     RegisterPcVtableFn register_pc_vtable;
  *     PcDispatchLoopFn pc_dispatch_loop;
  *     SymbolDefinitionFn symbol_definition;
+ *     SearchMethodsFn search_methods;
  * }
  * }
  */
@@ -40,7 +41,8 @@ public class RustVtable {
         boundary_h.C_POINTER.withName("log"),
         boundary_h.C_POINTER.withName("register_pc_vtable"),
         boundary_h.C_POINTER.withName("pc_dispatch_loop"),
-        boundary_h.C_POINTER.withName("symbol_definition")
+        boundary_h.C_POINTER.withName("symbol_definition"),
+        boundary_h.C_POINTER.withName("search_methods")
     ).withName("RustVtable");
 
     /**
@@ -738,6 +740,108 @@ public class RustVtable {
      */
     public static void symbol_definition(MemorySegment struct, MemorySegment fieldValue) {
         struct.set(symbol_definition$LAYOUT, symbol_definition$OFFSET, fieldValue);
+    }
+
+    /**
+     * {@snippet lang=c :
+     * SearchMethodsFn search_methods
+     * }
+     */
+    public final static class search_methods {
+
+        private search_methods() {
+            // Should not be called directly
+        }
+
+        /**
+         * The function pointer signature, expressed as a functional interface
+         */
+        public interface Function {
+            int apply(MemorySegment _x0, MemorySegment _x1, MemorySegment _x2);
+        }
+
+        private static final FunctionDescriptor $DESC = FunctionDescriptor.of(
+            boundary_h.C_INT,
+            LsStr.layout(),
+            LsStr.layout(),
+            boundary_h.C_POINTER
+        );
+
+        /**
+         * The descriptor of this function pointer
+         */
+        public static FunctionDescriptor descriptor() {
+            return $DESC;
+        }
+
+        private static final MethodHandle UP$MH = boundary_h.upcallHandle(search_methods.Function.class, "apply", $DESC);
+
+        /**
+         * Allocates a new upcall stub, whose implementation is defined by {@code fi}.
+         * The lifetime of the returned segment is managed by {@code arena}
+         */
+        public static MemorySegment allocate(search_methods.Function fi, Arena arena) {
+            return Linker.nativeLinker().upcallStub(UP$MH.bindTo(fi), $DESC, arena);
+        }
+
+        private static final MethodHandle DOWN$MH = Linker.nativeLinker().downcallHandle($DESC);
+
+        /**
+         * Invoke the upcall stub {@code funcPtr}, with given parameters
+         */
+        public static int invoke(MemorySegment funcPtr, MemorySegment _x0, MemorySegment _x1, MemorySegment _x2) {
+            try {
+                return (int) DOWN$MH.invokeExact(funcPtr, _x0, _x1, _x2);
+            } catch (Error | RuntimeException ex) {
+                throw ex;
+            } catch (Throwable ex$) {
+                throw new AssertionError("should not reach here", ex$);
+            }
+        }
+    }
+
+    private static final AddressLayout search_methods$LAYOUT = (AddressLayout)$LAYOUT.select(groupElement("search_methods"));
+
+    /**
+     * Layout for field:
+     * {@snippet lang=c :
+     * SearchMethodsFn search_methods
+     * }
+     */
+    public static final AddressLayout search_methods$layout() {
+        return search_methods$LAYOUT;
+    }
+
+    private static final long search_methods$OFFSET = $LAYOUT.byteOffset(groupElement("search_methods"));
+
+    /**
+     * Offset for field:
+     * {@snippet lang=c :
+     * SearchMethodsFn search_methods
+     * }
+     */
+    public static final long search_methods$offset() {
+        return search_methods$OFFSET;
+    }
+
+    /**
+     * Getter for field:
+     * {@snippet lang=c :
+     * SearchMethodsFn search_methods
+     * }
+     */
+    public static MemorySegment search_methods(MemorySegment struct) {
+        return struct.get(search_methods$LAYOUT, search_methods$OFFSET);
+    }
+
+    /**
+     * Setter for field:
+     * {@snippet lang=c :
+     * SearchMethodsFn search_methods
+     * }
+     */
+    public static void search_methods(MemorySegment struct, MemorySegment fieldValue) {
+        struct.set(search_methods$LAYOUT, search_methods$OFFSET, fieldValue);
     }
 
     /**

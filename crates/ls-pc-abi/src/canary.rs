@@ -21,7 +21,7 @@ const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 /// The ordered layout facts hashed into the canary: for every boundary struct
 /// its size followed by every field offset, then each vtable's size followed by
 /// every slot offset.
-const fn facts() -> [u64; 50] {
+const fn facts() -> [u64; 51] {
     [
         // LsStr.
         size_of::<LsStr>() as u64,
@@ -64,6 +64,7 @@ const fn facts() -> [u64; 50] {
         offset_of!(RustVtable, register_pc_vtable) as u64,
         offset_of!(RustVtable, pc_dispatch_loop) as u64,
         offset_of!(RustVtable, symbol_definition) as u64,
+        offset_of!(RustVtable, search_methods) as u64,
         // PC vtable: size + every slot offset.
         size_of::<PcVtable>() as u64,
         offset_of!(PcVtable, abi_version) as u64,

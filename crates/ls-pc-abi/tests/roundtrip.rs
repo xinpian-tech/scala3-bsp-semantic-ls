@@ -8,9 +8,10 @@ use ls_pc_abi::payloads::{
     origin, Command, CompilerPlugin, CompletionApplyKind, CompletionEdit, CompletionItem,
     CompletionItemDefaults, CompletionList, DefinitionResult, DidChangeParams, DidOpenParams,
     DisabledPlugin, Documentation, EditRange, Hover, HoverContents, HoverResult, InsertReplaceEdit,
-    LabelDetails, Location, LocationsResult, MarkedStringItem, MarkupContent, ParameterInfo,
-    ParameterLabel, PluginStatus, PositionParams, PrepareRenameResult, ResolveParams, Rng,
-    ServicePlugin, SignatureHelp, SignatureInfo, TargetConfig, TextEdit,
+    LabelDetails, Location, LocationsResult, MarkedStringItem, MarkupContent, MethodHit,
+    MethodHitsResult, ParameterInfo, ParameterLabel, PluginStatus, PositionParams,
+    PrepareRenameResult, ResolveParams, Rng, ServicePlugin, SignatureHelp, SignatureInfo,
+    TargetConfig, TextEdit,
 };
 use proptest::prelude::*;
 
@@ -383,6 +384,36 @@ fn opaque_data_bytes_survive_and_empty_is_distinct_from_none() {
 }
 
 #[test]
+fn method_hits_round_trip_and_empty_is_a_real_empty_list() {
+    let result = MethodHitsResult {
+        hits: vec![
+            MethodHit {
+                uri: "file:///w/Enrichments.scala".to_string(),
+                symbol: "a/b/A$package.incr().".to_string(),
+                kind: 3,
+                range: range(1, 6, 1, 10),
+            },
+            MethodHit {
+                uri: "file:///w/Ops.scala".to_string(),
+                symbol: "pkg/Ops.deco().".to_string(),
+                kind: 0,
+                range: Rng::default(),
+            },
+        ],
+    };
+    let decoded = MethodHitsResult::decode(&result.encode().unwrap()).unwrap();
+    assert_eq!(decoded, result);
+
+    let empty = MethodHitsResult { hits: vec![] };
+    let decoded = MethodHitsResult::decode(&empty.encode().unwrap()).unwrap();
+    assert!(decoded.hits.is_empty());
+
+    // A method-hits buffer is not decodable as the locations payload (distinct
+    // envelope kinds), so the two callback responses cannot be confused.
+    assert!(LocationsResult::decode(&result.encode().unwrap()).is_err());
+}
+
+#[test]
 fn unicode_strings_round_trip() {
     let params = DidOpenParams {
         target_id: "root/módulo".to_string(),
@@ -598,6 +629,15 @@ fn location_strat() -> impl Strategy<Value = Location> {
     (".*", rng_strat(), 0u32..3).prop_map(|(uri, range, origin)| Location { uri, range, origin })
 }
 
+fn method_hit_strat() -> impl Strategy<Value = MethodHit> {
+    (".*", ".*", any::<i32>(), rng_strat()).prop_map(|(uri, symbol, kind, range)| MethodHit {
+        uri,
+        symbol,
+        kind,
+        range,
+    })
+}
+
 prop_compose! {
     fn compiler_plugin_strat()(
         jars in proptest::collection::vec(".*", 0..3),
@@ -709,6 +749,12 @@ proptest! {
     fn locations_round_trip(locations in proptest::collection::vec(location_strat(), 0..6)) {
         let result = LocationsResult { locations };
         prop_assert_eq!(LocationsResult::decode(&result.encode().unwrap()).unwrap(), result);
+    }
+
+    #[test]
+    fn method_hits_round_trip(hits in proptest::collection::vec(method_hit_strat(), 0..6)) {
+        let result = MethodHitsResult { hits };
+        prop_assert_eq!(MethodHitsResult::decode(&result.encode().unwrap()).unwrap(), result);
     }
 
     #[test]

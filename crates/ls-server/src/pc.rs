@@ -25,10 +25,12 @@ use std::time::Duration;
 
 use ls_jvm::backend::VtableBackend;
 use ls_jvm::watchdog::{PcError, PcRequest, QueryKind, Supervisor};
-use ls_jvm::{boot_island, install_symbol_definition_resolver, IslandConfig};
+use ls_jvm::{
+    boot_island, install_search_methods_resolver, install_symbol_definition_resolver, IslandConfig,
+};
 use ls_pc_abi::payloads::{
     origin, CompletionItem, CompletionList, DefinitionResult, HoverResult, LocationsResult,
-    PrepareRenameResult, Rng, SignatureHelp, TargetConfig,
+    MethodHitsResult, PrepareRenameResult, Rng, SignatureHelp, TargetConfig,
 };
 use serde_json::Value;
 
@@ -181,6 +183,12 @@ pub trait PcQueryService: Send + Sync {
 /// from the global index (`QueryOrchestrator::symbol_definition`).
 pub type SymbolResolver = dyn Fn(&str, &str) -> LocationsResult + Send + Sync;
 
+/// The `search_methods` resolver the island calls for member-mode workspace
+/// extension-method discovery (`SymbolSearch.searchMethods`): `(query,
+/// bsp_target_id) -> method hits`. Answers from the global index
+/// (`QueryOrchestrator::search_methods`).
+pub type SearchMethodsResolver = dyn Fn(&str, &str) -> MethodHitsResult + Send + Sync;
+
 /// Strips the SemanticDB-generation flags from a target's scalac options so the
 /// presentation compiler does not re-emit SemanticDB. Removes `-Xsemanticdb`,
 /// `-Ysemanticdb`, and both the two-token (`-semanticdb-target <v>`) and colon
@@ -233,8 +241,8 @@ fn accepted(outcome: &Result<Vec<u8>, PcError>) -> bool {
 }
 
 /// The lazily-booted embedded PC island. Constructed with the workspace's PC
-/// target registrations and the index-backed `symbol_definition` resolver, but
-/// the JVM is not started until the first PC request.
+/// target registrations and the index-backed resolvers (`symbol_definition` +
+/// `search_methods`), but the JVM is not started until the first PC request.
 pub struct IslandPcService {
     state: Mutex<IslandState>,
 }
@@ -248,6 +256,10 @@ struct IslandState {
     /// The `symbol_definition` resolver, installed into the island's global slot
     /// once, at boot; taken then.
     resolver: Option<Box<SymbolResolver>>,
+    /// The `search_methods` resolver, installed into the island's global slot
+    /// once, at boot; taken then (the second resolver closure next to
+    /// `symbol_definition`).
+    search_resolver: Option<Box<SearchMethodsResolver>>,
     /// The mirrored open buffers (`uri -> (owning target, text)`), replayed into
     /// the island on boot and the source of the `is_open`/`withPcBuffer` gate.
     /// Kept status-aware: a buffer is recorded only after the island has actually
@@ -291,17 +303,20 @@ const RENDEZVOUS_TIMEOUT: Duration = Duration::from_secs(60);
 
 impl IslandPcService {
     /// Build the service from the workspace's PC target registrations and the
-    /// `symbol_definition` resolver. Does not boot the JVM.
+    /// index-backed resolvers (`symbol_definition` + `search_methods`). Does
+    /// not boot the JVM.
     pub fn new(
         workspace_root: PathBuf,
         targets: Vec<TargetConfig>,
         resolver: Box<SymbolResolver>,
+        search_resolver: Box<SearchMethodsResolver>,
     ) -> IslandPcService {
         IslandPcService {
             state: Mutex::new(IslandState {
                 workspace_root,
                 targets,
                 resolver: Some(resolver),
+                search_resolver: Some(search_resolver),
                 buffers: BTreeMap::new(),
                 driver: None,
                 boot_error: None,
@@ -640,11 +655,14 @@ fn boot(state: &mut IslandState) -> bool {
                 return false;
             }
         };
-    // The resolver slot is global and set-once; a second install (e.g. a second
-    // workspace in the process) is ignored, which is correct — one server, one
-    // process. Installed before boot so the premain sees it.
+    // The resolver slots are global and set-once; a second install (e.g. a
+    // second workspace in the process) is ignored, which is correct — one
+    // server, one process. Installed before boot so the premain sees them.
     if let Some(resolver) = state.resolver.take() {
         install_symbol_definition_resolver(resolver);
+    }
+    if let Some(search_resolver) = state.search_resolver.take() {
+        install_search_methods_resolver(search_resolver);
     }
     // A clearly test-scoped fault seam: when `LS_PC_TEST_FAULT` is set, arm the
     // Java-side fault property (`-Dls.pc.host.testFault=<kind>`) and tighten the
@@ -900,6 +918,10 @@ mod tests {
         })
     }
 
+    fn empty_search_resolver() -> Box<SearchMethodsResolver> {
+        Box::new(|_query, _target| MethodHitsResult { hits: Vec::new() })
+    }
+
     fn target_config(id: &str) -> TargetConfig {
         TargetConfig {
             bsp_id: id.to_string(),
@@ -948,6 +970,7 @@ mod tests {
             PathBuf::from("/ws"),
             vec![target_config(target)],
             empty_resolver(),
+            empty_search_resolver(),
         );
         let (driver, calls) = FakeDriver::new(outcomes);
         pc.state.lock().unwrap().driver = Some(Box::new(driver));
@@ -964,6 +987,7 @@ mod tests {
             PathBuf::from("/ws"),
             vec![target_config("t")],
             empty_resolver(),
+            empty_search_resolver(),
         );
         let a = "file:///ws/a.scala";
 
@@ -997,6 +1021,7 @@ mod tests {
             PathBuf::from("/ws"),
             vec![target_config("old")],
             empty_resolver(),
+            empty_search_resolver(),
         );
         cold.reconfigure_targets(vec![target_config("new")]);
         assert!(cold.is_registered("new"));
@@ -1022,6 +1047,7 @@ mod tests {
             PathBuf::from("/ws"),
             vec![target_config("known")],
             empty_resolver(),
+            empty_search_resolver(),
         );
         pc.did_open("unknown", "file:///ws/a.scala", "v1");
         assert!(!pc.is_open("file:///ws/a.scala"));
@@ -1098,6 +1124,7 @@ mod tests {
             PathBuf::from("/ws"),
             vec![target_config("t")],
             empty_resolver(),
+            empty_search_resolver(),
         );
         // A buffer is pending replay (opened while cold).
         pc.did_open("t", "file:///ws/a.scala", "v1");
@@ -1129,6 +1156,7 @@ mod tests {
             PathBuf::from("/ws"),
             vec![target_config("t")],
             empty_resolver(),
+            empty_search_resolver(),
         );
         pc.did_open("t", "file:///ws/a.scala", "v1");
         let (driver, _calls) = FakeDriver::new(vec![Ok(Vec::new()), Ok(Vec::new())]);
