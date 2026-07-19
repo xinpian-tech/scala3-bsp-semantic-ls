@@ -239,12 +239,13 @@ pub trait PcQueryService: Send + Sync {
     /// re-read.
     fn on_config_changed(&self) {}
 
-    // --- ABI v2 payload-query ops (transport wave W3a). ---------------------
+    // --- ABI v2 payload-query ops. ------------------------------------------
     //
-    // Each returns the DECODED payload carrier — the LSP mapping is the
-    // feature task's job — and degrades to the empty/None fallback on any
-    // boundary error, including the island's `STATUS_NOT_YET` transport-stub
-    // answer. Defaults are empty so fakes and PC-less bundles compile.
+    // Each returns the DECODED payload carrier — the LSP surface mapping is
+    // the editor-facing wiring's job — and degrades to the empty/None fallback
+    // on any boundary error (including `STATUS_NOT_YET`, the answer a
+    // transport-first future op would give). Defaults are empty so fakes and
+    // PC-less bundles compile.
 
     /// Inlay hints for `range` of the mirrored buffer `uri` (`flags` is the
     /// boundary hint-category bitset). Default empty.
@@ -315,8 +316,8 @@ pub type SearchMethodsResolver = dyn Fn(&str, &str) -> MethodHitsResult + Send +
 /// The `definition_source_toplevels` resolver the island calls for the
 /// toplevel symbols of a definition source (`SymbolSearch.
 /// definitionSourceToplevels`): `(semanticdb_symbol, source_uri) -> toplevel
-/// symbols`. Will answer from the global index; until the engine query lands
-/// with the feature task the bootstrap installs a placeholder empty closure.
+/// symbols`. Answers from the global index — the bootstrap wires
+/// `QueryOrchestrator::definition_source_toplevels` here.
 pub type ToplevelsResolver = dyn Fn(&str, &str) -> ToplevelsResult + Send + Sync;
 
 /// Strips the SemanticDB-generation flags from a target's scalac options so the

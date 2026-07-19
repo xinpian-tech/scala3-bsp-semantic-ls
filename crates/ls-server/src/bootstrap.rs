@@ -422,13 +422,15 @@ impl<M: ModelSource> IndexBootstrap<M> {
                 method_hits_result(search_orchestrator.search_methods(query, bsp_target_id))
             });
         // The `definition_source_toplevels` resolver the PC island calls for the
-        // toplevel symbols of a definition source. TODO(feature task, W3
-        // provider wave): wire the QueryOrchestrator toplevels query here; until
-        // that engine query lands the island gets a placeholder that answers
-        // empty (the same shape `search_methods` had before its engine landed).
+        // toplevel symbols of a definition source (exhaustive-match case
+        // ordering): it answers from the global index — the defining doc's
+        // toplevels in source order, pruned to the forward closure of the
+        // requesting buffer's target — the third resolver closure next to
+        // `symbol_definition` and `search_methods`.
+        let toplevels_orchestrator = orchestrator.clone();
         let toplevels_resolver: Box<ToplevelsResolver> =
-            Box::new(|_symbol: &str, _source_uri: &str| ToplevelsResult {
-                symbols: Vec::new(),
+            Box::new(move |symbol: &str, source_uri: &str| ToplevelsResult {
+                symbols: toplevels_orchestrator.definition_source_toplevels(symbol, source_uri),
             });
         let pc: Arc<dyn PcQueryService> = (self.pc_factory)(
             workspace_root.to_path_buf(),

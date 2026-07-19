@@ -100,36 +100,43 @@ final class PcFacade(
     val (req, text, config) = prepare(PcRequestKind.PrepareRename, uri, line, character)
     manager.run(config)(_.prepareRename(req.uri, text, req.line, req.character))
 
-  // --- ABI v2 op stubs (transport wave W3a) ----------------------------------
+  // --- ABI v2 payload-query providers ----------------------------------------
   //
-  // Each of the six ops below is a typed stub: the boundary slot, payload
-  // codecs, and dispatch routing exist end-to-end, but the presentation-
-  // compiler provider lands with the feature task. Until then every call
-  // throws [[PcNotYetSupported]], which the boundary runtime maps to the
-  // distinct `STATUS_NOT_YET` status (`pc_diagnostics` has no stub here: its
-  // provider will route through [[diagnostics]] below).
+  // The six ops below resolve the buffer + target directly (no plugin
+  // `beforeRequest` rewriting: the stable SPI has no hooks for these ops) and
+  // drive the dotty presentation compiler through the worker manager, exactly
+  // like the position queries above. `pc_diagnostics` routes through
+  // [[diagnostics]] below.
 
   /** Inlay hints for `range` of the open buffer `uri`; `flags` is the boundary
-    * hint-category bitset (opaque to the transport).
+    * hint-category bitset ([[PcInlayHintFlags]] documents the bit assignment;
+    * an unset bit disables its hint category).
     */
   def inlayHints(uri: String, range: Range, flags: Int): Vector[PcInlayHint] =
-    throw PcNotYetSupported("inlayHints")
+    val (text, config) = bufferAndConfig(uri)
+    val start = Utf16Text.offsetAt(text, range.getStart.getLine, range.getStart.getCharacter)
+    val end = Utf16Text.offsetAt(text, range.getEnd.getLine, range.getEnd.getCharacter)
+    manager.run(config)(_.inlayHints(uri, text, start, end, flags))
 
   /** Semantic tokens of the open buffer `uri`, as offset-based nodes. */
   def semanticTokens(uri: String): Vector[PcSemanticNode] =
-    throw PcNotYetSupported("semanticTokens")
+    val (text, config) = bufferAndConfig(uri)
+    manager.run(config)(_.semanticTokens(uri, text))
 
   /** Per query position, the chain of enclosing selection ranges, innermost
     * first.
     */
   def selectionRanges(uri: String, positions: Vector[Position]): Vector[Vector[Range]] =
-    throw PcNotYetSupported("selectionRanges")
+    val (text, config) = bufferAndConfig(uri)
+    val offsets = positions.map(p => Utf16Text.offsetAt(text, p.getLine, p.getCharacter))
+    manager.run(config)(_.selectionRanges(uri, text, offsets))
 
   /** Run the PC-backed code action `actionId` (the boundary's action-id enum)
-    * at `position`; `extractionEnd` is extract-method's selection end,
-    * `argIndices` convert-to-named-arguments' argument list. A refusal the
-    * editor should surface comes back as data on the result, not as a thrown
-    * error.
+    * at `position`; `extractionEnd` is extract-method's selection end (the
+    * selection is `[position, extractionEnd]` and the extraction anchor is the
+    * selection start), `argIndices` convert-to-named-arguments' argument list.
+    * A refusal the editor should surface (the dotty `DisplayableException`)
+    * comes back as data on the result, not as a thrown error.
     */
   def codeAction(
       uri: String,
@@ -138,7 +145,35 @@ final class PcFacade(
       extractionEnd: Option[Position],
       argIndices: Option[Vector[Int]]
   ): PcCodeActionResult =
-    throw PcNotYetSupported("codeAction")
+    val (text, config) = bufferAndConfig(uri)
+    val offset = Utf16Text.offsetAt(text, position.getLine, position.getCharacter)
+    try
+      val edits = manager.run(config) { instance =>
+        actionId match
+          case PcCodeActionId.ConvertToNamedArguments =>
+            instance.convertToNamedArguments(uri, text, offset, argIndices.getOrElse(Vector.empty))
+          case PcCodeActionId.ImplementAbstractMembers =>
+            instance.implementAbstractMembers(uri, text, offset)
+          case PcCodeActionId.ExtractMethod =>
+            val end = extractionEnd
+              .map(p => Utf16Text.offsetAt(text, p.getLine, p.getCharacter))
+              .getOrElse(offset)
+            instance.extractMethod(uri, text, offset, end, offset)
+          case PcCodeActionId.InlineValue =>
+            instance.inlineValue(uri, text, offset)
+          case PcCodeActionId.InsertInferredType =>
+            instance.insertInferredType(uri, text, offset)
+          case PcCodeActionId.InsertInferredMethod =>
+            instance.insertInferredMethod(uri, text, offset)
+          case PcCodeActionId.ConvertToNamedLambdaParameters =>
+            instance.convertToNamedLambdaParameters(uri, text, offset)
+          case other =>
+            throw new IllegalArgumentException(s"unknown PC code-action id $other")
+      }
+      PcCodeActionResult(edits)
+    catch
+      case e: scala.meta.pc.DisplayableException =>
+        PcCodeActionResult(Vector.empty, refusal = Option(e.getMessage))
 
   /** Auto-import candidates for `name` at `position` (`isExtension` requests
     * extension-method imports), best first.
@@ -149,11 +184,16 @@ final class PcFacade(
       name: String,
       isExtension: Boolean
   ): Vector[PcAutoImport] =
-    throw PcNotYetSupported("autoImports")
+    val (text, config) = bufferAndConfig(uri)
+    val offset = Utf16Text.offsetAt(text, position.getLine, position.getCharacter)
+    manager.run(config)(_.autoImports(uri, text, name, offset, isExtension))
 
-  /** Folding ranges of the open buffer `uri`. */
+  /** Folding ranges of the open buffer `uri`: the one custom provider (no
+    * dotty provider exists) — a parser-only walk over the current buffer text,
+    * see [[FoldingRangeProvider]]. Never touches the PC instance.
+    */
   def foldingRanges(uri: String): Vector[PcFoldingRange] =
-    throw PcNotYetSupported("foldingRanges")
+    FoldingRangeProvider.foldingRanges(uri, buffer(uri).text)
 
   /** Push the current buffer text through the PC and return its (secondary)
     * diagnostics, filtered by plugin `filterPcDiagnostics` hooks. Build
@@ -195,6 +235,11 @@ final class PcFacade(
       targetId,
       throw new IllegalStateException(s"target '$targetId' is not registered with the PC facade")
     )
+
+  /** Buffer text + target config for a payload-query op (no plugin hooks). */
+  private def bufferAndConfig(uri: String): (String, PcTargetConfig) =
+    val buf = buffer(uri)
+    (buf.text, configOf(buf.targetId))
 
   /** Run `beforeRequest` hooks, then resolve buffer text and target config for
     * the (possibly rewritten) request. The compiler offset is derived from the

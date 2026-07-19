@@ -166,6 +166,20 @@ final case class PcCodeActionResult(
     refusal: Option[String] = None
 )
 
+/** The boundary's PC code-action id enum, mirrored island-side (bit-for-bit
+  * the Rust `payloads::code_action_id` constants / the host codec
+  * `Payloads.CodeActionId`). [[PcFacade.codeAction]] dispatches each id to its
+  * typed dotty PC entry point.
+  */
+object PcCodeActionId:
+  val ConvertToNamedArguments: Int = 0
+  val ImplementAbstractMembers: Int = 1
+  val ExtractMethod: Int = 2
+  val InlineValue: Int = 3
+  val InsertInferredType: Int = 4
+  val InsertInferredMethod: Int = 5
+  val ConvertToNamedLambdaParameters: Int = 6
+
 /** One auto-import candidate: the providing package, the edits that apply it,
   * and optionally the imported SemanticDB symbol.
   */

@@ -1406,8 +1406,25 @@ fn read_text_edit_list(r: &mut Reader) -> Result<Vec<TextEdit>, AbiError> {
     Ok(edits)
 }
 
-/// `inlay_hints` params: the buffer, the requested range, and a flags bitset
-/// (the provider's hint-category toggles; opaque to the transport).
+/// `inlay_hints` flag bits ([`InlayHintParams::flags`]): one bit per
+/// `scala.meta.pc.InlayHintsParams` hint-category boolean, decoded island-side
+/// by the Scala `PcInlayHintFlags` mirror (bit-for-bit). An unset bit disables
+/// its category; `0` requests no hints.
+pub mod inlay_hint_flags {
+    pub const INFERRED_TYPES: u32 = 1 << 0;
+    pub const TYPE_PARAMETERS: u32 = 1 << 1;
+    pub const IMPLICIT_PARAMETERS: u32 = 1 << 2;
+    pub const BY_NAME_PARAMETERS: u32 = 1 << 3;
+    pub const IMPLICIT_CONVERSIONS: u32 = 1 << 4;
+    pub const NAMED_PARAMETERS: u32 = 1 << 5;
+    pub const HINTS_XRAY_MODE: u32 = 1 << 6;
+    pub const HINTS_IN_PATTERN_MATCH: u32 = 1 << 7;
+    pub const CLOSING_LABELS: u32 = 1 << 8;
+}
+
+/// `inlay_hints` params: the buffer, the requested range, and the
+/// [`inlay_hint_flags`] bitset (the provider's hint-category toggles; the
+/// transport carries it verbatim).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InlayHintParams {
     pub uri: String,

@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 
 use ls_index_model::uri;
 use ls_index_model::{
-    Loc, LsError, NormalizedDocument, Occurrence, Role, Span, SymKind, TargetBitset,
+    occ_flags, Loc, LsError, NormalizedDocument, Occurrence, Role, Span, SymKind, TargetBitset,
 };
 use ls_semanticdb::{md5, normalize, parse_file, SemanticdbLocator};
 use ls_store::{GroupRecord, SearchIndex, Snapshot, Store, StoreResult, WorkspaceSymbolHit};
@@ -749,6 +749,103 @@ impl QueryOrchestrator {
             });
         }
         dedupe_and_sort_method_hits(out)
+    }
+
+    /// Index-backed definition-source toplevels for the presentation compiler
+    /// (the callback behind `SymbolSearch.definitionSourceToplevels`, exhaustive-
+    /// match case ordering): the toplevel SemanticDB symbols of the source that
+    /// DEFINES `semantic_symbol`, in source order.
+    ///
+    /// The parent symbol is resolved byte-for-byte with
+    /// [`QueryOrchestrator::symbol_definition`]'s discipline: `find_symbol_ord`,
+    /// then the ref-group def scan with the `symbol_at` exactness filter,
+    /// pruned to the requesting buffer's forward closure (`source_uri` locates
+    /// the requesting target; a disconnected duplicate definition never
+    /// leaks). Among the visible defining occurrences the FIRST defining doc
+    /// wins (lowest `target_ord`, `doc_ord` tie-break); that doc is enumerated
+    /// in source order (`SegmentReader::scan_doc`), keeping DEFINITION
+    /// occurrences whose decoded symbol is global and its own enclosing
+    /// toplevel (`enclosing_top_level(sym) == Some(sym)`), deduped first-seen.
+    ///
+    /// Never panics; unknown/empty symbols answer empty. Reads only the
+    /// immutable snapshot and the workspace graph, so it is safe on PC callback
+    /// threads.
+    pub fn definition_source_toplevels(
+        &self,
+        semantic_symbol: &str,
+        source_uri: &str,
+    ) -> Vec<String> {
+        if semantic_symbol.is_empty() {
+            return Vec::new();
+        }
+        let Some(snap) = self.current_snapshot() else {
+            return Vec::new();
+        };
+        let seg = snap.segment();
+        let Some(ord) = seg.find_symbol_ord(&symbol_encoding::encode(semantic_symbol, None)) else {
+            return Vec::new();
+        };
+        let ref_group = seg.symbol_view(ord).ref_group_ord;
+        if ref_group < 0 {
+            return Vec::new();
+        }
+        // The bsp ids the requesting buffer's target can see, or None (unscoped).
+        let allowed = self.requesting_forward_closure(source_uri);
+        // First visible defining doc: lowest target_ord, doc_ord tie-break.
+        let mut best: Option<(u32, u32)> = None;
+        seg.scan_def_group(ref_group as u32, &mut |rec: GroupRecord| {
+            if rec.target_ord < 0 {
+                return;
+            }
+            let ps = rec.packed_start as u32;
+            let sl = Span::unpack_line(ps);
+            let sc = Span::unpack_char(ps);
+            let doc_ord = rec.doc_ord as u32;
+            // Keep only occurrences that define EXACTLY `ord`, not the other
+            // members of its ref group (the `symbol_definition` exactness
+            // filter).
+            if seg.symbol_at(doc_ord, sl, sc).map(|h| h.symbol_ord) != Some(ord as i32) {
+                return;
+            }
+            let meta = seg.target_meta(rec.target_ord as u32);
+            let visible = allowed
+                .as_ref()
+                .map(|ids| ids.contains(&meta.bsp_id))
+                .unwrap_or(true);
+            if !visible {
+                return;
+            }
+            let candidate = (rec.target_ord as u32, doc_ord);
+            if best.is_none_or(|b| candidate < b) {
+                best = Some(candidate);
+            }
+        });
+        let Some((_, doc_ord)) = best else {
+            return Vec::new();
+        };
+        // Enumerate the defining doc in source order; keep global toplevel
+        // DEFINITION occurrences, first-seen order.
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut out: Vec<String> = Vec::new();
+        seg.scan_doc(doc_ord, false, &mut |rec| {
+            if !occ_flags::has(rec.flags as u32, occ_flags::DEFINITION) {
+                return;
+            }
+            let (raw, local_doc) =
+                symbol_encoding::decode(seg.semantic_symbol_of(rec.symbol_ord as u32));
+            // Locals never surface (they are doc-scoped, not toplevels).
+            if local_doc.is_some() {
+                return;
+            }
+            // Toplevels only: the symbol must BE its own enclosing toplevel.
+            if ls_semanticdb::symbols::enclosing_top_level(&raw).as_deref() != Some(raw.as_str()) {
+                return;
+            }
+            if seen.insert(raw.clone()) {
+                out.push(raw);
+            }
+        });
+        out
     }
 
     /// Forward dependency closure (bsp ids) of the target owning `from_uri`,

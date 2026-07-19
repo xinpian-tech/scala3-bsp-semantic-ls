@@ -9,7 +9,6 @@ import ls.pc.{
   PcFacade,
   PcFoldingRange,
   PcInlayHint,
-  PcNotYetSupported,
   PcPluginStatusReport,
   PcSemanticNode,
   PcTargetConfig
@@ -37,9 +36,9 @@ trait PcOps:
   def restartInstances(): Unit
   def shutdown(): Unit
 
-  // ABI v2 payload-query ops. Providers land with the feature task; until then
-  // the facade adapter surfaces the typed [[PcNotYetSupported]] stub answer,
-  // which the boundary runtime maps to `STATUS_NOT_YET`.
+  // ABI v2 payload-query ops, backed by the facade's real providers. (A future
+  // op added transport-first would surface the typed `PcNotYetSupported` stub
+  // answer here, which the boundary runtime maps to `STATUS_NOT_YET`.)
   def inlayHints(uri: String, range: l.Range, flags: Int): Vector[PcInlayHint]
   def semanticTokens(uri: String): Vector[PcSemanticNode]
   def selectionRanges(uri: String, positions: Vector[l.Position]): Vector[Vector[l.Range]]
@@ -82,10 +81,9 @@ final class FacadePcOps(facade: PcFacade) extends PcOps:
   def restartInstances(): Unit = facade.activeTargets.foreach(facade.restartTarget)
   def shutdown(): Unit = facade.shutdown()
 
-  // ABI v2 payload-query ops: pure delegation to the facade's typed stubs
-  // (each throws [[PcNotYetSupported]] until its provider lands with the
-  // feature task). `pcDiagnostics` throws here directly — the facade already
-  // has a working `diagnostics(uri)` the provider task will route through.
+  // ABI v2 payload-query ops: pure delegation to the facade's real providers.
+  // `pcDiagnostics` routes through the facade's `diagnostics(uri)` (the
+  // didChange push path), keeping build diagnostics primary.
   def inlayHints(uri: String, range: l.Range, flags: Int): Vector[PcInlayHint] =
     facade.inlayHints(uri, range, flags)
   def semanticTokens(uri: String): Vector[PcSemanticNode] = facade.semanticTokens(uri)
@@ -101,7 +99,7 @@ final class FacadePcOps(facade: PcFacade) extends PcOps:
     facade.codeAction(uri, actionId, position, extractionEnd, argIndices)
   def autoImports(uri: String, position: l.Position, name: String, isExtension: Boolean): Vector[PcAutoImport] =
     facade.autoImports(uri, position, name, isExtension)
-  def pcDiagnostics(uri: String): Vector[l.Diagnostic] = throw PcNotYetSupported("pcDiagnostics")
+  def pcDiagnostics(uri: String): Vector[l.Diagnostic] = facade.diagnostics(uri)
   def foldingRanges(uri: String): Vector[PcFoldingRange] = facade.foldingRanges(uri)
 
 /** Test-only dispatch-lane fault injection, controlled by the

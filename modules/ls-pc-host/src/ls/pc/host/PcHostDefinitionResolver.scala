@@ -117,9 +117,9 @@ final class PcHostDefinitionResolver(vtable: MemorySegment, log: String => Unit)
     * `SymbolSearch.definitionSourceToplevels`) for the toplevel SemanticDB
     * symbols of the source defining `semanticdbSymbol`; this marshals
     * `(semanticdbSymbol, sourceUri)` across the FFM boundary, and Rust answers
-    * from the immutable index snapshot (empty until the engine query lands
-    * with the feature task — ls-jvm answers an empty toplevels buffer when no
-    * resolver is installed). Same memory and containment discipline as
+    * from the immutable index snapshot in source order (ls-jvm answers an
+    * empty toplevels buffer when no resolver is installed). Same memory and
+    * containment discipline as
     * [[definition]]: the Rust-owned response buffer is copied out and freed
     * through the vtable `free` slot, and any failure answers empty (the
     * [[PcDefinitionResolver.definitionSourceToplevels]] default).

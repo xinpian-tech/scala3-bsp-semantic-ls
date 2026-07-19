@@ -713,6 +713,111 @@ fn search_methods_empty_query_matches_all_visible_methods() {
     );
 }
 
+/// The definition-source-toplevels fixture, cloning the `symbol_definition`
+/// forward-closure geometry: `core` defines `pkg/S#` in a doc whose toplevels
+/// are (in deliberate non-alphabetical source order) `pkg/Zed#`, `pkg/S#`,
+/// `pkg/Mid.` — plus a NESTED member `pkg/S#inner().` and a LOCAL definition
+/// that must never surface; `app` depends on `core` and references `pkg/S#`;
+/// `dup` is DISCONNECTED and ALSO defines `pkg/S#` in a doc with different
+/// toplevels (`pkg/S#`, `pkg/DupOnly#`).
+fn build_toplevels_workspace(dir: &TempDir) -> (Arc<WorkspaceTargets>, PathBuf, PathBuf) {
+    let core_t = dir.sub("coretarget");
+    let core_s = dir.sub("coresrc");
+    let app_t = dir.sub("apptarget");
+    let app_s = dir.sub("appsrc");
+    let dup_t = dir.sub("duptarget");
+    let dup_s = dir.sub("dupsrc");
+    write_doc(
+        &core_t,
+        &core_s,
+        &DocFixture::new(
+            "c/Shapes.scala",
+            "sealed trait Zed\nclass S extends Zed:\n  def inner: Int =\n    val loc = 1\nobject Mid\n",
+        )
+        .symbol(sym("pkg/Zed#", KIND_CLASS, 0, "Zed"))
+        .symbol(sym("pkg/S#", KIND_CLASS, 0, "S"))
+        .symbol(sym("pkg/S#inner().", KIND_METHOD, 0, "inner"))
+        .occurrence(occ(rng(0, 13, 0, 16), "pkg/Zed#", DEFINITION))
+        .occurrence(occ(rng(1, 6, 1, 7), "pkg/S#", DEFINITION))
+        .occurrence(occ(rng(1, 16, 1, 19), "pkg/Zed#", REFERENCE))
+        .occurrence(occ(rng(2, 6, 2, 11), "pkg/S#inner().", DEFINITION))
+        .occurrence(occ(rng(3, 8, 3, 11), "local0", DEFINITION))
+        .occurrence(occ(rng(4, 7, 4, 10), "pkg/Mid.", DEFINITION)),
+    );
+    write_doc(
+        &app_t,
+        &app_s,
+        &DocFixture::new("a/A.scala", "val a = new S\n").occurrence(occ(
+            rng(0, 12, 0, 13),
+            "pkg/S#",
+            REFERENCE,
+        )),
+    );
+    write_doc(
+        &dup_t,
+        &dup_s,
+        &DocFixture::new("d/S.scala", "class S\nclass DupOnly\n")
+            .symbol(sym("pkg/S#", KIND_CLASS, 0, "S"))
+            .symbol(sym("pkg/DupOnly#", KIND_CLASS, 0, "DupOnly"))
+            .occurrence(occ(rng(0, 6, 0, 7), "pkg/S#", DEFINITION))
+            .occurrence(occ(rng(1, 6, 1, 13), "pkg/DupOnly#", DEFINITION)),
+    );
+    let ws = WorkspaceTargets::new(vec![
+        TargetSpec::new("core", core_t, core_s),
+        TargetSpec::new("app", app_t, app_s.clone()).with_deps(vec!["core".to_string()]),
+        TargetSpec::new("dup", dup_t, dup_s.clone()),
+    ]);
+    (Arc::new(ws), app_s, dup_s)
+}
+
+#[test]
+fn definition_source_toplevels_lists_the_defining_doc_in_source_order() {
+    let dir = TempDir::new("toplevels");
+    let (ws, app_s, _dup_s) = build_toplevels_workspace(&dir);
+    let orch = orchestrator(&dir, ws);
+    // From `app`, the defining doc is core's `c/Shapes.scala`: its toplevels
+    // come back in SOURCE order (Zed before S before Mid — not alphabetical),
+    // with the nested member and the local definition excluded.
+    let symbols = orch.definition_source_toplevels("pkg/S#", &file_uri(&app_s, "a/A.scala"));
+    assert_eq!(symbols, vec!["pkg/Zed#", "pkg/S#", "pkg/Mid."]);
+}
+
+#[test]
+fn definition_source_toplevels_unknown_and_empty_symbols_answer_empty() {
+    let dir = TempDir::new("toplevelsunknown");
+    let (ws, app_s, _dup_s) = build_toplevels_workspace(&dir);
+    let orch = orchestrator(&dir, ws);
+    let from = file_uri(&app_s, "a/A.scala");
+    assert!(orch
+        .definition_source_toplevels("pkg/Nope#", &from)
+        .is_empty());
+    assert!(orch.definition_source_toplevels("", &from).is_empty());
+    // A reference-only symbol with no indexed definition also answers empty.
+    assert!(orch
+        .definition_source_toplevels("pkg/S#inner().x.", &from)
+        .is_empty());
+}
+
+#[test]
+fn definition_source_toplevels_resolves_through_the_requesting_closure() {
+    let dir = TempDir::new("toplevelsclosure");
+    let (ws, app_s, dup_s) = build_toplevels_workspace(&dir);
+    let orch = orchestrator(&dir, ws);
+    // `pkg/S#` is defined in BOTH core and the disconnected dup. From `app`
+    // (core in its forward closure) the defining doc resolves to core's — the
+    // dup duplicate never leaks its toplevels.
+    let symbols = orch.definition_source_toplevels("pkg/S#", &file_uri(&app_s, "a/A.scala"));
+    assert_eq!(symbols, vec!["pkg/Zed#", "pkg/S#", "pkg/Mid."]);
+    // From `dup` only its own definition is visible, so its doc's toplevels
+    // answer instead.
+    let symbols = orch.definition_source_toplevels("pkg/S#", &file_uri(&dup_s, "d/S.scala"));
+    assert_eq!(symbols, vec!["pkg/S#", "pkg/DupOnly#"]);
+    // An unscoped buffer sees every definition; the FIRST visible defining doc
+    // wins (lowest target ordinal — core precedes dup in workspace order).
+    let symbols = orch.definition_source_toplevels("pkg/S#", "file:///nowhere/X.scala");
+    assert_eq!(symbols, vec!["pkg/Zed#", "pkg/S#", "pkg/Mid."]);
+}
+
 #[test]
 fn no_semanticdb_source_returns_hard_error() {
     let dir = TempDir::new("nosdb");

@@ -106,10 +106,9 @@ pub fn install_search_methods_resolver(resolver: Box<SearchMethodsResolver>) {
 /// definitionSourceToplevels` seam: `(semanticdb_symbol, source_uri) ->
 /// toplevel symbols of the resolved definition source`. Read-only and
 /// snapshot-backed like the other two callbacks; the server installs one over
-/// the immutable index snapshot before boot. (The engine query behind it lands
-/// with the feature task — until then the server may install nothing and the
-/// callback answers empty, exactly as `search_methods` did before its engine
-/// landed.)
+/// the immutable index snapshot before boot (the engine query is
+/// `QueryOrchestrator::definition_source_toplevels`); with none installed the
+/// callback answers empty.
 pub type DefinitionSourceToplevelsResolver = dyn Fn(&str, &str) -> ToplevelsResult + Send + Sync;
 
 static DEFINITION_SOURCE_TOPLEVELS_RESOLVER: OnceLock<Box<DefinitionSourceToplevelsResolver>> =
