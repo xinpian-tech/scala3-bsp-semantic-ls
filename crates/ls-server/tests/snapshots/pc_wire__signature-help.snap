@@ -1,0 +1,13 @@
+---
+source: crates/ls-server/tests/pc_wire.rs
+expression: scrub(&help)
+---
+{
+  "activeParameter": 0,
+  "activeSignature": 0,
+  "signatures": [
+    {
+      "label": "fakeSig(line: 3, character: 6)"
+    }
+  ]
+}

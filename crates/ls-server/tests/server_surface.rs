@@ -26,9 +26,10 @@ use ls_bsp::model::{BspProjectModel, BspTarget};
 use ls_engine::{CompileOutcome, CompileService};
 use ls_index_model::uri::path_to_uri;
 use ls_server::{
-    libjvm_mapped, read_frame, serve, Bootstrap, BuildCompiler, CoreHandlers, Handlers,
-    IndexBootstrap, LoadOutcome, ModelSource, OutputSink, ReadyModel, ServerCore,
+    libjvm_mapped, serve, Bootstrap, BuildCompiler, CoreHandlers, Handlers, IndexBootstrap,
+    LoadOutcome, ModelSource, OutputSink, ReadyModel, ServerCore,
 };
+use ls_testkit::wire::{by_id, decode_frames, notification, request, split_after_initialized};
 
 // --- fixture model + black-box harness ---------------------------------------
 
@@ -99,46 +100,6 @@ fn fixture_model() -> BspProjectModel {
     )
 }
 
-fn frame(body: Value) -> Vec<u8> {
-    let text = serde_json::to_string(&body).unwrap();
-    format!("Content-Length: {}\r\n\r\n{}", text.len(), text).into_bytes()
-}
-
-fn request(id: i64, method: &str, params: Value) -> Value {
-    json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params })
-}
-
-fn notification(method: &str, params: Value) -> Value {
-    json!({ "jsonrpc": "2.0", "method": method, "params": params })
-}
-
-fn responses(bytes: Vec<u8>) -> Vec<Value> {
-    let mut reader = Cursor::new(bytes);
-    let mut out = Vec::new();
-    while let Some(body) = read_frame(&mut reader).unwrap() {
-        out.push(serde_json::from_slice(&body).unwrap());
-    }
-    out
-}
-
-/// The byte offset just after the `initialized` notification, so the loop is run
-/// in two passes with the async bootstrap driven to completion between them
-/// (pump-until-ready). A stream with no `initialized` runs as one pre-ready pass.
-fn split_after_initialized(bytes: &[u8]) -> usize {
-    let mut reader = Cursor::new(bytes.to_vec());
-    while let Ok(Some(body)) = read_frame(&mut reader) {
-        let is_initialized = serde_json::from_slice::<Value>(&body)
-            .ok()
-            .and_then(|v| v.get("method")?.as_str().map(str::to_string))
-            .as_deref()
-            == Some("initialized");
-        if is_initialized {
-            return reader.position() as usize;
-        }
-    }
-    bytes.len()
-}
-
 /// Drives `serve` over the framed `input`, pumping the async bootstrap to
 /// completion between the `initialized`-split halves, and returns every framed
 /// response the loop wrote.
@@ -162,15 +123,9 @@ where
         let mut reader = Cursor::new(chunk);
         let sink = OutputSink::new(Vec::new());
         serve(&mut reader, &sink, core, handlers, bootstrap()).unwrap();
-        out.extend(responses(sink.written()));
+        out.extend(decode_frames(sink.written()));
     }
     out
-}
-
-fn by_id(out: &[Value], id: i64) -> &Value {
-    out.iter()
-        .find(|r| r["id"] == id)
-        .unwrap_or_else(|| panic!("no response for id {id} in {out:?}"))
 }
 
 /// A build compiler that records its `compile` calls, for the `compile`
@@ -212,11 +167,7 @@ impl ModelSource for RecordingModelSource {
 }
 
 fn init(store: &Path) -> Vec<u8> {
-    frame(request(
-        1,
-        "initialize",
-        json!({ "rootUri": path_to_uri(store) }),
-    ))
+    request(1, "initialize", json!({ "rootUri": path_to_uri(store) }))
 }
 
 // --- capabilities -------------------------------------------------------------
@@ -230,7 +181,7 @@ fn initialize_advertises_exactly_the_implemented_capability_set() {
         &mut ServerCore::new(),
         &CoreHandlers,
         || IndexBootstrap::new(|_root: &Path| Ok(fixture_model())),
-        [init(store.path()), frame(notification("exit", json!({})))].concat(),
+        [init(store.path()), notification("exit", json!({}))].concat(),
     );
     let caps = &by_id(&out, 1)["result"]["capabilities"];
 
@@ -277,23 +228,20 @@ fn initialize_advertises_exactly_the_implemented_capability_set() {
 #[test]
 fn advertised_execute_commands_are_exactly_the_routed_ones() {
     let store = tempfile::tempdir().unwrap();
-    let mut input = vec![
-        init(store.path()),
-        frame(notification("initialized", json!({}))),
-    ];
+    let mut input = vec![init(store.path()), notification("initialized", json!({}))];
     for (id, command) in [
         (2, "scala3SemanticLs.doctor"),
         (3, "scala3SemanticLs.reindex"),
         (4, "scala3SemanticLs.compile"),
         (5, "scala3SemanticLs.pcPluginStatus"),
     ] {
-        input.push(frame(request(
+        input.push(request(
             id,
             "workspace/executeCommand",
             json!({ "command": command }),
-        )));
+        ));
     }
-    input.push(frame(notification("exit", json!({}))));
+    input.push(notification("exit", json!({})));
     let out = serve_pumped(
         &mut ServerCore::new(),
         &CoreHandlers,
@@ -333,18 +281,18 @@ fn pre_ready_methods_take_their_per_method_fallbacks() {
     // No `initialized` — the stream runs as a single pre-ready pass.
     let input = [
         init(store.path()),
-        frame(request(2, "workspace/symbol", json!({ "query": "Core" }))),
-        frame(request(
+        request(2, "workspace/symbol", json!({ "query": "Core" })),
+        request(
             3,
             "textDocument/references",
             json!({ "textDocument": { "uri": uri }, "position": { "line": 2, "character": 6 } }),
-        )),
-        frame(request(
+        ),
+        request(
             4,
             "textDocument/prepareRename",
             json!({ "textDocument": { "uri": uri }, "position": { "line": 2, "character": 6 } }),
-        )),
-        frame(notification("exit", json!({}))),
+        ),
+        notification("exit", json!({})),
     ]
     .concat();
     let out = serve_pumped(
@@ -381,9 +329,9 @@ fn ready_session_serves_real_index_queries() {
     let uri = path_to_uri(&fixtures_root().join("sources/a/src/pkga/Core.scala"));
     let input = [
         init(store.path()),
-        frame(notification("initialized", json!({}))),
-        frame(request(2, "workspace/symbol", json!({ "query": "Core" }))),
-        frame(request(
+        notification("initialized", json!({})),
+        request(2, "workspace/symbol", json!({ "query": "Core" })),
+        request(
             3,
             "textDocument/references",
             json!({
@@ -391,8 +339,8 @@ fn ready_session_serves_real_index_queries() {
                 "position": { "line": 2, "character": 6 },
                 "context": { "includeDeclaration": true }
             }),
-        )),
-        frame(notification("exit", json!({}))),
+        ),
+        notification("exit", json!({})),
     ]
     .concat();
     let mut core = ServerCore::new();
@@ -425,18 +373,18 @@ fn execute_command_doctor_renders_text_and_json() {
     let store = tempfile::tempdir().unwrap();
     let input = [
         init(store.path()),
-        frame(notification("initialized", json!({}))),
-        frame(request(
+        notification("initialized", json!({})),
+        request(
             2,
             "workspace/executeCommand",
             json!({ "command": "scala3SemanticLs.doctor" }),
-        )),
-        frame(request(
+        ),
+        request(
             3,
             "workspace/executeCommand",
             json!({ "command": "scala3SemanticLs.doctor", "arguments": [{ "json": true }] }),
-        )),
-        frame(notification("exit", json!({}))),
+        ),
+        notification("exit", json!({})),
     ]
     .concat();
     let out = serve_pumped(
@@ -479,23 +427,23 @@ fn execute_command_reindex_compile_and_unknown() {
     };
     let input = [
         init(store.path()),
-        frame(notification("initialized", json!({}))),
-        frame(request(
+        notification("initialized", json!({})),
+        request(
             2,
             "workspace/executeCommand",
             json!({ "command": "scala3SemanticLs.reindex" }),
-        )),
-        frame(request(
+        ),
+        request(
             3,
             "workspace/executeCommand",
             json!({ "command": "scala3SemanticLs.compile" }),
-        )),
-        frame(request(
+        ),
+        request(
             4,
             "workspace/executeCommand",
             json!({ "command": "scala3SemanticLs.nonesuch" }),
-        )),
-        frame(notification("exit", json!({}))),
+        ),
+        notification("exit", json!({})),
     ]
     .concat();
     let out = serve_pumped(
@@ -542,12 +490,12 @@ fn doctor_renders_before_ready() {
     let store = tempfile::tempdir().unwrap();
     let input = [
         init(store.path()),
-        frame(request(
+        request(
             2,
             "workspace/executeCommand",
             json!({ "command": "scala3SemanticLs.doctor" }),
-        )),
-        frame(notification("exit", json!({}))),
+        ),
+        notification("exit", json!({})),
     ]
     .concat();
     let out = serve_pumped(
@@ -588,34 +536,34 @@ fn an_index_only_session_never_boots_the_embedded_jvm() {
     };
     let input = [
         init(store.path()),
-        frame(notification("initialized", json!({}))),
-        frame(request(2, "workspace/symbol", json!({ "query": "Core" }))),
-        frame(request(
+        notification("initialized", json!({})),
+        request(2, "workspace/symbol", json!({ "query": "Core" })),
+        request(
             3,
             "textDocument/references",
             json!({ "textDocument": { "uri": uri }, "position": { "line": 2, "character": 6 } }),
-        )),
-        frame(request(
+        ),
+        request(
             4,
             "textDocument/documentHighlight",
             json!({ "textDocument": { "uri": uri }, "position": { "line": 2, "character": 6 } }),
-        )),
-        frame(request(
+        ),
+        request(
             5,
             "workspace/executeCommand",
             json!({ "command": "scala3SemanticLs.reindex" }),
-        )),
-        frame(request(
+        ),
+        request(
             6,
             "workspace/executeCommand",
             json!({ "command": "scala3SemanticLs.compile" }),
-        )),
-        frame(request(
+        ),
+        request(
             7,
             "workspace/executeCommand",
             json!({ "command": "scala3SemanticLs.doctor" }),
-        )),
-        frame(notification("exit", json!({}))),
+        ),
+        notification("exit", json!({})),
     ]
     .concat();
     let mut core = ServerCore::new();

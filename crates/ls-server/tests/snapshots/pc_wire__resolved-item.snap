@@ -1,0 +1,12 @@
+---
+source: crates/ls-server/tests/pc_wire.rs
+expression: scrub(&resolved)
+---
+{
+  "data": {
+    "symbol": "fake/Symbol#"
+  },
+  "detail": "resolved by fake PC (bsp://workspace/fixture-a, fake/Symbol#)",
+  "kind": 3,
+  "label": "fakeItem@3:6"
+}

@@ -1,0 +1,10 @@
+---
+source: crates/ls-server/tests/pc_wire.rs
+expression: scrub(&hover)
+---
+{
+  "contents": {
+    "kind": "markdown",
+    "value": "fake hover at 3:6"
+  }
+}

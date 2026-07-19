@@ -257,11 +257,39 @@ where
 /// answers over the snapshot (references, documentHighlight, workspace/symbol).
 pub struct IndexBootstrap<M> {
     model_source: M,
+    pc_factory: PcServiceFactory,
 }
+
+/// Builds the ready bundle's PC capability from the workspace root, the model's
+/// PC target registrations, and the index-backed cross-file symbol resolver.
+/// The default factory ([`IndexBootstrap::new`]) stands up the production
+/// embedded-island service; tests inject a JVM-free fake through
+/// [`IndexBootstrap::with_pc`] so the PC-backed wire surface (completion, hover,
+/// signature help, the definition family) runs through the real serve loop
+/// without booting a JVM.
+pub type PcServiceFactory = Arc<
+    dyn Fn(PathBuf, Vec<TargetConfig>, Box<SymbolResolver>) -> Arc<dyn PcQueryService>
+        + Send
+        + Sync,
+>;
 
 impl<M: ModelSource> IndexBootstrap<M> {
     pub fn new(model_source: M) -> Self {
-        IndexBootstrap { model_source }
+        Self::with_pc(
+            model_source,
+            Arc::new(|root, targets, resolver| {
+                Arc::new(IslandPcService::new(root, targets, resolver)) as Arc<dyn PcQueryService>
+            }),
+        )
+    }
+
+    /// An `IndexBootstrap` whose ready bundle carries the PC service built by
+    /// `pc_factory` instead of the production embedded island.
+    pub fn with_pc(model_source: M, pc_factory: PcServiceFactory) -> Self {
+        IndexBootstrap {
+            model_source,
+            pc_factory,
+        }
     }
 
     /// Loads the model, ingests it into a fresh store under the root, and returns
@@ -340,11 +368,8 @@ impl<M: ModelSource> IndexBootstrap<M> {
         let resolver: Box<SymbolResolver> = Box::new(move |symbol: &str, from_uri: &str| {
             locations_result(resolver_orchestrator.symbol_definition(symbol, from_uri))
         });
-        let pc: Arc<dyn PcQueryService> = Arc::new(IslandPcService::new(
-            workspace_root.to_path_buf(),
-            pc_targets,
-            resolver,
-        ));
+        let pc: Arc<dyn PcQueryService> =
+            (self.pc_factory)(workspace_root.to_path_buf(), pc_targets, resolver);
         Ok(CoreServices::new(
             orchestrator,
             uris,

@@ -1,0 +1,19 @@
+---
+source: crates/ls-server/tests/pc_wire.rs
+expression: scrub(&type_definition)
+---
+[
+  {
+    "range": {
+      "end": {
+        "character": 13,
+        "line": 3
+      },
+      "start": {
+        "character": 6,
+        "line": 3
+      }
+    },
+    "uri": "[SOURCES]/a/src/pkga/Core.scala"
+  }
+]

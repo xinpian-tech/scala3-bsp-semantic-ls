@@ -1,0 +1,17 @@
+[package]
+name = "ls-testkit"
+description = "Shared LSP test harness: framed-wire builders, the interactive wire client (in-process serve loop or a spawned binary over stdio), the scriptable fake BSP build server, the scriptable JVM-free fake PC service, and the committed fixture-corpus geometry. Test-only support consumed as a dev-dependency; never shipped."
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+ls-bsp = { path = "../ls-bsp" }
+ls-pc-abi = { path = "../ls-pc-abi" }
+ls-server = { path = "../ls-server" }
+serde_json = "1"
+tempfile = "3"
