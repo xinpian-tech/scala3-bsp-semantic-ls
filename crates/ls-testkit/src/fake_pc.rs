@@ -12,13 +12,18 @@ use std::sync::{Arc, Barrier, Mutex};
 
 use serde_json::{json, Value};
 
-use ls_pc_abi::payloads::TargetConfig;
+use ls_pc_abi::payloads::{
+    AutoImport, CodeActionResult, FoldingRange, InlayHint, InlayLabelPart, PcDiagnostic, Pos, Rng,
+    SemanticNode, TargetConfig, TextEdit,
+};
 use ls_server::bootstrap::PcServiceFactory;
 use ls_server::pc::{
     PcCompilerPluginStatus, PcDefLocation, PcDefOrigin, PcDefinition, PcDisabledPlugin,
     PcPluginStatusReport, PcServicePluginStatus, PcSpan,
 };
-use ls_server::{PcLocation, PcQueryService, SearchMethodsResolver, SymbolResolver};
+use ls_server::{
+    PcLocation, PcQueryService, SearchMethodsResolver, SymbolResolver, ToplevelsResolver,
+};
 
 /// The symbol every fake result carries; resolve gates key off `data.symbol`.
 pub const FAKE_SYMBOL: &str = "fake/Symbol#";
@@ -52,7 +57,8 @@ impl FakePcService {
             move |_root,
                   targets: Vec<TargetConfig>,
                   _resolver: Box<SymbolResolver>,
-                  _search_resolver: Box<SearchMethodsResolver>| {
+                  _search_resolver: Box<SearchMethodsResolver>,
+                  _toplevels_resolver: Box<ToplevelsResolver>| {
                 let mut registered = this.registered.lock().unwrap();
                 registered.clear();
                 registered.extend(targets.iter().map(|t| t.bsp_id.clone()));
@@ -228,6 +234,149 @@ impl PcQueryService for FakePcService {
         let mut registered = self.registered.lock().unwrap();
         registered.clear();
         registered.extend(targets.into_iter().map(|t| t.bsp_id));
+    }
+
+    // --- ABI v2 payload-query ops: deterministic, position/uri-echoing canned
+    // --- answers + call logging, so the wire suites are ready for the feature
+    // --- task's LSP mapping without a JVM.
+
+    fn inlay_hints(&self, uri: &str, range: Rng, flags: u32) -> Vec<InlayHint> {
+        self.record(format!(
+            "inlay_hints {uri}:{}:{}-{}:{} flags={flags}",
+            range.start_line, range.start_character, range.end_line, range.end_character
+        ));
+        vec![InlayHint {
+            position: Pos {
+                line: range.start_line,
+                character: range.start_character + 2,
+            },
+            label_parts: vec![InlayLabelPart {
+                text: ": Int".to_string(),
+                location: Some((uri.to_string(), range.clone())),
+                tooltip: Some("fake inferred type".to_string()),
+            }],
+            kind: 1,
+            padding_left: true,
+            padding_right: false,
+            text_edits: None,
+            data: Some(FAKE_SYMBOL.as_bytes().to_vec()),
+        }]
+    }
+
+    fn semantic_tokens(&self, uri: &str) -> Vec<SemanticNode> {
+        self.record(format!("semantic_tokens {uri}"));
+        vec![
+            SemanticNode {
+                start: 0,
+                end: 4,
+                token_type: 3,
+                token_modifier: 1,
+            },
+            SemanticNode {
+                start: 8,
+                end: 12,
+                token_type: 15,
+                token_modifier: 0,
+            },
+        ]
+    }
+
+    fn selection_range(&self, uri: &str, positions: &[Pos]) -> Vec<Vec<Rng>> {
+        self.record(format!("selection_range {uri} ({})", positions.len()));
+        positions
+            .iter()
+            .map(|pos| {
+                vec![
+                    Rng {
+                        start_line: pos.line,
+                        start_character: pos.character,
+                        end_line: pos.line,
+                        end_character: pos.character + 2,
+                    },
+                    Rng {
+                        start_line: pos.line,
+                        start_character: 0,
+                        end_line: pos.line + 1,
+                        end_character: 0,
+                    },
+                ]
+            })
+            .collect()
+    }
+
+    fn code_action(
+        &self,
+        uri: &str,
+        action: i32,
+        position: Pos,
+        _extraction_end: Option<Pos>,
+        _arg_indices: Option<Vec<i32>>,
+    ) -> CodeActionResult {
+        self.record(format!(
+            "code_action {uri}:{}:{} action={action}",
+            position.line, position.character
+        ));
+        CodeActionResult {
+            edits: vec![TextEdit {
+                range: Rng {
+                    start_line: position.line,
+                    start_character: position.character,
+                    end_line: position.line,
+                    end_character: position.character,
+                },
+                new_text: format!("/* fake action {action} */"),
+            }],
+            refusal: None,
+        }
+    }
+
+    fn auto_imports(
+        &self,
+        uri: &str,
+        position: Pos,
+        name: &str,
+        is_extension: bool,
+    ) -> Vec<AutoImport> {
+        self.record(format!(
+            "auto_imports {uri}:{}:{} {name} ext={is_extension}",
+            position.line, position.character
+        ));
+        vec![AutoImport {
+            package_name: "fake.pkg".to_string(),
+            edits: vec![TextEdit {
+                range: Rng::default(),
+                new_text: format!("import fake.pkg.{name}\n"),
+            }],
+            symbol: Some(format!("fake/pkg/{name}#")),
+        }]
+    }
+
+    fn pc_diagnostics(&self, uri: &str) -> Vec<PcDiagnostic> {
+        self.record(format!("pc_diagnostics {uri}"));
+        vec![PcDiagnostic {
+            range: Rng {
+                start_line: 0,
+                start_character: 0,
+                end_line: 0,
+                end_character: 4,
+            },
+            severity: 2,
+            code: "FAKE1".to_string(),
+            message: format!("fake diagnostic for {uri}"),
+        }]
+    }
+
+    fn folding_range(&self, uri: &str) -> Vec<FoldingRange> {
+        self.record(format!("folding_range {uri}"));
+        vec![FoldingRange {
+            range: Rng {
+                start_line: 0,
+                start_character: 0,
+                end_line: 3,
+                end_character: 1,
+            },
+            kind: 2,
+        }]
     }
 
     /// A canned plugin-status report, so the `pcPluginStatus` executeCommand

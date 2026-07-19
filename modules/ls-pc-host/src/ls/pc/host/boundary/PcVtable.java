@@ -31,6 +31,13 @@ import static java.lang.foreign.MemoryLayout.PathElement.*;
  *     PcVoidFn restart_instances;
  *     PcVoidFn shutdown;
  *     PcSpawnDispatchFn spawn_dispatch;
+ *     PcPayloadQueryFn inlay_hints;
+ *     PcPayloadQueryFn semantic_tokens;
+ *     PcPayloadQueryFn selection_range;
+ *     PcPayloadQueryFn code_action;
+ *     PcPayloadQueryFn auto_imports;
+ *     PcPayloadQueryFn pc_diagnostics;
+ *     PcPayloadQueryFn folding_range;
  * }
  * }
  */
@@ -56,7 +63,14 @@ public class PcVtable {
         boundary_h.C_POINTER.withName("plugin_status"),
         boundary_h.C_POINTER.withName("restart_instances"),
         boundary_h.C_POINTER.withName("shutdown"),
-        boundary_h.C_POINTER.withName("spawn_dispatch")
+        boundary_h.C_POINTER.withName("spawn_dispatch"),
+        boundary_h.C_POINTER.withName("inlay_hints"),
+        boundary_h.C_POINTER.withName("semantic_tokens"),
+        boundary_h.C_POINTER.withName("selection_range"),
+        boundary_h.C_POINTER.withName("code_action"),
+        boundary_h.C_POINTER.withName("auto_imports"),
+        boundary_h.C_POINTER.withName("pc_diagnostics"),
+        boundary_h.C_POINTER.withName("folding_range")
     ).withName("PcVtable");
 
     /**
@@ -1629,6 +1643,720 @@ public class PcVtable {
      */
     public static void spawn_dispatch(MemorySegment struct, MemorySegment fieldValue) {
         struct.set(spawn_dispatch$LAYOUT, spawn_dispatch$OFFSET, fieldValue);
+    }
+
+    /**
+     * {@snippet lang=c :
+     * PcPayloadQueryFn inlay_hints
+     * }
+     */
+    public final static class inlay_hints {
+
+        private inlay_hints() {
+            // Should not be called directly
+        }
+
+        /**
+         * The function pointer signature, expressed as a functional interface
+         */
+        public interface Function {
+            int apply(MemorySegment _x0, int _x1, MemorySegment _x2);
+        }
+
+        private static final FunctionDescriptor $DESC = FunctionDescriptor.of(
+            boundary_h.C_INT,
+            boundary_h.C_POINTER,
+            boundary_h.C_INT,
+            boundary_h.C_POINTER
+        );
+
+        /**
+         * The descriptor of this function pointer
+         */
+        public static FunctionDescriptor descriptor() {
+            return $DESC;
+        }
+
+        private static final MethodHandle UP$MH = boundary_h.upcallHandle(inlay_hints.Function.class, "apply", $DESC);
+
+        /**
+         * Allocates a new upcall stub, whose implementation is defined by {@code fi}.
+         * The lifetime of the returned segment is managed by {@code arena}
+         */
+        public static MemorySegment allocate(inlay_hints.Function fi, Arena arena) {
+            return Linker.nativeLinker().upcallStub(UP$MH.bindTo(fi), $DESC, arena);
+        }
+
+        private static final MethodHandle DOWN$MH = Linker.nativeLinker().downcallHandle($DESC);
+
+        /**
+         * Invoke the upcall stub {@code funcPtr}, with given parameters
+         */
+        public static int invoke(MemorySegment funcPtr, MemorySegment _x0, int _x1, MemorySegment _x2) {
+            try {
+                return (int) DOWN$MH.invokeExact(funcPtr, _x0, _x1, _x2);
+            } catch (Error | RuntimeException ex) {
+                throw ex;
+            } catch (Throwable ex$) {
+                throw new AssertionError("should not reach here", ex$);
+            }
+        }
+    }
+
+    private static final AddressLayout inlay_hints$LAYOUT = (AddressLayout)$LAYOUT.select(groupElement("inlay_hints"));
+
+    /**
+     * Layout for field:
+     * {@snippet lang=c :
+     * PcPayloadQueryFn inlay_hints
+     * }
+     */
+    public static final AddressLayout inlay_hints$layout() {
+        return inlay_hints$LAYOUT;
+    }
+
+    private static final long inlay_hints$OFFSET = $LAYOUT.byteOffset(groupElement("inlay_hints"));
+
+    /**
+     * Offset for field:
+     * {@snippet lang=c :
+     * PcPayloadQueryFn inlay_hints
+     * }
+     */
+    public static final long inlay_hints$offset() {
+        return inlay_hints$OFFSET;
+    }
+
+    /**
+     * Getter for field:
+     * {@snippet lang=c :
+     * PcPayloadQueryFn inlay_hints
+     * }
+     */
+    public static MemorySegment inlay_hints(MemorySegment struct) {
+        return struct.get(inlay_hints$LAYOUT, inlay_hints$OFFSET);
+    }
+
+    /**
+     * Setter for field:
+     * {@snippet lang=c :
+     * PcPayloadQueryFn inlay_hints
+     * }
+     */
+    public static void inlay_hints(MemorySegment struct, MemorySegment fieldValue) {
+        struct.set(inlay_hints$LAYOUT, inlay_hints$OFFSET, fieldValue);
+    }
+
+    /**
+     * {@snippet lang=c :
+     * PcPayloadQueryFn semantic_tokens
+     * }
+     */
+    public final static class semantic_tokens {
+
+        private semantic_tokens() {
+            // Should not be called directly
+        }
+
+        /**
+         * The function pointer signature, expressed as a functional interface
+         */
+        public interface Function {
+            int apply(MemorySegment _x0, int _x1, MemorySegment _x2);
+        }
+
+        private static final FunctionDescriptor $DESC = FunctionDescriptor.of(
+            boundary_h.C_INT,
+            boundary_h.C_POINTER,
+            boundary_h.C_INT,
+            boundary_h.C_POINTER
+        );
+
+        /**
+         * The descriptor of this function pointer
+         */
+        public static FunctionDescriptor descriptor() {
+            return $DESC;
+        }
+
+        private static final MethodHandle UP$MH = boundary_h.upcallHandle(semantic_tokens.Function.class, "apply", $DESC);
+
+        /**
+         * Allocates a new upcall stub, whose implementation is defined by {@code fi}.
+         * The lifetime of the returned segment is managed by {@code arena}
+         */
+        public static MemorySegment allocate(semantic_tokens.Function fi, Arena arena) {
+            return Linker.nativeLinker().upcallStub(UP$MH.bindTo(fi), $DESC, arena);
+        }
+
+        private static final MethodHandle DOWN$MH = Linker.nativeLinker().downcallHandle($DESC);
+
+        /**
+         * Invoke the upcall stub {@code funcPtr}, with given parameters
+         */
+        public static int invoke(MemorySegment funcPtr, MemorySegment _x0, int _x1, MemorySegment _x2) {
+            try {
+                return (int) DOWN$MH.invokeExact(funcPtr, _x0, _x1, _x2);
+            } catch (Error | RuntimeException ex) {
+                throw ex;
+            } catch (Throwable ex$) {
+                throw new AssertionError("should not reach here", ex$);
+            }
+        }
+    }
+
+    private static final AddressLayout semantic_tokens$LAYOUT = (AddressLayout)$LAYOUT.select(groupElement("semantic_tokens"));
+
+    /**
+     * Layout for field:
+     * {@snippet lang=c :
+     * PcPayloadQueryFn semantic_tokens
+     * }
+     */
+    public static final AddressLayout semantic_tokens$layout() {
+        return semantic_tokens$LAYOUT;
+    }
+
+    private static final long semantic_tokens$OFFSET = $LAYOUT.byteOffset(groupElement("semantic_tokens"));
+
+    /**
+     * Offset for field:
+     * {@snippet lang=c :
+     * PcPayloadQueryFn semantic_tokens
+     * }
+     */
+    public static final long semantic_tokens$offset() {
+        return semantic_tokens$OFFSET;
+    }
+
+    /**
+     * Getter for field:
+     * {@snippet lang=c :
+     * PcPayloadQueryFn semantic_tokens
+     * }
+     */
+    public static MemorySegment semantic_tokens(MemorySegment struct) {
+        return struct.get(semantic_tokens$LAYOUT, semantic_tokens$OFFSET);
+    }
+
+    /**
+     * Setter for field:
+     * {@snippet lang=c :
+     * PcPayloadQueryFn semantic_tokens
+     * }
+     */
+    public static void semantic_tokens(MemorySegment struct, MemorySegment fieldValue) {
+        struct.set(semantic_tokens$LAYOUT, semantic_tokens$OFFSET, fieldValue);
+    }
+
+    /**
+     * {@snippet lang=c :
+     * PcPayloadQueryFn selection_range
+     * }
+     */
+    public final static class selection_range {
+
+        private selection_range() {
+            // Should not be called directly
+        }
+
+        /**
+         * The function pointer signature, expressed as a functional interface
+         */
+        public interface Function {
+            int apply(MemorySegment _x0, int _x1, MemorySegment _x2);
+        }
+
+        private static final FunctionDescriptor $DESC = FunctionDescriptor.of(
+            boundary_h.C_INT,
+            boundary_h.C_POINTER,
+            boundary_h.C_INT,
+            boundary_h.C_POINTER
+        );
+
+        /**
+         * The descriptor of this function pointer
+         */
+        public static FunctionDescriptor descriptor() {
+            return $DESC;
+        }
+
+        private static final MethodHandle UP$MH = boundary_h.upcallHandle(selection_range.Function.class, "apply", $DESC);
+
+        /**
+         * Allocates a new upcall stub, whose implementation is defined by {@code fi}.
+         * The lifetime of the returned segment is managed by {@code arena}
+         */
+        public static MemorySegment allocate(selection_range.Function fi, Arena arena) {
+            return Linker.nativeLinker().upcallStub(UP$MH.bindTo(fi), $DESC, arena);
+        }
+
+        private static final MethodHandle DOWN$MH = Linker.nativeLinker().downcallHandle($DESC);
+
+        /**
+         * Invoke the upcall stub {@code funcPtr}, with given parameters
+         */
+        public static int invoke(MemorySegment funcPtr, MemorySegment _x0, int _x1, MemorySegment _x2) {
+            try {
+                return (int) DOWN$MH.invokeExact(funcPtr, _x0, _x1, _x2);
+            } catch (Error | RuntimeException ex) {
+                throw ex;
+            } catch (Throwable ex$) {
+                throw new AssertionError("should not reach here", ex$);
+            }
+        }
+    }
+
+    private static final AddressLayout selection_range$LAYOUT = (AddressLayout)$LAYOUT.select(groupElement("selection_range"));
+
+    /**
+     * Layout for field:
+     * {@snippet lang=c :
+     * PcPayloadQueryFn selection_range
+     * }
+     */
+    public static final AddressLayout selection_range$layout() {
+        return selection_range$LAYOUT;
+    }
+
+    private static final long selection_range$OFFSET = $LAYOUT.byteOffset(groupElement("selection_range"));
+
+    /**
+     * Offset for field:
+     * {@snippet lang=c :
+     * PcPayloadQueryFn selection_range
+     * }
+     */
+    public static final long selection_range$offset() {
+        return selection_range$OFFSET;
+    }
+
+    /**
+     * Getter for field:
+     * {@snippet lang=c :
+     * PcPayloadQueryFn selection_range
+     * }
+     */
+    public static MemorySegment selection_range(MemorySegment struct) {
+        return struct.get(selection_range$LAYOUT, selection_range$OFFSET);
+    }
+
+    /**
+     * Setter for field:
+     * {@snippet lang=c :
+     * PcPayloadQueryFn selection_range
+     * }
+     */
+    public static void selection_range(MemorySegment struct, MemorySegment fieldValue) {
+        struct.set(selection_range$LAYOUT, selection_range$OFFSET, fieldValue);
+    }
+
+    /**
+     * {@snippet lang=c :
+     * PcPayloadQueryFn code_action
+     * }
+     */
+    public final static class code_action {
+
+        private code_action() {
+            // Should not be called directly
+        }
+
+        /**
+         * The function pointer signature, expressed as a functional interface
+         */
+        public interface Function {
+            int apply(MemorySegment _x0, int _x1, MemorySegment _x2);
+        }
+
+        private static final FunctionDescriptor $DESC = FunctionDescriptor.of(
+            boundary_h.C_INT,
+            boundary_h.C_POINTER,
+            boundary_h.C_INT,
+            boundary_h.C_POINTER
+        );
+
+        /**
+         * The descriptor of this function pointer
+         */
+        public static FunctionDescriptor descriptor() {
+            return $DESC;
+        }
+
+        private static final MethodHandle UP$MH = boundary_h.upcallHandle(code_action.Function.class, "apply", $DESC);
+
+        /**
+         * Allocates a new upcall stub, whose implementation is defined by {@code fi}.
+         * The lifetime of the returned segment is managed by {@code arena}
+         */
+        public static MemorySegment allocate(code_action.Function fi, Arena arena) {
+            return Linker.nativeLinker().upcallStub(UP$MH.bindTo(fi), $DESC, arena);
+        }
+
+        private static final MethodHandle DOWN$MH = Linker.nativeLinker().downcallHandle($DESC);
+
+        /**
+         * Invoke the upcall stub {@code funcPtr}, with given parameters
+         */
+        public static int invoke(MemorySegment funcPtr, MemorySegment _x0, int _x1, MemorySegment _x2) {
+            try {
+                return (int) DOWN$MH.invokeExact(funcPtr, _x0, _x1, _x2);
+            } catch (Error | RuntimeException ex) {
+                throw ex;
+            } catch (Throwable ex$) {
+                throw new AssertionError("should not reach here", ex$);
+            }
+        }
+    }
+
+    private static final AddressLayout code_action$LAYOUT = (AddressLayout)$LAYOUT.select(groupElement("code_action"));
+
+    /**
+     * Layout for field:
+     * {@snippet lang=c :
+     * PcPayloadQueryFn code_action
+     * }
+     */
+    public static final AddressLayout code_action$layout() {
+        return code_action$LAYOUT;
+    }
+
+    private static final long code_action$OFFSET = $LAYOUT.byteOffset(groupElement("code_action"));
+
+    /**
+     * Offset for field:
+     * {@snippet lang=c :
+     * PcPayloadQueryFn code_action
+     * }
+     */
+    public static final long code_action$offset() {
+        return code_action$OFFSET;
+    }
+
+    /**
+     * Getter for field:
+     * {@snippet lang=c :
+     * PcPayloadQueryFn code_action
+     * }
+     */
+    public static MemorySegment code_action(MemorySegment struct) {
+        return struct.get(code_action$LAYOUT, code_action$OFFSET);
+    }
+
+    /**
+     * Setter for field:
+     * {@snippet lang=c :
+     * PcPayloadQueryFn code_action
+     * }
+     */
+    public static void code_action(MemorySegment struct, MemorySegment fieldValue) {
+        struct.set(code_action$LAYOUT, code_action$OFFSET, fieldValue);
+    }
+
+    /**
+     * {@snippet lang=c :
+     * PcPayloadQueryFn auto_imports
+     * }
+     */
+    public final static class auto_imports {
+
+        private auto_imports() {
+            // Should not be called directly
+        }
+
+        /**
+         * The function pointer signature, expressed as a functional interface
+         */
+        public interface Function {
+            int apply(MemorySegment _x0, int _x1, MemorySegment _x2);
+        }
+
+        private static final FunctionDescriptor $DESC = FunctionDescriptor.of(
+            boundary_h.C_INT,
+            boundary_h.C_POINTER,
+            boundary_h.C_INT,
+            boundary_h.C_POINTER
+        );
+
+        /**
+         * The descriptor of this function pointer
+         */
+        public static FunctionDescriptor descriptor() {
+            return $DESC;
+        }
+
+        private static final MethodHandle UP$MH = boundary_h.upcallHandle(auto_imports.Function.class, "apply", $DESC);
+
+        /**
+         * Allocates a new upcall stub, whose implementation is defined by {@code fi}.
+         * The lifetime of the returned segment is managed by {@code arena}
+         */
+        public static MemorySegment allocate(auto_imports.Function fi, Arena arena) {
+            return Linker.nativeLinker().upcallStub(UP$MH.bindTo(fi), $DESC, arena);
+        }
+
+        private static final MethodHandle DOWN$MH = Linker.nativeLinker().downcallHandle($DESC);
+
+        /**
+         * Invoke the upcall stub {@code funcPtr}, with given parameters
+         */
+        public static int invoke(MemorySegment funcPtr, MemorySegment _x0, int _x1, MemorySegment _x2) {
+            try {
+                return (int) DOWN$MH.invokeExact(funcPtr, _x0, _x1, _x2);
+            } catch (Error | RuntimeException ex) {
+                throw ex;
+            } catch (Throwable ex$) {
+                throw new AssertionError("should not reach here", ex$);
+            }
+        }
+    }
+
+    private static final AddressLayout auto_imports$LAYOUT = (AddressLayout)$LAYOUT.select(groupElement("auto_imports"));
+
+    /**
+     * Layout for field:
+     * {@snippet lang=c :
+     * PcPayloadQueryFn auto_imports
+     * }
+     */
+    public static final AddressLayout auto_imports$layout() {
+        return auto_imports$LAYOUT;
+    }
+
+    private static final long auto_imports$OFFSET = $LAYOUT.byteOffset(groupElement("auto_imports"));
+
+    /**
+     * Offset for field:
+     * {@snippet lang=c :
+     * PcPayloadQueryFn auto_imports
+     * }
+     */
+    public static final long auto_imports$offset() {
+        return auto_imports$OFFSET;
+    }
+
+    /**
+     * Getter for field:
+     * {@snippet lang=c :
+     * PcPayloadQueryFn auto_imports
+     * }
+     */
+    public static MemorySegment auto_imports(MemorySegment struct) {
+        return struct.get(auto_imports$LAYOUT, auto_imports$OFFSET);
+    }
+
+    /**
+     * Setter for field:
+     * {@snippet lang=c :
+     * PcPayloadQueryFn auto_imports
+     * }
+     */
+    public static void auto_imports(MemorySegment struct, MemorySegment fieldValue) {
+        struct.set(auto_imports$LAYOUT, auto_imports$OFFSET, fieldValue);
+    }
+
+    /**
+     * {@snippet lang=c :
+     * PcPayloadQueryFn pc_diagnostics
+     * }
+     */
+    public final static class pc_diagnostics {
+
+        private pc_diagnostics() {
+            // Should not be called directly
+        }
+
+        /**
+         * The function pointer signature, expressed as a functional interface
+         */
+        public interface Function {
+            int apply(MemorySegment _x0, int _x1, MemorySegment _x2);
+        }
+
+        private static final FunctionDescriptor $DESC = FunctionDescriptor.of(
+            boundary_h.C_INT,
+            boundary_h.C_POINTER,
+            boundary_h.C_INT,
+            boundary_h.C_POINTER
+        );
+
+        /**
+         * The descriptor of this function pointer
+         */
+        public static FunctionDescriptor descriptor() {
+            return $DESC;
+        }
+
+        private static final MethodHandle UP$MH = boundary_h.upcallHandle(pc_diagnostics.Function.class, "apply", $DESC);
+
+        /**
+         * Allocates a new upcall stub, whose implementation is defined by {@code fi}.
+         * The lifetime of the returned segment is managed by {@code arena}
+         */
+        public static MemorySegment allocate(pc_diagnostics.Function fi, Arena arena) {
+            return Linker.nativeLinker().upcallStub(UP$MH.bindTo(fi), $DESC, arena);
+        }
+
+        private static final MethodHandle DOWN$MH = Linker.nativeLinker().downcallHandle($DESC);
+
+        /**
+         * Invoke the upcall stub {@code funcPtr}, with given parameters
+         */
+        public static int invoke(MemorySegment funcPtr, MemorySegment _x0, int _x1, MemorySegment _x2) {
+            try {
+                return (int) DOWN$MH.invokeExact(funcPtr, _x0, _x1, _x2);
+            } catch (Error | RuntimeException ex) {
+                throw ex;
+            } catch (Throwable ex$) {
+                throw new AssertionError("should not reach here", ex$);
+            }
+        }
+    }
+
+    private static final AddressLayout pc_diagnostics$LAYOUT = (AddressLayout)$LAYOUT.select(groupElement("pc_diagnostics"));
+
+    /**
+     * Layout for field:
+     * {@snippet lang=c :
+     * PcPayloadQueryFn pc_diagnostics
+     * }
+     */
+    public static final AddressLayout pc_diagnostics$layout() {
+        return pc_diagnostics$LAYOUT;
+    }
+
+    private static final long pc_diagnostics$OFFSET = $LAYOUT.byteOffset(groupElement("pc_diagnostics"));
+
+    /**
+     * Offset for field:
+     * {@snippet lang=c :
+     * PcPayloadQueryFn pc_diagnostics
+     * }
+     */
+    public static final long pc_diagnostics$offset() {
+        return pc_diagnostics$OFFSET;
+    }
+
+    /**
+     * Getter for field:
+     * {@snippet lang=c :
+     * PcPayloadQueryFn pc_diagnostics
+     * }
+     */
+    public static MemorySegment pc_diagnostics(MemorySegment struct) {
+        return struct.get(pc_diagnostics$LAYOUT, pc_diagnostics$OFFSET);
+    }
+
+    /**
+     * Setter for field:
+     * {@snippet lang=c :
+     * PcPayloadQueryFn pc_diagnostics
+     * }
+     */
+    public static void pc_diagnostics(MemorySegment struct, MemorySegment fieldValue) {
+        struct.set(pc_diagnostics$LAYOUT, pc_diagnostics$OFFSET, fieldValue);
+    }
+
+    /**
+     * {@snippet lang=c :
+     * PcPayloadQueryFn folding_range
+     * }
+     */
+    public final static class folding_range {
+
+        private folding_range() {
+            // Should not be called directly
+        }
+
+        /**
+         * The function pointer signature, expressed as a functional interface
+         */
+        public interface Function {
+            int apply(MemorySegment _x0, int _x1, MemorySegment _x2);
+        }
+
+        private static final FunctionDescriptor $DESC = FunctionDescriptor.of(
+            boundary_h.C_INT,
+            boundary_h.C_POINTER,
+            boundary_h.C_INT,
+            boundary_h.C_POINTER
+        );
+
+        /**
+         * The descriptor of this function pointer
+         */
+        public static FunctionDescriptor descriptor() {
+            return $DESC;
+        }
+
+        private static final MethodHandle UP$MH = boundary_h.upcallHandle(folding_range.Function.class, "apply", $DESC);
+
+        /**
+         * Allocates a new upcall stub, whose implementation is defined by {@code fi}.
+         * The lifetime of the returned segment is managed by {@code arena}
+         */
+        public static MemorySegment allocate(folding_range.Function fi, Arena arena) {
+            return Linker.nativeLinker().upcallStub(UP$MH.bindTo(fi), $DESC, arena);
+        }
+
+        private static final MethodHandle DOWN$MH = Linker.nativeLinker().downcallHandle($DESC);
+
+        /**
+         * Invoke the upcall stub {@code funcPtr}, with given parameters
+         */
+        public static int invoke(MemorySegment funcPtr, MemorySegment _x0, int _x1, MemorySegment _x2) {
+            try {
+                return (int) DOWN$MH.invokeExact(funcPtr, _x0, _x1, _x2);
+            } catch (Error | RuntimeException ex) {
+                throw ex;
+            } catch (Throwable ex$) {
+                throw new AssertionError("should not reach here", ex$);
+            }
+        }
+    }
+
+    private static final AddressLayout folding_range$LAYOUT = (AddressLayout)$LAYOUT.select(groupElement("folding_range"));
+
+    /**
+     * Layout for field:
+     * {@snippet lang=c :
+     * PcPayloadQueryFn folding_range
+     * }
+     */
+    public static final AddressLayout folding_range$layout() {
+        return folding_range$LAYOUT;
+    }
+
+    private static final long folding_range$OFFSET = $LAYOUT.byteOffset(groupElement("folding_range"));
+
+    /**
+     * Offset for field:
+     * {@snippet lang=c :
+     * PcPayloadQueryFn folding_range
+     * }
+     */
+    public static final long folding_range$offset() {
+        return folding_range$OFFSET;
+    }
+
+    /**
+     * Getter for field:
+     * {@snippet lang=c :
+     * PcPayloadQueryFn folding_range
+     * }
+     */
+    public static MemorySegment folding_range(MemorySegment struct) {
+        return struct.get(folding_range$LAYOUT, folding_range$OFFSET);
+    }
+
+    /**
+     * Setter for field:
+     * {@snippet lang=c :
+     * PcPayloadQueryFn folding_range
+     * }
+     */
+    public static void folding_range(MemorySegment struct, MemorySegment fieldValue) {
+        struct.set(folding_range$LAYOUT, folding_range$OFFSET, fieldValue);
     }
 
     /**

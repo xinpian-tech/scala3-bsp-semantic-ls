@@ -5,13 +5,17 @@
 //! nullable-vs-empty distinctions, and the definition origin tags.
 
 use ls_pc_abi::payloads::{
-    origin, Command, CompilerPlugin, CompletionApplyKind, CompletionEdit, CompletionItem,
-    CompletionItemDefaults, CompletionList, DefinitionResult, DidChangeParams, DidOpenParams,
-    DisabledPlugin, Documentation, EditRange, Hover, HoverContents, HoverResult, InsertReplaceEdit,
-    LabelDetails, Location, LocationsResult, MarkedStringItem, MarkupContent, MethodHit,
-    MethodHitsResult, ParameterInfo, ParameterLabel, PluginStatus, PositionParams,
-    PrepareRenameResult, ResolveParams, Rng, ServicePlugin, SignatureHelp, SignatureInfo,
-    TargetConfig, TextEdit,
+    code_action_id, folding_kind, origin, AutoImport, AutoImportParams, AutoImportsResult,
+    CodeActionParams, CodeActionResult, Command, CompilerPlugin, CompletionApplyKind,
+    CompletionEdit, CompletionItem, CompletionItemDefaults, CompletionList, DefinitionResult,
+    DidChangeParams, DidOpenParams, DisabledPlugin, Documentation, EditRange, FoldingRange,
+    FoldingRangesResult, Hover, HoverContents, HoverResult, InlayHint, InlayHintParams,
+    InlayHintsResult, InlayLabelPart, InsertReplaceEdit, LabelDetails, Location, LocationsResult,
+    MarkedStringItem, MarkupContent, MethodHit, MethodHitsResult, ParameterInfo, ParameterLabel,
+    PcDiagnostic, PcDiagnosticsResult, PluginStatus, Pos, PositionParams, PrepareRenameResult,
+    ResolveParams, Rng, SelectionRangeParams, SelectionRangesResult, SemanticNode,
+    SemanticTokensResult, ServicePlugin, SignatureHelp, SignatureInfo, TargetConfig, TextEdit,
+    ToplevelsResult, UriParams,
 };
 use proptest::prelude::*;
 
@@ -413,6 +417,329 @@ fn method_hits_round_trip_and_empty_is_a_real_empty_list() {
     assert!(LocationsResult::decode(&result.encode().unwrap()).is_err());
 }
 
+// ---------------------------------------------------------------------------
+// Payload-query carriers (ABI v2).
+// ---------------------------------------------------------------------------
+
+fn pos(line: u32, character: u32) -> Pos {
+    Pos { line, character }
+}
+
+#[test]
+fn inlay_hint_params_round_trip() {
+    let params = InlayHintParams {
+        uri: "file:///w/H.scala".to_string(),
+        range: range(0, 0, 20, 0),
+        flags: 0b101,
+    };
+    assert_eq!(
+        InlayHintParams::decode(&params.encode().unwrap()).unwrap(),
+        params
+    );
+}
+
+#[test]
+fn inlay_hints_full_surface_round_trips() {
+    let result = InlayHintsResult {
+        hints: vec![
+            InlayHint {
+                position: pos(2, 10),
+                label_parts: vec![
+                    InlayLabelPart {
+                        text: ": Int".to_string(),
+                        location: Some(("file:///w/I.scala".to_string(), range(1, 0, 1, 3))),
+                        tooltip: Some("inferred type".to_string()),
+                    },
+                    InlayLabelPart {
+                        text: "=>".to_string(),
+                        location: None,
+                        tooltip: None,
+                    },
+                ],
+                kind: 1,
+                padding_left: true,
+                padding_right: false,
+                text_edits: Some(vec![TextEdit {
+                    range: range(2, 10, 2, 10),
+                    new_text: ": Int".to_string(),
+                }]),
+                data: Some(vec![0u8, 1, 2, 0, 255]),
+            },
+            InlayHint {
+                position: pos(0, 0),
+                label_parts: vec![],
+                kind: 0,
+                padding_left: false,
+                padding_right: false,
+                text_edits: None,
+                data: None,
+            },
+        ],
+    };
+    assert_eq!(
+        InlayHintsResult::decode(&result.encode().unwrap()).unwrap(),
+        result
+    );
+
+    // The opaque data bytes distinguish empty-present from absent, exactly
+    // like CompletionItem.data.
+    let mut empty_data = result.clone();
+    empty_data.hints[0].data = Some(vec![]);
+    let mut no_data = result.clone();
+    no_data.hints[0].data = None;
+    assert_eq!(
+        InlayHintsResult::decode(&empty_data.encode().unwrap()).unwrap(),
+        empty_data
+    );
+    assert_ne!(empty_data.encode().unwrap(), no_data.encode().unwrap());
+}
+
+#[test]
+fn semantic_tokens_round_trip_as_offsets() {
+    let result = SemanticTokensResult {
+        nodes: vec![
+            SemanticNode {
+                start: 0,
+                end: 6,
+                token_type: 3,
+                token_modifier: 1,
+            },
+            SemanticNode {
+                start: 10,
+                end: 14,
+                token_type: 15,
+                token_modifier: 0,
+            },
+        ],
+    };
+    assert_eq!(
+        SemanticTokensResult::decode(&result.encode().unwrap()).unwrap(),
+        result
+    );
+    let empty = SemanticTokensResult { nodes: vec![] };
+    assert!(SemanticTokensResult::decode(&empty.encode().unwrap())
+        .unwrap()
+        .nodes
+        .is_empty());
+}
+
+#[test]
+fn selection_ranges_round_trip_per_position_chains() {
+    let params = SelectionRangeParams {
+        uri: "file:///w/S.scala".to_string(),
+        positions: vec![pos(1, 2), pos(3, 4)],
+    };
+    assert_eq!(
+        SelectionRangeParams::decode(&params.encode().unwrap()).unwrap(),
+        params
+    );
+
+    // Innermost-first chains; an empty chain (no enclosing range for a
+    // position) is preserved as a real empty list.
+    let result = SelectionRangesResult {
+        chains: vec![
+            vec![range(1, 2, 1, 4), range(1, 0, 2, 0), range(0, 0, 9, 0)],
+            vec![],
+        ],
+    };
+    let decoded = SelectionRangesResult::decode(&result.encode().unwrap()).unwrap();
+    assert_eq!(decoded, result);
+    assert!(decoded.chains[1].is_empty());
+}
+
+#[test]
+fn code_action_params_round_trip_with_and_without_optionals() {
+    let full = CodeActionParams {
+        uri: "file:///w/C.scala".to_string(),
+        action: code_action_id::EXTRACT_METHOD,
+        position: pos(5, 1),
+        extraction_end: Some(pos(7, 2)),
+        arg_indices: Some(vec![0, 2]),
+    };
+    assert_eq!(
+        CodeActionParams::decode(&full.encode().unwrap()).unwrap(),
+        full
+    );
+
+    let bare = CodeActionParams {
+        uri: "file:///w/C.scala".to_string(),
+        action: code_action_id::INSERT_INFERRED_TYPE,
+        position: pos(5, 1),
+        extraction_end: None,
+        arg_indices: None,
+    };
+    assert_eq!(
+        CodeActionParams::decode(&bare.encode().unwrap()).unwrap(),
+        bare
+    );
+    // An absent extraction end is distinct from a present zero position.
+    let zero_end = CodeActionParams {
+        extraction_end: Some(pos(0, 0)),
+        ..bare.clone()
+    };
+    assert_ne!(bare.encode().unwrap(), zero_end.encode().unwrap());
+}
+
+#[test]
+fn code_action_refusal_is_data_not_an_error() {
+    let refused = CodeActionResult {
+        edits: vec![],
+        refusal: Some("Cannot extract selection".to_string()),
+    };
+    assert_eq!(
+        CodeActionResult::decode(&refused.encode().unwrap()).unwrap(),
+        refused
+    );
+
+    let edits = CodeActionResult {
+        edits: vec![TextEdit {
+            range: range(3, 0, 3, 0),
+            new_text: ": Int".to_string(),
+        }],
+        refusal: None,
+    };
+    assert_eq!(
+        CodeActionResult::decode(&edits.encode().unwrap()).unwrap(),
+        edits
+    );
+    // A refusal-less empty result and an empty-string refusal stay distinct.
+    let empty = CodeActionResult {
+        edits: vec![],
+        refusal: None,
+    };
+    let empty_refusal = CodeActionResult {
+        edits: vec![],
+        refusal: Some(String::new()),
+    };
+    assert_ne!(empty.encode().unwrap(), empty_refusal.encode().unwrap());
+}
+
+#[test]
+fn auto_imports_round_trip() {
+    let params = AutoImportParams {
+        uri: "file:///w/A.scala".to_string(),
+        position: pos(4, 9),
+        name: "Future".to_string(),
+        is_extension: false,
+    };
+    assert_eq!(
+        AutoImportParams::decode(&params.encode().unwrap()).unwrap(),
+        params
+    );
+
+    let result = AutoImportsResult {
+        imports: vec![AutoImport {
+            package_name: "scala.concurrent".to_string(),
+            edits: vec![TextEdit {
+                range: range(0, 0, 0, 0),
+                new_text: "import scala.concurrent.Future\n".to_string(),
+            }],
+            symbol: Some("scala/concurrent/Future#".to_string()),
+        }],
+    };
+    assert_eq!(
+        AutoImportsResult::decode(&result.encode().unwrap()).unwrap(),
+        result
+    );
+}
+
+#[test]
+fn pc_diagnostics_round_trip() {
+    let result = PcDiagnosticsResult {
+        diagnostics: vec![PcDiagnostic {
+            range: range(3, 0, 3, 5),
+            severity: 1,
+            code: "E007".to_string(),
+            message: "not found: value x".to_string(),
+        }],
+    };
+    assert_eq!(
+        PcDiagnosticsResult::decode(&result.encode().unwrap()).unwrap(),
+        result
+    );
+}
+
+#[test]
+fn folding_ranges_round_trip_with_kind_ordinals() {
+    let result = FoldingRangesResult {
+        ranges: vec![
+            FoldingRange {
+                range: range(0, 0, 5, 1),
+                kind: folding_kind::IMPORTS,
+            },
+            FoldingRange {
+                range: range(6, 10, 9, 1),
+                kind: folding_kind::NONE,
+            },
+        ],
+    };
+    assert_eq!(
+        FoldingRangesResult::decode(&result.encode().unwrap()).unwrap(),
+        result
+    );
+}
+
+#[test]
+fn toplevels_round_trip_and_empty_is_a_real_empty_list() {
+    let result = ToplevelsResult {
+        symbols: vec!["a/b/Main.".to_string(), "a/b/Main#".to_string()],
+    };
+    assert_eq!(
+        ToplevelsResult::decode(&result.encode().unwrap()).unwrap(),
+        result
+    );
+    let empty = ToplevelsResult { symbols: vec![] };
+    assert!(ToplevelsResult::decode(&empty.encode().unwrap())
+        .unwrap()
+        .symbols
+        .is_empty());
+}
+
+#[test]
+fn new_payload_kinds_cannot_be_confused() {
+    // Every new envelope kind is distinct: a buffer of one payload never
+    // decodes as another (the same guarantee method_hits vs locations pins).
+    let uri = UriParams {
+        uri: "file:///w/U.scala".to_string(),
+    }
+    .encode()
+    .unwrap();
+    assert!(InlayHintParams::decode(&uri).is_err());
+    assert!(SemanticTokensResult::decode(&uri).is_err());
+    assert!(FoldingRangesResult::decode(&uri).is_err());
+    assert!(PcDiagnosticsResult::decode(&uri).is_err());
+
+    let toplevels = ToplevelsResult {
+        symbols: vec!["a/b/Main.".to_string()],
+    }
+    .encode()
+    .unwrap();
+    assert!(LocationsResult::decode(&toplevels).is_err());
+    assert!(MethodHitsResult::decode(&toplevels).is_err());
+
+    let tokens = SemanticTokensResult {
+        nodes: vec![SemanticNode {
+            start: 0,
+            end: 4,
+            token_type: 1,
+            token_modifier: 0,
+        }],
+    }
+    .encode()
+    .unwrap();
+    assert!(SelectionRangesResult::decode(&tokens).is_err());
+    assert!(InlayHintsResult::decode(&tokens).is_err());
+
+    let refusal = CodeActionResult {
+        edits: vec![],
+        refusal: None,
+    }
+    .encode()
+    .unwrap();
+    assert!(AutoImportsResult::decode(&refusal).is_err());
+    assert!(CodeActionParams::decode(&refusal).is_err());
+}
+
 #[test]
 fn unicode_strings_round_trip() {
     let params = DidOpenParams {
@@ -638,6 +965,72 @@ fn method_hit_strat() -> impl Strategy<Value = MethodHit> {
     })
 }
 
+fn pos_strat() -> impl Strategy<Value = Pos> {
+    (any::<u32>(), any::<u32>()).prop_map(|(line, character)| Pos { line, character })
+}
+
+fn inlay_label_part_strat() -> impl Strategy<Value = InlayLabelPart> {
+    (
+        ".*",
+        proptest::option::of((".*", rng_strat())),
+        proptest::option::of(".*"),
+    )
+        .prop_map(|(text, location, tooltip)| InlayLabelPart {
+            text,
+            location,
+            tooltip,
+        })
+}
+
+fn inlay_hint_strat() -> impl Strategy<Value = InlayHint> {
+    (
+        pos_strat(),
+        proptest::collection::vec(inlay_label_part_strat(), 0..3),
+        any::<i32>(),
+        any::<bool>(),
+        any::<bool>(),
+        proptest::option::of(proptest::collection::vec(text_edit_strat(), 0..3)),
+        opt_bytes(),
+    )
+        .prop_map(
+            |(position, label_parts, kind, padding_left, padding_right, text_edits, data)| {
+                InlayHint {
+                    position,
+                    label_parts,
+                    kind,
+                    padding_left,
+                    padding_right,
+                    text_edits,
+                    data,
+                }
+            },
+        )
+}
+
+fn semantic_node_strat() -> impl Strategy<Value = SemanticNode> {
+    (any::<u32>(), any::<u32>(), any::<i32>(), any::<i32>()).prop_map(
+        |(start, end, token_type, token_modifier)| SemanticNode {
+            start,
+            end,
+            token_type,
+            token_modifier,
+        },
+    )
+}
+
+fn auto_import_strat() -> impl Strategy<Value = AutoImport> {
+    (
+        ".*",
+        proptest::collection::vec(text_edit_strat(), 0..3),
+        proptest::option::of(".*"),
+    )
+        .prop_map(|(package_name, edits, symbol)| AutoImport {
+            package_name,
+            edits,
+            symbol,
+        })
+}
+
 prop_compose! {
     fn compiler_plugin_strat()(
         jars in proptest::collection::vec(".*", 0..3),
@@ -755,6 +1148,115 @@ proptest! {
     fn method_hits_round_trip(hits in proptest::collection::vec(method_hit_strat(), 0..6)) {
         let result = MethodHitsResult { hits };
         prop_assert_eq!(MethodHitsResult::decode(&result.encode().unwrap()).unwrap(), result);
+    }
+
+    #[test]
+    fn inlay_hint_params_round_trip_prop(uri in ".*", range in rng_strat(), flags in any::<u32>()) {
+        let params = InlayHintParams { uri, range, flags };
+        prop_assert_eq!(InlayHintParams::decode(&params.encode().unwrap()).unwrap(), params);
+    }
+
+    #[test]
+    fn inlay_hints_round_trip_prop(hints in proptest::collection::vec(inlay_hint_strat(), 0..4)) {
+        let result = InlayHintsResult { hints };
+        prop_assert_eq!(InlayHintsResult::decode(&result.encode().unwrap()).unwrap(), result);
+    }
+
+    #[test]
+    fn uri_params_round_trip_prop(uri in ".*") {
+        let params = UriParams { uri };
+        prop_assert_eq!(UriParams::decode(&params.encode().unwrap()).unwrap(), params);
+    }
+
+    #[test]
+    fn semantic_tokens_round_trip_prop(nodes in proptest::collection::vec(semantic_node_strat(), 0..8)) {
+        let result = SemanticTokensResult { nodes };
+        prop_assert_eq!(SemanticTokensResult::decode(&result.encode().unwrap()).unwrap(), result);
+    }
+
+    #[test]
+    fn selection_range_params_round_trip_prop(
+        uri in ".*",
+        positions in proptest::collection::vec(pos_strat(), 0..5),
+    ) {
+        let params = SelectionRangeParams { uri, positions };
+        prop_assert_eq!(SelectionRangeParams::decode(&params.encode().unwrap()).unwrap(), params);
+    }
+
+    #[test]
+    fn selection_ranges_round_trip_prop(
+        chains in proptest::collection::vec(proptest::collection::vec(rng_strat(), 0..4), 0..4),
+    ) {
+        let result = SelectionRangesResult { chains };
+        prop_assert_eq!(SelectionRangesResult::decode(&result.encode().unwrap()).unwrap(), result);
+    }
+
+    #[test]
+    fn code_action_params_round_trip_prop(
+        uri in ".*",
+        action in any::<i32>(),
+        position in pos_strat(),
+        extraction_end in proptest::option::of(pos_strat()),
+        arg_indices in proptest::option::of(proptest::collection::vec(any::<i32>(), 0..4)),
+    ) {
+        let params = CodeActionParams { uri, action, position, extraction_end, arg_indices };
+        prop_assert_eq!(CodeActionParams::decode(&params.encode().unwrap()).unwrap(), params);
+    }
+
+    #[test]
+    fn code_action_result_round_trip_prop(
+        edits in proptest::collection::vec(text_edit_strat(), 0..4),
+        refusal in proptest::option::of(".*"),
+    ) {
+        let result = CodeActionResult { edits, refusal };
+        prop_assert_eq!(CodeActionResult::decode(&result.encode().unwrap()).unwrap(), result);
+    }
+
+    #[test]
+    fn auto_import_params_round_trip_prop(
+        uri in ".*",
+        position in pos_strat(),
+        name in ".*",
+        is_extension in any::<bool>(),
+    ) {
+        let params = AutoImportParams { uri, position, name, is_extension };
+        prop_assert_eq!(AutoImportParams::decode(&params.encode().unwrap()).unwrap(), params);
+    }
+
+    #[test]
+    fn auto_imports_round_trip_prop(imports in proptest::collection::vec(auto_import_strat(), 0..4)) {
+        let result = AutoImportsResult { imports };
+        prop_assert_eq!(AutoImportsResult::decode(&result.encode().unwrap()).unwrap(), result);
+    }
+
+    #[test]
+    fn pc_diagnostics_round_trip_prop(
+        diagnostics in proptest::collection::vec(
+            (rng_strat(), any::<i32>(), ".*", ".*").prop_map(|(range, severity, code, message)| {
+                PcDiagnostic { range, severity, code, message }
+            }),
+            0..5,
+        ),
+    ) {
+        let result = PcDiagnosticsResult { diagnostics };
+        prop_assert_eq!(PcDiagnosticsResult::decode(&result.encode().unwrap()).unwrap(), result);
+    }
+
+    #[test]
+    fn folding_ranges_round_trip_prop(
+        ranges in proptest::collection::vec(
+            (rng_strat(), any::<i32>()).prop_map(|(range, kind)| FoldingRange { range, kind }),
+            0..5,
+        ),
+    ) {
+        let result = FoldingRangesResult { ranges };
+        prop_assert_eq!(FoldingRangesResult::decode(&result.encode().unwrap()).unwrap(), result);
+    }
+
+    #[test]
+    fn toplevels_round_trip_prop(symbols in proptest::collection::vec(".*", 0..6)) {
+        let result = ToplevelsResult { symbols };
+        prop_assert_eq!(ToplevelsResult::decode(&result.encode().unwrap()).unwrap(), result);
     }
 
     #[test]

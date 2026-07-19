@@ -12,8 +12,10 @@ fn canary_is_deterministic_and_nonzero() {
 }
 
 #[test]
-fn abi_version_is_one() {
-    assert_eq!(ABI_VERSION, 1);
+fn abi_version_is_two() {
+    // v2: the seven payload-query PC ops + the definition_source_toplevels
+    // callback, one batched bump.
+    assert_eq!(ABI_VERSION, 2);
 }
 
 /// Re-implements the canary's FNV-1a-over-facts hashing so we can perturb a

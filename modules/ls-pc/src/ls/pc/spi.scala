@@ -116,3 +116,66 @@ trait PcServicePlugin:
   def afterDefinition(req: PcRequest, result: DefinitionResult): DefinitionResult = result
   def filterPcDiagnostics(req: PcRequest, diagnostics: Vector[Diagnostic]): Vector[Diagnostic] =
     diagnostics
+
+/** Thrown by a facade op whose provider has not landed yet (the transport-stub
+  * phase of a freshly added boundary op). The island's boundary runtime maps it
+  * to the distinct `STATUS_NOT_YET` status, which the Rust side surfaces as a
+  * typed backend error (degrading to the query's empty fallback) — never a
+  * panic. The feature task replaces the throwing stub with a real provider and
+  * retires this answer per op.
+  */
+final class PcNotYetSupported(op: String)
+    extends RuntimeException(s"presentation-compiler op '$op' has no provider yet")
+
+/** One part of an inlay hint's label: the text, an optional target location,
+  * and an optional tooltip string (the lsp4j `InlayHintLabelPart` subset the
+  * boundary carries).
+  */
+final case class PcInlayLabelPart(
+    text: String,
+    location: Option[Location] = None,
+    tooltip: Option[String] = None
+)
+
+/** One inlay hint: position, label parts, the LSP `InlayHintKind` int value,
+  * the padding flags, optional text edits, and opaque `data` bytes carried
+  * verbatim (the `CompletionItem.data` idiom — never interpreted).
+  */
+final case class PcInlayHint(
+    position: org.eclipse.lsp4j.Position,
+    labelParts: Vector[PcInlayLabelPart],
+    kind: Int,
+    paddingLeft: Boolean,
+    paddingRight: Boolean,
+    textEdits: Option[Vector[org.eclipse.lsp4j.TextEdit]] = None,
+    data: Option[Seq[Byte]] = None
+)
+
+/** One semantic-tokens node: `[start, end)` UTF-16 offsets into the buffer
+  * text (offsets, not line/character — the Rust host converts), plus the token
+  * type and modifier bitset ints.
+  */
+final case class PcSemanticNode(start: Int, end: Int, tokenType: Int, tokenModifier: Int)
+
+/** A code-action result: the edits plus an optional typed refusal message (the
+  * dotty `DisplayableException` carrier — a refusal the editor should surface
+  * is data, not an error).
+  */
+final case class PcCodeActionResult(
+    edits: Vector[org.eclipse.lsp4j.TextEdit],
+    refusal: Option[String] = None
+)
+
+/** One auto-import candidate: the providing package, the edits that apply it,
+  * and optionally the imported SemanticDB symbol.
+  */
+final case class PcAutoImport(
+    packageName: String,
+    edits: Vector[org.eclipse.lsp4j.TextEdit],
+    symbol: Option[String] = None
+)
+
+/** One folding range: the span plus its kind ordinal (0 none, 1 comment,
+  * 2 imports, 3 region — the boundary `folding_kind` contract).
+  */
+final case class PcFoldingRange(range: org.eclipse.lsp4j.Range, kind: Int)

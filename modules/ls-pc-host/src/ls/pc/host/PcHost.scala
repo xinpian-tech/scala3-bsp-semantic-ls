@@ -7,14 +7,14 @@ import ls.pc.host.codec.Payloads
 
 /** The presentation-compiler op seam behind the boundary upcall stubs.
   *
-  * [[PcHostAgent]] exposes each of the 15 PC vtable slots to Rust as an FFM
+  * [[PcHostAgent]] exposes each of the 22 PC vtable slots to Rust as an FFM
   * upcall stub and routes the decoded call here. Each op decodes its request
   * (flat [[Payloads]]), calls the live [[PcOps]] facade, converts the lsp4j /
   * `spi` result with [[Marshal]], and writes the flat response through
   * [[PcHostRuntime]] (lifecycle ops via `runStatus`, response-bearing ops via
   * the alloc-once `runResponse`). The method signatures mirror the boundary
   * function-pointer shapes (`PcRequestFn`/`PcUriFn`/`PcQueryFn`/`PcResolveFn`/
-  * `PcStatusOutFn`/`PcVoidFn`/`PcSpawnDispatchFn`).
+  * `PcStatusOutFn`/`PcVoidFn`/`PcSpawnDispatchFn`/`PcPayloadQueryFn`).
   *
   * `loanDispatch(generation)` loans a fresh Java platform thread into the Rust
   * `pc_dispatch_loop` for that generation; the facade seam and the loaning
@@ -79,6 +79,62 @@ final class PcHost(runtime: PcHostRuntime, ops: PcOps, loanDispatch: Int => Unit
       val item = Payloads.CompletionItem.decode(readRequest(itemPtr, itemLen))
       val resolved = ops.completionItemResolve(readLsStr(targetId), Marshal.toLsp4jItem(item), readLsStr(symbol))
       Marshal.completionItem(resolved).encode()
+    }
+
+  // Payload-in/payload-out queries (ABI v2: inlay_hints/semantic_tokens/
+  // selection_range/code_action/auto_imports/pc_diagnostics/folding_range).
+  // Each decodes its params payload, calls the op seam, and encodes the flat
+  // response; a not-yet-provided op surfaces `STATUS_NOT_YET` through the
+  // runtime's typed mapping.
+  def inlayHints(paramsPtr: MemorySegment, paramsLen: Int, out: MemorySegment): Int =
+    runtime.runResponse(out) {
+      val p = Payloads.InlayHintParams.decode(readRequest(paramsPtr, paramsLen))
+      Marshal.inlayHints(ops.inlayHints(p.uri, Marshal.toLspRange(p.range), p.flags)).encode()
+    }
+
+  def semanticTokens(paramsPtr: MemorySegment, paramsLen: Int, out: MemorySegment): Int =
+    runtime.runResponse(out) {
+      val p = Payloads.UriParams.decode(readRequest(paramsPtr, paramsLen))
+      Marshal.semanticTokens(ops.semanticTokens(p.uri)).encode()
+    }
+
+  def selectionRange(paramsPtr: MemorySegment, paramsLen: Int, out: MemorySegment): Int =
+    runtime.runResponse(out) {
+      val p = Payloads.SelectionRangeParams.decode(readRequest(paramsPtr, paramsLen))
+      val positions = p.positions.iterator.map(Marshal.toLspPosition).toVector
+      Marshal.selectionRanges(ops.selectionRanges(p.uri, positions)).encode()
+    }
+
+  def codeAction(paramsPtr: MemorySegment, paramsLen: Int, out: MemorySegment): Int =
+    runtime.runResponse(out) {
+      val p = Payloads.CodeActionParams.decode(readRequest(paramsPtr, paramsLen))
+      val result = ops.codeAction(
+        p.uri,
+        p.action,
+        Marshal.toLspPosition(p.position),
+        p.extractionEnd.map(Marshal.toLspPosition),
+        p.argIndices.map(_.toVector)
+      )
+      Marshal.codeActionResult(result).encode()
+    }
+
+  def autoImports(paramsPtr: MemorySegment, paramsLen: Int, out: MemorySegment): Int =
+    runtime.runResponse(out) {
+      val p = Payloads.AutoImportParams.decode(readRequest(paramsPtr, paramsLen))
+      val imports = ops.autoImports(p.uri, Marshal.toLspPosition(p.position), p.name, p.isExtension)
+      Marshal.autoImports(imports).encode()
+    }
+
+  def pcDiagnostics(paramsPtr: MemorySegment, paramsLen: Int, out: MemorySegment): Int =
+    runtime.runResponse(out) {
+      val p = Payloads.UriParams.decode(readRequest(paramsPtr, paramsLen))
+      Marshal.pcDiagnostics(ops.pcDiagnostics(p.uri)).encode()
+    }
+
+  def foldingRange(paramsPtr: MemorySegment, paramsLen: Int, out: MemorySegment): Int =
+    runtime.runResponse(out) {
+      val p = Payloads.UriParams.decode(readRequest(paramsPtr, paramsLen))
+      Marshal.foldingRanges(ops.foldingRanges(p.uri)).encode()
     }
 
   // No-argument status query (plugin_status).

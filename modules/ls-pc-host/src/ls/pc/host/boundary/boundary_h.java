@@ -23,10 +23,10 @@ public class boundary_h extends boundary_h$shared {
     static final SymbolLookup SYMBOL_LOOKUP = SymbolLookup.loaderLookup()
             .or(Linker.nativeLinker().defaultLookup());
 
-    private static final int ABI_VERSION = (int)1L;
+    private static final int ABI_VERSION = (int)2L;
     /**
      * {@snippet lang=c :
-     * #define ABI_VERSION 1
+     * #define ABI_VERSION 2
      * }
      */
     public static int ABI_VERSION() {
@@ -103,6 +103,15 @@ public class boundary_h extends boundary_h$shared {
      */
     public static int STATUS_INTERNAL() {
         return STATUS_INTERNAL;
+    }
+    private static final int STATUS_NOT_YET = (int)-7L;
+    /**
+     * {@snippet lang=c :
+     * #define STATUS_NOT_YET -7
+     * }
+     */
+    public static int STATUS_NOT_YET() {
+        return STATUS_NOT_YET;
     }
 }
 

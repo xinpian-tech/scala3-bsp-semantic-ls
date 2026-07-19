@@ -29,7 +29,9 @@ use ls_engine::{
 };
 use ls_index_model::uri::normalize_uri;
 use ls_index_model::Loc;
-use ls_pc_abi::payloads::{origin, LocationsResult, MethodHitsResult, Rng, TargetConfig};
+use ls_pc_abi::payloads::{
+    origin, LocationsResult, MethodHitsResult, Rng, TargetConfig, ToplevelsResult,
+};
 use ls_store::Store;
 
 use crate::doctor::DoctorTargets;
@@ -37,6 +39,7 @@ use crate::documents::DocumentStore;
 use crate::lifecycle::WorkspaceState;
 use crate::pc::{
     pc_options, IslandPcService, PcQueryService, SearchMethodsResolver, SymbolResolver,
+    ToplevelsResolver,
 };
 use crate::pc_overlay::PcOverlay;
 use crate::server::Bootstrap;
@@ -299,6 +302,7 @@ pub type PcServiceFactory = Arc<
             Vec<TargetConfig>,
             Box<SymbolResolver>,
             Box<SearchMethodsResolver>,
+            Box<ToplevelsResolver>,
         ) -> Arc<dyn PcQueryService>
         + Send
         + Sync,
@@ -308,14 +312,17 @@ impl<M: ModelSource> IndexBootstrap<M> {
     pub fn new(model_source: M) -> Self {
         Self::with_pc(
             model_source,
-            Arc::new(|root, targets, resolver, search_resolver| {
-                Arc::new(IslandPcService::new(
-                    root,
-                    targets,
-                    resolver,
-                    search_resolver,
-                )) as Arc<dyn PcQueryService>
-            }),
+            Arc::new(
+                |root, targets, resolver, search_resolver, toplevels_resolver| {
+                    Arc::new(IslandPcService::new(
+                        root,
+                        targets,
+                        resolver,
+                        search_resolver,
+                        toplevels_resolver,
+                    )) as Arc<dyn PcQueryService>
+                },
+            ),
         )
     }
 
@@ -414,11 +421,21 @@ impl<M: ModelSource> IndexBootstrap<M> {
             Box::new(move |query: &str, bsp_target_id: &str| {
                 method_hits_result(search_orchestrator.search_methods(query, bsp_target_id))
             });
+        // The `definition_source_toplevels` resolver the PC island calls for the
+        // toplevel symbols of a definition source. TODO(feature task, W3
+        // provider wave): wire the QueryOrchestrator toplevels query here; until
+        // that engine query lands the island gets a placeholder that answers
+        // empty (the same shape `search_methods` had before its engine landed).
+        let toplevels_resolver: Box<ToplevelsResolver> =
+            Box::new(|_symbol: &str, _source_uri: &str| ToplevelsResult {
+                symbols: Vec::new(),
+            });
         let pc: Arc<dyn PcQueryService> = (self.pc_factory)(
             workspace_root.to_path_buf(),
             pc_targets,
             resolver,
             search_resolver,
+            toplevels_resolver,
         );
         Ok(CoreServices::new(
             orchestrator,

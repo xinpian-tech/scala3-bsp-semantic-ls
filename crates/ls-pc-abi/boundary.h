@@ -4,8 +4,11 @@
 
 #include <stdint.h>
 
-// Boundary contract version, checked at registration.
-#define ABI_VERSION 1
+// Boundary contract version, checked at registration. Version 2 adds the seven
+// payload-query PC ops (`inlay_hints`/`semantic_tokens`/`selection_range`/
+// `code_action`/`auto_imports`/`pc_diagnostics`/`folding_range`) and the
+// `definition_source_toplevels` Rust-vtable callback.
+#define ABI_VERSION 2
 
 // Shared status codes returned by every boundary function (`0` = ok).
 #define STATUS_OK 0
@@ -28,6 +31,13 @@
 // An unexpected internal error.
 #define STATUS_INTERNAL -6
 
+// The op crossed the boundary but its island-side provider has not landed yet
+// (the transport-stub answer of a freshly added op). A distinct nonzero status
+// so the Rust side surfaces it as a typed backend error (degrading to the
+// query's empty fallback), never a panic; the provider task replaces the stub
+// and retires this answer per op.
+#define STATUS_NOT_YET -7
+
 // The envelope magic (`"LPAB"` little-endian).
 #define MAGIC 1111576652
 
@@ -36,6 +46,28 @@
 #define SYNTHETIC 1
 
 #define PLUGIN 2
+
+#define CONVERT_TO_NAMED_ARGUMENTS 0
+
+#define IMPLEMENT_ABSTRACT_MEMBERS 1
+
+#define EXTRACT_METHOD 2
+
+#define INLINE_VALUE 3
+
+#define INSERT_INFERRED_TYPE 4
+
+#define INSERT_INFERRED_METHOD 5
+
+#define CONVERT_TO_NAMED_LAMBDA_PARAMETERS 6
+
+#define NONE 0
+
+#define COMMENT 1
+
+#define IMPORTS 2
+
+#define REGION 3
 
 // A borrowed UTF-8 string argument (no NUL), valid only for the call.
 typedef struct LsStr {
@@ -124,7 +156,16 @@ typedef int32_t (*PcVoidFn)(void);
 // Spawns a fresh loaned dispatch thread for the given generation.
 typedef int32_t (*PcSpawnDispatchFn)(uint32_t generation);
 
-// The 15-op PC vtable. Slot order is the cross-language contract.
+// A payload-in/payload-out query (inlay_hints/semantic_tokens/selection_range/
+// code_action/auto_imports/pc_diagnostics/folding_range): the request crosses
+// as an encoded payload buffer (the `register_target`-inbound shape) and the
+// response payload is written to `out` (the `plugin_status`-outbound shape).
+// Defined once and reused for every payload-query slot.
+typedef int32_t (*PcPayloadQueryFn)(const uint8_t *params_ptr,
+                                    uint32_t params_len,
+                                    struct LsBuf *out);
+
+// The 22-op PC vtable. Slot order is the cross-language contract.
 typedef struct PcVtable {
     uint64_t abi_version;
     PcRequestFn register_target;
@@ -142,6 +183,13 @@ typedef struct PcVtable {
     PcVoidFn restart_instances;
     PcVoidFn shutdown;
     PcSpawnDispatchFn spawn_dispatch;
+    PcPayloadQueryFn inlay_hints;
+    PcPayloadQueryFn semantic_tokens;
+    PcPayloadQueryFn selection_range;
+    PcPayloadQueryFn code_action;
+    PcPayloadQueryFn auto_imports;
+    PcPayloadQueryFn pc_diagnostics;
+    PcPayloadQueryFn folding_range;
 } PcVtable;
 
 // Island → Rust registration of the PC vtable; returns a status code.
@@ -159,6 +207,13 @@ typedef int32_t (*SymbolDefinitionFn)(struct LsStr symbol, struct LsStr from_uri
 // `bsp_target_id`) into a method-hits response written to `out`.
 typedef int32_t (*SearchMethodsFn)(struct LsStr query, struct LsStr bsp_target_id, struct LsBuf *out);
 
+// Index-backed toplevel-symbol callback (the PC `SymbolSearch.
+// definitionSourceToplevels` seam): resolves the SemanticDB `symbol` (with the
+// defining `source_uri`) into a toplevels response written to `out`.
+typedef int32_t (*DefinitionSourceToplevelsFn)(struct LsStr symbol,
+                                               struct LsStr source_uri,
+                                               struct LsBuf *out);
+
 // The Rust vtable handed to the premain. The island mirrors this layout
 // through jextract-generated FFM bindings; `layout_canary` is recomputed
 // independently and a mismatch refuses registration.
@@ -172,6 +227,7 @@ typedef struct RustVtable {
     PcDispatchLoopFn pc_dispatch_loop;
     SymbolDefinitionFn symbol_definition;
     SearchMethodsFn search_methods;
+    DefinitionSourceToplevelsFn definition_source_toplevels;
 } RustVtable;
 
 

@@ -32,6 +32,7 @@ jextract --output "$module/src" -I "$glibc_inc" -t ls.pc.host.boundary \
   --include-constant STATUS_DECODE \
   --include-constant STATUS_ALLOC \
   --include-constant STATUS_INTERNAL \
+  --include-constant STATUS_NOT_YET \
   --include-constant MAGIC \
   --include-struct LsStr \
   --include-struct LsBytes \
@@ -52,10 +53,12 @@ jextract --output "$module/src" -I "$glibc_inc" -t ls.pc.host.boundary \
   --include-typedef PcStatusOutFn \
   --include-typedef PcVoidFn \
   --include-typedef PcSpawnDispatchFn \
+  --include-typedef PcPayloadQueryFn \
   --include-typedef RegisterPcVtableFn \
   --include-typedef PcDispatchLoopFn \
   --include-typedef SymbolDefinitionFn \
   --include-typedef SearchMethodsFn \
+  --include-typedef DefinitionSourceToplevelsFn \
   "$crate/boundary.h"
 
 echo "==> generated:"

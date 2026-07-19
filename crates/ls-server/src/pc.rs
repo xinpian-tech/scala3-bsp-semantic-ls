@@ -24,13 +24,18 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use ls_jvm::backend::VtableBackend;
-use ls_jvm::watchdog::{PcError, PcRequest, QueryKind, Supervisor};
+use ls_jvm::watchdog::{PayloadQueryKind, PcError, PcRequest, QueryKind, Supervisor};
 use ls_jvm::{
-    boot_island, install_search_methods_resolver, install_symbol_definition_resolver, IslandConfig,
+    boot_island, install_definition_source_toplevels_resolver, install_search_methods_resolver,
+    install_symbol_definition_resolver, IslandConfig,
 };
 use ls_pc_abi::payloads::{
-    origin, CompletionItem, CompletionList, DefinitionResult, HoverResult, LocationsResult,
-    MethodHitsResult, PluginStatus, PrepareRenameResult, Rng, SignatureHelp, TargetConfig,
+    origin, AutoImport, AutoImportParams, AutoImportsResult, CodeActionParams, CodeActionResult,
+    CompletionItem, CompletionList, DefinitionResult, FoldingRange, FoldingRangesResult,
+    HoverResult, InlayHint, InlayHintParams, InlayHintsResult, LocationsResult, MethodHitsResult,
+    PcDiagnostic, PcDiagnosticsResult, PluginStatus, Pos, PrepareRenameResult, Rng,
+    SelectionRangeParams, SelectionRangesResult, SemanticNode, SemanticTokensResult, SignatureHelp,
+    TargetConfig, ToplevelsResult, UriParams,
 };
 use serde_json::Value;
 
@@ -233,6 +238,67 @@ pub trait PcQueryService: Send + Sync {
     /// Default no-op: a services bundle with no PC island has no config to
     /// re-read.
     fn on_config_changed(&self) {}
+
+    // --- ABI v2 payload-query ops (transport wave W3a). ---------------------
+    //
+    // Each returns the DECODED payload carrier — the LSP mapping is the
+    // feature task's job — and degrades to the empty/None fallback on any
+    // boundary error, including the island's `STATUS_NOT_YET` transport-stub
+    // answer. Defaults are empty so fakes and PC-less bundles compile.
+
+    /// Inlay hints for `range` of the mirrored buffer `uri` (`flags` is the
+    /// boundary hint-category bitset). Default empty.
+    fn inlay_hints(&self, _uri: &str, _range: Rng, _flags: u32) -> Vec<InlayHint> {
+        Vec::new()
+    }
+
+    /// Semantic tokens of the mirrored buffer `uri`, as offset-based nodes
+    /// (the caller converts offsets to line/character). Default empty.
+    fn semantic_tokens(&self, _uri: &str) -> Vec<SemanticNode> {
+        Vec::new()
+    }
+
+    /// Per query position, the chain of enclosing selection ranges, innermost
+    /// first. Default empty.
+    fn selection_range(&self, _uri: &str, _positions: &[Pos]) -> Vec<Vec<Rng>> {
+        Vec::new()
+    }
+
+    /// Run the PC-backed code action (`ls_pc_abi::payloads::code_action_id`)
+    /// at `position`; a typed refusal comes back as data on the result.
+    /// Default empty (no edits, no refusal).
+    fn code_action(
+        &self,
+        _uri: &str,
+        _action: i32,
+        _position: Pos,
+        _extraction_end: Option<Pos>,
+        _arg_indices: Option<Vec<i32>>,
+    ) -> CodeActionResult {
+        CodeActionResult::default()
+    }
+
+    /// Auto-import candidates for `name` at `position`, best first. Default
+    /// empty.
+    fn auto_imports(
+        &self,
+        _uri: &str,
+        _position: Pos,
+        _name: &str,
+        _is_extension: bool,
+    ) -> Vec<AutoImport> {
+        Vec::new()
+    }
+
+    /// The mirrored buffer's presentation-compiler diagnostics. Default empty.
+    fn pc_diagnostics(&self, _uri: &str) -> Vec<PcDiagnostic> {
+        Vec::new()
+    }
+
+    /// Folding ranges of the mirrored buffer `uri`. Default empty.
+    fn folding_range(&self, _uri: &str) -> Vec<FoldingRange> {
+        Vec::new()
+    }
 }
 
 /// The `symbol_definition` resolver the island calls when the presentation
@@ -245,6 +311,13 @@ pub type SymbolResolver = dyn Fn(&str, &str) -> LocationsResult + Send + Sync;
 /// bsp_target_id) -> method hits`. Answers from the global index
 /// (`QueryOrchestrator::search_methods`).
 pub type SearchMethodsResolver = dyn Fn(&str, &str) -> MethodHitsResult + Send + Sync;
+
+/// The `definition_source_toplevels` resolver the island calls for the
+/// toplevel symbols of a definition source (`SymbolSearch.
+/// definitionSourceToplevels`): `(semanticdb_symbol, source_uri) -> toplevel
+/// symbols`. Will answer from the global index; until the engine query lands
+/// with the feature task the bootstrap installs a placeholder empty closure.
+pub type ToplevelsResolver = dyn Fn(&str, &str) -> ToplevelsResult + Send + Sync;
 
 /// Strips the SemanticDB-generation flags from a target's scalac options so the
 /// presentation compiler does not re-emit SemanticDB. Removes `-Xsemanticdb`,
@@ -327,6 +400,9 @@ struct IslandState {
     /// once, at boot; taken then (the second resolver closure next to
     /// `symbol_definition`).
     search_resolver: Option<Box<SearchMethodsResolver>>,
+    /// The `definition_source_toplevels` resolver, installed into the island's
+    /// global slot once, at boot; taken then (the third resolver closure).
+    toplevels_resolver: Option<Box<ToplevelsResolver>>,
     /// The mirrored open buffers (`uri -> (owning target, text)`), replayed into
     /// the island on boot and the source of the `is_open`/`withPcBuffer` gate.
     /// Kept status-aware: a buffer is recorded only after the island has actually
@@ -370,13 +446,14 @@ const RENDEZVOUS_TIMEOUT: Duration = Duration::from_secs(60);
 
 impl IslandPcService {
     /// Build the service from the workspace's PC target registrations and the
-    /// index-backed resolvers (`symbol_definition` + `search_methods`). Does
-    /// not boot the JVM.
+    /// index-backed resolvers (`symbol_definition` + `search_methods` +
+    /// `definition_source_toplevels`). Does not boot the JVM.
     pub fn new(
         workspace_root: PathBuf,
         targets: Vec<TargetConfig>,
         resolver: Box<SymbolResolver>,
         search_resolver: Box<SearchMethodsResolver>,
+        toplevels_resolver: Box<ToplevelsResolver>,
     ) -> IslandPcService {
         IslandPcService {
             state: Mutex::new(IslandState {
@@ -384,6 +461,7 @@ impl IslandPcService {
                 targets,
                 resolver: Some(resolver),
                 search_resolver: Some(search_resolver),
+                toplevels_resolver: Some(toplevels_resolver),
                 buffers: BTreeMap::new(),
                 driver: None,
                 boot_error: None,
@@ -461,6 +539,22 @@ impl IslandPcService {
             .and_then(|reply| DefinitionResult::decode(&reply).ok())
             .map(|result| result.locations.into_iter().map(pc_location_of).collect())
             .unwrap_or_default()
+    }
+
+    /// Dispatches a payload-query op: encodes the typed params, routes the
+    /// `PcRequest::PayloadQuery` through the (lazily booted) driver, and
+    /// returns the raw reply bytes. `None` on an encode failure, a boot
+    /// failure, or any boundary error — including the island's
+    /// `STATUS_NOT_YET` transport-stub answer, which surfaces as
+    /// `PcError::Backend(STATUS_NOT_YET)` and degrades to each method's empty
+    /// fallback exactly like every other error status.
+    fn payload_query_reply(
+        &self,
+        kind: PayloadQueryKind,
+        params: Result<Vec<u8>, ls_pc_abi::AbiError>,
+    ) -> Option<Vec<u8>> {
+        let params = params.ok()?;
+        self.dispatch(PcRequest::PayloadQuery { kind, params })
     }
 }
 
@@ -677,6 +771,119 @@ impl PcQueryService for IslandPcService {
         }
     }
 
+    fn inlay_hints(&self, uri: &str, range: Rng, flags: u32) -> Vec<InlayHint> {
+        self.payload_query_reply(
+            PayloadQueryKind::InlayHints,
+            InlayHintParams {
+                uri: uri.to_string(),
+                range,
+                flags,
+            }
+            .encode(),
+        )
+        .and_then(|reply| InlayHintsResult::decode(&reply).ok())
+        .map(|result| result.hints)
+        .unwrap_or_default()
+    }
+
+    fn semantic_tokens(&self, uri: &str) -> Vec<SemanticNode> {
+        self.payload_query_reply(
+            PayloadQueryKind::SemanticTokens,
+            UriParams {
+                uri: uri.to_string(),
+            }
+            .encode(),
+        )
+        .and_then(|reply| SemanticTokensResult::decode(&reply).ok())
+        .map(|result| result.nodes)
+        .unwrap_or_default()
+    }
+
+    fn selection_range(&self, uri: &str, positions: &[Pos]) -> Vec<Vec<Rng>> {
+        self.payload_query_reply(
+            PayloadQueryKind::SelectionRange,
+            SelectionRangeParams {
+                uri: uri.to_string(),
+                positions: positions.to_vec(),
+            }
+            .encode(),
+        )
+        .and_then(|reply| SelectionRangesResult::decode(&reply).ok())
+        .map(|result| result.chains)
+        .unwrap_or_default()
+    }
+
+    fn code_action(
+        &self,
+        uri: &str,
+        action: i32,
+        position: Pos,
+        extraction_end: Option<Pos>,
+        arg_indices: Option<Vec<i32>>,
+    ) -> CodeActionResult {
+        self.payload_query_reply(
+            PayloadQueryKind::CodeAction,
+            CodeActionParams {
+                uri: uri.to_string(),
+                action,
+                position,
+                extraction_end,
+                arg_indices,
+            }
+            .encode(),
+        )
+        .and_then(|reply| CodeActionResult::decode(&reply).ok())
+        .unwrap_or_default()
+    }
+
+    fn auto_imports(
+        &self,
+        uri: &str,
+        position: Pos,
+        name: &str,
+        is_extension: bool,
+    ) -> Vec<AutoImport> {
+        self.payload_query_reply(
+            PayloadQueryKind::AutoImports,
+            AutoImportParams {
+                uri: uri.to_string(),
+                position,
+                name: name.to_string(),
+                is_extension,
+            }
+            .encode(),
+        )
+        .and_then(|reply| AutoImportsResult::decode(&reply).ok())
+        .map(|result| result.imports)
+        .unwrap_or_default()
+    }
+
+    fn pc_diagnostics(&self, uri: &str) -> Vec<PcDiagnostic> {
+        self.payload_query_reply(
+            PayloadQueryKind::PcDiagnostics,
+            UriParams {
+                uri: uri.to_string(),
+            }
+            .encode(),
+        )
+        .and_then(|reply| PcDiagnosticsResult::decode(&reply).ok())
+        .map(|result| result.diagnostics)
+        .unwrap_or_default()
+    }
+
+    fn folding_range(&self, uri: &str) -> Vec<FoldingRange> {
+        self.payload_query_reply(
+            PayloadQueryKind::FoldingRange,
+            UriParams {
+                uri: uri.to_string(),
+            }
+            .encode(),
+        )
+        .and_then(|reply| FoldingRangesResult::decode(&reply).ok())
+        .map(|result| result.ranges)
+        .unwrap_or_default()
+    }
+
     fn on_config_changed(&self) {
         let mut guard = self.state.lock().expect("pc island state mutex");
         let state = &mut *guard;
@@ -807,6 +1014,9 @@ fn boot(state: &mut IslandState) -> bool {
     }
     if let Some(search_resolver) = state.search_resolver.take() {
         install_search_methods_resolver(search_resolver);
+    }
+    if let Some(toplevels_resolver) = state.toplevels_resolver.take() {
+        install_definition_source_toplevels_resolver(toplevels_resolver);
     }
     // A clearly test-scoped fault seam: when `LS_PC_TEST_FAULT` is set, arm the
     // Java-side fault property (`-Dls.pc.host.testFault=<kind>`) and tighten the
@@ -1120,6 +1330,12 @@ mod tests {
         Box::new(|_query, _target| MethodHitsResult { hits: Vec::new() })
     }
 
+    fn empty_toplevels_resolver() -> Box<ToplevelsResolver> {
+        Box::new(|_symbol, _uri| ToplevelsResult {
+            symbols: Vec::new(),
+        })
+    }
+
     fn target_config(id: &str) -> TargetConfig {
         TargetConfig {
             bsp_id: id.to_string(),
@@ -1184,6 +1400,7 @@ mod tests {
             vec![target_config(target)],
             empty_resolver(),
             empty_search_resolver(),
+            empty_toplevels_resolver(),
         );
         let (driver, calls) = FakeDriver::new(outcomes);
         pc.state.lock().unwrap().driver = Some(Box::new(driver));
@@ -1200,6 +1417,7 @@ mod tests {
             vec![target_config(target)],
             empty_resolver(),
             empty_search_resolver(),
+            empty_toplevels_resolver(),
         );
         let (driver, calls) = FakeDriver::new(Vec::new());
         let driver = driver.with_status(status);
@@ -1218,6 +1436,7 @@ mod tests {
             vec![target_config("t")],
             empty_resolver(),
             empty_search_resolver(),
+            empty_toplevels_resolver(),
         );
         let a = "file:///ws/a.scala";
 
@@ -1252,6 +1471,7 @@ mod tests {
             vec![target_config("old")],
             empty_resolver(),
             empty_search_resolver(),
+            empty_toplevels_resolver(),
         );
         cold.reconfigure_targets(vec![target_config("new")]);
         assert!(cold.is_registered("new"));
@@ -1278,6 +1498,7 @@ mod tests {
             vec![target_config("known")],
             empty_resolver(),
             empty_search_resolver(),
+            empty_toplevels_resolver(),
         );
         pc.did_open("unknown", "file:///ws/a.scala", "v1");
         assert!(!pc.is_open("file:///ws/a.scala"));
@@ -1355,6 +1576,7 @@ mod tests {
             vec![target_config("t")],
             empty_resolver(),
             empty_search_resolver(),
+            empty_toplevels_resolver(),
         );
         // A buffer is pending replay (opened while cold).
         pc.did_open("t", "file:///ws/a.scala", "v1");
@@ -1387,6 +1609,7 @@ mod tests {
             vec![target_config("t")],
             empty_resolver(),
             empty_search_resolver(),
+            empty_toplevels_resolver(),
         );
         pc.did_open("t", "file:///ws/a.scala", "v1");
         let (driver, _calls) = FakeDriver::new(vec![Ok(Vec::new()), Ok(Vec::new())]);
@@ -1494,6 +1717,184 @@ mod tests {
         );
     }
 
+    // A booted payload-query op dispatches through the driver and decodes its
+    // typed carrier; a backend error — including the island's STATUS_NOT_YET
+    // transport-stub answer — degrades to the empty fallback (no panic, no
+    // error surfaced across the seam).
+    #[test]
+    fn booted_payload_queries_decode_their_carriers_and_not_yet_degrades_to_empty() {
+        use ls_pc_abi::payloads::{
+            AutoImport, FoldingRange, InlayHint, InlayLabelPart, PcDiagnostic, SemanticNode,
+            TextEdit,
+        };
+
+        let a = "file:///ws/a.scala";
+        let rng = Rng {
+            start_line: 0,
+            start_character: 0,
+            end_line: 9,
+            end_character: 0,
+        };
+        let pos = Pos {
+            line: 1,
+            character: 2,
+        };
+
+        let hints = InlayHintsResult {
+            hints: vec![InlayHint {
+                position: pos,
+                label_parts: vec![InlayLabelPart {
+                    text: ": Int".to_string(),
+                    location: Some((a.to_string(), rng.clone())),
+                    tooltip: None,
+                }],
+                kind: 1,
+                padding_left: true,
+                padding_right: false,
+                text_edits: None,
+                data: Some(vec![1, 2]),
+            }],
+        };
+        let (pc, _calls) = booted("t", vec![Ok(hints.encode().unwrap())]);
+        assert_eq!(pc.inlay_hints(a, rng.clone(), 3), hints.hints);
+
+        let tokens = SemanticTokensResult {
+            nodes: vec![SemanticNode {
+                start: 0,
+                end: 6,
+                token_type: 3,
+                token_modifier: 1,
+            }],
+        };
+        let (pc, _calls) = booted("t", vec![Ok(tokens.encode().unwrap())]);
+        assert_eq!(pc.semantic_tokens(a), tokens.nodes);
+
+        let chains = SelectionRangesResult {
+            chains: vec![vec![rng.clone()], vec![]],
+        };
+        let (pc, _calls) = booted("t", vec![Ok(chains.encode().unwrap())]);
+        assert_eq!(
+            pc.selection_range(
+                a,
+                &[
+                    pos,
+                    Pos {
+                        line: 3,
+                        character: 4
+                    }
+                ]
+            ),
+            chains.chains
+        );
+
+        let action = CodeActionResult {
+            edits: vec![TextEdit {
+                range: rng.clone(),
+                new_text: ": Int".to_string(),
+            }],
+            refusal: None,
+        };
+        let (pc, _calls) = booted("t", vec![Ok(action.encode().unwrap())]);
+        assert_eq!(pc.code_action(a, 4, pos, None, None), action);
+
+        // A typed refusal is data on the decoded result, not an error.
+        let refused = CodeActionResult {
+            edits: vec![],
+            refusal: Some("Cannot extract selection".to_string()),
+        };
+        let (pc, _calls) = booted("t", vec![Ok(refused.encode().unwrap())]);
+        assert_eq!(
+            pc.code_action(
+                a,
+                2,
+                pos,
+                Some(Pos {
+                    line: 7,
+                    character: 0
+                }),
+                None
+            )
+            .refusal
+            .as_deref(),
+            Some("Cannot extract selection")
+        );
+
+        let imports = AutoImportsResult {
+            imports: vec![AutoImport {
+                package_name: "scala.concurrent".to_string(),
+                edits: vec![],
+                symbol: None,
+            }],
+        };
+        let (pc, _calls) = booted("t", vec![Ok(imports.encode().unwrap())]);
+        assert_eq!(pc.auto_imports(a, pos, "Future", false), imports.imports);
+
+        let diags = PcDiagnosticsResult {
+            diagnostics: vec![PcDiagnostic {
+                range: rng.clone(),
+                severity: 1,
+                code: "E007".to_string(),
+                message: "not found".to_string(),
+            }],
+        };
+        let (pc, _calls) = booted("t", vec![Ok(diags.encode().unwrap())]);
+        assert_eq!(pc.pc_diagnostics(a), diags.diagnostics);
+
+        let folds = FoldingRangesResult {
+            ranges: vec![FoldingRange {
+                range: rng.clone(),
+                kind: 2,
+            }],
+        };
+        let (pc, _calls) = booted("t", vec![Ok(folds.encode().unwrap())]);
+        assert_eq!(pc.folding_range(a), folds.ranges);
+
+        // The island's NOT_YET transport stub degrades every op to its empty
+        // fallback, exactly like any other backend status.
+        let not_yet = || Err(PcError::Backend(ls_pc_abi::STATUS_NOT_YET));
+        let (pc, _calls) = booted(
+            "t",
+            vec![
+                not_yet(),
+                not_yet(),
+                not_yet(),
+                not_yet(),
+                not_yet(),
+                not_yet(),
+                not_yet(),
+            ],
+        );
+        assert!(pc.inlay_hints(a, rng.clone(), 0).is_empty());
+        assert!(pc.semantic_tokens(a).is_empty());
+        assert!(pc.selection_range(a, &[pos]).is_empty());
+        assert_eq!(
+            pc.code_action(a, 0, pos, None, None),
+            CodeActionResult::default()
+        );
+        assert!(pc.auto_imports(a, pos, "X", true).is_empty());
+        assert!(pc.pc_diagnostics(a).is_empty());
+        assert!(pc.folding_range(a).is_empty());
+    }
+
+    // A cold service must not boot the island for a payload query either: with
+    // no JAVA_HOME-style environment the boot fails typed, the query degrades
+    // to empty, and no driver is installed.
+    #[test]
+    fn a_payload_query_on_an_unbootable_service_degrades_to_empty() {
+        let pc = IslandPcService::new(
+            PathBuf::from("/nonexistent-ws"),
+            vec![target_config("t")],
+            empty_resolver(),
+            empty_search_resolver(),
+            empty_toplevels_resolver(),
+        );
+        // Latch a boot error so the dispatch path degrades without touching the
+        // real environment.
+        pc.state.lock().unwrap().boot_error = Some("no javaHome".to_string());
+        assert!(pc.semantic_tokens("file:///ws/a.scala").is_empty());
+        assert!(!pc.is_booted());
+    }
+
     // `workspace/didChangeConfiguration` un-latches a recorded boot failure ONLY
     // while the island is still cold, so the next PC query re-reads config.json
     // and re-attempts the boot; a booted island ignores the notification (the
@@ -1507,6 +1908,7 @@ mod tests {
             vec![target_config("t")],
             empty_resolver(),
             empty_search_resolver(),
+            empty_toplevels_resolver(),
         );
         cold.state.lock().unwrap().boot_error = Some("bad javaHome".to_string());
         cold.on_config_changed();
@@ -1588,6 +1990,7 @@ mod tests {
             vec![target_config("t")],
             empty_resolver(),
             empty_search_resolver(),
+            empty_toplevels_resolver(),
         );
         assert_eq!(pc.plugin_status(), None);
         assert!(

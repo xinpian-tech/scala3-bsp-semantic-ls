@@ -9,7 +9,17 @@ import com.google.gson.{Gson, JsonParser}
 import org.eclipse.lsp4j as l
 import org.eclipse.lsp4j.jsonrpc.messages.{Either as JEither, Tuple}
 
-import ls.pc.{DefinitionOrigin, DefinitionResult as SpiDefinitionResult, PcPluginStatusReport, PcTargetConfig}
+import ls.pc.{
+  DefinitionOrigin,
+  DefinitionResult as SpiDefinitionResult,
+  PcAutoImport,
+  PcCodeActionResult,
+  PcFoldingRange,
+  PcInlayHint,
+  PcPluginStatusReport,
+  PcSemanticNode,
+  PcTargetConfig
+}
 import ls.pc.host.codec.Payloads
 
 /** Translates between the live presentation-compiler facade's carrier values —
@@ -99,6 +109,79 @@ object Marshal:
       disabled = report.disabled.map(d => Payloads.DisabledPlugin(d.id, d.reason))
     )
 
+  // ---- ABI v2 payload-query responses: spi carriers → flat ----------------
+
+  def inlayHints(hints: Vector[PcInlayHint]): Payloads.InlayHintsResult =
+    Payloads.InlayHintsResult(hints.map { h =>
+      Payloads.InlayHint(
+        position = pos(h.position),
+        labelParts = h.labelParts.map { p =>
+          Payloads.InlayLabelPart(
+            p.text,
+            p.location.map(loc => (loc.getUri, rng(loc.getRange))),
+            p.tooltip
+          )
+        },
+        kind = h.kind,
+        paddingLeft = h.paddingLeft,
+        paddingRight = h.paddingRight,
+        textEdits = h.textEdits.map(_.map(textEdit)),
+        data = h.data
+      )
+    })
+
+  def semanticTokens(nodes: Vector[PcSemanticNode]): Payloads.SemanticTokensResult =
+    Payloads.SemanticTokensResult(
+      nodes.map(n => Payloads.SemanticNode(n.start, n.end, n.tokenType, n.tokenModifier))
+    )
+
+  def selectionRanges(chains: Vector[Vector[l.Range]]): Payloads.SelectionRangesResult =
+    Payloads.SelectionRangesResult(chains.map(_.map(rng)))
+
+  def codeActionResult(result: PcCodeActionResult): Payloads.CodeActionResult =
+    Payloads.CodeActionResult(result.edits.map(textEdit), result.refusal)
+
+  def autoImports(imports: Vector[PcAutoImport]): Payloads.AutoImportsResult =
+    Payloads.AutoImportsResult(
+      imports.map(i => Payloads.AutoImport(i.packageName, i.edits.map(textEdit), i.symbol))
+    )
+
+  def pcDiagnostics(diagnostics: Vector[l.Diagnostic]): Payloads.PcDiagnosticsResult =
+    Payloads.PcDiagnosticsResult(diagnostics.map { d =>
+      Payloads.PcDiagnostic(
+        range = rng(d.getRange),
+        severity = Option(d.getSeverity).map(_.getValue).getOrElse(0),
+        code = diagnosticCode(d.getCode),
+        message = diagnosticMessage(d.getMessage)
+      )
+    })
+
+  def foldingRanges(ranges: Vector[PcFoldingRange]): Payloads.FoldingRangesResult =
+    Payloads.FoldingRangesResult(ranges.map(f => Payloads.FoldingRange(rng(f.range), f.kind)))
+
+  /** A diagnostic's code (`Either<String, Integer>`, nullable) as the flat
+    * string the boundary carries; absent codes carry the empty string.
+    */
+  private def diagnosticCode(e: JEither[String, Integer]): String =
+    if e == null then ""
+    else if e.isLeft then e.getLeft
+    else String.valueOf(e.getRight)
+
+  /** A diagnostic's message (`Either<String, MarkupContent>` on the resolved
+    * LSP4J 1.0.0 surface, nullable) as the flat string the boundary carries;
+    * a markup message carries its raw value.
+    */
+  private def diagnosticMessage(e: JEither[String, l.MarkupContent]): String =
+    if e == null then ""
+    else if e.isLeft then e.getLeft
+    else Option(e.getRight.getValue).getOrElse("")
+
+  // ---- ABI v2 payload-query params: flat → LSP4J --------------------------
+
+  def toLspRange(r: Payloads.Rng): l.Range = toRange(r)
+
+  def toLspPosition(p: Payloads.Pos): l.Position = l.Position(p.line, p.character)
+
   // ---- Requests: flat → LSP4J / spi --------------------------------------
 
   def targetConfig(c: Payloads.TargetConfig): PcTargetConfig =
@@ -153,6 +236,9 @@ object Marshal:
     val s = r.getStart
     val e = r.getEnd
     Payloads.Rng(s.getLine, s.getCharacter, e.getLine, e.getCharacter)
+
+  private def pos(p: l.Position): Payloads.Pos =
+    Payloads.Pos(p.getLine, p.getCharacter)
 
   private def toRange(r: Payloads.Rng): l.Range =
     l.Range(l.Position(r.startLine, r.startCharacter), l.Position(r.endLine, r.endCharacter))

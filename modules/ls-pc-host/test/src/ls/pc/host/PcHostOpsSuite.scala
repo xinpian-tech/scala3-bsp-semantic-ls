@@ -8,6 +8,15 @@ import org.eclipse.lsp4j as l
 
 import ls.pc.{CompilerPluginStatus, DefinitionLocation, DefinitionOrigin}
 import ls.pc.{DefinitionResult as SpiDefinitionResult, PcPluginStatusReport, PcTargetConfig}
+import ls.pc.{
+  PcAutoImport,
+  PcCodeActionResult,
+  PcFoldingRange,
+  PcInlayHint,
+  PcInlayLabelPart,
+  PcNotYetSupported,
+  PcSemanticNode
+}
 import ls.pc.host.boundary.{boundary_h, LsBuf, LsStr}
 import ls.pc.host.codec.Payloads
 
@@ -65,7 +74,52 @@ final class RecordingPcOps extends PcOps:
   def restartInstances(): Unit = restarted += 1
   def shutdown(): Unit = shutdowns += 1
 
-/** The 15 boundary ops routed through a [[PcHost]] over a stub facade: each op
+  // ABI v2 payload-query ops. `notYet = true` makes them answer the transport
+  // stub (throw [[PcNotYetSupported]]), like [[FacadePcOps]] before the
+  // provider task lands.
+  var notYet = false
+  var lastInlayHints: Option[(String, l.Range, Int)] = None
+  var lastSemanticTokens: Option[String] = None
+  var lastSelectionRanges: Option[(String, Vector[l.Position])] = None
+  var lastCodeAction: Option[(String, Int, l.Position, Option[l.Position], Option[Vector[Int]])] = None
+  var lastAutoImports: Option[(String, l.Position, String, Boolean)] = None
+  var lastPcDiagnostics: Option[String] = None
+  var lastFoldingRanges: Option[String] = None
+
+  var inlayHintsResult: Vector[PcInlayHint] = Vector.empty
+  var semanticTokensResult: Vector[PcSemanticNode] = Vector.empty
+  var selectionRangesResult: Vector[Vector[l.Range]] = Vector.empty
+  var codeActionResult: PcCodeActionResult = PcCodeActionResult(Vector.empty, None)
+  var autoImportsResult: Vector[PcAutoImport] = Vector.empty
+  var pcDiagnosticsResult: Vector[l.Diagnostic] = Vector.empty
+  var foldingRangesResult: Vector[PcFoldingRange] = Vector.empty
+
+  private def stubbed[T](op: String)(result: T): T =
+    if notYet then throw PcNotYetSupported(op) else guard(result)
+
+  def inlayHints(uri: String, range: l.Range, flags: Int): Vector[PcInlayHint] =
+    lastInlayHints = Some((uri, range, flags)); stubbed("inlayHints")(inlayHintsResult)
+  def semanticTokens(uri: String): Vector[PcSemanticNode] =
+    lastSemanticTokens = Some(uri); stubbed("semanticTokens")(semanticTokensResult)
+  def selectionRanges(uri: String, positions: Vector[l.Position]): Vector[Vector[l.Range]] =
+    lastSelectionRanges = Some((uri, positions)); stubbed("selectionRanges")(selectionRangesResult)
+  def codeAction(
+      uri: String,
+      actionId: Int,
+      position: l.Position,
+      extractionEnd: Option[l.Position],
+      argIndices: Option[Vector[Int]]
+  ): PcCodeActionResult =
+    lastCodeAction = Some((uri, actionId, position, extractionEnd, argIndices))
+    stubbed("codeAction")(codeActionResult)
+  def autoImports(uri: String, position: l.Position, name: String, isExtension: Boolean): Vector[PcAutoImport] =
+    lastAutoImports = Some((uri, position, name, isExtension)); stubbed("autoImports")(autoImportsResult)
+  def pcDiagnostics(uri: String): Vector[l.Diagnostic] =
+    lastPcDiagnostics = Some(uri); stubbed("pcDiagnostics")(pcDiagnosticsResult)
+  def foldingRanges(uri: String): Vector[PcFoldingRange] =
+    lastFoldingRanges = Some(uri); stubbed("foldingRanges")(foldingRangesResult)
+
+/** The 22 boundary ops routed through a [[PcHost]] over a stub facade: each op
   * decodes its request, calls the facade, converts the result with [[Marshal]],
   * and writes the flat response — no live compiler or booted JVM. */
 class PcHostOpsSuite extends munit.FunSuite:
@@ -230,6 +284,196 @@ class PcHostOpsSuite extends munit.FunSuite:
     run(ops, gen => loaned = gen :: loaned) { (arena, host) =>
       assertEquals(host.spawnDispatch(7), OK)
       assertEquals(loaned, List(7))
+    }
+
+  test("inlay_hints routes decode -> facade -> encode"):
+    val ops = RecordingPcOps()
+    ops.inlayHintsResult = Vector(
+      PcInlayHint(
+        l.Position(2, 10),
+        Vector(PcInlayLabelPart(": Int", None, Some("inferred"))),
+        kind = 1,
+        paddingLeft = true,
+        paddingRight = false,
+        textEdits = Some(Vector(l.TextEdit(l.Range(l.Position(2, 10), l.Position(2, 10)), ": Int"))),
+        data = Some(Seq[Byte](1, 2))
+      )
+    )
+    run(ops) { (arena, host) =>
+      val (p, n) = req(arena, Payloads.InlayHintParams("u", Payloads.Rng(0, 0, 9, 0), 3).encode())
+      val out = LsBuf.allocate(arena)
+      assertEquals(host.inlayHints(p, n, out), OK)
+      assertEquals(ops.lastInlayHints.map(_._1), Some("u"))
+      assertEquals(ops.lastInlayHints.map(_._2), Some(l.Range(l.Position(0, 0), l.Position(9, 0))))
+      assertEquals(ops.lastInlayHints.map(_._3), Some(3))
+      assertEquals(Payloads.InlayHintsResult.decode(outBytes(out)), Marshal.inlayHints(ops.inlayHintsResult))
+    }
+
+  test("semantic_tokens routes decode -> facade -> encode"):
+    val ops = RecordingPcOps()
+    ops.semanticTokensResult = Vector(PcSemanticNode(0, 6, 3, 1))
+    run(ops) { (arena, host) =>
+      val (p, n) = req(arena, Payloads.UriParams("u").encode())
+      val out = LsBuf.allocate(arena)
+      assertEquals(host.semanticTokens(p, n, out), OK)
+      assertEquals(ops.lastSemanticTokens, Some("u"))
+      assertEquals(
+        Payloads.SemanticTokensResult.decode(outBytes(out)),
+        Marshal.semanticTokens(ops.semanticTokensResult)
+      )
+    }
+
+  test("selection_range routes decode -> facade -> encode"):
+    val ops = RecordingPcOps()
+    ops.selectionRangesResult = Vector(
+      Vector(l.Range(l.Position(1, 2), l.Position(1, 4)), l.Range(l.Position(0, 0), l.Position(9, 0))),
+      Vector.empty
+    )
+    run(ops) { (arena, host) =>
+      val (p, n) = req(
+        arena,
+        Payloads.SelectionRangeParams("u", Seq(Payloads.Pos(1, 2), Payloads.Pos(3, 4))).encode()
+      )
+      val out = LsBuf.allocate(arena)
+      assertEquals(host.selectionRange(p, n, out), OK)
+      assertEquals(ops.lastSelectionRanges.map(_._1), Some("u"))
+      assertEquals(
+        ops.lastSelectionRanges.map(_._2),
+        Some(Vector(l.Position(1, 2), l.Position(3, 4)))
+      )
+      assertEquals(
+        Payloads.SelectionRangesResult.decode(outBytes(out)),
+        Marshal.selectionRanges(ops.selectionRangesResult)
+      )
+    }
+
+  test("code_action routes decode -> facade -> encode (refusal is data)"):
+    val ops = RecordingPcOps()
+    ops.codeActionResult = PcCodeActionResult(Vector.empty, Some("Cannot extract selection"))
+    run(ops) { (arena, host) =>
+      val (p, n) = req(
+        arena,
+        Payloads
+          .CodeActionParams(
+            "u",
+            Payloads.CodeActionId.ExtractMethod,
+            Payloads.Pos(5, 1),
+            Some(Payloads.Pos(7, 2)),
+            Some(Seq(0, 2))
+          )
+          .encode()
+      )
+      val out = LsBuf.allocate(arena)
+      assertEquals(host.codeAction(p, n, out), OK)
+      assertEquals(
+        ops.lastCodeAction,
+        Some(
+          (
+            "u",
+            Payloads.CodeActionId.ExtractMethod,
+            l.Position(5, 1),
+            Some(l.Position(7, 2)),
+            Some(Vector(0, 2))
+          )
+        )
+      )
+      val decoded = Payloads.CodeActionResult.decode(outBytes(out))
+      assertEquals(decoded, Marshal.codeActionResult(ops.codeActionResult))
+      assertEquals(decoded.refusal, Some("Cannot extract selection"))
+    }
+
+  test("auto_imports routes decode -> facade -> encode"):
+    val ops = RecordingPcOps()
+    ops.autoImportsResult = Vector(
+      PcAutoImport(
+        "scala.concurrent",
+        Vector(l.TextEdit(l.Range(l.Position(0, 0), l.Position(0, 0)), "import scala.concurrent.Future\n")),
+        Some("scala/concurrent/Future#")
+      )
+    )
+    run(ops) { (arena, host) =>
+      val (p, n) =
+        req(arena, Payloads.AutoImportParams("u", Payloads.Pos(4, 9), "Future", isExtension = true).encode())
+      val out = LsBuf.allocate(arena)
+      assertEquals(host.autoImports(p, n, out), OK)
+      assertEquals(ops.lastAutoImports, Some(("u", l.Position(4, 9), "Future", true)))
+      assertEquals(
+        Payloads.AutoImportsResult.decode(outBytes(out)),
+        Marshal.autoImports(ops.autoImportsResult)
+      )
+    }
+
+  test("pc_diagnostics routes decode -> facade -> encode"):
+    val ops = RecordingPcOps()
+    val diag = l.Diagnostic(l.Range(l.Position(3, 0), l.Position(3, 5)), "not found: value x")
+    diag.setSeverity(l.DiagnosticSeverity.Error)
+    diag.setCode("E007")
+    ops.pcDiagnosticsResult = Vector(diag)
+    run(ops) { (arena, host) =>
+      val (p, n) = req(arena, Payloads.UriParams("u").encode())
+      val out = LsBuf.allocate(arena)
+      assertEquals(host.pcDiagnostics(p, n, out), OK)
+      assertEquals(ops.lastPcDiagnostics, Some("u"))
+      val decoded = Payloads.PcDiagnosticsResult.decode(outBytes(out))
+      assertEquals(decoded, Marshal.pcDiagnostics(ops.pcDiagnosticsResult))
+      assertEquals(decoded.diagnostics.head.code, "E007")
+      assertEquals(decoded.diagnostics.head.severity, 1)
+    }
+
+  test("folding_range routes decode -> facade -> encode"):
+    val ops = RecordingPcOps()
+    ops.foldingRangesResult = Vector(
+      PcFoldingRange(l.Range(l.Position(0, 0), l.Position(5, 1)), Payloads.FoldingKind.Imports)
+    )
+    run(ops) { (arena, host) =>
+      val (p, n) = req(arena, Payloads.UriParams("u").encode())
+      val out = LsBuf.allocate(arena)
+      assertEquals(host.foldingRange(p, n, out), OK)
+      assertEquals(ops.lastFoldingRanges, Some("u"))
+      assertEquals(
+        Payloads.FoldingRangesResult.decode(outBytes(out)),
+        Marshal.foldingRanges(ops.foldingRangesResult)
+      )
+    }
+
+  test("a not-yet-provided payload-query op maps to STATUS_NOT_YET"):
+    // The transport-stub phase: the op crosses the boundary, decodes cleanly,
+    // reaches the facade seam, and the typed PcNotYetSupported answer maps to
+    // the distinct nonzero STATUS_NOT_YET — never a panic and never one of the
+    // generic error statuses.
+    val ops = RecordingPcOps()
+    ops.notYet = true
+    run(ops) { (arena, host) =>
+      val out = LsBuf.allocate(arena)
+      val (ip, in_) = req(arena, Payloads.InlayHintParams("u", Payloads.Rng(0, 0, 1, 0), 0).encode())
+      assertEquals(host.inlayHints(ip, in_, out), boundary_h.STATUS_NOT_YET())
+      val (up, un) = req(arena, Payloads.UriParams("u").encode())
+      assertEquals(host.semanticTokens(up, un, out), boundary_h.STATUS_NOT_YET())
+      assertEquals(host.pcDiagnostics(up, un, out), boundary_h.STATUS_NOT_YET())
+      assertEquals(host.foldingRange(up, un, out), boundary_h.STATUS_NOT_YET())
+      val (sp, sn) = req(arena, Payloads.SelectionRangeParams("u", Seq(Payloads.Pos(0, 0))).encode())
+      assertEquals(host.selectionRange(sp, sn, out), boundary_h.STATUS_NOT_YET())
+      val (cp, cn) = req(
+        arena,
+        Payloads.CodeActionParams("u", Payloads.CodeActionId.InlineValue, Payloads.Pos(0, 0), None, None).encode()
+      )
+      assertEquals(host.codeAction(cp, cn, out), boundary_h.STATUS_NOT_YET())
+      val (ap, an) =
+        req(arena, Payloads.AutoImportParams("u", Payloads.Pos(0, 0), "X", isExtension = false).encode())
+      assertEquals(host.autoImports(ap, an, out), boundary_h.STATUS_NOT_YET())
+      // The requests still reached the op seam (decode happened before the stub).
+      assertEquals(ops.lastInlayHints.map(_._1), Some("u"))
+      assertEquals(ops.lastAutoImports.map(_._3), Some("X"))
+    }
+
+  test("a malformed payload-query request maps to STATUS_DECODE before the facade"):
+    val ops = RecordingPcOps()
+    run(ops) { (arena, host) =>
+      val out = LsBuf.allocate(arena)
+      // A uri-params buffer is not an inlay-hint params buffer (wrong kind).
+      val (p, n) = req(arena, Payloads.UriParams("u").encode())
+      assertEquals(host.inlayHints(p, n, out), DECODE)
+      assertEquals(ops.lastInlayHints, None)
     }
 
   test("a malformed request payload maps to STATUS_DECODE"):

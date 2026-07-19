@@ -27,12 +27,46 @@ const KIND_PREPARE_RENAME: u32 = 11;
 const KIND_PLUGIN_STATUS: u32 = 12;
 const KIND_LOCATIONS: u32 = 13;
 const KIND_METHOD_HITS: u32 = 14;
+const KIND_INLAY_HINT_PARAMS: u32 = 15;
+const KIND_INLAY_HINTS: u32 = 16;
+const KIND_URI_PARAMS: u32 = 17;
+const KIND_SEMANTIC_TOKENS: u32 = 18;
+const KIND_SELECTION_RANGE_PARAMS: u32 = 19;
+const KIND_SELECTION_RANGES: u32 = 20;
+const KIND_CODE_ACTION_PARAMS: u32 = 21;
+const KIND_CODE_ACTION_EDITS: u32 = 22;
+const KIND_AUTO_IMPORT_PARAMS: u32 = 23;
+const KIND_AUTO_IMPORTS: u32 = 24;
+const KIND_PC_DIAGNOSTICS: u32 = 25;
+const KIND_FOLDING_RANGES: u32 = 26;
+const KIND_TOPLEVELS: u32 = 27;
 
 /// `DefinitionOrigin` ordinals (mirrors the Scala `enum DefinitionOrigin`).
 pub mod origin {
     pub const WORKSPACE: u32 = 0;
     pub const SYNTHETIC: u32 = 1;
     pub const PLUGIN: u32 = 2;
+}
+
+/// `code_action` action ids (the boundary's enum of PC-backed code actions;
+/// mirrors the Scala `Payloads.CodeActionId` constants).
+pub mod code_action_id {
+    pub const CONVERT_TO_NAMED_ARGUMENTS: i32 = 0;
+    pub const IMPLEMENT_ABSTRACT_MEMBERS: i32 = 1;
+    pub const EXTRACT_METHOD: i32 = 2;
+    pub const INLINE_VALUE: i32 = 3;
+    pub const INSERT_INFERRED_TYPE: i32 = 4;
+    pub const INSERT_INFERRED_METHOD: i32 = 5;
+    pub const CONVERT_TO_NAMED_LAMBDA_PARAMETERS: i32 = 6;
+}
+
+/// `folding_range` kind ordinals (mirrors the Scala `Payloads.FoldingKind`
+/// constants; `NONE` means the range carries no LSP folding kind).
+pub mod folding_kind {
+    pub const NONE: i32 = 0;
+    pub const COMMENT: i32 = 1;
+    pub const IMPORTS: i32 = 2;
+    pub const REGION: i32 = 3;
 }
 
 fn bad_tag(what: &str, tag: u32) -> AbiError {
@@ -123,6 +157,48 @@ impl Rng {
         let present = r.u32()?;
         let rng = Rng::read(r)?;
         Ok(if present == 0 { None } else { Some(rng) })
+    }
+}
+
+/// A zero-based `line`/`character` position (UTF-16 code units, as LSP).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Pos {
+    pub line: u32,
+    pub character: u32,
+}
+
+impl Pos {
+    fn write(&self, w: &mut Writer) {
+        w.u32(self.line);
+        w.u32(self.character);
+    }
+
+    fn read(r: &mut Reader) -> Result<Pos, AbiError> {
+        let line = r.u32()?;
+        let character = r.u32()?;
+        Ok(Pos { line, character })
+    }
+
+    /// Fixed-shape optional (mirrors [`Rng::write_opt`]): a presence flag then
+    /// the two words, zeroed when absent.
+    fn write_opt(w: &mut Writer, pos: &Option<Pos>) {
+        match pos {
+            Some(p) => {
+                w.u32(1);
+                p.write(w);
+            }
+            None => {
+                w.u32(0);
+                w.u32(0);
+                w.u32(0);
+            }
+        }
+    }
+
+    fn read_opt(r: &mut Reader) -> Result<Option<Pos>, AbiError> {
+        let present = r.u32()?;
+        let pos = Pos::read(r)?;
+        Ok(if present == 0 { None } else { Some(pos) })
     }
 }
 
@@ -1303,5 +1379,608 @@ impl PluginStatus {
             service_plugins,
             disabled,
         })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Payload-query ops (ABI v2): inlay hints, semantic tokens, selection ranges,
+// code actions, auto-imports, PC diagnostics, folding ranges — plus the
+// `definition_source_toplevels` callback response. Params cross as encoded
+// payloads (the shared `PcPayloadQueryFn` slot shape), results come back the
+// same way.
+// ---------------------------------------------------------------------------
+
+fn write_text_edit_list(w: &mut Writer, edits: &[TextEdit]) {
+    w.count(edits.len());
+    for edit in edits {
+        edit.write(w);
+    }
+}
+
+fn read_text_edit_list(r: &mut Reader) -> Result<Vec<TextEdit>, AbiError> {
+    let n = r.count()?;
+    let mut edits = Vec::with_capacity(n);
+    for _ in 0..n {
+        edits.push(TextEdit::read(r)?);
+    }
+    Ok(edits)
+}
+
+/// `inlay_hints` params: the buffer, the requested range, and a flags bitset
+/// (the provider's hint-category toggles; opaque to the transport).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InlayHintParams {
+    pub uri: String,
+    pub range: Rng,
+    pub flags: u32,
+}
+
+impl InlayHintParams {
+    pub fn encode(&self) -> Result<Vec<u8>, AbiError> {
+        let mut w = Writer::new();
+        w.str(&self.uri);
+        self.range.write(&mut w);
+        w.u32(self.flags);
+        w.finish(KIND_INLAY_HINT_PARAMS)
+    }
+
+    pub fn decode(buf: &[u8]) -> Result<InlayHintParams, AbiError> {
+        let mut r = Reader::new(buf, KIND_INLAY_HINT_PARAMS)?;
+        let uri = r.str()?;
+        let range = Rng::read(&mut r)?;
+        let flags = r.u32()?;
+        r.finish()?;
+        Ok(InlayHintParams { uri, range, flags })
+    }
+}
+
+/// One part of an inlay hint's label: the text, an optional target location
+/// (`{uri, range}` — no origin), and an optional tooltip string.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InlayLabelPart {
+    pub text: String,
+    pub location: Option<(String, Rng)>,
+    pub tooltip: Option<String>,
+}
+
+impl InlayLabelPart {
+    fn write(&self, w: &mut Writer) {
+        w.str(&self.text);
+        match &self.location {
+            Some((uri, range)) => {
+                w.u32(1);
+                w.str(uri);
+                range.write(w);
+            }
+            None => w.u32(0),
+        }
+        w.opt_str(self.tooltip.as_deref());
+    }
+
+    fn read(r: &mut Reader) -> Result<InlayLabelPart, AbiError> {
+        let text = r.str()?;
+        let location = if r.u32()? != 0 {
+            let uri = r.str()?;
+            let range = Rng::read(r)?;
+            Some((uri, range))
+        } else {
+            None
+        };
+        let tooltip = r.opt_str()?;
+        Ok(InlayLabelPart {
+            text,
+            location,
+            tooltip,
+        })
+    }
+}
+
+/// One inlay hint: position, label parts, the LSP `InlayHintKind` int, the
+/// padding flags, optional text edits, and opaque `data` bytes (the
+/// `CompletionItem.data` idiom — carried verbatim, never interpreted).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InlayHint {
+    pub position: Pos,
+    pub label_parts: Vec<InlayLabelPart>,
+    pub kind: i32,
+    pub padding_left: bool,
+    pub padding_right: bool,
+    pub text_edits: Option<Vec<TextEdit>>,
+    pub data: Option<Vec<u8>>,
+}
+
+impl InlayHint {
+    fn write(&self, w: &mut Writer) {
+        self.position.write(w);
+        w.count(self.label_parts.len());
+        for part in &self.label_parts {
+            part.write(w);
+        }
+        w.i32(self.kind);
+        w.bool32(self.padding_left);
+        w.bool32(self.padding_right);
+        match &self.text_edits {
+            Some(edits) => {
+                w.u32(1);
+                write_text_edit_list(w, edits);
+            }
+            None => w.u32(0),
+        }
+        w.opt_bytes(self.data.as_deref());
+    }
+
+    fn read(r: &mut Reader) -> Result<InlayHint, AbiError> {
+        let position = Pos::read(r)?;
+        let n = r.count()?;
+        let mut label_parts = Vec::with_capacity(n);
+        for _ in 0..n {
+            label_parts.push(InlayLabelPart::read(r)?);
+        }
+        let kind = r.i32()?;
+        let padding_left = r.bool32()?;
+        let padding_right = r.bool32()?;
+        let text_edits = if r.u32()? != 0 {
+            Some(read_text_edit_list(r)?)
+        } else {
+            None
+        };
+        let data = r.opt_bytes()?;
+        Ok(InlayHint {
+            position,
+            label_parts,
+            kind,
+            padding_left,
+            padding_right,
+            text_edits,
+            data,
+        })
+    }
+}
+
+/// The `inlay_hints` response: the hints for the requested range.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct InlayHintsResult {
+    pub hints: Vec<InlayHint>,
+}
+
+impl InlayHintsResult {
+    pub fn encode(&self) -> Result<Vec<u8>, AbiError> {
+        let mut w = Writer::new();
+        w.count(self.hints.len());
+        for hint in &self.hints {
+            hint.write(&mut w);
+        }
+        w.finish(KIND_INLAY_HINTS)
+    }
+
+    pub fn decode(buf: &[u8]) -> Result<InlayHintsResult, AbiError> {
+        let mut r = Reader::new(buf, KIND_INLAY_HINTS)?;
+        let n = r.count()?;
+        let mut hints = Vec::with_capacity(n);
+        for _ in 0..n {
+            hints.push(InlayHint::read(&mut r)?);
+        }
+        r.finish()?;
+        Ok(InlayHintsResult { hints })
+    }
+}
+
+/// A single-uri params payload (`semantic_tokens`/`pc_diagnostics`/
+/// `folding_range` — the three payload-query ops whose request is just the
+/// buffer).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UriParams {
+    pub uri: String,
+}
+
+impl UriParams {
+    pub fn encode(&self) -> Result<Vec<u8>, AbiError> {
+        let mut w = Writer::new();
+        w.str(&self.uri);
+        w.finish(KIND_URI_PARAMS)
+    }
+
+    pub fn decode(buf: &[u8]) -> Result<UriParams, AbiError> {
+        let mut r = Reader::new(buf, KIND_URI_PARAMS)?;
+        let uri = r.str()?;
+        r.finish()?;
+        Ok(UriParams { uri })
+    }
+}
+
+/// One semantic-tokens node: `[start, end)` UTF-16 **offsets** into the buffer
+/// text (not line/character — the Rust side converts), plus the token type and
+/// modifier bitset ints.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SemanticNode {
+    pub start: u32,
+    pub end: u32,
+    pub token_type: i32,
+    pub token_modifier: i32,
+}
+
+/// The `semantic_tokens` response: the offset-based token nodes in buffer order.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SemanticTokensResult {
+    pub nodes: Vec<SemanticNode>,
+}
+
+impl SemanticTokensResult {
+    pub fn encode(&self) -> Result<Vec<u8>, AbiError> {
+        let mut w = Writer::new();
+        w.count(self.nodes.len());
+        for node in &self.nodes {
+            w.u32(node.start);
+            w.u32(node.end);
+            w.i32(node.token_type);
+            w.i32(node.token_modifier);
+        }
+        w.finish(KIND_SEMANTIC_TOKENS)
+    }
+
+    pub fn decode(buf: &[u8]) -> Result<SemanticTokensResult, AbiError> {
+        let mut r = Reader::new(buf, KIND_SEMANTIC_TOKENS)?;
+        let n = r.count()?;
+        let mut nodes = Vec::with_capacity(n);
+        for _ in 0..n {
+            let start = r.u32()?;
+            let end = r.u32()?;
+            let token_type = r.i32()?;
+            let token_modifier = r.i32()?;
+            nodes.push(SemanticNode {
+                start,
+                end,
+                token_type,
+                token_modifier,
+            });
+        }
+        r.finish()?;
+        Ok(SemanticTokensResult { nodes })
+    }
+}
+
+/// `selection_range` params: the buffer and the query positions.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SelectionRangeParams {
+    pub uri: String,
+    pub positions: Vec<Pos>,
+}
+
+impl SelectionRangeParams {
+    pub fn encode(&self) -> Result<Vec<u8>, AbiError> {
+        let mut w = Writer::new();
+        w.str(&self.uri);
+        w.count(self.positions.len());
+        for pos in &self.positions {
+            pos.write(&mut w);
+        }
+        w.finish(KIND_SELECTION_RANGE_PARAMS)
+    }
+
+    pub fn decode(buf: &[u8]) -> Result<SelectionRangeParams, AbiError> {
+        let mut r = Reader::new(buf, KIND_SELECTION_RANGE_PARAMS)?;
+        let uri = r.str()?;
+        let n = r.count()?;
+        let mut positions = Vec::with_capacity(n);
+        for _ in 0..n {
+            positions.push(Pos::read(&mut r)?);
+        }
+        r.finish()?;
+        Ok(SelectionRangeParams { uri, positions })
+    }
+}
+
+/// The `selection_range` response: per query position, the chain of enclosing
+/// ranges, innermost first.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SelectionRangesResult {
+    pub chains: Vec<Vec<Rng>>,
+}
+
+impl SelectionRangesResult {
+    pub fn encode(&self) -> Result<Vec<u8>, AbiError> {
+        let mut w = Writer::new();
+        w.count(self.chains.len());
+        for chain in &self.chains {
+            w.count(chain.len());
+            for range in chain {
+                range.write(&mut w);
+            }
+        }
+        w.finish(KIND_SELECTION_RANGES)
+    }
+
+    pub fn decode(buf: &[u8]) -> Result<SelectionRangesResult, AbiError> {
+        let mut r = Reader::new(buf, KIND_SELECTION_RANGES)?;
+        let chain_count = r.count()?;
+        let mut chains = Vec::with_capacity(chain_count);
+        for _ in 0..chain_count {
+            let n = r.count()?;
+            let mut chain = Vec::with_capacity(n);
+            for _ in 0..n {
+                chain.push(Rng::read(&mut r)?);
+            }
+            chains.push(chain);
+        }
+        r.finish()?;
+        Ok(SelectionRangesResult { chains })
+    }
+}
+
+/// `code_action` params: the buffer, the [`code_action_id`] action, the cursor
+/// position, an optional extraction end (extract-method's selection end), and
+/// optional argument indices (convert-to-named-arguments).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CodeActionParams {
+    pub uri: String,
+    pub action: i32,
+    pub position: Pos,
+    pub extraction_end: Option<Pos>,
+    pub arg_indices: Option<Vec<i32>>,
+}
+
+impl CodeActionParams {
+    pub fn encode(&self) -> Result<Vec<u8>, AbiError> {
+        let mut w = Writer::new();
+        w.str(&self.uri);
+        w.i32(self.action);
+        self.position.write(&mut w);
+        Pos::write_opt(&mut w, &self.extraction_end);
+        match &self.arg_indices {
+            Some(indices) => {
+                w.u32(1);
+                w.count(indices.len());
+                for index in indices {
+                    w.i32(*index);
+                }
+            }
+            None => w.u32(0),
+        }
+        w.finish(KIND_CODE_ACTION_PARAMS)
+    }
+
+    pub fn decode(buf: &[u8]) -> Result<CodeActionParams, AbiError> {
+        let mut r = Reader::new(buf, KIND_CODE_ACTION_PARAMS)?;
+        let uri = r.str()?;
+        let action = r.i32()?;
+        let position = Pos::read(&mut r)?;
+        let extraction_end = Pos::read_opt(&mut r)?;
+        let arg_indices = if r.u32()? != 0 {
+            let n = r.count()?;
+            let mut indices = Vec::with_capacity(n);
+            for _ in 0..n {
+                indices.push(r.i32()?);
+            }
+            Some(indices)
+        } else {
+            None
+        };
+        r.finish()?;
+        Ok(CodeActionParams {
+            uri,
+            action,
+            position,
+            extraction_end,
+            arg_indices,
+        })
+    }
+}
+
+/// The `code_action` response: the edits plus an optional typed refusal
+/// message (the island's `DisplayableException` carrier — a refusal the editor
+/// should surface is DATA on a `STATUS_OK` reply, not an error status).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CodeActionResult {
+    pub edits: Vec<TextEdit>,
+    pub refusal: Option<String>,
+}
+
+impl CodeActionResult {
+    pub fn encode(&self) -> Result<Vec<u8>, AbiError> {
+        let mut w = Writer::new();
+        write_text_edit_list(&mut w, &self.edits);
+        w.opt_str(self.refusal.as_deref());
+        w.finish(KIND_CODE_ACTION_EDITS)
+    }
+
+    pub fn decode(buf: &[u8]) -> Result<CodeActionResult, AbiError> {
+        let mut r = Reader::new(buf, KIND_CODE_ACTION_EDITS)?;
+        let edits = read_text_edit_list(&mut r)?;
+        let refusal = r.opt_str()?;
+        r.finish()?;
+        Ok(CodeActionResult { edits, refusal })
+    }
+}
+
+/// `auto_imports` params: the buffer, the cursor position, the name to import,
+/// and whether an extension-method import is requested.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AutoImportParams {
+    pub uri: String,
+    pub position: Pos,
+    pub name: String,
+    pub is_extension: bool,
+}
+
+impl AutoImportParams {
+    pub fn encode(&self) -> Result<Vec<u8>, AbiError> {
+        let mut w = Writer::new();
+        w.str(&self.uri);
+        self.position.write(&mut w);
+        w.str(&self.name);
+        w.bool32(self.is_extension);
+        w.finish(KIND_AUTO_IMPORT_PARAMS)
+    }
+
+    pub fn decode(buf: &[u8]) -> Result<AutoImportParams, AbiError> {
+        let mut r = Reader::new(buf, KIND_AUTO_IMPORT_PARAMS)?;
+        let uri = r.str()?;
+        let position = Pos::read(&mut r)?;
+        let name = r.str()?;
+        let is_extension = r.bool32()?;
+        r.finish()?;
+        Ok(AutoImportParams {
+            uri,
+            position,
+            name,
+            is_extension,
+        })
+    }
+}
+
+/// One auto-import candidate: the providing package, the edits that apply it,
+/// and optionally the imported SemanticDB symbol.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AutoImport {
+    pub package_name: String,
+    pub edits: Vec<TextEdit>,
+    pub symbol: Option<String>,
+}
+
+/// The `auto_imports` response: the candidates, best first.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AutoImportsResult {
+    pub imports: Vec<AutoImport>,
+}
+
+impl AutoImportsResult {
+    pub fn encode(&self) -> Result<Vec<u8>, AbiError> {
+        let mut w = Writer::new();
+        w.count(self.imports.len());
+        for import in &self.imports {
+            w.str(&import.package_name);
+            write_text_edit_list(&mut w, &import.edits);
+            w.opt_str(import.symbol.as_deref());
+        }
+        w.finish(KIND_AUTO_IMPORTS)
+    }
+
+    pub fn decode(buf: &[u8]) -> Result<AutoImportsResult, AbiError> {
+        let mut r = Reader::new(buf, KIND_AUTO_IMPORTS)?;
+        let n = r.count()?;
+        let mut imports = Vec::with_capacity(n);
+        for _ in 0..n {
+            let package_name = r.str()?;
+            let edits = read_text_edit_list(&mut r)?;
+            let symbol = r.opt_str()?;
+            imports.push(AutoImport {
+                package_name,
+                edits,
+                symbol,
+            });
+        }
+        r.finish()?;
+        Ok(AutoImportsResult { imports })
+    }
+}
+
+/// One presentation-compiler diagnostic (the reduced record the boundary
+/// carries: span, LSP severity int, code string, message).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PcDiagnostic {
+    pub range: Rng,
+    pub severity: i32,
+    pub code: String,
+    pub message: String,
+}
+
+/// The `pc_diagnostics` response: the buffer's PC diagnostics in report order.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PcDiagnosticsResult {
+    pub diagnostics: Vec<PcDiagnostic>,
+}
+
+impl PcDiagnosticsResult {
+    pub fn encode(&self) -> Result<Vec<u8>, AbiError> {
+        let mut w = Writer::new();
+        w.count(self.diagnostics.len());
+        for diagnostic in &self.diagnostics {
+            diagnostic.range.write(&mut w);
+            w.i32(diagnostic.severity);
+            w.str(&diagnostic.code);
+            w.str(&diagnostic.message);
+        }
+        w.finish(KIND_PC_DIAGNOSTICS)
+    }
+
+    pub fn decode(buf: &[u8]) -> Result<PcDiagnosticsResult, AbiError> {
+        let mut r = Reader::new(buf, KIND_PC_DIAGNOSTICS)?;
+        let n = r.count()?;
+        let mut diagnostics = Vec::with_capacity(n);
+        for _ in 0..n {
+            let range = Rng::read(&mut r)?;
+            let severity = r.i32()?;
+            let code = r.str()?;
+            let message = r.str()?;
+            diagnostics.push(PcDiagnostic {
+                range,
+                severity,
+                code,
+                message,
+            });
+        }
+        r.finish()?;
+        Ok(PcDiagnosticsResult { diagnostics })
+    }
+}
+
+/// One folding range: the span plus its [`folding_kind`] ordinal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FoldingRange {
+    pub range: Rng,
+    pub kind: i32,
+}
+
+/// The `folding_range` response: the buffer's folding ranges.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FoldingRangesResult {
+    pub ranges: Vec<FoldingRange>,
+}
+
+impl FoldingRangesResult {
+    pub fn encode(&self) -> Result<Vec<u8>, AbiError> {
+        let mut w = Writer::new();
+        w.count(self.ranges.len());
+        for folding in &self.ranges {
+            folding.range.write(&mut w);
+            w.i32(folding.kind);
+        }
+        w.finish(KIND_FOLDING_RANGES)
+    }
+
+    pub fn decode(buf: &[u8]) -> Result<FoldingRangesResult, AbiError> {
+        let mut r = Reader::new(buf, KIND_FOLDING_RANGES)?;
+        let n = r.count()?;
+        let mut ranges = Vec::with_capacity(n);
+        for _ in 0..n {
+            let range = Rng::read(&mut r)?;
+            let kind = r.i32()?;
+            ranges.push(FoldingRange { range, kind });
+        }
+        r.finish()?;
+        Ok(FoldingRangesResult { ranges })
+    }
+}
+
+/// The `definition_source_toplevels` callback response: the toplevel SemanticDB
+/// symbols of the resolved definition source (mirrors [`LocationsResult`]'s
+/// shape for the definition callback).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ToplevelsResult {
+    pub symbols: Vec<String>,
+}
+
+impl ToplevelsResult {
+    pub fn encode(&self) -> Result<Vec<u8>, AbiError> {
+        let mut w = Writer::new();
+        write_str_list(&mut w, &self.symbols);
+        w.finish(KIND_TOPLEVELS)
+    }
+
+    pub fn decode(buf: &[u8]) -> Result<ToplevelsResult, AbiError> {
+        let mut r = Reader::new(buf, KIND_TOPLEVELS)?;
+        let symbols = read_str_list(&mut r)?;
+        r.finish()?;
+        Ok(ToplevelsResult { symbols })
     }
 }

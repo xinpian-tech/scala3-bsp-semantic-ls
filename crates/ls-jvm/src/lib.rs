@@ -34,7 +34,7 @@ use std::time::{Duration, Instant};
 
 use ls_pc_abi::abi::{LsBuf, LsStr};
 use ls_pc_abi::memory::{abi_alloc, abi_free, write_response};
-use ls_pc_abi::payloads::{LocationsResult, MethodHitsResult};
+use ls_pc_abi::payloads::{LocationsResult, MethodHitsResult, ToplevelsResult};
 use ls_pc_abi::{
     PcVtable, RustVtable, ABI_VERSION, LAYOUT_CANARY, STATUS_ABI_MISMATCH, STATUS_ALLOC,
     STATUS_BAD_ARG, STATUS_INTERNAL, STATUS_OK, STATUS_PANIC,
@@ -100,6 +100,29 @@ static SEARCH_METHODS_RESOLVER: OnceLock<Box<SearchMethodsResolver>> = OnceLock:
 /// empty method-hits buffer.
 pub fn install_search_methods_resolver(resolver: Box<SearchMethodsResolver>) {
     let _ = SEARCH_METHODS_RESOLVER.set(resolver);
+}
+
+/// The island's toplevel-symbol resolver behind the PC `SymbolSearch.
+/// definitionSourceToplevels` seam: `(semanticdb_symbol, source_uri) ->
+/// toplevel symbols of the resolved definition source`. Read-only and
+/// snapshot-backed like the other two callbacks; the server installs one over
+/// the immutable index snapshot before boot. (The engine query behind it lands
+/// with the feature task — until then the server may install nothing and the
+/// callback answers empty, exactly as `search_methods` did before its engine
+/// landed.)
+pub type DefinitionSourceToplevelsResolver = dyn Fn(&str, &str) -> ToplevelsResult + Send + Sync;
+
+static DEFINITION_SOURCE_TOPLEVELS_RESOLVER: OnceLock<Box<DefinitionSourceToplevelsResolver>> =
+    OnceLock::new();
+
+/// Install the resolver the island downcalls for definition-source toplevels.
+/// Idempotent per process, exactly like
+/// [`install_symbol_definition_resolver`]. Without one, the callback answers an
+/// empty toplevels buffer.
+pub fn install_definition_source_toplevels_resolver(
+    resolver: Box<DefinitionSourceToplevelsResolver>,
+) {
+    let _ = DEFINITION_SOURCE_TOPLEVELS_RESOLVER.set(resolver);
 }
 
 fn rendezvous() -> &'static Rendezvous {
@@ -210,6 +233,39 @@ unsafe extern "C" fn vt_search_methods(query: LsStr, bsp_target_id: LsStr, out: 
     }
 }
 
+/// Index-backed toplevel-symbol callback (the `SymbolSearch.
+/// definitionSourceToplevels` seam). Decodes the incoming SemanticDB symbol +
+/// defining `file://` uri, runs the installed resolver (an empty response when
+/// none is wired), and writes an encoded `ToplevelsResult` into `out`. Rust
+/// owns the response buffer; the island frees it through the `free` slot.
+unsafe extern "C" fn vt_definition_source_toplevels(
+    symbol: LsStr,
+    source_uri: LsStr,
+    out: *mut LsBuf,
+) -> i32 {
+    match std::panic::catch_unwind(|| {
+        let symbol = match read_utf8_strict(symbol.ptr, symbol.len) {
+            Ok(s) => s,
+            Err(status) => return status,
+        };
+        let source_uri = match read_utf8_strict(source_uri.ptr, source_uri.len) {
+            Ok(s) => s,
+            Err(status) => return status,
+        };
+        run_toplevels_resolver(
+            DEFINITION_SOURCE_TOPLEVELS_RESOLVER
+                .get()
+                .map(|r| r.as_ref()),
+            &symbol,
+            &source_uri,
+            out,
+        )
+    }) {
+        Ok(status) => status,
+        Err(_) => STATUS_PANIC,
+    }
+}
+
 /// Validates an incoming PC vtable registration: non-null pointer, matching ABI
 /// version, and every op slot a non-null function pointer. Split out so the
 /// registration contract is unit-tested directly.
@@ -230,7 +286,7 @@ fn validate_pc_registration(pc: *const PcVtable) -> i32 {
 }
 
 /// Every PC vtable op slot must be a non-null function pointer. The island builds
-/// all 15 upcall stubs, so a null slot means a malformed registration; reject it
+/// all 22 upcall stubs, so a null slot means a malformed registration; reject it
 /// here rather than reading a null `fn`-typed field later (which is UB). Slots
 /// are read as raw pointer bits — never materialized as an invalid `fn` value.
 fn all_pc_slots_non_null(pc: *const PcVtable) -> bool {
@@ -361,6 +417,48 @@ fn run_search_resolver(
     }
 }
 
+/// Runs the toplevels resolver (if any) and writes an encoded
+/// `ToplevelsResult` into `out`, with the same containment contract as
+/// [`run_resolver`]: a missing resolver answers empty symbols, a panicking
+/// resolver is contained to `STATUS_PANIC`, a null `out` is `STATUS_BAD_ARG`,
+/// and an allocation failure is `STATUS_ALLOC`. Split out so the containment
+/// contract is unit-tested without booting a JVM.
+fn run_toplevels_resolver(
+    resolver: Option<&DefinitionSourceToplevelsResolver>,
+    symbol: &str,
+    source_uri: &str,
+    out: *mut LsBuf,
+) -> i32 {
+    if out.is_null() {
+        return STATUS_BAD_ARG;
+    }
+    let result = match resolver {
+        None => ToplevelsResult {
+            symbols: Vec::new(),
+        },
+        Some(resolve) => {
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                resolve(symbol, source_uri)
+            })) {
+                Ok(result) => result,
+                Err(_) => return STATUS_PANIC,
+            }
+        }
+    };
+    let payload = match result.encode() {
+        Ok(bytes) => bytes,
+        // A response too large to represent in the ABI is an internal failure,
+        // not a truncated buffer handed across the boundary.
+        Err(_) => return STATUS_INTERNAL,
+    };
+    // SAFETY: `out` is a valid writable `LsBuf` for the call (checked non-null).
+    if unsafe { write_response(&payload, out) } {
+        STATUS_OK
+    } else {
+        STATUS_ALLOC
+    }
+}
+
 fn read_utf8(ptr: *const u8, len: u32) -> String {
     if ptr.is_null() || len == 0 {
         return String::new();
@@ -396,6 +494,7 @@ static RUST_VTABLE: RustVtable = RustVtable {
     pc_dispatch_loop: vt_pc_dispatch_loop,
     symbol_definition: vt_symbol_definition,
     search_methods: vt_search_methods,
+    definition_source_toplevels: vt_definition_source_toplevels,
 };
 
 // ---------------------------------------------------------------------------
@@ -491,6 +590,18 @@ fn wait_for_registration(timeout: Duration) -> Result<(), BootError> {
 mod tests {
     use super::*;
 
+    /// Serializes the tests that allocate through `write_response`: the three
+    /// resolver families assert the global live-allocation counter, so a
+    /// concurrent allocation from a sibling test would flake the accounting.
+    /// Poison-resilient so a failed assertion cannot wedge the others.
+    fn alloc_serial() -> std::sync::MutexGuard<'static, ()> {
+        static SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
+        SERIAL
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
     #[test]
     fn read_utf8_handles_null_and_bytes() {
         assert_eq!(read_utf8(std::ptr::null(), 5), "");
@@ -534,6 +645,29 @@ mod tests {
     }
 
     #[test]
+    fn vt_definition_source_toplevels_rejects_a_null_argument_pointer() {
+        // Same containment contract as the other two callbacks: a borrowed
+        // argument with a null pointer + positive length maps to a typed
+        // bad-arg status.
+        let mut out = LsBuf {
+            ptr: std::ptr::null_mut(),
+            len: 0,
+        };
+        let bad = LsStr {
+            ptr: std::ptr::null(),
+            len: 5,
+        };
+        let empty = LsStr {
+            ptr: std::ptr::null(),
+            len: 0,
+        };
+        // SAFETY: `out` is a valid writable LsBuf; the args are borrowed structs.
+        let status =
+            unsafe { vt_definition_source_toplevels(bad, empty, std::ptr::addr_of_mut!(out)) };
+        assert_eq!(status, STATUS_BAD_ARG);
+    }
+
+    #[test]
     fn vt_symbol_definition_rejects_a_null_argument_pointer() {
         // A borrowed argument with a null pointer + positive length must map to a
         // typed bad-arg status, not silently resolve for an empty symbol.
@@ -565,7 +699,7 @@ mod tests {
             validate_pc_registration(raw.as_ptr() as *const PcVtable),
             STATUS_OK
         );
-        raw[words - 1] = 0; // null the last op slot (spawn_dispatch)
+        raw[words - 1] = 0; // null the last op slot (folding_range)
         assert_eq!(
             validate_pc_registration(raw.as_ptr() as *const PcVtable),
             STATUS_BAD_ARG
@@ -635,6 +769,7 @@ mod tests {
 
     #[test]
     fn run_resolver_rejects_null_out_and_answers_empty_without_a_resolver() {
+        let _serial = alloc_serial();
         assert_eq!(
             run_resolver(None, "sym", "uri", std::ptr::null_mut()),
             STATUS_BAD_ARG
@@ -654,6 +789,7 @@ mod tests {
 
     #[test]
     fn run_resolver_writes_the_resolved_locations_and_frees_clean() {
+        let _serial = alloc_serial();
         use ls_pc_abi::payloads::{origin, Location, Rng};
 
         let seen = Arc::new(Mutex::new(None));
@@ -719,6 +855,7 @@ mod tests {
 
     #[test]
     fn run_search_resolver_rejects_null_out_and_answers_empty_without_a_resolver() {
+        let _serial = alloc_serial();
         assert_eq!(
             run_search_resolver(None, "incr", "root/t", std::ptr::null_mut()),
             STATUS_BAD_ARG
@@ -738,6 +875,7 @@ mod tests {
 
     #[test]
     fn run_search_resolver_writes_the_resolved_hits_and_frees_clean() {
+        let _serial = alloc_serial();
         use ls_pc_abi::payloads::{MethodHit, Rng};
 
         let seen = Arc::new(Mutex::new(None));
@@ -788,6 +926,105 @@ mod tests {
             ls_pc_abi::memory::live_allocations(),
             before,
             "the response buffer is freed"
+        );
+    }
+
+    fn decode_toplevels_out(out: &LsBuf) -> ToplevelsResult {
+        let bytes = if out.ptr.is_null() || out.len == 0 {
+            Vec::new()
+        } else {
+            // SAFETY: a successful `write_response` left `ptr`/`len` valid.
+            unsafe { std::slice::from_raw_parts(out.ptr, out.len as usize).to_vec() }
+        };
+        ToplevelsResult::decode(&bytes).expect("decode toplevels")
+    }
+
+    #[test]
+    fn run_toplevels_resolver_rejects_null_out_and_answers_empty_without_a_resolver() {
+        let _serial = alloc_serial();
+        assert_eq!(
+            run_toplevels_resolver(None, "pkg/A#", "file:///w/A.scala", std::ptr::null_mut()),
+            STATUS_BAD_ARG
+        );
+        let mut out = LsBuf {
+            ptr: std::ptr::dangling_mut::<u8>(),
+            len: 7,
+        };
+        assert_eq!(
+            run_toplevels_resolver(
+                None,
+                "pkg/A#",
+                "file:///w/A.scala",
+                std::ptr::addr_of_mut!(out)
+            ),
+            STATUS_OK
+        );
+        // With no resolver the response is a decodable empty toplevels buffer.
+        assert!(decode_toplevels_out(&out).symbols.is_empty());
+        free_out(&mut out);
+    }
+
+    #[test]
+    fn run_toplevels_resolver_writes_the_resolved_symbols_and_frees_clean() {
+        let _serial = alloc_serial();
+        let seen = Arc::new(Mutex::new(None));
+        let captured = seen.clone();
+        let resolver: Box<DefinitionSourceToplevelsResolver> =
+            Box::new(move |symbol: &str, source_uri: &str| {
+                *captured.lock().unwrap() = Some((symbol.to_string(), source_uri.to_string()));
+                ToplevelsResult {
+                    symbols: vec!["a/b/Main.".to_string(), "a/b/Main#".to_string()],
+                }
+            });
+
+        let before = ls_pc_abi::memory::live_allocations();
+        let mut out = LsBuf {
+            ptr: std::ptr::null_mut(),
+            len: 0,
+        };
+        assert_eq!(
+            run_toplevels_resolver(
+                Some(resolver.as_ref()),
+                "a/b/Main#",
+                "file:///w/Main.scala",
+                std::ptr::addr_of_mut!(out),
+            ),
+            STATUS_OK
+        );
+        // The resolver saw exactly the decoded arguments.
+        assert_eq!(
+            *seen.lock().unwrap(),
+            Some(("a/b/Main#".to_string(), "file:///w/Main.scala".to_string()))
+        );
+        let decoded = decode_toplevels_out(&out);
+        assert_eq!(
+            decoded.symbols,
+            vec!["a/b/Main.".to_string(), "a/b/Main#".to_string()]
+        );
+        free_out(&mut out);
+        assert_eq!(
+            ls_pc_abi::memory::live_allocations(),
+            before,
+            "the response buffer is freed"
+        );
+    }
+
+    #[test]
+    fn run_toplevels_resolver_contains_a_panicking_resolver() {
+        let resolver: Box<DefinitionSourceToplevelsResolver> =
+            Box::new(|_: &str, _: &str| panic!("boom in the toplevels resolver"));
+        let mut out = LsBuf {
+            ptr: std::ptr::dangling_mut::<u8>(),
+            len: 9,
+        };
+        assert_eq!(
+            run_toplevels_resolver(
+                Some(resolver.as_ref()),
+                "sym",
+                "uri",
+                std::ptr::addr_of_mut!(out),
+            ),
+            STATUS_PANIC
         );
     }
 
@@ -859,6 +1096,9 @@ mod tests {
         unsafe extern "C" fn spawn(_g: u32) -> i32 {
             STATUS_OK
         }
+        unsafe extern "C" fn payload_query(_p: *const u8, _l: u32, _o: *mut LsBuf) -> i32 {
+            STATUS_OK
+        }
 
         PcVtable {
             abi_version: ABI_VERSION,
@@ -877,6 +1117,13 @@ mod tests {
             restart_instances: void_op,
             shutdown: void_op,
             spawn_dispatch: spawn,
+            inlay_hints: payload_query,
+            semantic_tokens: payload_query,
+            selection_range: payload_query,
+            code_action: payload_query,
+            auto_imports: payload_query,
+            pc_diagnostics: payload_query,
+            folding_range: payload_query,
         }
     }
 }

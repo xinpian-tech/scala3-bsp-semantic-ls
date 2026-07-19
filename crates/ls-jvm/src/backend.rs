@@ -27,7 +27,7 @@ use ls_pc_abi::payloads::{DidChangeParams, DidOpenParams};
 use ls_pc_abi::{abi_len, AbiError, STATUS_INTERNAL, STATUS_OK, STATUS_PANIC};
 
 use crate::mirror::ReplayPlan;
-use crate::watchdog::{DispatchOutcome, PcBackend, PcRequest, QueryKind};
+use crate::watchdog::{DispatchOutcome, PayloadQueryKind, PcBackend, PcRequest, QueryKind};
 
 // ---------------------------------------------------------------------------
 // Vtable-slot invocation (all response memory is Rust-owned and freed here).
@@ -181,6 +181,26 @@ fn invoke_dispatch_inner(pc: &PcVtable, request: &PcRequest) -> Result<OpOutcome
             let mut out = empty_buf();
             // SAFETY: `uri` outlives the call; `out` is a valid out-param.
             let status = unsafe { slot(arg, *line, *character, &mut out) };
+            OpOutcome {
+                status,
+                out: take_response(out),
+            }
+        }
+        PcRequest::PayloadQuery { kind, params } => {
+            let slot = match kind {
+                PayloadQueryKind::InlayHints => pc.inlay_hints,
+                PayloadQueryKind::SemanticTokens => pc.semantic_tokens,
+                PayloadQueryKind::SelectionRange => pc.selection_range,
+                PayloadQueryKind::CodeAction => pc.code_action,
+                PayloadQueryKind::AutoImports => pc.auto_imports,
+                PayloadQueryKind::PcDiagnostics => pc.pc_diagnostics,
+                PayloadQueryKind::FoldingRange => pc.folding_range,
+            };
+            let len = abi_len(params.len()).map_err(|_| STATUS_INTERNAL)?;
+            let mut out = empty_buf();
+            // SAFETY: `params` outlives the call via `request`; `out` is a valid
+            // out-param.
+            let status = unsafe { slot(params.as_ptr(), len, &mut out) };
             OpOutcome {
                 status,
                 out: take_response(out),
@@ -591,6 +611,9 @@ mod tests {
         calls: Vec<&'static str>,
         completion_response: Vec<u8>,
         completion_status: i32,
+        /// Status every payload-query slot answers (params are echoed back on
+        /// `STATUS_OK`; the NOT_YET stub answer is exercised by setting this).
+        payload_status: i32,
         wedge_completion: bool,
         unwedged: bool,
         restart_unwedges: bool,
@@ -609,6 +632,7 @@ mod tests {
                 calls: Vec::new(),
                 completion_response: Vec::new(),
                 completion_status: STATUS_OK,
+                payload_status: STATUS_OK,
                 wedge_completion: false,
                 unwedged: false,
                 restart_unwedges: false,
@@ -753,6 +777,45 @@ mod tests {
         guard().spawn_status
     }
 
+    /// Shared payload-query stub body: record the slot name, then on
+    /// `STATUS_OK` echo the request payload back as the response (proving both
+    /// directions marshal through the slot).
+    fn payload_stub(name: &'static str, p: *const u8, l: u32, out: *mut LsBuf) -> i32 {
+        let status = {
+            let mut s = guard();
+            s.calls.push(name);
+            s.payload_status
+        };
+        if status == STATUS_OK && !p.is_null() {
+            // SAFETY: the backend passes a valid `p`/`l` request buffer.
+            let bytes = unsafe { std::slice::from_raw_parts(p, l as usize) }.to_vec();
+            write_out(out, &bytes);
+        }
+        status
+    }
+
+    unsafe extern "C" fn s_inlay_hints(p: *const u8, l: u32, o: *mut LsBuf) -> i32 {
+        payload_stub("inlay_hints", p, l, o)
+    }
+    unsafe extern "C" fn s_semantic_tokens(p: *const u8, l: u32, o: *mut LsBuf) -> i32 {
+        payload_stub("semantic_tokens", p, l, o)
+    }
+    unsafe extern "C" fn s_selection_range(p: *const u8, l: u32, o: *mut LsBuf) -> i32 {
+        payload_stub("selection_range", p, l, o)
+    }
+    unsafe extern "C" fn s_code_action(p: *const u8, l: u32, o: *mut LsBuf) -> i32 {
+        payload_stub("code_action", p, l, o)
+    }
+    unsafe extern "C" fn s_auto_imports(p: *const u8, l: u32, o: *mut LsBuf) -> i32 {
+        payload_stub("auto_imports", p, l, o)
+    }
+    unsafe extern "C" fn s_pc_diagnostics(p: *const u8, l: u32, o: *mut LsBuf) -> i32 {
+        payload_stub("pc_diagnostics", p, l, o)
+    }
+    unsafe extern "C" fn s_folding_range(p: *const u8, l: u32, o: *mut LsBuf) -> i32 {
+        payload_stub("folding_range", p, l, o)
+    }
+
     fn stub_vtable() -> NonNull<PcVtable> {
         let vt = PcVtable {
             abi_version: ls_pc_abi::ABI_VERSION,
@@ -771,6 +834,13 @@ mod tests {
             restart_instances: s_restart_instances,
             shutdown: s_shutdown,
             spawn_dispatch: s_spawn_dispatch,
+            inlay_hints: s_inlay_hints,
+            semantic_tokens: s_semantic_tokens,
+            selection_range: s_selection_range,
+            code_action: s_code_action,
+            auto_imports: s_auto_imports,
+            pc_diagnostics: s_pc_diagnostics,
+            folding_range: s_folding_range,
         };
         NonNull::from(Box::leak(Box::new(vt)))
     }
@@ -866,6 +936,52 @@ mod tests {
         // A nonzero PC status is a typed error, not a wedge.
         guard().completion_status = -4;
         assert_eq!(sup.request(query()), Err(PcError::Backend(-4)));
+        assert_eq!(sup.generation(), 0);
+        assert!(!sup.is_fatal());
+    }
+
+    #[test]
+    fn payload_query_ops_route_to_their_slots_and_surface_the_stub_status() {
+        let _serial = serial_guard();
+        *guard() = StubState::reset();
+
+        let mut sup = supervisor(start_runtime());
+
+        // Each payload-query kind invokes exactly its slot, the encoded params
+        // buffer marshals through unchanged (the stub echoes it back), and the
+        // ops serialize on the single dispatch worker in submission order.
+        let lanes: [(PayloadQueryKind, &str); 7] = [
+            (PayloadQueryKind::InlayHints, "inlay_hints"),
+            (PayloadQueryKind::SemanticTokens, "semantic_tokens"),
+            (PayloadQueryKind::SelectionRange, "selection_range"),
+            (PayloadQueryKind::CodeAction, "code_action"),
+            (PayloadQueryKind::AutoImports, "auto_imports"),
+            (PayloadQueryKind::PcDiagnostics, "pc_diagnostics"),
+            (PayloadQueryKind::FoldingRange, "folding_range"),
+        ];
+        for (index, (kind, _)) in lanes.iter().enumerate() {
+            let params = vec![index as u8, 0xab, 0xcd];
+            assert_eq!(
+                sup.request(PcRequest::PayloadQuery {
+                    kind: *kind,
+                    params: params.clone(),
+                }),
+                Ok(params)
+            );
+        }
+        let expected: Vec<&str> = lanes.iter().map(|(_, name)| *name).collect();
+        assert_eq!(calls(), expected);
+
+        // The transport-stub NOT_YET answer is a typed backend error, not a
+        // wedge: no recovery, no generation advance.
+        guard().payload_status = ls_pc_abi::STATUS_NOT_YET;
+        assert_eq!(
+            sup.request(PcRequest::PayloadQuery {
+                kind: PayloadQueryKind::InlayHints,
+                params: vec![7],
+            }),
+            Err(PcError::Backend(ls_pc_abi::STATUS_NOT_YET))
+        );
         assert_eq!(sup.generation(), 0);
         assert!(!sup.is_fatal());
     }

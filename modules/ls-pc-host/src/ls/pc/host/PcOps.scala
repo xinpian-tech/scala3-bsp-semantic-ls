@@ -2,7 +2,18 @@ package ls.pc.host
 
 import org.eclipse.lsp4j as l
 
-import ls.pc.{DefinitionResult as SpiDefinitionResult, PcFacade, PcPluginStatusReport, PcTargetConfig}
+import ls.pc.{
+  DefinitionResult as SpiDefinitionResult,
+  PcAutoImport,
+  PcCodeActionResult,
+  PcFacade,
+  PcFoldingRange,
+  PcInlayHint,
+  PcNotYetSupported,
+  PcPluginStatusReport,
+  PcSemanticNode,
+  PcTargetConfig
+}
 
 /** The presentation-compiler operations the boundary op seam drives, as a thin
   * interface over [[ls.pc.PcFacade]]. Isolating the facade behind this seam lets
@@ -25,6 +36,23 @@ trait PcOps:
   def pluginStatus: PcPluginStatusReport
   def restartInstances(): Unit
   def shutdown(): Unit
+
+  // ABI v2 payload-query ops. Providers land with the feature task; until then
+  // the facade adapter surfaces the typed [[PcNotYetSupported]] stub answer,
+  // which the boundary runtime maps to `STATUS_NOT_YET`.
+  def inlayHints(uri: String, range: l.Range, flags: Int): Vector[PcInlayHint]
+  def semanticTokens(uri: String): Vector[PcSemanticNode]
+  def selectionRanges(uri: String, positions: Vector[l.Position]): Vector[Vector[l.Range]]
+  def codeAction(
+      uri: String,
+      actionId: Int,
+      position: l.Position,
+      extractionEnd: Option[l.Position],
+      argIndices: Option[Vector[Int]]
+  ): PcCodeActionResult
+  def autoImports(uri: String, position: l.Position, name: String, isExtension: Boolean): Vector[PcAutoImport]
+  def pcDiagnostics(uri: String): Vector[l.Diagnostic]
+  def foldingRanges(uri: String): Vector[PcFoldingRange]
 
 /** Adapts the retained in-process [[PcFacade]] to [[PcOps]]. `restartInstances`
   * disposes every live target instance (each lazily recreated on its next
@@ -53,6 +81,28 @@ final class FacadePcOps(facade: PcFacade) extends PcOps:
   def pluginStatus: PcPluginStatusReport = facade.pluginStatus
   def restartInstances(): Unit = facade.activeTargets.foreach(facade.restartTarget)
   def shutdown(): Unit = facade.shutdown()
+
+  // ABI v2 payload-query ops: pure delegation to the facade's typed stubs
+  // (each throws [[PcNotYetSupported]] until its provider lands with the
+  // feature task). `pcDiagnostics` throws here directly — the facade already
+  // has a working `diagnostics(uri)` the provider task will route through.
+  def inlayHints(uri: String, range: l.Range, flags: Int): Vector[PcInlayHint] =
+    facade.inlayHints(uri, range, flags)
+  def semanticTokens(uri: String): Vector[PcSemanticNode] = facade.semanticTokens(uri)
+  def selectionRanges(uri: String, positions: Vector[l.Position]): Vector[Vector[l.Range]] =
+    facade.selectionRanges(uri, positions)
+  def codeAction(
+      uri: String,
+      actionId: Int,
+      position: l.Position,
+      extractionEnd: Option[l.Position],
+      argIndices: Option[Vector[Int]]
+  ): PcCodeActionResult =
+    facade.codeAction(uri, actionId, position, extractionEnd, argIndices)
+  def autoImports(uri: String, position: l.Position, name: String, isExtension: Boolean): Vector[PcAutoImport] =
+    facade.autoImports(uri, position, name, isExtension)
+  def pcDiagnostics(uri: String): Vector[l.Diagnostic] = throw PcNotYetSupported("pcDiagnostics")
+  def foldingRanges(uri: String): Vector[PcFoldingRange] = facade.foldingRanges(uri)
 
 /** Test-only dispatch-lane fault injection, controlled by the
   * `ls.pc.host.testFault` JVM system property (unset in production → a no-op).

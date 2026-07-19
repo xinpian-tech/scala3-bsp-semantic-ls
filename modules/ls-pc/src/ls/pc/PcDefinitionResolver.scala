@@ -59,6 +59,15 @@ trait PcDefinitionResolver:
   def searchMethods(query: String, buildTargetIdentifier: String): Vector[WorkspaceMethodHit] =
     Vector.empty
 
+  /** Toplevel SemanticDB symbols of the source that defines `semanticdbSymbol`
+    * (the PC asks through `SymbolSearch.definitionSourceToplevels` when it
+    * needs the companion structure of a definition source). `sourceUri` is the
+    * definition source's `file://` uri. Must never throw; the default answers
+    * empty so index-less embedders keep the previous no-toplevels behavior.
+    */
+  def definitionSourceToplevels(semanticdbSymbol: String, sourceUri: String): Vector[String] =
+    Vector.empty
+
 object PcDefinitionResolver:
   /** Default no-op resolver: cross-file definition stays empty, exactly the
     * behavior of the PC's built-in `EmptySymbolSearch`.
@@ -76,6 +85,8 @@ object PcDefinitionResolver:
   *     `classpath` — a pure island-local lookup, no index involved;
   *   - `searchMethods` (member-mode workspace extension-method discovery)
   *     forwards the resolver's [[WorkspaceMethodHit]]s to the visitor;
+  *   - `definitionSourceToplevels` routes to the resolver (the definition
+  *     source's toplevel symbols, answered from the index over the boundary);
   *   - documentation stays empty like the PC's `EmptySymbolSearch`.
   *
   * The classpath index is built lazily on first `search` and is expensive:
@@ -106,7 +117,15 @@ final class IndexBackedSymbolSearch(
     catch case NonFatal(_) => java.util.Collections.emptyList()
 
   override def definitionSourceToplevels(symbol: String, sourceUri: URI): java.util.List[String] =
-    java.util.Collections.emptyList()
+    try
+      val symbols = resolver.definitionSourceToplevels(
+        if symbol == null then "" else symbol,
+        if sourceUri == null then "" else sourceUri.toString
+      )
+      val out = new java.util.ArrayList[String](symbols.length)
+      symbols.foreach(out.add)
+      out
+    catch case NonFatal(_) => java.util.Collections.emptyList()
 
   override def documentation(symbol: String, parents: ParentSymbols): Optional[SymbolDocumentation] =
     Optional.empty()

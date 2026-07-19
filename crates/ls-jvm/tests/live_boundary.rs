@@ -1,6 +1,6 @@
 //! Live embedded-island integration: boots the PRODUCTION island
 //! (`boot_island`) with the real PC-host assembly against a real JVM and drives
-//! the full PC operation surface through the 15-slot vtable to a **live Scala
+//! the full PC operation surface through the 22-slot vtable to a **live Scala
 //! presentation compiler**. This exercises the production boundary end-to-end —
 //! boot + registration, the flat-codec round-trip for every payload, and
 //! loaned-thread dispatch/control — against a real compiler, not the spike echo

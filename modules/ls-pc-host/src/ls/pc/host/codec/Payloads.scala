@@ -8,9 +8,12 @@ import ls.pc.host.codec.Codec.{Reader, Writer}
   * the island consumes (`register_target`/`did_open`/`did_change`/position/
   * resolve), the carrier-free responses it produces (`hover`/`definition`/
   * `type_definition`/`prepare_rename`/`plugin_status` and the
-  * `symbol_definition`/`search_methods` callbacks), and the LSP4J-carrier
-  * responses (`completion`/`completion_resolve`/`signature_help`) at the
-  * resolved LSP4J 1.0.0 field surface. All 14 payload kinds are implemented
+  * `symbol_definition`/`search_methods`/`definition_source_toplevels`
+  * callbacks), the LSP4J-carrier responses
+  * (`completion`/`completion_resolve`/`signature_help`) at the resolved LSP4J
+  * 1.0.0 field surface, and the ABI v2 payload-query carriers (`inlay_hints`/
+  * `semantic_tokens`/`selection_range`/`code_action`/`auto_imports`/
+  * `pc_diagnostics`/`folding_range`). All 27 payload kinds are implemented
   * below.
   */
 object Payloads:
@@ -29,12 +32,44 @@ object Payloads:
   val KindPluginStatus: Int = 12
   val KindLocations: Int = 13
   val KindMethodHits: Int = 14
+  val KindInlayHintParams: Int = 15
+  val KindInlayHints: Int = 16
+  val KindUriParams: Int = 17
+  val KindSemanticTokens: Int = 18
+  val KindSelectionRangeParams: Int = 19
+  val KindSelectionRanges: Int = 20
+  val KindCodeActionParams: Int = 21
+  val KindCodeActionEdits: Int = 22
+  val KindAutoImportParams: Int = 23
+  val KindAutoImports: Int = 24
+  val KindPcDiagnostics: Int = 25
+  val KindFoldingRanges: Int = 26
+  val KindToplevels: Int = 27
 
   /** `DefinitionOrigin` ordinals (mirror the Scala `enum DefinitionOrigin`). */
   object Origin:
     val Workspace: Int = 0
     val Synthetic: Int = 1
     val Plugin: Int = 2
+
+  /** `code_action` action ids (mirror the Rust `code_action_id` constants). */
+  object CodeActionId:
+    val ConvertToNamedArguments: Int = 0
+    val ImplementAbstractMembers: Int = 1
+    val ExtractMethod: Int = 2
+    val InlineValue: Int = 3
+    val InsertInferredType: Int = 4
+    val InsertInferredMethod: Int = 5
+    val ConvertToNamedLambdaParameters: Int = 6
+
+  /** `folding_range` kind ordinals (mirror the Rust `folding_kind` constants;
+    * `None` means the range carries no LSP folding kind).
+    */
+  object FoldingKind:
+    val None: Int = 0
+    val Comment: Int = 1
+    val Imports: Int = 2
+    val Region: Int = 3
 
   // -------------------------------------------------------------------------
   // Shared value types.
@@ -63,6 +98,36 @@ object Payloads:
       val present = r.u32()
       val rng = read(r)
       if present == 0 then None else Some(rng)
+
+  /** A zero-based `line`/`character` position (UTF-16 code units, as LSP). */
+  final case class Pos(line: Int, character: Int)
+
+  object Pos:
+    def write(w: Writer, p: Pos): Unit =
+      w.u32(p.line)
+      w.u32(p.character)
+
+    def read(r: Reader): Pos =
+      val line = r.u32()
+      val character = r.u32()
+      Pos(line, character)
+
+    /** Fixed-shape optional (mirrors [[Rng.writeOpt]]): a presence flag then
+      * the two words, zeroed when absent.
+      */
+    def writeOpt(w: Writer, pos: Option[Pos]): Unit = pos match
+      case Some(p) =>
+        w.u32(1)
+        write(w, p)
+      case None =>
+        w.u32(0)
+        w.u32(0)
+        w.u32(0)
+
+    def readOpt(r: Reader): Option[Pos] =
+      val present = r.u32()
+      val pos = read(r)
+      if present == 0 then None else Some(pos)
 
   /** A definition/reference location plus its `DefinitionOrigin` ordinal. */
   final case class Location(uri: String, range: Rng, origin: Int)
@@ -901,3 +966,443 @@ object Payloads:
       val activeParameter = r.optI32()
       r.finish()
       SignatureHelp(signatures.result(), activeSignature, activeParameter)
+
+  // -------------------------------------------------------------------------
+  // Payload-query ops (ABI v2): inlay hints, semantic tokens, selection
+  // ranges, code actions, auto-imports, PC diagnostics, folding ranges — plus
+  // the `definition_source_toplevels` callback response. Byte-for-byte mirrors
+  // of the Rust `payloads` additions.
+  // -------------------------------------------------------------------------
+
+  private def writeTextEditList(w: Writer, edits: Seq[TextEdit]): Unit =
+    w.u32(edits.length)
+    edits.foreach(TextEdit.write(w, _))
+
+  private def readTextEditList(r: Reader): Seq[TextEdit] =
+    val n = r.count()
+    val out = Vector.newBuilder[TextEdit]
+    var i = 0
+    while i < n do
+      out += TextEdit.read(r)
+      i += 1
+    out.result()
+
+  /** `inlay_hints` params: the buffer, the requested range, and a flags bitset
+    * (the provider's hint-category toggles; opaque to the transport).
+    */
+  final case class InlayHintParams(uri: String, range: Rng, flags: Int):
+    def encode(): Array[Byte] =
+      val w = Writer()
+      w.str(uri)
+      Rng.write(w, range)
+      w.u32(flags)
+      w.finish(KindInlayHintParams)
+
+  object InlayHintParams:
+    def decode(buf: Array[Byte]): InlayHintParams =
+      val r = Reader(buf, KindInlayHintParams)
+      val uri = r.str()
+      val range = Rng.read(r)
+      val flags = r.u32()
+      r.finish()
+      InlayHintParams(uri, range, flags)
+
+  /** One part of an inlay hint's label: the text, an optional target location
+    * (`(uri, range)` — no origin), and an optional tooltip string.
+    */
+  final case class InlayLabelPart(
+      text: String,
+      location: Option[(String, Rng)],
+      tooltip: Option[String]
+  )
+
+  object InlayLabelPart:
+    def write(w: Writer, p: InlayLabelPart): Unit =
+      w.str(p.text)
+      p.location match
+        case Some((uri, range)) =>
+          w.u32(1)
+          w.str(uri)
+          Rng.write(w, range)
+        case None => w.u32(0)
+      w.optStr(p.tooltip)
+
+    def read(r: Reader): InlayLabelPart =
+      val text = r.str()
+      val location =
+        if r.u32() != 0 then
+          val uri = r.str()
+          val range = Rng.read(r)
+          Some((uri, range))
+        else None
+      val tooltip = r.optStr()
+      InlayLabelPart(text, location, tooltip)
+
+  /** One inlay hint: position, label parts, the LSP `InlayHintKind` int, the
+    * padding flags, optional text edits, and opaque `data` bytes (the
+    * `CompletionItem.data` idiom — carried verbatim, never interpreted).
+    */
+  final case class InlayHint(
+      position: Pos,
+      labelParts: Seq[InlayLabelPart],
+      kind: Int,
+      paddingLeft: Boolean,
+      paddingRight: Boolean,
+      textEdits: Option[Seq[TextEdit]],
+      data: Option[Seq[Byte]]
+  )
+
+  object InlayHint:
+    def write(w: Writer, h: InlayHint): Unit =
+      Pos.write(w, h.position)
+      w.u32(h.labelParts.length)
+      h.labelParts.foreach(InlayLabelPart.write(w, _))
+      w.i32(h.kind)
+      w.bool32(h.paddingLeft)
+      w.bool32(h.paddingRight)
+      h.textEdits match
+        case Some(edits) =>
+          w.u32(1)
+          writeTextEditList(w, edits)
+        case None => w.u32(0)
+      w.optBytes(h.data.map(_.toArray))
+
+    def read(r: Reader): InlayHint =
+      val position = Pos.read(r)
+      val n = r.count()
+      val parts = Vector.newBuilder[InlayLabelPart]
+      var i = 0
+      while i < n do
+        parts += InlayLabelPart.read(r)
+        i += 1
+      val kind = r.i32()
+      val paddingLeft = r.bool32()
+      val paddingRight = r.bool32()
+      val textEdits = if r.u32() != 0 then Some(readTextEditList(r)) else None
+      val data = r.optBytes().map(_.toSeq)
+      InlayHint(position, parts.result(), kind, paddingLeft, paddingRight, textEdits, data)
+
+  /** The `inlay_hints` response: the hints for the requested range. */
+  final case class InlayHintsResult(hints: Seq[InlayHint]):
+    def encode(): Array[Byte] =
+      val w = Writer()
+      w.u32(hints.length)
+      hints.foreach(InlayHint.write(w, _))
+      w.finish(KindInlayHints)
+
+  object InlayHintsResult:
+    def decode(buf: Array[Byte]): InlayHintsResult =
+      val r = Reader(buf, KindInlayHints)
+      val n = r.count()
+      val hints = Vector.newBuilder[InlayHint]
+      var i = 0
+      while i < n do
+        hints += InlayHint.read(r)
+        i += 1
+      r.finish()
+      InlayHintsResult(hints.result())
+
+  /** A single-uri params payload (`semantic_tokens`/`pc_diagnostics`/
+    * `folding_range`).
+    */
+  final case class UriParams(uri: String):
+    def encode(): Array[Byte] =
+      val w = Writer()
+      w.str(uri)
+      w.finish(KindUriParams)
+
+  object UriParams:
+    def decode(buf: Array[Byte]): UriParams =
+      val r = Reader(buf, KindUriParams)
+      val uri = r.str()
+      r.finish()
+      UriParams(uri)
+
+  /** One semantic-tokens node: `[start, end)` UTF-16 offsets into the buffer
+    * text (offsets, not line/character — the Rust host converts), plus the
+    * token type and modifier bitset ints.
+    */
+  final case class SemanticNode(start: Int, end: Int, tokenType: Int, tokenModifier: Int)
+
+  /** The `semantic_tokens` response: the offset-based token nodes in buffer
+    * order.
+    */
+  final case class SemanticTokensResult(nodes: Seq[SemanticNode]):
+    def encode(): Array[Byte] =
+      val w = Writer()
+      w.u32(nodes.length)
+      nodes.foreach { n =>
+        w.u32(n.start)
+        w.u32(n.end)
+        w.i32(n.tokenType)
+        w.i32(n.tokenModifier)
+      }
+      w.finish(KindSemanticTokens)
+
+  object SemanticTokensResult:
+    def decode(buf: Array[Byte]): SemanticTokensResult =
+      val r = Reader(buf, KindSemanticTokens)
+      val n = r.count()
+      val nodes = Vector.newBuilder[SemanticNode]
+      var i = 0
+      while i < n do
+        val start = r.u32()
+        val end = r.u32()
+        val tokenType = r.i32()
+        val tokenModifier = r.i32()
+        nodes += SemanticNode(start, end, tokenType, tokenModifier)
+        i += 1
+      r.finish()
+      SemanticTokensResult(nodes.result())
+
+  /** `selection_range` params: the buffer and the query positions. */
+  final case class SelectionRangeParams(uri: String, positions: Seq[Pos]):
+    def encode(): Array[Byte] =
+      val w = Writer()
+      w.str(uri)
+      w.u32(positions.length)
+      positions.foreach(Pos.write(w, _))
+      w.finish(KindSelectionRangeParams)
+
+  object SelectionRangeParams:
+    def decode(buf: Array[Byte]): SelectionRangeParams =
+      val r = Reader(buf, KindSelectionRangeParams)
+      val uri = r.str()
+      val n = r.count()
+      val positions = Vector.newBuilder[Pos]
+      var i = 0
+      while i < n do
+        positions += Pos.read(r)
+        i += 1
+      r.finish()
+      SelectionRangeParams(uri, positions.result())
+
+  /** The `selection_range` response: per query position, the chain of
+    * enclosing ranges, innermost first.
+    */
+  final case class SelectionRangesResult(chains: Seq[Seq[Rng]]):
+    def encode(): Array[Byte] =
+      val w = Writer()
+      w.u32(chains.length)
+      chains.foreach { chain =>
+        w.u32(chain.length)
+        chain.foreach(Rng.write(w, _))
+      }
+      w.finish(KindSelectionRanges)
+
+  object SelectionRangesResult:
+    def decode(buf: Array[Byte]): SelectionRangesResult =
+      val r = Reader(buf, KindSelectionRanges)
+      val chainCount = r.count()
+      val chains = Vector.newBuilder[Seq[Rng]]
+      var i = 0
+      while i < chainCount do
+        val n = r.count()
+        val chain = Vector.newBuilder[Rng]
+        var j = 0
+        while j < n do
+          chain += Rng.read(r)
+          j += 1
+        chains += chain.result()
+        i += 1
+      r.finish()
+      SelectionRangesResult(chains.result())
+
+  /** `code_action` params: the buffer, the [[CodeActionId]] action, the cursor
+    * position, an optional extraction end (extract-method's selection end),
+    * and optional argument indices (convert-to-named-arguments).
+    */
+  final case class CodeActionParams(
+      uri: String,
+      action: Int,
+      position: Pos,
+      extractionEnd: Option[Pos],
+      argIndices: Option[Seq[Int]]
+  ):
+    def encode(): Array[Byte] =
+      val w = Writer()
+      w.str(uri)
+      w.i32(action)
+      Pos.write(w, position)
+      Pos.writeOpt(w, extractionEnd)
+      argIndices match
+        case Some(indices) =>
+          w.u32(1)
+          w.u32(indices.length)
+          indices.foreach(w.i32)
+        case None => w.u32(0)
+      w.finish(KindCodeActionParams)
+
+  object CodeActionParams:
+    def decode(buf: Array[Byte]): CodeActionParams =
+      val r = Reader(buf, KindCodeActionParams)
+      val uri = r.str()
+      val action = r.i32()
+      val position = Pos.read(r)
+      val extractionEnd = Pos.readOpt(r)
+      val argIndices =
+        if r.u32() != 0 then
+          val n = r.count()
+          val indices = Vector.newBuilder[Int]
+          var i = 0
+          while i < n do
+            indices += r.i32()
+            i += 1
+          Some(indices.result())
+        else None
+      r.finish()
+      CodeActionParams(uri, action, position, extractionEnd, argIndices)
+
+  /** The `code_action` response: the edits plus an optional typed refusal
+    * message (the `DisplayableException` carrier — a refusal is DATA on a
+    * `STATUS_OK` reply, not an error status).
+    */
+  final case class CodeActionResult(edits: Seq[TextEdit], refusal: Option[String]):
+    def encode(): Array[Byte] =
+      val w = Writer()
+      writeTextEditList(w, edits)
+      w.optStr(refusal)
+      w.finish(KindCodeActionEdits)
+
+  object CodeActionResult:
+    def decode(buf: Array[Byte]): CodeActionResult =
+      val r = Reader(buf, KindCodeActionEdits)
+      val edits = readTextEditList(r)
+      val refusal = r.optStr()
+      r.finish()
+      CodeActionResult(edits, refusal)
+
+  /** `auto_imports` params: the buffer, the cursor position, the name to
+    * import, and whether an extension-method import is requested.
+    */
+  final case class AutoImportParams(uri: String, position: Pos, name: String, isExtension: Boolean):
+    def encode(): Array[Byte] =
+      val w = Writer()
+      w.str(uri)
+      Pos.write(w, position)
+      w.str(name)
+      w.bool32(isExtension)
+      w.finish(KindAutoImportParams)
+
+  object AutoImportParams:
+    def decode(buf: Array[Byte]): AutoImportParams =
+      val r = Reader(buf, KindAutoImportParams)
+      val uri = r.str()
+      val position = Pos.read(r)
+      val name = r.str()
+      val isExtension = r.bool32()
+      r.finish()
+      AutoImportParams(uri, position, name, isExtension)
+
+  /** One auto-import candidate: the providing package, the edits that apply
+    * it, and optionally the imported SemanticDB symbol.
+    */
+  final case class AutoImport(packageName: String, edits: Seq[TextEdit], symbol: Option[String])
+
+  /** The `auto_imports` response: the candidates, best first. */
+  final case class AutoImportsResult(imports: Seq[AutoImport]):
+    def encode(): Array[Byte] =
+      val w = Writer()
+      w.u32(imports.length)
+      imports.foreach { imp =>
+        w.str(imp.packageName)
+        writeTextEditList(w, imp.edits)
+        w.optStr(imp.symbol)
+      }
+      w.finish(KindAutoImports)
+
+  object AutoImportsResult:
+    def decode(buf: Array[Byte]): AutoImportsResult =
+      val r = Reader(buf, KindAutoImports)
+      val n = r.count()
+      val imports = Vector.newBuilder[AutoImport]
+      var i = 0
+      while i < n do
+        val packageName = r.str()
+        val edits = readTextEditList(r)
+        val symbol = r.optStr()
+        imports += AutoImport(packageName, edits, symbol)
+        i += 1
+      r.finish()
+      AutoImportsResult(imports.result())
+
+  /** One presentation-compiler diagnostic (the reduced record the boundary
+    * carries: span, LSP severity int, code string, message).
+    */
+  final case class PcDiagnostic(range: Rng, severity: Int, code: String, message: String)
+
+  /** The `pc_diagnostics` response: the buffer's PC diagnostics in report
+    * order.
+    */
+  final case class PcDiagnosticsResult(diagnostics: Seq[PcDiagnostic]):
+    def encode(): Array[Byte] =
+      val w = Writer()
+      w.u32(diagnostics.length)
+      diagnostics.foreach { d =>
+        Rng.write(w, d.range)
+        w.i32(d.severity)
+        w.str(d.code)
+        w.str(d.message)
+      }
+      w.finish(KindPcDiagnostics)
+
+  object PcDiagnosticsResult:
+    def decode(buf: Array[Byte]): PcDiagnosticsResult =
+      val r = Reader(buf, KindPcDiagnostics)
+      val n = r.count()
+      val diagnostics = Vector.newBuilder[PcDiagnostic]
+      var i = 0
+      while i < n do
+        val range = Rng.read(r)
+        val severity = r.i32()
+        val code = r.str()
+        val message = r.str()
+        diagnostics += PcDiagnostic(range, severity, code, message)
+        i += 1
+      r.finish()
+      PcDiagnosticsResult(diagnostics.result())
+
+  /** One folding range: the span plus its [[FoldingKind]] ordinal. */
+  final case class FoldingRange(range: Rng, kind: Int)
+
+  /** The `folding_range` response: the buffer's folding ranges. */
+  final case class FoldingRangesResult(ranges: Seq[FoldingRange]):
+    def encode(): Array[Byte] =
+      val w = Writer()
+      w.u32(ranges.length)
+      ranges.foreach { f =>
+        Rng.write(w, f.range)
+        w.i32(f.kind)
+      }
+      w.finish(KindFoldingRanges)
+
+  object FoldingRangesResult:
+    def decode(buf: Array[Byte]): FoldingRangesResult =
+      val r = Reader(buf, KindFoldingRanges)
+      val n = r.count()
+      val ranges = Vector.newBuilder[FoldingRange]
+      var i = 0
+      while i < n do
+        val range = Rng.read(r)
+        val kind = r.i32()
+        ranges += FoldingRange(range, kind)
+        i += 1
+      r.finish()
+      FoldingRangesResult(ranges.result())
+
+  /** The `definition_source_toplevels` callback response: the toplevel
+    * SemanticDB symbols of the resolved definition source (mirrors
+    * [[LocationsResult]]'s shape for the definition callback).
+    */
+  final case class ToplevelsResult(symbols: Seq[String]):
+    def encode(): Array[Byte] =
+      val w = Writer()
+      w.strList(symbols)
+      w.finish(KindToplevels)
+
+  object ToplevelsResult:
+    def decode(buf: Array[Byte]): ToplevelsResult =
+      val r = Reader(buf, KindToplevels)
+      val symbols = r.strList()
+      r.finish()
+      ToplevelsResult(symbols)

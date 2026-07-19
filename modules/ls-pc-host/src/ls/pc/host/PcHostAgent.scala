@@ -11,6 +11,7 @@ import ls.pc.host.boundary.{
   boundary_h,
   LogFn,
   PcDispatchLoopFn,
+  PcPayloadQueryFn,
   PcQueryFn,
   PcRequestFn,
   PcResolveFn,
@@ -30,7 +31,7 @@ import ls.pc.host.boundary.{
   * `ls.pc.host.boundary` bindings (no JNI, no JNIEnv), it reads the Rust vtable
   * at the address passed as the agent argument, refuses to register on an ABI
   * or layout-canary mismatch, re-points `System.out` off the LSP protocol
-  * stream, builds an FFM upcall stub for each of the 15 PC vtable slots,
+  * stream, builds an FFM upcall stub for each of the 22 PC vtable slots,
   * registers the PC vtable, and loans two platform threads to Rust (worker 0 =
   * dispatch, worker 1 = control): they enter `pc_dispatch_loop` and never
   * return.
@@ -172,6 +173,55 @@ object PcHostAgent:
     PcVtable.spawn_dispatch(
       pc,
       PcSpawnDispatchFn.allocate(gen => contained("spawn_dispatch")(host.spawnDispatch(gen)), arena)
+    )
+    PcVtable.inlay_hints(
+      pc,
+      PcPayloadQueryFn.allocate(
+        (p, n, o) => contained("inlay_hints")(host.inlayHints(p, n, o)),
+        arena
+      )
+    )
+    PcVtable.semantic_tokens(
+      pc,
+      PcPayloadQueryFn.allocate(
+        (p, n, o) => contained("semantic_tokens")(host.semanticTokens(p, n, o)),
+        arena
+      )
+    )
+    PcVtable.selection_range(
+      pc,
+      PcPayloadQueryFn.allocate(
+        (p, n, o) => contained("selection_range")(host.selectionRange(p, n, o)),
+        arena
+      )
+    )
+    PcVtable.code_action(
+      pc,
+      PcPayloadQueryFn.allocate(
+        (p, n, o) => contained("code_action")(host.codeAction(p, n, o)),
+        arena
+      )
+    )
+    PcVtable.auto_imports(
+      pc,
+      PcPayloadQueryFn.allocate(
+        (p, n, o) => contained("auto_imports")(host.autoImports(p, n, o)),
+        arena
+      )
+    )
+    PcVtable.pc_diagnostics(
+      pc,
+      PcPayloadQueryFn.allocate(
+        (p, n, o) => contained("pc_diagnostics")(host.pcDiagnostics(p, n, o)),
+        arena
+      )
+    )
+    PcVtable.folding_range(
+      pc,
+      PcPayloadQueryFn.allocate(
+        (p, n, o) => contained("folding_range")(host.foldingRange(p, n, o)),
+        arena
+      )
     )
 
     val rc = RegisterPcVtableFn.invoke(RustVtable.register_pc_vtable(vtable), pc)

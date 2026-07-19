@@ -6,6 +6,7 @@ import java.nio.charset.StandardCharsets.UTF_8
 import ls.pc.{PcDefinitionResolver, WorkspaceMethodHit}
 import ls.pc.host.boundary.{
   boundary_h,
+  DefinitionSourceToplevelsFn,
   FreeFn,
   LsBuf,
   LsStr,
@@ -110,6 +111,53 @@ final class PcHostDefinitionResolver(vtable: MemorySegment, log: String => Unit)
         log(s"search_methods downcall failed: $t")
         Vector.empty
     finally arena.close()
+
+  /** Downcalls the Rust `definition_source_toplevels` vtable slot: the
+    * presentation compiler asks (through
+    * `SymbolSearch.definitionSourceToplevels`) for the toplevel SemanticDB
+    * symbols of the source defining `semanticdbSymbol`; this marshals
+    * `(semanticdbSymbol, sourceUri)` across the FFM boundary, and Rust answers
+    * from the immutable index snapshot (empty until the engine query lands
+    * with the feature task — ls-jvm answers an empty toplevels buffer when no
+    * resolver is installed). Same memory and containment discipline as
+    * [[definition]]: the Rust-owned response buffer is copied out and freed
+    * through the vtable `free` slot, and any failure answers empty (the
+    * [[PcDefinitionResolver.definitionSourceToplevels]] default).
+    */
+  override def definitionSourceToplevels(
+      semanticdbSymbol: String,
+      sourceUri: String
+  ): Vector[String] =
+    if semanticdbSymbol == null || semanticdbSymbol.isEmpty then Vector.empty
+    else
+      val arena = Arena.ofConfined()
+      try
+        val out = LsBuf.allocate(arena)
+        val status = DefinitionSourceToplevelsFn.invoke(
+          RustVtable.definition_source_toplevels(vtable),
+          lsStr(arena, semanticdbSymbol),
+          lsStr(arena, if sourceUri == null then "" else sourceUri),
+          out
+        )
+        if status != boundary_h.STATUS_OK() then Vector.empty
+        else
+          val ptr = LsBuf.ptr(out)
+          val len = LsBuf.len(out)
+          try
+            // Copy the payload out of Rust memory and decode it.
+            val bytes = readResponse(ptr, len)
+            if bytes.isEmpty then Vector.empty
+            else Payloads.ToplevelsResult.decode(bytes).symbols.toVector
+          finally
+            // Always hand a non-null Rust-owned buffer back — even if the copy
+            // or decode above threw — passing the raw 32-bit length so `free`
+            // matches the original `alloc` size (mirrors [[definition]]).
+            if ptr.address() != 0 then FreeFn.invoke(RustVtable.free(vtable), ptr, len)
+      catch
+        case t: Throwable =>
+          log(s"definition_source_toplevels downcall failed: $t")
+          Vector.empty
+      finally arena.close()
 
   /** Fills a borrowed `LsStr` (UTF-8, no NUL) in `arena`. An empty string is a
     * null pointer with zero length.

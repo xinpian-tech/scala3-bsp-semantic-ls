@@ -87,6 +87,17 @@ class BoundarySuite extends munit.FunSuite:
       assertEquals(rt.runResponse(out)(throw CodecException("bad")), boundary_h.STATUS_DECODE())
     finally arena.close()
 
+  test("runResponse maps a not-yet-provided op to STATUS_NOT_YET"):
+    val arena = Arena.ofConfined()
+    try
+      val rt = PcHostRuntime(arenaAllocator(arena))
+      val out = LsBuf.allocate(arena)
+      assertEquals(
+        rt.runResponse(out)(throw ls.pc.PcNotYetSupported("inlayHints")),
+        boundary_h.STATUS_NOT_YET()
+      )
+    finally arena.close()
+
   test("runResponse maps an unexpected throwable to STATUS_INTERNAL"):
     val arena = Arena.ofConfined()
     try
@@ -101,6 +112,10 @@ class BoundarySuite extends munit.FunSuite:
       val rt = PcHostRuntime(arenaAllocator(arena))
       assertEquals(rt.runStatus(()), boundary_h.STATUS_OK())
       assertEquals(rt.runStatus(throw CodecException("bad")), boundary_h.STATUS_DECODE())
+      assertEquals(
+        rt.runStatus(throw ls.pc.PcNotYetSupported("op")),
+        boundary_h.STATUS_NOT_YET()
+      )
       assertEquals(rt.runStatus(throw RuntimeException("boom")), boundary_h.STATUS_INTERNAL())
     finally arena.close()
 

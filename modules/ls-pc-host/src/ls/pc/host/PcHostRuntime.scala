@@ -3,6 +3,7 @@ package ls.pc.host
 import java.lang.foreign.{MemorySegment, ValueLayout}
 import java.nio.charset.StandardCharsets.UTF_8
 
+import ls.pc.PcNotYetSupported
 import ls.pc.host.boundary.{boundary_h, AllocFn, FreeFn, LsBuf, LsStr, RustVtable}
 import ls.pc.host.codec.CodecException
 
@@ -32,17 +33,21 @@ final class PcHostRuntime(allocator: LsAllocator):
 
   /** Runs a query op that produces an encoded codec response and writes it into
     * the caller's Rust-owned `out` buffer. A `CodecException` (a malformed
-    * request or response) maps to `STATUS_DECODE` and any other throwable to
-    * `STATUS_INTERNAL`, so nothing escapes across the native boundary.
+    * request or response) maps to `STATUS_DECODE`, a [[PcNotYetSupported]] (a
+    * transport-stub op whose provider has not landed) to `STATUS_NOT_YET`, and
+    * any other throwable to `STATUS_INTERNAL`, so nothing escapes across the
+    * native boundary.
     */
   def runResponse(out: MemorySegment)(body: => Array[Byte]): Int =
     try writeResponse(out, body, allocator)
     catch
       case _: CodecException => boundary_h.STATUS_DECODE()
+      case _: PcNotYetSupported => boundary_h.STATUS_NOT_YET()
       case _: Throwable => boundary_h.STATUS_INTERNAL()
 
   /** Runs a lifecycle op that returns no payload: `STATUS_OK` on success,
-    * `STATUS_DECODE` on a malformed request, `STATUS_INTERNAL` otherwise.
+    * `STATUS_DECODE` on a malformed request, `STATUS_NOT_YET` for a
+    * transport-stub op, `STATUS_INTERNAL` otherwise.
     */
   def runStatus(body: => Unit): Int =
     try
@@ -50,6 +55,7 @@ final class PcHostRuntime(allocator: LsAllocator):
       boundary_h.STATUS_OK()
     catch
       case _: CodecException => boundary_h.STATUS_DECODE()
+      case _: PcNotYetSupported => boundary_h.STATUS_NOT_YET()
       case _: Throwable => boundary_h.STATUS_INTERNAL()
 
 object PcHostRuntime:

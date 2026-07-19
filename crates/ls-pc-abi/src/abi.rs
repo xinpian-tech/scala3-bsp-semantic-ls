@@ -1,5 +1,5 @@
 //! The flat `#[repr(C)]` boundary types: the two vtables (Rust callbacks + the
-//! 15-op PC surface), the string/list/buffer primitives, and the fixed record
+//! 22-op PC surface), the string/list/buffer primitives, and the fixed record
 //! structs. Every field is a fixed-width integer, pointer, or another such
 //! struct, so a record's byte image equals the concatenation of its little-
 //! endian fields with no padding — which is exactly what the flat codec writes
@@ -7,8 +7,11 @@
 
 use std::ffi::c_void;
 
-/// Boundary contract version, checked at registration.
-pub const ABI_VERSION: u64 = 1;
+/// Boundary contract version, checked at registration. Version 2 adds the seven
+/// payload-query PC ops (`inlay_hints`/`semantic_tokens`/`selection_range`/
+/// `code_action`/`auto_imports`/`pc_diagnostics`/`folding_range`) and the
+/// `definition_source_toplevels` Rust-vtable callback.
+pub const ABI_VERSION: u64 = 2;
 
 /// Shared status codes returned by every boundary function (`0` = ok).
 pub const STATUS_OK: i32 = 0;
@@ -24,6 +27,12 @@ pub const STATUS_DECODE: i32 = -4;
 pub const STATUS_ALLOC: i32 = -5;
 /// An unexpected internal error.
 pub const STATUS_INTERNAL: i32 = -6;
+/// The op crossed the boundary but its island-side provider has not landed yet
+/// (the transport-stub answer of a freshly added op). A distinct nonzero status
+/// so the Rust side surfaces it as a typed backend error (degrading to the
+/// query's empty fallback), never a panic; the provider task replaces the stub
+/// and retires this answer per op.
+pub const STATUS_NOT_YET: i32 = -7;
 
 // ---------------------------------------------------------------------------
 // Primitives.
@@ -109,6 +118,11 @@ pub type SymbolDefinitionFn =
 /// `bsp_target_id`) into a method-hits response written to `out`.
 pub type SearchMethodsFn =
     unsafe extern "C" fn(query: LsStr, bsp_target_id: LsStr, out: *mut LsBuf) -> i32;
+/// Index-backed toplevel-symbol callback (the PC `SymbolSearch.
+/// definitionSourceToplevels` seam): resolves the SemanticDB `symbol` (with the
+/// defining `source_uri`) into a toplevels response written to `out`.
+pub type DefinitionSourceToplevelsFn =
+    unsafe extern "C" fn(symbol: LsStr, source_uri: LsStr, out: *mut LsBuf) -> i32;
 
 /// The Rust vtable handed to the premain. The island mirrors this layout
 /// through jextract-generated FFM bindings; `layout_canary` is recomputed
@@ -124,10 +138,11 @@ pub struct RustVtable {
     pub pc_dispatch_loop: PcDispatchLoopFn,
     pub symbol_definition: SymbolDefinitionFn,
     pub search_methods: SearchMethodsFn,
+    pub definition_source_toplevels: DefinitionSourceToplevelsFn,
 }
 
 // ---------------------------------------------------------------------------
-// PC vtable (15 ops, built by the island as FFM upcall stubs).
+// PC vtable (22 ops, built by the island as FFM upcall stubs).
 // ---------------------------------------------------------------------------
 
 /// A request carrying an encoded payload buffer (register_target/did_open/
@@ -154,8 +169,15 @@ pub type PcStatusOutFn = unsafe extern "C" fn(out: *mut LsBuf) -> i32;
 pub type PcVoidFn = unsafe extern "C" fn() -> i32;
 /// Spawns a fresh loaned dispatch thread for the given generation.
 pub type PcSpawnDispatchFn = unsafe extern "C" fn(generation: u32) -> i32;
+/// A payload-in/payload-out query (inlay_hints/semantic_tokens/selection_range/
+/// code_action/auto_imports/pc_diagnostics/folding_range): the request crosses
+/// as an encoded payload buffer (the `register_target`-inbound shape) and the
+/// response payload is written to `out` (the `plugin_status`-outbound shape).
+/// Defined once and reused for every payload-query slot.
+pub type PcPayloadQueryFn =
+    unsafe extern "C" fn(params_ptr: *const u8, params_len: u32, out: *mut LsBuf) -> i32;
 
-/// The 15-op PC vtable. Slot order is the cross-language contract.
+/// The 22-op PC vtable. Slot order is the cross-language contract.
 #[repr(C)]
 pub struct PcVtable {
     pub abi_version: u64,
@@ -174,6 +196,13 @@ pub struct PcVtable {
     pub restart_instances: PcVoidFn,
     pub shutdown: PcVoidFn,
     pub spawn_dispatch: PcSpawnDispatchFn,
+    pub inlay_hints: PcPayloadQueryFn,
+    pub semantic_tokens: PcPayloadQueryFn,
+    pub selection_range: PcPayloadQueryFn,
+    pub code_action: PcPayloadQueryFn,
+    pub auto_imports: PcPayloadQueryFn,
+    pub pc_diagnostics: PcPayloadQueryFn,
+    pub folding_range: PcPayloadQueryFn,
 }
 
 // ---------------------------------------------------------------------------
@@ -212,8 +241,8 @@ const _: () = {
     assert!(offset_of!(LocationRecord, range) == 8);
     assert!(offset_of!(LocationRecord, origin) == 24);
 
-    // RustVtable: two u64 + 7 fn pointers; assert every slot offset.
-    assert!(size_of::<RustVtable>() == 72);
+    // RustVtable: two u64 + 8 fn pointers; assert every slot offset.
+    assert!(size_of::<RustVtable>() == 80);
     assert!(offset_of!(RustVtable, abi_version) == 0);
     assert!(offset_of!(RustVtable, layout_canary) == 8);
     assert!(offset_of!(RustVtable, alloc) == 16);
@@ -223,9 +252,10 @@ const _: () = {
     assert!(offset_of!(RustVtable, pc_dispatch_loop) == 48);
     assert!(offset_of!(RustVtable, symbol_definition) == 56);
     assert!(offset_of!(RustVtable, search_methods) == 64);
+    assert!(offset_of!(RustVtable, definition_source_toplevels) == 72);
 
-    // PcVtable: one u64 + 15 fn pointers; assert every slot offset.
-    assert!(size_of::<PcVtable>() == 128);
+    // PcVtable: one u64 + 22 fn pointers; assert every slot offset.
+    assert!(size_of::<PcVtable>() == 184);
     assert!(offset_of!(PcVtable, abi_version) == 0);
     assert!(offset_of!(PcVtable, register_target) == 8);
     assert!(offset_of!(PcVtable, did_open) == 16);
@@ -242,4 +272,11 @@ const _: () = {
     assert!(offset_of!(PcVtable, restart_instances) == 104);
     assert!(offset_of!(PcVtable, shutdown) == 112);
     assert!(offset_of!(PcVtable, spawn_dispatch) == 120);
+    assert!(offset_of!(PcVtable, inlay_hints) == 128);
+    assert!(offset_of!(PcVtable, semantic_tokens) == 136);
+    assert!(offset_of!(PcVtable, selection_range) == 144);
+    assert!(offset_of!(PcVtable, code_action) == 152);
+    assert!(offset_of!(PcVtable, auto_imports) == 160);
+    assert!(offset_of!(PcVtable, pc_diagnostics) == 168);
+    assert!(offset_of!(PcVtable, folding_range) == 176);
 };

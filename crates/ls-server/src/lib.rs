@@ -51,7 +51,7 @@ pub use ls_jvm::libjvm_mapped;
 pub use pc::{
     pc_options, IslandPcService, PcCompilerPluginStatus, PcDisabledPlugin, PcLocation,
     PcPluginStatusReport, PcQueryService, PcServicePluginStatus, SearchMethodsResolver,
-    SymbolResolver,
+    SymbolResolver, ToplevelsResolver,
 };
 pub use protocol::{Diagnostic, DiagnosticCode, Position, PublishDiagnosticsParams, Range};
 pub use server::{

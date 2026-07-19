@@ -23,9 +23,10 @@ import ls.pc.host.boundary.{
   */
 class LayoutSuite extends munit.FunSuite:
 
-  // The value of `ls_pc_abi::LAYOUT_CANARY` (FNV-1a over the 51 ordered layout
-  // facts). If the Rust ABI changes, regenerate the bindings and update this.
-  private val RustLayoutCanary: Long = 0x9e1bfa41f279e689L
+  // The value of `ls_pc_abi::LAYOUT_CANARY` (FNV-1a over the 59 ordered layout
+  // facts). If the Rust ABI changes, regenerate the bindings and update this
+  // (`cargo run -p ls-pc-abi --example codec_vectors` prints it to stderr).
+  private val RustLayoutCanary: Long = 0x8a3210065cd07b59L
 
   test("string/buffer argument structs are two pointer-sized words"):
     assertEquals(LsStr.sizeof(), 16L)
@@ -59,8 +60,8 @@ class LayoutSuite extends munit.FunSuite:
     assertEquals(LocationRecord.`origin$offset`(), 24L)
     assertEquals(LocationRecord.sizeof(), 28L)
 
-  test("rust vtable is nine 8-byte slots in the contract order"):
-    assertEquals(RustVtable.sizeof(), 72L)
+  test("rust vtable is ten 8-byte slots in the contract order"):
+    assertEquals(RustVtable.sizeof(), 80L)
     assertEquals(RustVtable.`abi_version$offset`(), 0L)
     assertEquals(RustVtable.`layout_canary$offset`(), 8L)
     assertEquals(RustVtable.`alloc$offset`(), 16L)
@@ -70,9 +71,10 @@ class LayoutSuite extends munit.FunSuite:
     assertEquals(RustVtable.`pc_dispatch_loop$offset`(), 48L)
     assertEquals(RustVtable.`symbol_definition$offset`(), 56L)
     assertEquals(RustVtable.`search_methods$offset`(), 64L)
+    assertEquals(RustVtable.`definition_source_toplevels$offset`(), 72L)
 
-  test("pc vtable is abi_version then 15 slots in the contract order"):
-    assertEquals(PcVtable.sizeof(), 128L)
+  test("pc vtable is abi_version then 22 slots in the contract order"):
+    assertEquals(PcVtable.sizeof(), 184L)
     assertEquals(PcVtable.`abi_version$offset`(), 0L)
     assertEquals(PcVtable.`register_target$offset`(), 8L)
     assertEquals(PcVtable.`did_open$offset`(), 16L)
@@ -89,9 +91,16 @@ class LayoutSuite extends munit.FunSuite:
     assertEquals(PcVtable.`restart_instances$offset`(), 104L)
     assertEquals(PcVtable.`shutdown$offset`(), 112L)
     assertEquals(PcVtable.`spawn_dispatch$offset`(), 120L)
+    assertEquals(PcVtable.`inlay_hints$offset`(), 128L)
+    assertEquals(PcVtable.`semantic_tokens$offset`(), 136L)
+    assertEquals(PcVtable.`selection_range$offset`(), 144L)
+    assertEquals(PcVtable.`code_action$offset`(), 152L)
+    assertEquals(PcVtable.`auto_imports$offset`(), 160L)
+    assertEquals(PcVtable.`pc_diagnostics$offset`(), 168L)
+    assertEquals(PcVtable.`folding_range$offset`(), 176L)
 
-  test("the fact list is exactly the 51 the Rust side hashes"):
-    assertEquals(LayoutCanary.facts().length, 51)
+  test("the fact list is exactly the 59 the Rust side hashes"):
+    assertEquals(LayoutCanary.facts().length, 59)
 
   test("recomputed canary equals the Rust LAYOUT_CANARY"):
     assertEquals(LayoutCanary.compute(), RustLayoutCanary)

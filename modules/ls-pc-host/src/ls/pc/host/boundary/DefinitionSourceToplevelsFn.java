@@ -14,36 +14,21 @@ import static java.lang.foreign.MemoryLayout.PathElement.*;
 
 /**
  * {@snippet lang=c :
- * typedef int32_t (*RegisterPcVtableFn)(const struct PcVtable {
- *     uint64_t abi_version;
- *     PcRequestFn register_target;
- *     PcRequestFn did_open;
- *     PcRequestFn did_change;
- *     PcUriFn did_close;
- *     PcQueryFn completion;
- *     PcResolveFn completion_resolve;
- *     PcQueryFn hover;
- *     PcQueryFn signature_help;
- *     PcQueryFn definition;
- *     PcQueryFn type_definition;
- *     PcQueryFn prepare_rename;
- *     PcStatusOutFn plugin_status;
- *     PcVoidFn restart_instances;
- *     PcVoidFn shutdown;
- *     PcSpawnDispatchFn spawn_dispatch;
- *     PcPayloadQueryFn inlay_hints;
- *     PcPayloadQueryFn semantic_tokens;
- *     PcPayloadQueryFn selection_range;
- *     PcPayloadQueryFn code_action;
- *     PcPayloadQueryFn auto_imports;
- *     PcPayloadQueryFn pc_diagnostics;
- *     PcPayloadQueryFn folding_range;
+ * typedef int32_t (*DefinitionSourceToplevelsFn)(struct LsStr {
+ *     const uint8_t *ptr;
+ *     uint32_t len;
+ * }, struct LsStr {
+ *     const uint8_t *ptr;
+ *     uint32_t len;
+ * }, struct LsBuf {
+ *     uint8_t *ptr;
+ *     uint32_t len;
  * } *)
  * }
  */
-public final class RegisterPcVtableFn {
+public final class DefinitionSourceToplevelsFn {
 
-    private RegisterPcVtableFn() {
+    private DefinitionSourceToplevelsFn() {
         // Should not be called directly
     }
 
@@ -51,11 +36,13 @@ public final class RegisterPcVtableFn {
      * The function pointer signature, expressed as a functional interface
      */
     public interface Function {
-        int apply(MemorySegment pc);
+        int apply(MemorySegment symbol, MemorySegment source_uri, MemorySegment out);
     }
 
     private static final FunctionDescriptor $DESC = FunctionDescriptor.of(
         boundary_h.C_INT,
+        LsStr.layout(),
+        LsStr.layout(),
         boundary_h.C_POINTER
     );
 
@@ -66,13 +53,13 @@ public final class RegisterPcVtableFn {
         return $DESC;
     }
 
-    private static final MethodHandle UP$MH = boundary_h.upcallHandle(RegisterPcVtableFn.Function.class, "apply", $DESC);
+    private static final MethodHandle UP$MH = boundary_h.upcallHandle(DefinitionSourceToplevelsFn.Function.class, "apply", $DESC);
 
     /**
      * Allocates a new upcall stub, whose implementation is defined by {@code fi}.
      * The lifetime of the returned segment is managed by {@code arena}
      */
-    public static MemorySegment allocate(RegisterPcVtableFn.Function fi, Arena arena) {
+    public static MemorySegment allocate(DefinitionSourceToplevelsFn.Function fi, Arena arena) {
         return Linker.nativeLinker().upcallStub(UP$MH.bindTo(fi), $DESC, arena);
     }
 
@@ -81,9 +68,9 @@ public final class RegisterPcVtableFn {
     /**
      * Invoke the upcall stub {@code funcPtr}, with given parameters
      */
-    public static int invoke(MemorySegment funcPtr, MemorySegment pc) {
+    public static int invoke(MemorySegment funcPtr, MemorySegment symbol, MemorySegment source_uri, MemorySegment out) {
         try {
-            return (int) DOWN$MH.invokeExact(funcPtr, pc);
+            return (int) DOWN$MH.invokeExact(funcPtr, symbol, source_uri, out);
         } catch (Error | RuntimeException ex) {
             throw ex;
         } catch (Throwable ex$) {

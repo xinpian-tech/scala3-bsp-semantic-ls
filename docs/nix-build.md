@@ -165,7 +165,7 @@ guard actually rejects what the lock does not carry.
 | `spike-boundary` | boots the spike island through the crane-built `ls-jvm-spike` binary and drives every boundary scenario (echo / java-throw / rust-panic / timeout / bad-canary) |
 | `pc-host-agent` | the agent jar builds offline and its manifest declares `Premain-Class: ls.pc.host.PcHostAgent` (a valid `-javaagent`) |
 | `package-cli` | the packaged binary works offline: `--version` prints the identity, `--doctor` renders the Store section pre-bootstrap, `dump` reports an absent store gracefully, and both island jars are shipped under `share/` |
-| `pc-boundary` | live `ls-jvm` test: boots the production island against a real JVM and drives register/open/completion/hover through the 15-slot vtable |
+| `pc-boundary` | live `ls-jvm` test: boots the production island against a real JVM and drives register/open/completion/hover through the 22-slot vtable |
 | `pc-recovery` | live dispatch-generation recovery: a real wedged completion is recovered by the watchdog; the generation cap turns into a fatal |
 | `pc-definition` | live cross-file go-to: the full FFM round-trip through the symbol-resolver slot with a real snapshot-backed resolver |
 | `pc-zaozi` | live zaozi navigation: the shipped plugin, loaded through a workspace `pc-plugins.json`, steers go-to on a zaozi dynamic field access |

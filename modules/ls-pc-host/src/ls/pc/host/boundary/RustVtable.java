@@ -24,6 +24,7 @@ import static java.lang.foreign.MemoryLayout.PathElement.*;
  *     PcDispatchLoopFn pc_dispatch_loop;
  *     SymbolDefinitionFn symbol_definition;
  *     SearchMethodsFn search_methods;
+ *     DefinitionSourceToplevelsFn definition_source_toplevels;
  * }
  * }
  */
@@ -42,7 +43,8 @@ public class RustVtable {
         boundary_h.C_POINTER.withName("register_pc_vtable"),
         boundary_h.C_POINTER.withName("pc_dispatch_loop"),
         boundary_h.C_POINTER.withName("symbol_definition"),
-        boundary_h.C_POINTER.withName("search_methods")
+        boundary_h.C_POINTER.withName("search_methods"),
+        boundary_h.C_POINTER.withName("definition_source_toplevels")
     ).withName("RustVtable");
 
     /**
@@ -842,6 +844,108 @@ public class RustVtable {
      */
     public static void search_methods(MemorySegment struct, MemorySegment fieldValue) {
         struct.set(search_methods$LAYOUT, search_methods$OFFSET, fieldValue);
+    }
+
+    /**
+     * {@snippet lang=c :
+     * DefinitionSourceToplevelsFn definition_source_toplevels
+     * }
+     */
+    public final static class definition_source_toplevels {
+
+        private definition_source_toplevels() {
+            // Should not be called directly
+        }
+
+        /**
+         * The function pointer signature, expressed as a functional interface
+         */
+        public interface Function {
+            int apply(MemorySegment _x0, MemorySegment _x1, MemorySegment _x2);
+        }
+
+        private static final FunctionDescriptor $DESC = FunctionDescriptor.of(
+            boundary_h.C_INT,
+            LsStr.layout(),
+            LsStr.layout(),
+            boundary_h.C_POINTER
+        );
+
+        /**
+         * The descriptor of this function pointer
+         */
+        public static FunctionDescriptor descriptor() {
+            return $DESC;
+        }
+
+        private static final MethodHandle UP$MH = boundary_h.upcallHandle(definition_source_toplevels.Function.class, "apply", $DESC);
+
+        /**
+         * Allocates a new upcall stub, whose implementation is defined by {@code fi}.
+         * The lifetime of the returned segment is managed by {@code arena}
+         */
+        public static MemorySegment allocate(definition_source_toplevels.Function fi, Arena arena) {
+            return Linker.nativeLinker().upcallStub(UP$MH.bindTo(fi), $DESC, arena);
+        }
+
+        private static final MethodHandle DOWN$MH = Linker.nativeLinker().downcallHandle($DESC);
+
+        /**
+         * Invoke the upcall stub {@code funcPtr}, with given parameters
+         */
+        public static int invoke(MemorySegment funcPtr, MemorySegment _x0, MemorySegment _x1, MemorySegment _x2) {
+            try {
+                return (int) DOWN$MH.invokeExact(funcPtr, _x0, _x1, _x2);
+            } catch (Error | RuntimeException ex) {
+                throw ex;
+            } catch (Throwable ex$) {
+                throw new AssertionError("should not reach here", ex$);
+            }
+        }
+    }
+
+    private static final AddressLayout definition_source_toplevels$LAYOUT = (AddressLayout)$LAYOUT.select(groupElement("definition_source_toplevels"));
+
+    /**
+     * Layout for field:
+     * {@snippet lang=c :
+     * DefinitionSourceToplevelsFn definition_source_toplevels
+     * }
+     */
+    public static final AddressLayout definition_source_toplevels$layout() {
+        return definition_source_toplevels$LAYOUT;
+    }
+
+    private static final long definition_source_toplevels$OFFSET = $LAYOUT.byteOffset(groupElement("definition_source_toplevels"));
+
+    /**
+     * Offset for field:
+     * {@snippet lang=c :
+     * DefinitionSourceToplevelsFn definition_source_toplevels
+     * }
+     */
+    public static final long definition_source_toplevels$offset() {
+        return definition_source_toplevels$OFFSET;
+    }
+
+    /**
+     * Getter for field:
+     * {@snippet lang=c :
+     * DefinitionSourceToplevelsFn definition_source_toplevels
+     * }
+     */
+    public static MemorySegment definition_source_toplevels(MemorySegment struct) {
+        return struct.get(definition_source_toplevels$LAYOUT, definition_source_toplevels$OFFSET);
+    }
+
+    /**
+     * Setter for field:
+     * {@snippet lang=c :
+     * DefinitionSourceToplevelsFn definition_source_toplevels
+     * }
+     */
+    public static void definition_source_toplevels(MemorySegment struct, MemorySegment fieldValue) {
+        struct.set(definition_source_toplevels$LAYOUT, definition_source_toplevels$OFFSET, fieldValue);
     }
 
     /**

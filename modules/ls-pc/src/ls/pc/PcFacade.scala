@@ -2,7 +2,7 @@ package ls.pc
 
 import scala.collection.concurrent.TrieMap
 
-import org.eclipse.lsp4j.{CompletionItem, CompletionList, Diagnostic, Hover, Range, SignatureHelp}
+import org.eclipse.lsp4j.{CompletionItem, CompletionList, Diagnostic, Hover, Position, Range, SignatureHelp}
 
 /** The single PC entry point for the LSP core (plan 4.3, 14).
   *
@@ -99,6 +99,61 @@ final class PcFacade(
   def prepareRename(uri: String, line: Int, character: Int): Option[Range] =
     val (req, text, config) = prepare(PcRequestKind.PrepareRename, uri, line, character)
     manager.run(config)(_.prepareRename(req.uri, text, req.line, req.character))
+
+  // --- ABI v2 op stubs (transport wave W3a) ----------------------------------
+  //
+  // Each of the six ops below is a typed stub: the boundary slot, payload
+  // codecs, and dispatch routing exist end-to-end, but the presentation-
+  // compiler provider lands with the feature task. Until then every call
+  // throws [[PcNotYetSupported]], which the boundary runtime maps to the
+  // distinct `STATUS_NOT_YET` status (`pc_diagnostics` has no stub here: its
+  // provider will route through [[diagnostics]] below).
+
+  /** Inlay hints for `range` of the open buffer `uri`; `flags` is the boundary
+    * hint-category bitset (opaque to the transport).
+    */
+  def inlayHints(uri: String, range: Range, flags: Int): Vector[PcInlayHint] =
+    throw PcNotYetSupported("inlayHints")
+
+  /** Semantic tokens of the open buffer `uri`, as offset-based nodes. */
+  def semanticTokens(uri: String): Vector[PcSemanticNode] =
+    throw PcNotYetSupported("semanticTokens")
+
+  /** Per query position, the chain of enclosing selection ranges, innermost
+    * first.
+    */
+  def selectionRanges(uri: String, positions: Vector[Position]): Vector[Vector[Range]] =
+    throw PcNotYetSupported("selectionRanges")
+
+  /** Run the PC-backed code action `actionId` (the boundary's action-id enum)
+    * at `position`; `extractionEnd` is extract-method's selection end,
+    * `argIndices` convert-to-named-arguments' argument list. A refusal the
+    * editor should surface comes back as data on the result, not as a thrown
+    * error.
+    */
+  def codeAction(
+      uri: String,
+      actionId: Int,
+      position: Position,
+      extractionEnd: Option[Position],
+      argIndices: Option[Vector[Int]]
+  ): PcCodeActionResult =
+    throw PcNotYetSupported("codeAction")
+
+  /** Auto-import candidates for `name` at `position` (`isExtension` requests
+    * extension-method imports), best first.
+    */
+  def autoImports(
+      uri: String,
+      position: Position,
+      name: String,
+      isExtension: Boolean
+  ): Vector[PcAutoImport] =
+    throw PcNotYetSupported("autoImports")
+
+  /** Folding ranges of the open buffer `uri`. */
+  def foldingRanges(uri: String): Vector[PcFoldingRange] =
+    throw PcNotYetSupported("foldingRanges")
 
   /** Push the current buffer text through the PC and return its (secondary)
     * diagnostics, filtered by plugin `filterPcDiagnostics` hooks. Build

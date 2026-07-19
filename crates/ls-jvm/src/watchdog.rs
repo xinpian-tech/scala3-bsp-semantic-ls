@@ -5,7 +5,7 @@
 //! recovery; a deadline overrun fails it typed (`PcError::RequestTimeout`,
 //! never deadlocking the caller) and escalates the recovery ladder over the
 //! control lane: `restart_instances` (the facade shutdown+recreate — the
-//! cooperative lever; the 15-op vtable has no separate cancel op) and, if that
+//! cooperative lever; the 22-op vtable has no separate cancel op) and, if that
 //! does not free the dispatch lane, a fresh dispatch generation via
 //! `spawn_dispatch(gen+1)` with the mirrored targets/buffers replayed into it.
 //! A failed control op, or exceeding the abandoned-generation cap, is
@@ -37,6 +37,19 @@ pub enum QueryKind {
     PrepareRename,
 }
 
+/// The payload-query PC ops (they share the `PcPayloadQueryFn`
+/// `params-buffer -> response-buffer` slot shape added in ABI v2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PayloadQueryKind {
+    InlayHints,
+    SemanticTokens,
+    SelectionRange,
+    CodeAction,
+    AutoImports,
+    PcDiagnostics,
+    FoldingRange,
+}
+
 /// A PC request routed through the supervisor onto the dispatch lane. Lifecycle
 /// variants update the replay mirror; the rest are pure queries.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -62,6 +75,14 @@ pub enum PcRequest {
         uri: String,
         line: u32,
         character: u32,
+    },
+    /// A payload-query op: `params` is the already-encoded request payload
+    /// (the caller owns the typed encode, like `Resolve::item`), routed to the
+    /// slot `kind` selects. A pure query for replay purposes, exactly like
+    /// `Query`/`Resolve`.
+    PayloadQuery {
+        kind: PayloadQueryKind,
+        params: Vec<u8>,
     },
     Resolve {
         target_id: String,
@@ -195,7 +216,9 @@ impl<B: PcBackend> Supervisor<B> {
             } => self.mirror.did_open(target_id, uri, text),
             PcRequest::DidChange { uri, text } => self.mirror.did_change(uri, text),
             PcRequest::DidClose { uri } => self.mirror.did_close(uri),
-            PcRequest::Query { .. } | PcRequest::Resolve { .. } => {}
+            PcRequest::Query { .. }
+            | PcRequest::PayloadQuery { .. }
+            | PcRequest::Resolve { .. } => {}
         }
     }
 
@@ -363,6 +386,31 @@ mod tests {
         assert_eq!(sup.backend.restarts, 0);
         assert!(sup.backend.spawns.is_empty());
         assert!(!sup.is_fatal());
+    }
+
+    #[test]
+    fn a_payload_query_stub_not_yet_status_is_a_typed_error_without_recovery() {
+        // The transport-stub answer of a not-yet-provided payload-query op
+        // (STATUS_NOT_YET) is a normal typed backend error: no recovery ladder,
+        // no fatal flag, and — like every pure query — no mirror mutation, so a
+        // later generation replay carries nothing from it.
+        let backend = FakeBackend::new(
+            vec![DispatchOutcome::Status(ls_pc_abi::STATUS_NOT_YET)],
+            true,
+        );
+        let mut sup = supervisor(backend, 4);
+        assert_eq!(
+            sup.request(PcRequest::PayloadQuery {
+                kind: PayloadQueryKind::InlayHints,
+                params: vec![1, 2, 3],
+            }),
+            Err(PcError::Backend(ls_pc_abi::STATUS_NOT_YET))
+        );
+        assert_eq!(sup.backend.restarts, 0);
+        assert!(sup.backend.spawns.is_empty());
+        assert!(!sup.is_fatal());
+        assert!(sup.mirror.replay_plan().targets.is_empty());
+        assert!(sup.mirror.replay_plan().buffers.is_empty());
     }
 
     #[test]

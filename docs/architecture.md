@@ -190,7 +190,7 @@ escalates the **dispatch-generation recovery ladder**:
 ```text
 deadline overrun
   → restart_instances (facade shutdown+recreate — the cooperative cancel;
-    the 15-op vtable has no separate cancel op)
+    the 22-op vtable has no separate cancel op)
   → lane still wedged: spawn_dispatch(generation+1) — the island loans a fresh
     dispatch thread; the Rust replay mirror re-registers targets and replays
     open buffers into the new generation (the editor reopens nothing)
@@ -214,16 +214,23 @@ regenerates `boundary.h` and jextract generates the island's Java bindings from
 it, so drift is a boot refusal, not a corrupt call. The Rust vtable carries
 `alloc`, `free`, `log`, `register_pc_vtable`, `pc_dispatch_loop`,
 `symbol_definition` — the index-backed cross-file go-to-definition callback —
-and `search_methods` — the index-backed workspace method search behind the PC
+`search_methods` — the index-backed workspace method search behind the PC
 `SymbolSearch.searchMethods` seam (member-mode extension-method / implicit-
-class-member discovery). Both index callbacks read **only** the immutable
-snapshot (the index writer is unreachable from island threads by construction)
-and scope results to the requesting target's forward dependency closure
-(`symbol_definition` locates the target by the buffer uri; `search_methods` is
-handed the PC target id directly). The PC vtable is the 15-op surface:
-`register_target, did_open, did_change, did_close, completion,
+class-member discovery) — and `definition_source_toplevels` — the index-backed
+toplevel-symbol callback behind `SymbolSearch.definitionSourceToplevels`
+(answering empty until its engine query lands). The index callbacks read
+**only** the immutable snapshot (the index writer is unreachable from island
+threads by construction) and scope results to the requesting target's forward
+dependency closure (`symbol_definition` locates the target by the buffer uri;
+`search_methods` is handed the PC target id directly). The PC vtable is the
+22-op surface: `register_target, did_open, did_change, did_close, completion,
 completion_resolve, hover, signature_help, definition, type_definition,
-prepare_rename, plugin_status, restart_instances, shutdown, spawn_dispatch`.
+prepare_rename, plugin_status, restart_instances, shutdown, spawn_dispatch`,
+plus the ABI-v2 payload-in/payload-out queries `inlay_hints, semantic_tokens,
+selection_range, code_action, auto_imports, pc_diagnostics, folding_range`
+(one shared `PcPayloadQueryFn` slot shape; each island provider is a typed
+`STATUS_NOT_YET` stub until its feature task lands, which the Rust side
+degrades to the query's empty fallback).
 
 stdout protection: the JVM and any PC plugin can write to fd 1, which would
 corrupt the LSP stream. Before boot, the server's `StdoutGuard` duplicates the

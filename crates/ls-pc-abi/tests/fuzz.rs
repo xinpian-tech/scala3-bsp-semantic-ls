@@ -5,9 +5,12 @@
 
 use ls_pc_abi::codec::{Reader, Writer, MAGIC};
 use ls_pc_abi::payloads::{
-    CompletionItem, CompletionList, DefinitionResult, DidChangeParams, DidOpenParams, HoverResult,
-    LocationsResult, MethodHitsResult, PluginStatus, PositionParams, PrepareRenameResult,
-    ResolveParams, SignatureHelp, TargetConfig,
+    AutoImportParams, AutoImportsResult, CodeActionParams, CodeActionResult, CompletionItem,
+    CompletionList, DefinitionResult, DidChangeParams, DidOpenParams, FoldingRangesResult,
+    HoverResult, InlayHintParams, InlayHintsResult, LocationsResult, MethodHitsResult,
+    PcDiagnosticsResult, PluginStatus, PositionParams, PrepareRenameResult, ResolveParams,
+    SelectionRangeParams, SelectionRangesResult, SemanticTokensResult, SignatureHelp, TargetConfig,
+    ToplevelsResult, UriParams,
 };
 use proptest::prelude::*;
 
@@ -29,6 +32,19 @@ fn decode_all(bytes: &[u8]) {
     let _ = PluginStatus::decode(bytes);
     let _ = LocationsResult::decode(bytes);
     let _ = MethodHitsResult::decode(bytes);
+    let _ = InlayHintParams::decode(bytes);
+    let _ = InlayHintsResult::decode(bytes);
+    let _ = UriParams::decode(bytes);
+    let _ = SemanticTokensResult::decode(bytes);
+    let _ = SelectionRangeParams::decode(bytes);
+    let _ = SelectionRangesResult::decode(bytes);
+    let _ = CodeActionParams::decode(bytes);
+    let _ = CodeActionResult::decode(bytes);
+    let _ = AutoImportParams::decode(bytes);
+    let _ = AutoImportsResult::decode(bytes);
+    let _ = PcDiagnosticsResult::decode(bytes);
+    let _ = FoldingRangesResult::decode(bytes);
+    let _ = ToplevelsResult::decode(bytes);
 }
 
 fn bare_item(label: &str) -> CompletionItem {
@@ -191,6 +207,45 @@ proptest! {
         let mut bytes = MAGIC.to_le_bytes().to_vec();
         bytes.extend_from_slice(&rest);
         decode_all(&bytes);
+    }
+
+    #[test]
+    fn single_byte_corruption_of_valid_inlay_hints_never_panics(
+        tooltips in proptest::collection::vec(proptest::option::of(".*"), 0..3),
+        index in any::<prop::sample::Index>(),
+        xor in 1u8..=255,
+    ) {
+        // The deepest of the new v2 carriers (nested parts, optional edits,
+        // opaque data) under the same single-byte-corruption regime as the
+        // completion list.
+        use ls_pc_abi::payloads::{InlayHint, InlayLabelPart, Pos, Rng, TextEdit};
+        let result = InlayHintsResult {
+            hints: tooltips
+                .iter()
+                .map(|tooltip| InlayHint {
+                    position: Pos { line: 1, character: 2 },
+                    label_parts: vec![InlayLabelPart {
+                        text: ": Int".to_string(),
+                        location: Some(("file:///a.scala".to_string(), Rng::default())),
+                        tooltip: tooltip.clone(),
+                    }],
+                    kind: 1,
+                    padding_left: true,
+                    padding_right: false,
+                    text_edits: Some(vec![TextEdit {
+                        range: Rng::default(),
+                        new_text: ": Int".to_string(),
+                    }]),
+                    data: Some(vec![1, 2, 3]),
+                })
+                .collect(),
+        };
+        let mut buf = result.encode().unwrap();
+        if !buf.is_empty() {
+            let i = index.index(buf.len());
+            buf[i] ^= xor;
+            decode_all(&buf);
+        }
     }
 
     #[test]

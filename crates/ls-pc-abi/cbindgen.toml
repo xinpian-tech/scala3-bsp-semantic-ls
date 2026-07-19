@@ -28,6 +28,7 @@ include = [
     "PcDispatchLoopFn",
     "SymbolDefinitionFn",
     "SearchMethodsFn",
+    "DefinitionSourceToplevelsFn",
     "PcRequestFn",
     "PcUriFn",
     "PcQueryFn",
@@ -35,6 +36,7 @@ include = [
     "PcStatusOutFn",
     "PcVoidFn",
     "PcSpawnDispatchFn",
+    "PcPayloadQueryFn",
 ]
 
 [parse]

@@ -325,6 +325,212 @@ class CodecSuite extends munit.FunSuite:
       SignatureHelp.decode
     )
 
+  // ---- ABI v2 payload-query carriers. ----
+
+  test("inlay-hint params round-trip"):
+    parity(
+      "inlay_hint_params",
+      InlayHintParams("file:///H.scala", Rng(0, 0, 20, 0), 3),
+      _.encode(),
+      InlayHintParams.decode
+    )
+
+  test("inlay hints (label parts, padding, edits, opaque data) round-trip"):
+    parity(
+      "inlay_hints",
+      InlayHintsResult(
+        Seq(
+          InlayHint(
+            Pos(2, 10),
+            Seq(
+              InlayLabelPart(": Int", Some(("file:///I.scala", Rng(1, 0, 1, 3))), Some("inferred type")),
+              InlayLabelPart("=>", None, None)
+            ),
+            kind = 1,
+            paddingLeft = true,
+            paddingRight = false,
+            textEdits = Some(Seq(TextEdit(Rng(2, 10, 2, 10), ": Int"))),
+            data = Some(Seq[Byte](1, 2, 3))
+          )
+        )
+      ),
+      _.encode(),
+      InlayHintsResult.decode
+    )
+
+  test("an empty inlay-hints list round-trips"):
+    parity("inlay_hints_empty", InlayHintsResult(Seq.empty), _.encode(), InlayHintsResult.decode)
+
+  test("uri params round-trip"):
+    parity("uri_params", UriParams("file:///U.scala"), _.encode(), UriParams.decode)
+
+  test("semantic tokens round-trip as offsets"):
+    parity(
+      "semantic_tokens",
+      SemanticTokensResult(Seq(SemanticNode(0, 6, 3, 1), SemanticNode(10, 14, 15, 0))),
+      _.encode(),
+      SemanticTokensResult.decode
+    )
+
+  test("an empty semantic-tokens list round-trips"):
+    parity(
+      "semantic_tokens_empty",
+      SemanticTokensResult(Seq.empty),
+      _.encode(),
+      SemanticTokensResult.decode
+    )
+
+  test("selection-range params round-trip"):
+    parity(
+      "selection_range_params",
+      SelectionRangeParams("file:///S.scala", Seq(Pos(1, 2), Pos(3, 4))),
+      _.encode(),
+      SelectionRangeParams.decode
+    )
+
+  test("selection ranges round-trip innermost-first chains (empty chain kept)"):
+    parity(
+      "selection_ranges",
+      SelectionRangesResult(
+        Seq(Seq(Rng(1, 2, 1, 4), Rng(1, 0, 2, 0), Rng(0, 0, 9, 0)), Seq.empty)
+      ),
+      _.encode(),
+      SelectionRangesResult.decode
+    )
+
+  test("an empty selection-ranges list round-trips"):
+    parity(
+      "selection_ranges_empty",
+      SelectionRangesResult(Seq.empty),
+      _.encode(),
+      SelectionRangesResult.decode
+    )
+
+  test("code-action params with both optionals round-trip"):
+    parity(
+      "code_action_params",
+      CodeActionParams(
+        "file:///C.scala",
+        CodeActionId.ExtractMethod,
+        Pos(5, 1),
+        Some(Pos(7, 2)),
+        Some(Seq(0, 2))
+      ),
+      _.encode(),
+      CodeActionParams.decode
+    )
+
+  test("code-action params without optionals round-trip"):
+    parity(
+      "code_action_params_bare",
+      CodeActionParams("file:///C.scala", CodeActionId.InsertInferredType, Pos(5, 1), None, None),
+      _.encode(),
+      CodeActionParams.decode
+    )
+
+  test("code-action edits round-trip"):
+    parity(
+      "code_action_edits",
+      CodeActionResult(Seq(TextEdit(Rng(3, 0, 3, 0), ": Int")), None),
+      _.encode(),
+      CodeActionResult.decode
+    )
+
+  test("a code-action refusal is data, not an error"):
+    parity(
+      "code_action_refusal",
+      CodeActionResult(Seq.empty, Some("Cannot extract selection")),
+      _.encode(),
+      CodeActionResult.decode
+    )
+
+  test("auto-import params round-trip"):
+    parity(
+      "auto_import_params",
+      AutoImportParams("file:///A.scala", Pos(4, 9), "Future", isExtension = false),
+      _.encode(),
+      AutoImportParams.decode
+    )
+
+  test("auto-import candidates round-trip"):
+    parity(
+      "auto_imports",
+      AutoImportsResult(
+        Seq(
+          AutoImport(
+            "scala.concurrent",
+            Seq(TextEdit(Rng(0, 0, 0, 0), "import scala.concurrent.Future\n")),
+            Some("scala/concurrent/Future#")
+          )
+        )
+      ),
+      _.encode(),
+      AutoImportsResult.decode
+    )
+
+  test("an empty auto-imports list round-trips"):
+    parity("auto_imports_empty", AutoImportsResult(Seq.empty), _.encode(), AutoImportsResult.decode)
+
+  test("pc diagnostics round-trip"):
+    parity(
+      "pc_diagnostics",
+      PcDiagnosticsResult(Seq(PcDiagnostic(Rng(3, 0, 3, 5), 1, "E007", "not found: value x"))),
+      _.encode(),
+      PcDiagnosticsResult.decode
+    )
+
+  test("an empty pc-diagnostics list round-trips"):
+    parity(
+      "pc_diagnostics_empty",
+      PcDiagnosticsResult(Seq.empty),
+      _.encode(),
+      PcDiagnosticsResult.decode
+    )
+
+  test("folding ranges round-trip with kind ordinals"):
+    parity(
+      "folding_ranges",
+      FoldingRangesResult(
+        Seq(
+          FoldingRange(Rng(0, 0, 5, 1), FoldingKind.Imports),
+          FoldingRange(Rng(6, 10, 9, 1), FoldingKind.None)
+        )
+      ),
+      _.encode(),
+      FoldingRangesResult.decode
+    )
+
+  test("an empty folding-ranges list round-trips"):
+    parity(
+      "folding_ranges_empty",
+      FoldingRangesResult(Seq.empty),
+      _.encode(),
+      FoldingRangesResult.decode
+    )
+
+  test("definition-source toplevels round-trip"):
+    parity(
+      "toplevels",
+      ToplevelsResult(Seq("a/b/Main.", "a/b/Main#")),
+      _.encode(),
+      ToplevelsResult.decode
+    )
+
+  test("an empty toplevels list round-trips"):
+    parity("toplevels_empty", ToplevelsResult(Seq.empty), _.encode(), ToplevelsResult.decode)
+
+  test("v2 payload kinds cannot be confused"):
+    // A buffer of one v2 payload never decodes as another (distinct envelope
+    // kinds), matching the Rust kind-confusion pins.
+    intercept[CodecException](InlayHintParams.decode(golden("uri_params")))
+    intercept[CodecException](SemanticTokensResult.decode(golden("uri_params")))
+    intercept[CodecException](LocationsResult.decode(golden("toplevels")))
+    intercept[CodecException](MethodHitsResult.decode(golden("toplevels")))
+    intercept[CodecException](SelectionRangesResult.decode(golden("semantic_tokens")))
+    intercept[CodecException](InlayHintsResult.decode(golden("semantic_tokens")))
+    intercept[CodecException](AutoImportsResult.decode(golden("code_action_edits")))
+    intercept[CodecException](CodeActionParams.decode(golden("code_action_edits")))
+
   // ---- Malformed buffers decode to a typed error, never a crash. ----
 
   test("a bad envelope magic is a typed decode error"):
