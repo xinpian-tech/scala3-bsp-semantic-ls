@@ -28,6 +28,10 @@ real-BSP rows) lives in `docs/coverage-audit.md`; this file maps the mandates.
 | Island parity (retained Scala) | `pc-plugins.json` loading, plugin SPI self-test/disable-on-throw, `PcTargetConfig`, `Utf16Text`, LRU instance cap, SemanticDB-flag stripping | mill suites under `modules/ls-pc/test` (`PluginManagerSuite`, `PcQuerySuite`, `PcSymbolSearchSuite`, `Utf16TextSuite`, `PcWorkerManagerSuite`, `CompilerPluginConfigSuite`), `modules/ls-zaozi-pcplugin/test` (`ZaoziPcNavSuite`), `modules/ls-pc-host/test` |
 | LSP server surface | capability set exactness, per-method pre-ready behavior, didChange buffering + reload, diagnostics router semantics, dirty-buffer overlay + PC-only detection, didSave debounce/single-flight, doctor section contract, CLI | unit tests in `crates/ls-server/src/` (capabilities, diagnostics, documents, pc_overlay, doctor, cli, convert), `crates/ls-server/tests/bootstrap.rs`, `crates/ls-server/tests/server_surface.rs` |
 | Fake-BSP e2e | the end-to-end scenario set over a Rust-hosted fake BSP server | `crates/ls-server/tests/fake_bsp_e2e.rs` |
+| PC wire surface (JVM-free) | completion, `completionItem/resolve`, hover, signatureHelp, definition/typeDefinition over the framed wire through the REAL serve loop + REAL `IndexBootstrap`, with the island replaced by the testkit fake PC through the `IndexBootstrap::with_pc` seam; gating (`require_semanticdb`, `withPcBuffer`, the resolve target gate) and response mapping pinned by insta snapshots | `crates/ls-server/tests/pc_wire.rs`, `crates/ls-testkit/src/fake_pc.rs` |
+| Shared wire harness | the one copy of the framed-wire builders, the interactive wire client (in-process serve loop or spawned binary over stdio), the fake BSP server, and the fixture-corpus geometry consumed by the `ls-server` suites | `crates/ls-testkit/src/wire.rs`, `crates/ls-testkit/src/client.rs`, `crates/ls-testkit/src/fake_bsp.rs`, `crates/ls-testkit/src/fixtures.rs`, `crates/ls-testkit/src/positions.rs` |
+| Black-box stdio e2e | the REAL `ls-server` binary spawned over stdio by an independent client (pytest-lsp), against the scriptable Python fake BSP server over the committed fixture corpus: capability exactness through lsprotocol's typed model, readiness, index queries, diagnostics publish/clear, typed unknown-method/command errors | `it/lsp-blackbox/` (`conftest.py`, `fake_bsp.py`, `test_lifecycle.py`, `test_index_queries.py`, `test_diagnostics.py`, `test_robustness.py`), flake check `lsp-blackbox`, `scripts/it-lsp-blackbox.sh` |
+| Project-level editor e2e | a REAL editor (headless Neovim) attaches the production server to a REAL third-party repo (the pinned, SemanticDB-patched zaozi source, CIRCT-free `decoder` module): readiness over the real mill BSP session, reindex ingest, workspace/symbol, cross-file definition, references, and PC-backed hover booting the embedded island against the real project classpath | `it/nvim/e2e.lua`, `scripts/it-nvim-zaozi.sh`, CI job `nvim-zaozi-e2e` |
 | Real-BSP e2e | E0–E8 equivalents over live mill on `it/sample-workspace`; cold-start zero-JVM hard assertion (`/proc/self/maps`) | `crates/ls-server/tests/real_bsp_e2e.rs`, `crates/ls-server/tests/real_bsp_pc.rs`, `crates/ls-server/tests/real_bsp_pc_recovery.rs` (`scripts/it-real-bsp-rs.sh`) |
 | Packaging | offline `nix build .#default` (Rust binary + island jars), packaged `--version`/offline `--doctor`/`dump`, Linux-only systems, ivy-lock hygiene | flake checks `package`, `package-cli`, `rust-build`, `rust-test`, `rust-clippy`, `rust-fmt`, `java25-toolchain`, `ivy-lock-present`, `pc-host-agent`; `scripts/check-ivy-lock.sh`, `scripts/check-offline-compile.sh` |
 | Bench | ingest + query measurements over the real storage layer, ground-truth cross-checked, CI smoke gate | `crates/ls-bench/tests/smoke.rs`, `crates/ls-bench/src/lib.rs` (`cargo run -p ls-bench -- --smoke`) |
@@ -50,6 +54,8 @@ Selected load-bearing cases, mechanically checked (`file` :: "case substring"):
 - `crates/ls-server/tests/server_surface.rs` :: "pre_ready_methods_take_their_per_method_fallbacks"
 - `crates/ls-server/tests/real_bsp_e2e.rs` :: "zero"
 - `crates/ls-server/tests/fake_bsp_e2e.rs` :: "diagnostics"
+- `it/lsp-blackbox/test_lifecycle.py` :: "test_initialize_advertises_the_exact_capability_surface"
+- `it/lsp-blackbox/test_diagnostics.py` :: "test_compile_diagnostics_publish_then_clear"
 
 ## Recorded trims and accepted evolutions
 
@@ -96,7 +102,21 @@ and the plan stay reconciled.
    ad-hoc probe flags. The pinned, patched zaozi source stays exposed as
    `ZAOZI_SRC` (flake input) for manual real-repo validation with any LSP
    client.
-9. **JNIEnv contingency retired.** The historical draft carried a two-call
+9. **Known gap (open finding): cross-file definition on real multi-package
+   projects.** The project-level editor e2e (`it/nvim/e2e.lua` over the pinned
+   zaozi `decoder` module) observes that `textDocument/definition` answers
+   empty for cross-file targets (both cross-target and same-target) while
+   hover at the SAME position answers — the presentation compiler resolves the
+   symbol, but the island's `symbol_definition` resolver
+   (`QueryOrchestrator::symbol_definition`) yields no location for the
+   PC-provided symbol. The gated sample-workspace suite
+   (`crates/ls-server/tests/real_bsp_pc.rs`) passes the cross-target shape
+   with single-segment packages (`pkga`), so the suspect is symbol-string or
+   target-closure handling on real-world multi-segment packages
+   (`me/jiuyang/decoder`). In-buffer definition passes. The e2e reports the
+   cross-file probes as `E2E INFO` observations; flip them to hard gates when
+   the resolver gap is fixed.
+10. **JNIEnv contingency retired.** The historical draft carried a two-call
    JNIEnv fallback for the island boot; the ratified decision is FFM-only with
    premain-only registration, proven on JDK 25 by the boundary spike
    (`crates/ls-jvm-spike/tests/no_jni_guard.rs` enforces the discipline).
