@@ -658,6 +658,36 @@ impl QueryOrchestrator {
     fn requesting_forward_closure(&self, from_uri: &str) -> Option<HashSet<String>> {
         let ws = self.workspace()?;
         let path = uri::normalize(&uri::uri_to_path(from_uri).ok()?);
+        // Exact attribution first: the ingested doc row records its owning
+        // target, which is decisive when several targets share one sourceroot —
+        // the mill layout, where EVERY target's `-sourceroot` is the workspace
+        // root, so prefix depth ties across all targets and any tie-pick would
+        // prune valid definitions through an unrelated target's closure.
+        if let Some(snap) = self.current_snapshot() {
+            let seg = snap.segment();
+            let mut roots: Vec<_> = ws
+                .targets
+                .iter()
+                .map(|t| uri::normalize(&t.sourceroot))
+                .collect();
+            roots.sort();
+            roots.dedup();
+            for root in roots {
+                let Ok(rel) = path.strip_prefix(&root) else {
+                    continue;
+                };
+                let rel = rel.to_string_lossy().replace('\\', "/");
+                if let Some(doc) = (0..seg.doc_count()).find(|&d| seg.uri_of(d) == rel) {
+                    let target_ord = seg.target_ord_of_doc(doc);
+                    if target_ord >= 0 {
+                        let bsp_id = seg.target_meta(target_ord as u32).bsp_id;
+                        return Some(ws.forward_dependency_closure(&bsp_id));
+                    }
+                }
+            }
+        }
+        // Fallback for files the snapshot does not hold (fresh/unsaved
+        // sources): the deepest containing sourceroot.
         let spec = ws
             .targets
             .iter()

@@ -789,3 +789,148 @@ fn rename_md5_stale_before_emit_rejected() {
     let err = engine.rename("a/A.scala", 0, 6, "Renamed").unwrap_err();
     assert!(matches!(err, LsError::StaleIndex { uri } if uri == "b/B.scala"));
 }
+
+// --- object-symbol definition (the zaozi cross-file shape) ---------------------
+
+const KIND_OBJECT: i32 = 5;
+const KIND_TRAIT: i32 = 12;
+
+/// Mirror of the real-project shape that surfaced empty definitions: a sealed
+/// trait + companion object in one doc, the OBJECT referenced from a sibling
+/// doc of the SAME target, in a multi-segment package.
+#[test]
+fn symbol_definition_resolves_a_companion_object_in_a_multi_segment_package() {
+    let dir = TempDir::new("symdefobj");
+    let t = dir.sub("target");
+    let s = dir.sub("src");
+    write_doc(
+        &t,
+        &s,
+        &DocFixture::new(
+            "decoder/BitSet.scala",
+            "package me.jiuyang.decoder\ntrait BitSet\nobject BitSet\n",
+        )
+        .symbol(sym("me/jiuyang/decoder/BitSet#", KIND_TRAIT, 0, "BitSet"))
+        .symbol(sym("me/jiuyang/decoder/BitSet.", KIND_OBJECT, 0, "BitSet"))
+        .occurrence(occ(rng(1, 6, 1, 12), "me/jiuyang/decoder/BitSet#", DEFINITION))
+        .occurrence(occ(rng(2, 7, 2, 13), "me/jiuyang/decoder/BitSet.", DEFINITION)),
+    );
+    write_doc(
+        &t,
+        &s,
+        &DocFixture::new(
+            "decoder/TruthTable.scala",
+            "package me.jiuyang.decoder\nval x = BitSet\n",
+        )
+        .occurrence(occ(rng(1, 8, 1, 14), "me/jiuyang/decoder/BitSet.", REFERENCE)),
+    );
+    let ws = WorkspaceTargets::new(vec![TargetSpec::new("decoder", t, s.clone())]);
+    let orch = orchestrator(&dir, Arc::new(ws));
+
+    let locs = orch.symbol_definition(
+        "me/jiuyang/decoder/BitSet.",
+        &file_uri(&s, "decoder/TruthTable.scala"),
+    );
+    assert_eq!(locs.len(), 1, "the object definition must resolve: {locs:?}");
+    assert_eq!(locs[0].uri, file_uri(&s, "decoder/BitSet.scala"));
+    assert_eq!(locs[0].span, Span::new(2, 7, 2, 13));
+
+    // The companion trait resolves independently to its own name span.
+    let trait_locs = orch.symbol_definition(
+        "me/jiuyang/decoder/BitSet#",
+        &file_uri(&s, "decoder/TruthTable.scala"),
+    );
+    assert_eq!(trait_locs.len(), 1, "the trait definition must resolve: {trait_locs:?}");
+    assert_eq!(trait_locs[0].span, Span::new(1, 6, 1, 12));
+}
+
+/// A lone object (no companion) in a single-segment package — the minimal
+/// object-symbol shape.
+#[test]
+fn symbol_definition_resolves_a_plain_object_symbol() {
+    let dir = TempDir::new("symdefobjplain");
+    let t = dir.sub("target");
+    let s = dir.sub("src");
+    write_doc(
+        &t,
+        &s,
+        &DocFixture::new("o/O.scala", "package pkg\nobject O\n")
+            .symbol(sym("pkg/O.", KIND_OBJECT, 0, "O"))
+            .occurrence(occ(rng(1, 7, 1, 8), "pkg/O.", DEFINITION)),
+    );
+    write_doc(
+        &t,
+        &s,
+        &DocFixture::new("u/U.scala", "package pkg\nval y = O\n")
+            .occurrence(occ(rng(1, 8, 1, 9), "pkg/O.", REFERENCE)),
+    );
+    let ws = WorkspaceTargets::new(vec![TargetSpec::new("app", t, s.clone())]);
+    let orch = orchestrator(&dir, Arc::new(ws));
+    let locs = orch.symbol_definition("pkg/O.", &file_uri(&s, "u/U.scala"));
+    assert_eq!(locs.len(), 1, "a plain object definition must resolve: {locs:?}");
+    assert_eq!(locs[0].uri, file_uri(&s, "o/O.scala"));
+}
+
+/// The mill layout: EVERY target's `-sourceroot` is the workspace root, so
+/// sourceroot-prefix attribution ties across all targets. The requesting
+/// buffer's true owner is the target whose ingested doc row carries it —
+/// never an arbitrary tied pick (which prunes valid definitions through a
+/// disconnected target's closure).
+#[test]
+fn symbol_definition_attributes_the_buffer_by_doc_row_under_a_shared_sourceroot() {
+    let dir = TempDir::new("symdefshared");
+    let s = dir.sub("ws"); // ONE sourceroot for every target, like mill.
+    let lib_t = dir.sub("lib-target");
+    let tests_t = dir.sub("tests-target");
+    let other_t = dir.sub("other-target");
+    let other2_t = dir.sub("other2-target");
+    write_doc(
+        &lib_t,
+        &s,
+        &DocFixture::new("decoder/src/BitSet.scala", "package pkg\nobject B\n")
+            .symbol(sym("pkg/B.", 5, 0, "B"))
+            .occurrence(occ(rng(1, 7, 1, 8), "pkg/B.", DEFINITION)),
+    );
+    write_doc(
+        &tests_t,
+        &s,
+        &DocFixture::new("decoder/tests/src/BSpec.scala", "package pkg\nval u = B\n")
+            .occurrence(occ(rng(1, 8, 1, 9), "pkg/B.", REFERENCE)),
+    );
+    write_doc(
+        &other_t,
+        &s,
+        &DocFixture::new("rv/src/R.scala", "package rv\nclass R\n")
+            .symbol(sym("rv/R#", KIND_CLASS, 0, "R"))
+            .occurrence(occ(rng(1, 6, 1, 7), "rv/R#", DEFINITION)),
+    );
+    write_doc(
+        &other2_t,
+        &s,
+        &DocFixture::new("rv/tests/src/RSpec.scala", "package rv\nval r = new R\n")
+            .occurrence(occ(rng(1, 12, 1, 13), "rv/R#", REFERENCE)),
+    );
+    // Workspace order mirrors the observed real model: the requesting target
+    // first, disconnected targets LAST (the arbitrary tie-pick victims).
+    let ws = WorkspaceTargets::new(vec![
+        TargetSpec::new("lib", lib_t, s.clone()),
+        TargetSpec::new("tests", tests_t, s.clone()).with_deps(vec!["lib".to_string()]),
+        TargetSpec::new("other", other_t, s.clone()),
+        TargetSpec::new("other2", other2_t, s.clone()).with_deps(vec!["other".to_string()]),
+    ]);
+    let orch = orchestrator(&dir, Arc::new(ws));
+
+    // From the tests buffer (owned by `tests`, which depends on `lib`), the
+    // object defined in `lib` must resolve.
+    let locs = orch.symbol_definition("pkg/B.", &file_uri(&s, "decoder/tests/src/BSpec.scala"));
+    assert_eq!(
+        locs.len(),
+        1,
+        "shared-sourceroot attribution must use the doc's own target: {locs:?}"
+    );
+    assert_eq!(locs[0].uri, file_uri(&s, "decoder/src/BitSet.scala"));
+
+    // And from the defining buffer itself (same-target cross-file).
+    let same = orch.symbol_definition("pkg/B.", &file_uri(&s, "decoder/src/BitSet.scala"));
+    assert_eq!(same.len(), 1, "same-target lookup must survive the tie: {same:?}");
+}

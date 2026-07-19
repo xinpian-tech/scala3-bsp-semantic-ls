@@ -56,6 +56,7 @@ Selected load-bearing cases, mechanically checked (`file` :: "case substring"):
 - `crates/ls-server/tests/fake_bsp_e2e.rs` :: "diagnostics"
 - `it/lsp-blackbox/test_lifecycle.py` :: "test_initialize_advertises_the_exact_capability_surface"
 - `it/lsp-blackbox/test_diagnostics.py` :: "test_compile_diagnostics_publish_then_clear"
+- `crates/ls-engine/tests/engine.rs` :: "symbol_definition_attributes_the_buffer_by_doc_row_under_a_shared_sourceroot"
 
 ## Recorded trims and accepted evolutions
 
@@ -102,20 +103,18 @@ and the plan stay reconciled.
    ad-hoc probe flags. The pinned, patched zaozi source stays exposed as
    `ZAOZI_SRC` (flake input) for manual real-repo validation with any LSP
    client.
-9. **Known gap (open finding): cross-file definition on real multi-package
-   projects.** The project-level editor e2e (`it/nvim/e2e.lua` over the pinned
-   zaozi `decoder` module) observes that `textDocument/definition` answers
-   empty for cross-file targets (both cross-target and same-target) while
-   hover at the SAME position answers — the presentation compiler resolves the
-   symbol, but the island's `symbol_definition` resolver
-   (`QueryOrchestrator::symbol_definition`) yields no location for the
-   PC-provided symbol. The gated sample-workspace suite
-   (`crates/ls-server/tests/real_bsp_pc.rs`) passes the cross-target shape
-   with single-segment packages (`pkga`), so the suspect is symbol-string or
-   target-closure handling on real-world multi-segment packages
-   (`me/jiuyang/decoder`). In-buffer definition passes. The e2e reports the
-   cross-file probes as `E2E INFO` observations; flip them to hard gates when
-   the resolver gap is fixed.
+9. **Fixed defect (found by the project-level editor e2e): shared-sourceroot
+   target attribution pruned cross-file definitions.** Under the mill layout
+   every target's `-sourceroot` is the workspace root, so
+   `QueryOrchestrator::symbol_definition`'s deepest-sourceroot-prefix
+   attribution of the requesting buffer tied across ALL targets and picked an
+   arbitrary one — whose forward closure then pruned valid definitions
+   (observed on zaozi: hover and references answered at a position where
+   definition was empty). The fix attributes the buffer by its ingested doc
+   row's own target first (exact), keeping the prefix heuristic only as the
+   fallback for un-indexed files. Regression:
+   `crates/ls-engine/tests/engine.rs` (shared-sourceroot + object-symbol
+   cases) and the now-hard cross-file definition gates in `it/nvim/e2e.lua`.
 10. **JNIEnv contingency retired.** The historical draft carried a two-call
    JNIEnv fallback for the island boot; the ratified decision is FFM-only with
    premain-only registration, proven on JDK 25 by the boundary spike

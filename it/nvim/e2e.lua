@@ -212,23 +212,20 @@ if not where then
 end
 pass("in-buffer definition resolves to " .. where)
 
--- Cross-file definition (both cross-target and same-target): OBSERVED, not
--- yet gated. On this real project the PC resolves the symbol (hover answers at
--- the same position) but the island's `symbol_definition` resolver answers
--- empty — a finding this e2e exists to surface; sample-workspace's gated
--- real-BSP suite passes the cross-target shape, so the gap is real-project
--- specific (multi-segment package?). Flip these to hard gates once fixed.
+-- Cross-file definition, both shapes, HARD gates: cross-target (tests -> main
+-- module) and same-target cross-file. Under the mill layout every target
+-- shares one `-sourceroot`, so these prove the doc-row target attribution in
+-- `QueryOrchestrator::symbol_definition` (the shared-sourceroot regression).
 local spec_buf = open_attached("decoder/tests/src/BitSetSpec.scala")
 for _, case in ipairs({
   { "cross-target definition", spec_buf, "BitSet.bitpat", 2 },
   { "same-target cross-file definition", buf, "BitSet.bitset", 1 },
 }) do
   local where, why = probe_definition(case[1], case[2], case[3], case[4])
-  if where then
-    pass(case[1] .. " resolves to " .. where)
-  else
-    io.stdout:write("E2E INFO: " .. why .. " (known gap — see docs/traceability.md)\n")
+  if not where then
+    fail(why)
   end
+  pass(case[1] .. " resolves to " .. where)
 end
 
 -- References over the index.
