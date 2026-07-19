@@ -176,6 +176,14 @@ pub trait PcQueryService: Send + Sync {
     /// `reloadBuildModel` reuse of `s.pc` with the refetched `pcConfigs`. Default
     /// no-op: a services bundle with no PC island keeps its (empty) target set.
     fn reconfigure_targets(&self, _targets: Vec<TargetConfig>) {}
+
+    /// `workspace/didChangeConfiguration` arrived. The notification's `settings`
+    /// payload is deliberately ignored — the workspace
+    /// `.scala3-bsp-semantic-ls/config.json` stays the single configuration
+    /// source — the hook only gives the service a chance to re-read that file.
+    /// Default no-op: a services bundle with no PC island has no config to
+    /// re-read.
+    fn on_config_changed(&self) {}
 }
 
 /// The `symbol_definition` resolver the island calls when the presentation
@@ -596,6 +604,25 @@ impl PcQueryService for IslandPcService {
             state.boot_error = Some(detail);
         }
     }
+
+    fn on_config_changed(&self) {
+        let mut guard = self.state.lock().expect("pc island state mutex");
+        let state = &mut *guard;
+        // A booted island cannot re-home its one-per-process JVM: the change is
+        // logged and ignored (a new `javaHome` applies from the next server
+        // start).
+        if state.driver.is_some() {
+            eprintln!(
+                "ls-server: workspace/didChangeConfiguration ignored: \
+                 the PC island is already booted"
+            );
+            return;
+        }
+        // Still cold: un-latch a recorded boot failure so the NEXT PC query
+        // re-reads config.json and re-attempts the boot (the user may have just
+        // fixed `javaHome`).
+        state.boot_error = None;
+    }
 }
 
 /// The workspace-level `javaHome` override, read from the optional
@@ -607,6 +634,48 @@ fn workspace_config_java_home(workspace_root: &std::path::Path) -> Option<PathBu
         std::fs::read_to_string(workspace_root.join(".scala3-bsp-semantic-ls/config.json")).ok()?;
     let value: Value = serde_json::from_str(&text).ok()?;
     value.get("javaHome")?.as_str().map(PathBuf::from)
+}
+
+/// Normalizes a resolved Java home for the nixpkgs JDK package layout: a
+/// nixpkgs JDK store path is a package ROOT whose real Java home is nested at
+/// `<root>/lib/openjdk` (`release`, `lib/server/libjvm.so`, and friends live
+/// there). When `home/release` is not a file but `home/lib/openjdk/release` is,
+/// the nested home is returned; any other layout passes through unchanged.
+fn normalize_java_home(home: PathBuf) -> PathBuf {
+    if !home.join("release").is_file() {
+        let nested = home.join("lib/openjdk");
+        if nested.join("release").is_file() {
+            return nested;
+        }
+    }
+    home
+}
+
+/// Resolves the island's Java HOME by the same precedence
+/// [`resolve_island_paths`] applies to the libjvm path — workspace config
+/// `javaHome`, then `LS_LIBJVM` (stripping the `lib/server/libjvm.so` tail to
+/// recover the home), then `JAVA_HOME` — normalized for the nixpkgs
+/// package-root layout ([`normalize_java_home`]). `None` when no tier is set.
+/// The doctor's `Runtime` probe reads the Java version from this home, so the
+/// reported JVM is the one the island boot would actually use.
+pub(crate) fn resolve_java_home(
+    workspace_root: &std::path::Path,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Option<PathBuf> {
+    let home = if let Some(home) = workspace_config_java_home(workspace_root) {
+        home
+    } else if let Some(libjvm) = env("LS_LIBJVM") {
+        // `<home>/lib/server/libjvm.so` -> `<home>` (three components up).
+        std::path::Path::new(&libjvm)
+            .ancestors()
+            .nth(3)?
+            .to_path_buf()
+    } else if let Some(home) = env("JAVA_HOME") {
+        PathBuf::from(home)
+    } else {
+        return None;
+    };
+    Some(normalize_java_home(home))
 }
 
 /// Resolves the embedded JVM's `libjvm.so` and the island host agent jar.
@@ -626,7 +695,10 @@ fn resolve_island_paths(
     } else if let Some(path) = env("LS_LIBJVM") {
         PathBuf::from(path)
     } else if let Some(home) = env("JAVA_HOME") {
-        PathBuf::from(home).join("lib/server/libjvm.so")
+        // A nixpkgs JDK's JAVA_HOME is often the package ROOT, whose real home
+        // (and libjvm) is nested at `lib/openjdk`; normalize so a bare
+        // `JAVA_HOME=<nix package root>` boots without needing LS_LIBJVM.
+        normalize_java_home(PathBuf::from(home)).join("lib/server/libjvm.so")
     } else {
         return Err("no Java home for the PC island: set javaHome in \
              .scala3-bsp-semantic-ls/config.json, or LS_LIBJVM / JAVA_HOME in the environment"
@@ -842,6 +914,25 @@ mod tests {
         ]);
         let (libjvm, _) = resolve_island_paths(ws.path(), &env).unwrap();
         assert_eq!(libjvm, PathBuf::from("/config/jdk/lib/server/libjvm.so"));
+    }
+
+    // The nixpkgs JDK package-root layout: `JAVA_HOME=<store path>` where the
+    // real home (release file + libjvm) is nested at `<store path>/lib/openjdk`.
+    // A bare package-root JAVA_HOME must still locate libjvm (before this
+    // normalization only LS_LIBJVM saved the dev shell).
+    #[test]
+    fn island_paths_normalize_a_nixpkgs_package_root_java_home() {
+        let jdk = tempfile::tempdir().unwrap();
+        let nested = jdk.path().join("lib/openjdk");
+        std::fs::create_dir_all(nested.join("lib/server")).unwrap();
+        std::fs::write(nested.join("release"), "JAVA_VERSION=\"25.0.4\"\n").unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        let env = env_of(&[
+            ("JAVA_HOME", jdk.path().to_str().unwrap()),
+            ("PC_HOST_AGENT_JAR", "/a.jar"),
+        ]);
+        let (libjvm, _) = resolve_island_paths(ws.path(), &env).unwrap();
+        assert_eq!(libjvm, nested.join("lib/server/libjvm.so"));
     }
 
     #[test]
@@ -1262,6 +1353,43 @@ mod tests {
             pc.completion(a, 0, 0),
             crate::pc_convert::empty_completions()
         );
+    }
+
+    // `workspace/didChangeConfiguration` un-latches a recorded boot failure ONLY
+    // while the island is still cold, so the next PC query re-reads config.json
+    // and re-attempts the boot; a booted island ignores the notification (the
+    // one-per-process JVM cannot re-home). The settings payload never reaches
+    // this hook — config.json stays the single configuration source.
+    #[test]
+    fn config_change_clears_a_latched_boot_error_only_while_cold() {
+        // Cold: the latch clears (and the island is still not booted).
+        let cold = IslandPcService::new(
+            PathBuf::from("/ws"),
+            vec![target_config("t")],
+            empty_resolver(),
+            empty_search_resolver(),
+        );
+        cold.state.lock().unwrap().boot_error = Some("bad javaHome".to_string());
+        cold.on_config_changed();
+        assert!(
+            cold.state.lock().unwrap().boot_error.is_none(),
+            "a cold island's latched boot error must clear on a config change"
+        );
+        assert!(
+            !cold.is_booted(),
+            "a config change must not boot the island"
+        );
+
+        // Booted: the notification is ignored — the latch survives and no
+        // request reaches the island.
+        let (booted_pc, calls) = booted("t", Vec::new());
+        booted_pc.state.lock().unwrap().boot_error = Some("re-registration rejected".to_string());
+        booted_pc.on_config_changed();
+        assert!(
+            booted_pc.state.lock().unwrap().boot_error.is_some(),
+            "a booted island must ignore a config change"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "no island traffic");
     }
 
     // `is_registered` reflects the registered PC targets — the resolve gate.

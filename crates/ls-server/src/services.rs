@@ -225,7 +225,7 @@ impl CoreServices {
             registered_targets: registered,
         });
         DoctorReport {
-            runtime: RuntimeSection::gather(),
+            runtime: RuntimeSection::gather(root.unwrap_or_else(|| Path::new("."))),
             nix: NixSection::gather(root.unwrap_or_else(|| Path::new("."))),
             bsp,
             semanticdb,
@@ -393,6 +393,15 @@ impl Handlers<CoreServices> for CoreHandlers {
 
     fn on_did_save(&self, services: &CoreServices, uri: &str) {
         services.schedule_save_build(uri);
+    }
+
+    /// `workspace/didChangeConfiguration`: the notification's `settings` payload
+    /// is deliberately ignored — the workspace `.scala3-bsp-semantic-ls/
+    /// config.json` stays the single configuration source — the PC island is
+    /// only nudged to re-read that file (a still-cold island un-latches a
+    /// recorded boot failure so the next PC query re-attempts the boot).
+    fn on_did_change_configuration(&self, services: &CoreServices) {
+        services.pc.on_config_changed();
     }
 
     fn doctor(
@@ -1057,6 +1066,9 @@ mod tests {
         signature_help: Value,
         registered: bool,
         resolved: Option<Value>,
+        /// Counts `on_config_changed` calls (shared so the test observes them
+        /// after the fake moves into the services bundle).
+        config_changes: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl PcQueryService for FakePc {
@@ -1087,6 +1099,32 @@ mod tests {
         fn resolve_completion_item(&self, _t: &str, _s: &str, item: &Value) -> Value {
             self.resolved.clone().unwrap_or_else(|| item.clone())
         }
+        fn on_config_changed(&self) {
+            self.config_changes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    // `workspace/didChangeConfiguration` reaches the PC service through the
+    // production handlers: the settings payload is dropped upstream and the hook
+    // only forwards to `PcQueryService::on_config_changed`.
+    #[test]
+    fn did_change_configuration_forwards_to_the_pc_service() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_changes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let services = services_with_pc(
+            dir.path(),
+            FakePc {
+                config_changes: config_changes.clone(),
+                ..FakePc::default()
+            },
+        );
+        CoreHandlers.on_did_change_configuration(&services);
+        assert_eq!(
+            config_changes.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the handlers must forward the config change to the PC service"
+        );
     }
 
     // Reference hits become locations; a hit whose URI cannot be resolved to a

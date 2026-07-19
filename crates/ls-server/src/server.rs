@@ -111,6 +111,13 @@ pub trait Handlers<S> {
     /// closure.
     fn on_did_save(&self, _services: &S, _uri: &str) {}
 
+    /// `workspace/didChangeConfiguration` arrived while ready. The notification's
+    /// `settings` payload is deliberately ignored — the workspace
+    /// `.scala3-bsp-semantic-ls/config.json` stays the single configuration
+    /// source — the hook only lets the ready services re-read that file.
+    /// Default no-op.
+    fn on_did_change_configuration(&self, _services: &S) {}
+
     /// The live doctor report for a ready workspace (the `Runtime`/`Nix`/`Store`
     /// plus the live `BSP`/`SemanticDB`/`PC` sections). `None` when this handler
     /// has no live report to add (a fake, or a non-`CoreServices` bundle), in
@@ -328,6 +335,15 @@ where
                     exiting = true;
                     break;
                 }
+            }
+            Ok(Incoming::Response(response)) => {
+                // An inbound client response (a reply to a server-to-client
+                // request): the server has no such request in flight yet, so it
+                // is consumed and dropped — never answered with an error frame.
+                eprintln!(
+                    "ls-server: ignoring a client response with no matching request (id: {:?})",
+                    response.id
+                );
             }
             Err(error) => sink.send(&null_id_error(&error))?,
         }
@@ -644,6 +660,14 @@ where
         "textDocument/didChange" => core.did_change(handlers, &note.params),
         "textDocument/didClose" => core.did_close(handlers, &note.params),
         "textDocument/didSave" => core.did_save(handlers, &note.params),
+        // `workspace/didChangeConfiguration`: `params.settings` is ignored
+        // (config.json is the single configuration source); the ready services
+        // are only nudged to re-read it. Before ready there is nothing to nudge.
+        "workspace/didChangeConfiguration" => {
+            if let Some(services) = core.state.ready() {
+                handlers.on_did_change_configuration(services);
+            }
+        }
         // Any other notification (including `$/setTrace`) is ignored.
         _ => {}
     }
@@ -1661,6 +1685,99 @@ mod tests {
         );
         // Not ready (failed bootstrap): the document store still syncs, but no
         // hook is invoked.
+        assert!(drive(false).is_empty());
+    }
+
+    // An inbound client RESPONSE frame (id + result/error, no method) is consumed
+    // and dropped: no error frame is written back, and the loop continues to serve
+    // the following messages. Base-protocol tolerance, and the prerequisite for
+    // dynamic registration.
+    #[test]
+    fn a_client_response_frame_is_consumed_without_an_error_frame() {
+        let (core, out) = run(
+            vec![
+                frame(request(1, "initialize", json!({ "rootUri": "file:///ws" }))),
+                frame(json!({ "jsonrpc": "2.0", "id": 99, "result": { "ok": true } })),
+                frame(json!({
+                    "jsonrpc": "2.0",
+                    "id": 100,
+                    "error": { "code": -32601, "message": "nope" }
+                })),
+                frame(request(2, "shutdown", json!({}))),
+                frame(notification("exit", json!({}))),
+            ],
+            ready("unused"),
+        );
+        // Exactly the two request responses — no null-id error frame for the
+        // inbound responses — and the loop reached the later messages.
+        assert_eq!(out.len(), 2, "{out:?}");
+        assert_eq!(out[0]["id"], 1);
+        assert_eq!(out[1]["id"], 2);
+        assert!(out.iter().all(|m| m.get("error").is_none()), "{out:?}");
+        assert!(core.shutting_down, "the loop continued past the responses");
+    }
+
+    // `workspace/didChangeConfiguration` reaches the handlers' hook only when the
+    // workspace is ready; the settings payload is ignored upstream of the hook
+    // (config.json stays the single configuration source).
+    #[test]
+    fn did_change_configuration_forwards_to_the_hook_only_when_ready() {
+        use std::sync::Mutex;
+
+        #[derive(Default)]
+        struct ConfigRecordingHandlers {
+            calls: Mutex<Vec<String>>,
+        }
+        impl Handlers<FakeServices> for ConfigRecordingHandlers {
+            fn handle(&self, cx: RequestContext<'_, FakeServices>) -> Response {
+                Response::success(cx.request.id.clone(), Value::Null)
+            }
+            fn on_did_change_configuration(&self, services: &FakeServices) {
+                self.calls.lock().unwrap().push(services.tag.clone());
+            }
+        }
+
+        let drive = |ready_state: bool| {
+            let bootstrap_state = if ready_state {
+                ready("svc")
+            } else {
+                WorkspaceState::Failed {
+                    detail: "no build server".to_string(),
+                }
+            };
+            let mut core = ServerCore::new();
+            let handlers = ConfigRecordingHandlers::default();
+            let pre = [
+                frame(request(1, "initialize", json!({ "rootUri": "file:///ws" }))),
+                frame(notification("initialized", json!({}))),
+            ]
+            .concat();
+            let post = [
+                frame(notification(
+                    "workspace/didChangeConfiguration",
+                    json!({ "settings": { "ignored": true } }),
+                )),
+                frame(notification("exit", json!({}))),
+            ]
+            .concat();
+            for group in [pre, post] {
+                let mut reader = Cursor::new(group);
+                let sink = OutputSink::new(Vec::new());
+                serve(
+                    &mut reader,
+                    &sink,
+                    &mut core,
+                    &handlers,
+                    FixedBootstrap(bootstrap_state.clone()),
+                )
+                .unwrap();
+            }
+            handlers.calls.into_inner().unwrap()
+        };
+
+        // Ready: the hook fires once with the ready services.
+        assert_eq!(drive(true), vec!["svc".to_string()]);
+        // Not ready (failed bootstrap): the notification is ignored.
         assert!(drive(false).is_empty());
     }
 }

@@ -65,11 +65,26 @@ pub struct Notification {
     pub params: Value,
 }
 
-/// An inbound message: a request (has an id) or a notification (no id).
+/// An inbound RESPONSE from the client — a reply to a server-to-client request:
+/// an `id` plus `result` or `error`, and no `method`. The server issues no such
+/// requests yet, so the loop consumes and drops these; recognizing the frame
+/// (instead of answering it with a null-id INVALID_REQUEST error) is base-
+/// protocol robustness and the prerequisite for dynamic registration.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ClientResponse {
+    /// The correlating id (`None` for a null id).
+    pub id: Option<RequestId>,
+    pub result: Option<Value>,
+    pub error: Option<Value>,
+}
+
+/// An inbound message: a request (has a method and an id), a notification (a
+/// method, no id), or a client response (`result`/`error`, no method).
 #[derive(Clone, Debug, PartialEq)]
 pub enum Incoming {
     Request(Request),
     Notification(Notification),
+    Response(ClientResponse),
 }
 
 /// An outbound response. `result` and `error` are mutually exclusive; exactly
@@ -152,19 +167,40 @@ fn header_value<'a>(line: &'a str, name: &str) -> Option<&'a str> {
 }
 
 /// Parses a framed body into an [`Incoming`] message: a JSON object with a
-/// non-null `id` is a request, otherwise a notification. Returns a
-/// [`ResponseError`] for a body that is not a well-formed JSON-RPC message.
+/// `method` and a non-null `id` is a request, with a `method` and no id a
+/// notification, and with no `method` but a `result` or `error` an inbound
+/// client [`ClientResponse`]. Returns a [`ResponseError`] for a body that is
+/// not a well-formed JSON-RPC message.
 pub fn parse_incoming(body: &[u8]) -> Result<Incoming, ResponseError> {
     let value: Value = serde_json::from_slice(body)
         .map_err(|e| ResponseError::new(error_codes::PARSE_ERROR, format!("invalid json: {e}")))?;
     let object = value.as_object().ok_or_else(|| {
         ResponseError::new(error_codes::INVALID_REQUEST, "message is not a json object")
     })?;
-    let method = object
-        .get("method")
-        .and_then(Value::as_str)
-        .ok_or_else(|| ResponseError::new(error_codes::INVALID_REQUEST, "message has no method"))?
-        .to_string();
+    let Some(method) = object.get("method").and_then(Value::as_str) else {
+        // No method: an inbound client RESPONSE frame when it carries `result`
+        // or `error`; anything else is malformed.
+        if !object.contains_key("method")
+            && (object.contains_key("result") || object.contains_key("error"))
+        {
+            let id = match object.get("id") {
+                None | Some(Value::Null) => None,
+                Some(id) => Some(serde_json::from_value(id.clone()).map_err(|_| {
+                    ResponseError::new(error_codes::INVALID_REQUEST, "invalid response id")
+                })?),
+            };
+            return Ok(Incoming::Response(ClientResponse {
+                id,
+                result: object.get("result").cloned(),
+                error: object.get("error").cloned(),
+            }));
+        }
+        return Err(ResponseError::new(
+            error_codes::INVALID_REQUEST,
+            "message has no method",
+        ));
+    };
+    let method = method.to_string();
     let params = object.get("params").cloned().unwrap_or(Value::Null);
     match object.get("id") {
         None | Some(Value::Null) => Ok(Incoming::Notification(Notification { method, params })),
@@ -308,7 +344,37 @@ mod tests {
 
     #[test]
     fn a_message_without_a_method_is_an_invalid_request() {
+        // No method AND no result/error: malformed, not a client response.
         let err = parse_incoming(br#"{"jsonrpc":"2.0","id":1}"#).unwrap_err();
         assert_eq!(err.code, error_codes::INVALID_REQUEST);
+    }
+
+    // An inbound client RESPONSE frame (a reply to a server-to-client request):
+    // id + result, no method. Parsed as `Incoming::Response`, never answered
+    // with a null-id INVALID_REQUEST error.
+    #[test]
+    fn an_id_result_frame_without_a_method_is_a_client_response() {
+        let body = r#"{"jsonrpc":"2.0","id":7,"result":{"ok":true}}"#;
+        match parse_incoming(body.as_bytes()).unwrap() {
+            Incoming::Response(response) => {
+                assert_eq!(response.id, Some(RequestId::Number(7)));
+                assert_eq!(response.result, Some(json!({ "ok": true })));
+                assert_eq!(response.error, None);
+            }
+            other => panic!("expected a client response, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_id_error_frame_without_a_method_is_a_client_response() {
+        let body = r#"{"jsonrpc":"2.0","id":"r1","error":{"code":-32601,"message":"nope"}}"#;
+        match parse_incoming(body.as_bytes()).unwrap() {
+            Incoming::Response(response) => {
+                assert_eq!(response.id, Some(RequestId::String("r1".to_string())));
+                assert_eq!(response.result, None);
+                assert_eq!(response.error.unwrap()["code"], -32601);
+            }
+            other => panic!("expected a client response, got {other:?}"),
+        }
     }
 }

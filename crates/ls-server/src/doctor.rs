@@ -144,7 +144,7 @@ impl DoctorReport {
     /// (the Scala `DoctorInput.offline`).
     pub fn offline(workspace_root: &Path) -> DoctorReport {
         DoctorReport {
-            runtime: RuntimeSection::gather(),
+            runtime: RuntimeSection::gather(workspace_root),
             nix: NixSection::gather(workspace_root),
             bsp: SectionState::Unavailable("no BSP connection".to_string()),
             semanticdb: SectionState::Unavailable("no BSP connection".to_string()),
@@ -437,11 +437,13 @@ fn pc_json(p: &PcSection) -> Value {
 impl RuntimeSection {
     /// Gathers Runtime facts from the host + the embedded island's STATIC launch
     /// policy (mirroring `ls_jvm::boot_options`) — never boots the island. The
-    /// island is launched from `$JAVA_HOME` with `--enable-native-access=
-    /// ALL-UNNAMED` and `-XX:+UseCompactObjectHeaders`, and no `-XX:AOTCache`.
-    pub fn gather() -> RuntimeSection {
+    /// island is launched from the Java home the boot would resolve (workspace
+    /// config `javaHome` > `LS_LIBJVM` > `JAVA_HOME`) with
+    /// `--enable-native-access=ALL-UNNAMED` and `-XX:+UseCompactObjectHeaders`,
+    /// and no `-XX:AOTCache`.
+    pub fn gather(workspace_root: &Path) -> RuntimeSection {
         RuntimeSection {
-            java: java_version(),
+            java: java_version(workspace_root, &|key| std::env::var(key).ok()),
             native_access_enabled_for: vec!["ALL-UNNAMED".to_string()],
             compact_object_headers: "enabled".to_string(),
             aot_cache: "missing (no -XX:AOTCache flag)".to_string(),
@@ -449,13 +451,18 @@ impl RuntimeSection {
     }
 }
 
-/// The configured Java version, read from `$JAVA_HOME/release` (a file read, no
-/// process launched). `unavailable`/`unknown` when it cannot be determined.
-fn java_version() -> String {
-    let Some(home) = std::env::var_os("JAVA_HOME") else {
-        return "unavailable: JAVA_HOME not set".to_string();
+/// The configured Java version, read from `<home>/release` of the Java home the
+/// island boot would resolve ([`crate::pc::resolve_java_home`]: workspace config
+/// `javaHome` > `LS_LIBJVM` > `JAVA_HOME`, normalized for the nixpkgs
+/// package-root layout whose real home is `<root>/lib/openjdk`). A file read, no
+/// process launched. `unavailable`/`unknown` when it cannot be determined.
+fn java_version(workspace_root: &Path, env: &dyn Fn(&str) -> Option<String>) -> String {
+    let Some(home) = crate::pc::resolve_java_home(workspace_root, env) else {
+        return "unavailable: no Java home (javaHome in .scala3-bsp-semantic-ls/config.json, \
+                LS_LIBJVM, and JAVA_HOME are all unset)"
+            .to_string();
     };
-    let release = Path::new(&home).join("release");
+    let release = home.join("release");
     match std::fs::read_to_string(&release) {
         Ok(content) => content
             .lines()
@@ -711,5 +718,116 @@ mod tests {
         assert!(value["pcPlugins"]["unavailable"].is_string());
         // A valid, serializable JSON object.
         assert!(serde_json::to_string(&value).is_ok());
+    }
+
+    // --- the Java-version probe (tier resolution + nixpkgs layout) --------------
+
+    fn env_of(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let owned: Vec<(String, String)> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        move |key: &str| owned.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
+    }
+
+    // The exact e2e failure this probe used to print `Java: unknown
+    // (<root>/release unreadable)` for: a nixpkgs JDK's JAVA_HOME is the package
+    // ROOT, and `release` lives at `<root>/lib/openjdk/release`.
+    #[test]
+    fn java_version_reads_a_nixpkgs_package_root_java_home() {
+        let jdk = tempfile::tempdir().unwrap();
+        let nested = jdk.path().join("lib/openjdk");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("release"), "JAVA_VERSION=\"25.0.4\"\n").unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        let env = env_of(&[("JAVA_HOME", jdk.path().to_str().unwrap())]);
+        assert_eq!(java_version(ws.path(), &env), "25.0.4");
+    }
+
+    #[test]
+    fn java_version_reads_a_plain_java_home_release() {
+        let jdk = tempfile::tempdir().unwrap();
+        std::fs::write(
+            jdk.path().join("release"),
+            "IMPLEMENTOR=\"x\"\nJAVA_VERSION=\"21.0.2\"\n",
+        )
+        .unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        let env = env_of(&[("JAVA_HOME", jdk.path().to_str().unwrap())]);
+        assert_eq!(java_version(ws.path(), &env), "21.0.2");
+    }
+
+    // The probe follows the island's resolution order: an exact `LS_LIBJVM`
+    // (`<home>/lib/server/libjvm.so`) implies its home and beats `JAVA_HOME`.
+    #[test]
+    fn java_version_prefers_the_ls_libjvm_derived_home_over_java_home() {
+        let libjvm_jdk = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(libjvm_jdk.path().join("lib/server")).unwrap();
+        std::fs::write(
+            libjvm_jdk.path().join("release"),
+            "JAVA_VERSION=\"25.0.4\"\n",
+        )
+        .unwrap();
+        let other = tempfile::tempdir().unwrap();
+        std::fs::write(other.path().join("release"), "JAVA_VERSION=\"11.0.1\"\n").unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        let libjvm = libjvm_jdk.path().join("lib/server/libjvm.so");
+        let env = env_of(&[
+            ("LS_LIBJVM", libjvm.to_str().unwrap()),
+            ("JAVA_HOME", other.path().to_str().unwrap()),
+        ]);
+        assert_eq!(java_version(ws.path(), &env), "25.0.4");
+    }
+
+    // The workspace config's `javaHome` is the top tier, over both env tiers.
+    #[test]
+    fn java_version_prefers_the_workspace_config_java_home_over_every_env_tier() {
+        let config_jdk = tempfile::tempdir().unwrap();
+        std::fs::write(
+            config_jdk.path().join("release"),
+            "JAVA_VERSION=\"25.0.4\"\n",
+        )
+        .unwrap();
+        let env_jdk = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(env_jdk.path().join("lib/server")).unwrap();
+        std::fs::write(env_jdk.path().join("release"), "JAVA_VERSION=\"11.0.1\"\n").unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        let conf_dir = ws.path().join(".scala3-bsp-semantic-ls");
+        std::fs::create_dir_all(&conf_dir).unwrap();
+        std::fs::write(
+            conf_dir.join("config.json"),
+            format!(r#"{{ "javaHome": "{}" }}"#, config_jdk.path().display()),
+        )
+        .unwrap();
+        let libjvm = env_jdk.path().join("lib/server/libjvm.so");
+        let env = env_of(&[
+            ("LS_LIBJVM", libjvm.to_str().unwrap()),
+            ("JAVA_HOME", env_jdk.path().to_str().unwrap()),
+        ]);
+        assert_eq!(java_version(ws.path(), &env), "25.0.4");
+    }
+
+    #[test]
+    fn java_version_without_a_java_version_line_names_the_release_file() {
+        let jdk = tempfile::tempdir().unwrap();
+        std::fs::write(jdk.path().join("release"), "IMPLEMENTOR=\"x\"\n").unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        let env = env_of(&[("JAVA_HOME", jdk.path().to_str().unwrap())]);
+        let version = java_version(ws.path(), &env);
+        assert!(
+            version.starts_with("unknown (no JAVA_VERSION in "),
+            "{version}"
+        );
+    }
+
+    #[test]
+    fn java_version_without_any_java_home_tier_is_unavailable() {
+        let ws = tempfile::tempdir().unwrap();
+        let version = java_version(ws.path(), &env_of(&[]));
+        assert!(version.starts_with("unavailable:"), "{version}");
+        // The message names every tier the resolution consults.
+        for tier in ["javaHome", "LS_LIBJVM", "JAVA_HOME"] {
+            assert!(version.contains(tier), "{version}");
+        }
     }
 }
