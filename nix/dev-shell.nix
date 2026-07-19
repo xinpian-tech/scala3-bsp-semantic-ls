@@ -23,6 +23,9 @@ pkgs.mkShell {
     # jextract generates the Java/Scala FFM bindings from the cbindgen C-ABI
     # header (island boundary); used by the ls-pc-host island + the boundary spike.
     jextract
+    # Headless editor client for the project-level e2e
+    # (scripts/it-nvim-zaozi.sh + it/nvim/e2e.lua).
+    neovim
   ] ++ pkgs.lib.optional (pythonEnv != null) pythonEnv;
 
   JAVA_HOME = "${jdk}";

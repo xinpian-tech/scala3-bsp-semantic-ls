@@ -10,6 +10,6 @@ diff --git a/build.mill b/build.mill
  trait ZaoziScalaModule extends ScalaModule {
    override def scalacOptions: T[Seq[String]] = Task(
 -    super.scalacOptions() ++ Seq("-java-output-version", "25")
-+    super.scalacOptions() ++ Seq("-java-output-version", "25", "-Xsemanticdb", "-sourceroot", mill.api.BuildCtx.workspaceRoot.toString)
++    super.scalacOptions() ++ Seq("-Xsemanticdb", "-sourceroot", mill.api.BuildCtx.workspaceRoot.toString)
    )
  }
