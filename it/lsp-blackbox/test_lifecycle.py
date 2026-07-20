@@ -42,6 +42,8 @@ async def test_initialize_advertises_the_exact_capability_surface(client):
     # negotiated); implementation is the override-family query.
     assert caps.document_symbol_provider is True
     assert caps.implementation_provider is True
+    # Index-backed call hierarchy (usage-hierarchy semantics): a plain boolean.
+    assert caps.call_hierarchy_provider is True
     # The payload-backed providers: inlay hints without resolve (every hint
     # ships complete), selection range and folding range as plain booleans.
     assert caps.inlay_hint_provider is not None

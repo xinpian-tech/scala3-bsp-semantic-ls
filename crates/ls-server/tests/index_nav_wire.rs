@@ -147,6 +147,86 @@ fn implementation_resolves_the_corpus_override_family() {
     client.shutdown();
 }
 
+// Call hierarchy over the framed wire, JVM-free: prepare -> incoming -> outgoing
+// round-tripped through the item's `data` field over the real corpus. Pins the
+// usage-hierarchy semantics end to end — incoming keeps the DISCONNECTED
+// target-C caller (no closure pruning, the deliberate difference from
+// references), outgoing resolves the body's target — and the island stays cold.
+#[test]
+fn call_hierarchy_prepares_then_round_trips_incoming_and_outgoing() {
+    assert!(
+        !ls_server::libjvm_mapped(),
+        "cold island before the session"
+    );
+    let (mut client, _pc) = boot();
+    client.initialize();
+    client.await_ready();
+
+    // prepare on the `make` definition in Core.scala.
+    let core_text = source_text("a/src/pkga/Core.scala");
+    let (line, character) = position_of(&core_text, "make", 0);
+    let prepared = client.result(
+        "textDocument/prepareCallHierarchy",
+        json!({
+            "textDocument": { "uri": core_uri() },
+            "position": { "line": line, "character": character }
+        }),
+    );
+    let items = prepared.as_array().expect("prepare returns an array");
+    assert_eq!(items.len(), 1, "one definition-side item: {prepared}");
+    let item = items[0].clone();
+    assert_eq!(item["name"], "make", "{item}");
+    // The raw SemanticDB symbol round-trips through `data`.
+    assert_eq!(item["data"]["symbol"], "pkga/Core.make().", "{item}");
+    // The index knows name spans only: range == selectionRange.
+    assert_eq!(item["range"], item["selectionRange"], "{item}");
+
+    // incomingCalls: the four callers, INCLUDING the disconnected target-C
+    // caller in CopyCore.scala (references prunes it; call hierarchy does not).
+    let incoming = client.result("callHierarchy/incomingCalls", json!({ "item": item }));
+    let calls = incoming.as_array().expect("incoming returns an array");
+    let names: std::collections::BTreeSet<&str> = calls
+        .iter()
+        .map(|c| c["from"]["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        ["core", "defaultCore"].into_iter().collect(),
+        "caller names: {incoming}"
+    );
+    let uris: Vec<&str> = calls
+        .iter()
+        .map(|c| c["from"]["uri"].as_str().unwrap())
+        .collect();
+    assert!(
+        uris.iter()
+            .any(|u| u.ends_with("c/src/pkga/CopyCore.scala")),
+        "the disconnected target-C caller must appear (no closure pruning): {uris:?}"
+    );
+    // Every incoming call carries at least one fromRange.
+    for call in calls {
+        assert!(
+            !call["fromRanges"].as_array().unwrap().is_empty(),
+            "a caller with no fromRanges: {call}"
+        );
+    }
+
+    // outgoingCalls: `make`'s body constructs the Core class.
+    let outgoing = client.result("callHierarchy/outgoingCalls", json!({ "item": item }));
+    let callees = outgoing.as_array().expect("outgoing returns an array");
+    let callee_names: Vec<&str> = callees
+        .iter()
+        .map(|c| c["to"]["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(callee_names, vec!["Core"], "make calls Core: {outgoing}");
+
+    assert!(
+        !ls_server::libjvm_mapped(),
+        "call hierarchy must not boot the island"
+    );
+    client.shutdown();
+}
+
 // The gate ladder of both methods: a no-SemanticDB source is the hard typed
 // error (never an empty lie), and an implementation cursor that resolves no
 // symbol is the typed references-style error.

@@ -71,6 +71,9 @@ pub enum Method {
     WorkspaceSymbol,
     DocumentSymbol,
     Implementation,
+    PrepareCallHierarchy,
+    IncomingCalls,
+    OutgoingCalls,
     Completion,
     Definition,
     TypeDefinition,
@@ -101,18 +104,21 @@ pub enum PreReadyOutcome {
 
 /// The per-method pre-ready fallback, matching the server's dispatch: references
 /// and rename fail typed; document highlight, workspace symbol, document
-/// symbol, implementation, completion,
+/// symbol, implementation, call-hierarchy incoming/outgoing calls, completion,
 /// definition, type definition, inlay hint, code action, folding range, and
 /// formatting answer empty (formatting because "nothing to change yet" is a
 /// valid, harmless answer while the workspace warms up — a not-ready error
 /// would make an editor's format-on-save fail loudly during bootstrap);
-/// hover, signature help, prepare rename, selection range, and the three
+/// hover, signature help, prepare rename, prepare call hierarchy, selection
+/// range, and the three
 /// semantic-tokens methods answer null (selection range because the spec ties
 /// `result[i]` to `positions[i]` — an empty array against a non-empty position
 /// list would break that correspondence, exactly as its ready-path gate
 /// fallback answers null; semantic tokens because the spec result is
 /// `SemanticTokens | null` and null — "no answer yet" — lets the client keep
-/// whatever highlighting it has instead of wiping it with an empty stream).
+/// whatever highlighting it has instead of wiping it with an empty stream;
+/// prepare call hierarchy because its result is `CallHierarchyItem[] | null`
+/// and null — "no item under the cursor yet" — is the spec's own no-answer).
 pub fn pre_ready_outcome(method: Method) -> PreReadyOutcome {
     match method {
         Method::References | Method::Rename => PreReadyOutcome::NotReadyError,
@@ -120,6 +126,8 @@ pub fn pre_ready_outcome(method: Method) -> PreReadyOutcome {
         | Method::WorkspaceSymbol
         | Method::DocumentSymbol
         | Method::Implementation
+        | Method::IncomingCalls
+        | Method::OutgoingCalls
         | Method::Completion
         | Method::Definition
         | Method::TypeDefinition
@@ -130,6 +138,7 @@ pub fn pre_ready_outcome(method: Method) -> PreReadyOutcome {
         Method::Hover
         | Method::SignatureHelp
         | Method::PrepareRename
+        | Method::PrepareCallHierarchy
         | Method::SelectionRange
         | Method::SemanticTokensFull
         | Method::SemanticTokensFullDelta
@@ -219,6 +228,8 @@ mod tests {
             Method::WorkspaceSymbol,
             Method::DocumentSymbol,
             Method::Implementation,
+            Method::IncomingCalls,
+            Method::OutgoingCalls,
             Method::Completion,
             Method::Definition,
             Method::TypeDefinition,

@@ -43,8 +43,9 @@ use serde_json::{json, Value};
 
 use ls_bsp::model::BspProjectModel;
 use ls_engine::{
-    CompileOutcome, CompileService, DocHighlight, DocumentHighlightService, IngestReport,
-    QueryOrchestrator, ReferencesEngine, ReferencesResult, RenameEngine, WorkspaceSymbolEntry,
+    CallEdge, CallItem, CompileOutcome, CompileService, DocHighlight, DocumentHighlightService,
+    IngestReport, QueryOrchestrator, ReferencesEngine, ReferencesResult, RenameEngine,
+    WorkspaceSymbolEntry,
 };
 use ls_index_model::uri::{normalize_uri, uri_to_path};
 use ls_index_model::{LsError, Span};
@@ -486,6 +487,11 @@ impl Handlers<CoreServices> for CoreHandlers {
             "workspace/symbol" => workspace_symbol(id, cx.services, &cx.request.params),
             "textDocument/documentSymbol" => document_symbol(id, cx.services, &cx.request.params),
             "textDocument/implementation" => implementation(id, cx.services, &cx.request.params),
+            "textDocument/prepareCallHierarchy" => {
+                prepare_call_hierarchy(id, cx.services, &cx.request.params)
+            }
+            "callHierarchy/incomingCalls" => incoming_calls(id, cx.services, &cx.request.params),
+            "callHierarchy/outgoingCalls" => outgoing_calls(id, cx.services, &cx.request.params),
             "textDocument/prepareRename" => prepare_rename(id, cx.services, &cx.request.params),
             "textDocument/rename" => rename(id, cx.services, &cx.request.params),
             "textDocument/definition" => definition(id, cx.services, &cx.request.params),
@@ -905,6 +911,159 @@ fn implementation(id: RequestId, services: &CoreServices, params: &Value) -> Res
             ok_json(id, &locations)
         }
         Err(error) => request_failed(id, &error),
+    }
+}
+
+/// `textDocument/prepareCallHierarchy`: the definition-side call item under the
+/// cursor from the index (`QueryOrchestrator::prepare_call_hierarchy` —
+/// usage-hierarchy semantics), as a single-element `CallHierarchyItem[]`. Gate
+/// ladder is the `references`/`implementation` one: `require_semanticdb` runs
+/// first as a hard error, an unmappable URI is `NotIndexed`, and every
+/// cursor-resolution failure maps to a typed `RequestFailed`. A resolved cursor
+/// that is not (and does not enclose) a callable — or whose item URI no longer
+/// resolves to a file — answers `null` (the spec's `CallHierarchyItem[] |
+/// null`). The definition-side `CallItem`'s raw SemanticDB symbol rides in the
+/// item's `data` field so incoming/outgoing round-trip it.
+fn prepare_call_hierarchy(id: RequestId, services: &CoreServices, params: &Value) -> Response {
+    let Some(raw) = text_document_uri(params) else {
+        return invalid_params(id, "prepareCallHierarchy: missing textDocument.uri");
+    };
+    if let Err(error) = services.require_semanticdb(&raw) {
+        return request_failed(id, &error);
+    }
+    let uri = normalize_uri(&raw);
+    let Some(sdb_uri) = services.to_sdb_uri(&uri) else {
+        return request_failed(id, &LsError::NotIndexed { uri });
+    };
+    let Some(pos) = position(params) else {
+        return invalid_params(id, "prepareCallHierarchy: missing position");
+    };
+    match services
+        .orchestrator
+        .prepare_call_hierarchy(&sdb_uri, pos.line, pos.character)
+    {
+        // A resolved item whose URI still maps to a file becomes the single
+        // prepared item; an unmappable item or no item at all answers null.
+        Ok(Some(item)) => match call_hierarchy_item(services, &item) {
+            Some(lsp_item) => ok_json(id, &vec![lsp_item]),
+            None => Response::success(id, Value::Null),
+        },
+        Ok(None) => Response::success(id, Value::Null),
+        Err(error) => request_failed(id, &error),
+    }
+}
+
+/// `callHierarchy/incomingCalls`: the callers of the prepared item under
+/// usage-hierarchy semantics (`QueryOrchestrator::incoming_calls` — the item's
+/// reference group scanned across ALL docs with NO closure pruning, import-line
+/// references dropped, grouped by enclosing definition). The item's raw
+/// SemanticDB symbol is read back from its `data` field (the prepare
+/// round-trip); an item without one — the synthetic file-level item, or a
+/// client that dropped `data` — answers the empty list. Each caller whose URI
+/// resolves to a file becomes one `CallHierarchyIncomingCall`; its
+/// `fromRanges` are the call sites in the caller's document.
+fn incoming_calls(id: RequestId, services: &CoreServices, params: &Value) -> Response {
+    let symbol = call_item_symbol(params).unwrap_or_default();
+    let calls: Vec<lsp_types::CallHierarchyIncomingCall> = services
+        .orchestrator
+        .incoming_calls(&symbol)
+        .iter()
+        .filter_map(|edge| {
+            call_hierarchy_item(services, &edge.item).map(|from| {
+                lsp_types::CallHierarchyIncomingCall {
+                    from,
+                    from_ranges: call_ranges(edge),
+                }
+            })
+        })
+        .collect();
+    ok_json(id, &calls)
+}
+
+/// `callHierarchy/outgoingCalls`: the callees of the prepared item under
+/// usage-hierarchy semantics (`QueryOrchestrator::outgoing_calls` — reference
+/// occurrences inside the item's successor-based extent, import lines dropped,
+/// resolved to their targets' definition items). The item symbol round-trips
+/// through `data` exactly as incoming does; each callee whose URI resolves to a
+/// file becomes one `CallHierarchyOutgoingCall` with its call sites (in the
+/// ITEM's document) as `fromRanges`.
+fn outgoing_calls(id: RequestId, services: &CoreServices, params: &Value) -> Response {
+    let symbol = call_item_symbol(params).unwrap_or_default();
+    let calls: Vec<lsp_types::CallHierarchyOutgoingCall> = services
+        .orchestrator
+        .outgoing_calls(&symbol)
+        .iter()
+        .filter_map(|edge| {
+            call_hierarchy_item(services, &edge.item).map(|to| {
+                lsp_types::CallHierarchyOutgoingCall {
+                    to,
+                    from_ranges: call_ranges(edge),
+                }
+            })
+        })
+        .collect();
+    ok_json(id, &calls)
+}
+
+/// An engine [`CallItem`] -> the LSP `CallHierarchyItem`, its SemanticDB URI
+/// mapped to a `file://` URI (the `references_locations` discipline — a URI
+/// that no longer resolves to a file drops the whole item, `None`). The index
+/// stores definition NAME spans only, so `range == selectionRange` (the
+/// documentSymbol name-span discipline). The raw SemanticDB `symbol` rides in
+/// `data` as `{"symbol": "..."}` so incoming/outgoing round-trip it; the
+/// synthetic file-level item (empty symbol) carries no `data`, and
+/// incoming/outgoing on it answer empty.
+fn call_hierarchy_item(
+    services: &CoreServices,
+    item: &CallItem,
+) -> Option<lsp_types::CallHierarchyItem> {
+    let file_uri = services.to_file_uri(&item.uri)?;
+    let uri = file_uri.parse::<lsp_types::Uri>().ok()?;
+    let range = lsp_range_of_span(item.span);
+    Some(lsp_types::CallHierarchyItem {
+        name: item.name.clone(),
+        kind: lsp_symbol_kind(item.kind),
+        tags: None,
+        detail: None,
+        uri,
+        range,
+        selection_range: range,
+        data: (!item.symbol.is_empty()).then(|| json!({ "symbol": item.symbol })),
+    })
+}
+
+/// The call-site spans of an edge as LSP ranges.
+fn call_ranges(edge: &CallEdge) -> Vec<lsp_types::Range> {
+    edge.call_sites
+        .iter()
+        .map(|s| lsp_range_of_span(*s))
+        .collect()
+}
+
+/// The raw SemanticDB symbol carried by a call-hierarchy request's `item.data`
+/// (`{"symbol": "..."}`), or `None` when the field is absent — the prepare
+/// round-trip the engine's incoming/outgoing queries key on.
+fn call_item_symbol(params: &Value) -> Option<String> {
+    params
+        .get("item")?
+        .get("data")?
+        .get("symbol")?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// Index [`Span`] -> `lsp_types::Range` (the coordinate systems match, as
+/// [`convert::range`] documents for the hand-rolled twin).
+fn lsp_range_of_span(span: Span) -> lsp_types::Range {
+    lsp_types::Range {
+        start: lsp_types::Position {
+            line: span.start_line,
+            character: span.start_char,
+        },
+        end: lsp_types::Position {
+            line: span.end_line,
+            character: span.end_char,
+        },
     }
 }
 

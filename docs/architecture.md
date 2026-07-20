@@ -574,6 +574,30 @@ Two index-backed navigation methods live within exactly this truth:
   implementors are not enumerable from any persisted truth, and inferring
   them from member overrides would silently miss every subtype that overrides
   nothing.
+- **Call hierarchy** (`prepareCallHierarchy` + `callHierarchy/incomingCalls`/
+  `outgoingCalls`) — the same truth again, one level up: the index records
+  that a symbol is REFERENCED at a position, never whether the reference is an
+  APPLICATION, so v1 ships **usage-hierarchy** semantics — a "call" is any
+  reference occurrence of the item's reference group, minus the one Plan-C
+  noise filter (references on an `import` line). Two consequences of the
+  name-span-only store surface here. First, **incoming** attributes each call
+  site to its enclosing definition by SYNTHESIZING containment from the
+  `document_symbols` entry set (the deepest owner-chain entry starting
+  at-or-before the reference, its extent closed by the next non-descendant
+  entry's line); a reference before any definition surfaces under a synthetic
+  file-level item, and — the honest false positive — toplevel code after a
+  class body attributes to that class's last member, because no later entry
+  exists to close its line-granular extent. Second, **outgoing** REUSES the
+  very synthetic extent that documentSymbol REJECTED above (a definition's
+  name span to the next non-descendant entry): rejected as a claim an OUTLINE
+  must not make, but ACCEPTED here as a best-effort QUERY projection — the
+  asymmetry is deliberate, and its cost (trailing non-definition code before
+  the next entry misattributed to the item) is pinned as actual behavior, not
+  hidden. incoming does NO closure pruning — a downstream or disconnected
+  caller that reuses the same symbol string is a legitimate caller, the
+  deliberate divergence from `references`' reverse-closure pruning. The
+  precision upgrade — persisting a per-occurrence call-site fact at ingest
+  (Plan A) — is a recorded follow-up, not built.
 
 ## 8. References flow
 

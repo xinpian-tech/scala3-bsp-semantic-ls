@@ -7,6 +7,7 @@
 mod hash;
 mod state;
 
+pub mod call_hierarchy;
 pub mod highlight;
 pub mod identifiers;
 pub mod ingest;
@@ -17,6 +18,7 @@ pub mod rename;
 pub mod symbol_encoding;
 pub mod targets;
 
+pub use call_hierarchy::{CallEdge, CallItem};
 pub use highlight::{DocHighlight, DocumentHighlightService, HighlightKind};
 pub use ingest::{ingest, IngestReport, SemanticdbFileError};
 pub use ls_semanticdb::DocFacts;

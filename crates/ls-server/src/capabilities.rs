@@ -137,6 +137,13 @@ pub struct ServerCapabilities {
     /// Plain `true` — index-backed `textDocument/implementation` over method
     /// override families.
     pub implementation_provider: bool,
+    /// Plain `true` — index-backed call hierarchy (`prepareCallHierarchy` +
+    /// `callHierarchy/incomingCalls`/`outgoingCalls`) under USAGE-HIERARCHY
+    /// semantics: a "call" is any reference occurrence of the item's reference
+    /// group (import-line references filtered), the honest v1 answer over an
+    /// index that persists no call-site facts (see
+    /// [`QueryOrchestrator::prepare_call_hierarchy`](ls_engine::QueryOrchestrator)).
+    pub call_hierarchy_provider: bool,
     /// `{resolveProvider: false}` — every hint ships complete; there is no
     /// `inlayHint/resolve` handler, so lazy-resolve must not be advertised.
     pub inlay_hint_provider: lsp_types::InlayHintOptions,
@@ -245,6 +252,7 @@ pub fn server_capabilities() -> ServerCapabilities {
         workspace_symbol_provider: true,
         document_symbol_provider: true,
         implementation_provider: true,
+        call_hierarchy_provider: true,
         inlay_hint_provider: lsp_types::InlayHintOptions {
             work_done_progress_options: Default::default(),
             resolve_provider: Some(false),
@@ -299,6 +307,9 @@ mod tests {
         // index-backed override-family query).
         assert!(json.contains("\"documentSymbolProvider\":true"), "{json}");
         assert!(json.contains("\"implementationProvider\":true"), "{json}");
+        // Index-backed call hierarchy (usage-hierarchy semantics): a plain
+        // boolean, advertised alongside the other index-backed nav providers.
+        assert!(json.contains("\"callHierarchyProvider\":true"), "{json}");
         assert!(json.contains("\"executeCommandProvider\""), "{json}");
         assert!(json.contains("\"completionProvider\""), "{json}");
         assert!(json.contains("\"resolveProvider\":true"), "{json}");

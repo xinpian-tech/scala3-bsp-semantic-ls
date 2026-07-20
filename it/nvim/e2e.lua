@@ -602,6 +602,84 @@ for _, loc in ipairs(impls) do
 end
 pass("implementation finds " .. #impls .. " override def site(s) for BitSet#overlap")
 
+-- Call hierarchy over a real decoder method with real callers
+-- (usage-hierarchy semantics). `BitSet.bitpat` is called from TruthTable.scala
+-- and BitSetSpec.scala, so prepareCallHierarchy on a `bitpat` occurrence
+-- answers the definition-side item and callHierarchy/incomingCalls resolves ≥1
+-- caller — a KNOWN caller file must appear. Index-backed: it round-trips the
+-- SemanticDB symbol through the item's `data` field and never depends on the PC
+-- island. Capability first: callHierarchyProvider must be advertised.
+if client.server_capabilities.callHierarchyProvider ~= true then
+  fail("callHierarchyProvider is not advertised")
+end
+local function find_in_bufs(tok)
+  for _, b in ipairs({ buf, ca_buf, spec_buf }) do
+    local p = find_pos(b, tok, 1)
+    if p then
+      return b, p
+    end
+  end
+  return nil
+end
+local ch_buf, bitpat_at = find_in_bufs("bitpat")
+if not bitpat_at then
+  fail("token 'bitpat' not found in the decoder buffers for the call-hierarchy probe")
+end
+local prepared = request("textDocument/prepareCallHierarchy", {
+  textDocument = { uri = vim.uri_from_bufnr(ch_buf) },
+  position = bitpat_at,
+}, 120000)
+if type(prepared) ~= "table" or #prepared == 0 then
+  fail("prepareCallHierarchy returned no item for bitpat: " .. vim.inspect(prepared))
+end
+local ch_item = prepared[1]
+if type(ch_item.name) ~= "string" or ch_item.name == "" then
+  fail("prepareCallHierarchy item has no name: " .. vim.inspect(ch_item))
+end
+-- The index stores definition NAME spans only.
+if not vim.deep_equal(ch_item.range, ch_item.selectionRange) then
+  fail("call-hierarchy item range must equal selectionRange (name spans only)")
+end
+-- The prepared item round-trips its SemanticDB symbol through `data`.
+if type(ch_item.data) ~= "table" or type(ch_item.data.symbol) ~= "string" then
+  fail("call-hierarchy item carries no data.symbol to round-trip: " .. vim.inspect(ch_item))
+end
+local incoming = request("callHierarchy/incomingCalls", { item = ch_item }, 120000)
+if type(incoming) ~= "table" or #incoming == 0 then
+  fail("incomingCalls returned no callers for '" .. ch_item.name .. "': " .. vim.inspect(incoming))
+end
+local caller_files = {}
+local known_caller = false
+for _, call in ipairs(incoming) do
+  local uri = (call.from or {}).uri or ""
+  -- Parenthesize: `gsub` returns (string, count) and the bare count would be
+  -- read by `table.insert` as a position argument.
+  table.insert(caller_files, (uri:gsub(".*/", "")))
+  if uri:find("TruthTable%.scala$") or uri:find("BitSetSpec%.scala$") then
+    known_caller = true
+  end
+  if type(call.fromRanges) ~= "table" or #call.fromRanges == 0 then
+    fail("an incoming call carries no fromRanges: " .. vim.inspect(call))
+  end
+end
+if not known_caller then
+  fail(
+    "no known caller (TruthTable.scala / BitSetSpec.scala) among '"
+      .. ch_item.name
+      .. "' callers: "
+      .. vim.inspect(caller_files)
+  )
+end
+pass(
+  "call hierarchy: prepare '"
+    .. ch_item.name
+    .. "' -> "
+    .. #incoming
+    .. " incoming caller(s) ("
+    .. table.concat(caller_files, ", ")
+    .. ")"
+)
+
 -- textDocument/formatting via the scalafmt COMMAND LINE. Capability first:
 -- documentFormatting is advertised, rangeFormatting deliberately is not (the
 -- CLI's hidden --range skips lines inside multi-line ranges). Then the probe

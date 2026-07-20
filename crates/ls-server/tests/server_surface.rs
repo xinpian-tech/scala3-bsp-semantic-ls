@@ -207,6 +207,8 @@ fn initialize_advertises_exactly_the_implemented_capability_set() {
     // trees always sent; implementation = the override-family query).
     assert_eq!(caps["documentSymbolProvider"], true);
     assert_eq!(caps["implementationProvider"], true);
+    // Index-backed call hierarchy (usage-hierarchy semantics): a plain boolean.
+    assert_eq!(caps["callHierarchyProvider"], true);
     // The payload-backed providers: inlay hints without resolve (every hint
     // ships complete), selection range and folding range as plain booleans.
     assert_eq!(
@@ -338,6 +340,19 @@ fn pre_ready_methods_take_their_per_method_fallbacks() {
             "textDocument/formatting",
             json!({ "textDocument": { "uri": uri }, "options": { "tabSize": 2 } }),
         ),
+        // Call hierarchy: prepare answers null pre-ready (the spec's
+        // `CallHierarchyItem[] | null` no-answer), incoming answers the empty
+        // list.
+        request(
+            7,
+            "textDocument/prepareCallHierarchy",
+            json!({ "textDocument": { "uri": uri }, "position": { "line": 2, "character": 6 } }),
+        ),
+        request(
+            8,
+            "callHierarchy/incomingCalls",
+            json!({ "item": { "data": { "symbol": "pkga/Core." } } }),
+        ),
         notification("exit", json!({})),
     ]
     .concat();
@@ -377,6 +392,13 @@ fn pre_ready_methods_take_their_per_method_fallbacks() {
     // Pre-ready formatting is the harmless empty edit list, so an editor's
     // format-on-save does not fail loudly during bootstrap.
     assert_eq!(by_id(&out, 6)["result"], json!([]), "formatting → []");
+    // prepareCallHierarchy → null (no item yet); incomingCalls → [].
+    assert_eq!(
+        by_id(&out, 7)["result"],
+        Value::Null,
+        "prepareCallHierarchy → null"
+    );
+    assert_eq!(by_id(&out, 8)["result"], json!([]), "incomingCalls → []");
 }
 
 // After `initialized` the same queries resolve over the freshly ingested index.
