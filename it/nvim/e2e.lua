@@ -206,6 +206,82 @@ if type(hover) ~= "table" or hover.contents == nil then
 end
 pass("PC-backed hover answered over the real project")
 
+-- Payload-backed probes over the now-booted island (nvim's client opened the
+-- buffer, so the PC mirror holds it and the withPcBuffer gate passes).
+
+-- foldingRange: the parser-only provider must fold a real source file. Kind
+-- facts: every range is well-formed (startLine <= endLine) and any kind is one
+-- of the three LSP kind strings; a kind-less range is the plain code fold.
+local folds = request("textDocument/foldingRange", { textDocument = doc_at.textDocument }, 120000)
+if type(folds) ~= "table" or #folds == 0 then
+  fail("foldingRange returned no ranges over the real buffer")
+end
+local fold_kinds = { comment = true, imports = true, region = true }
+local kinded = 0
+for _, fold in ipairs(folds) do
+  if type(fold.startLine) ~= "number" or type(fold.endLine) ~= "number" or fold.endLine < fold.startLine then
+    fail("foldingRange returned a malformed range: " .. vim.inspect(fold))
+  end
+  if fold.kind ~= nil then
+    if not fold_kinds[fold.kind] then
+      fail("foldingRange returned an unknown kind: " .. vim.inspect(fold))
+    end
+    kinded = kinded + 1
+  end
+end
+pass("foldingRange finds " .. #folds .. " ranges (" .. kinded .. " kinded)")
+
+-- selectionRange at the anchor: one linked chain whose innermost range
+-- contains the cursor and whose parents widen (each parent contains its
+-- child) — at least one parent level for a token nested in real code.
+local sel = request("textDocument/selectionRange", {
+  textDocument = doc_at.textDocument,
+  positions = { at },
+}, 120000)
+if type(sel) ~= "table" or #sel ~= 1 then
+  fail("selectionRange did not return exactly one chain: " .. vim.inspect(sel))
+end
+local function pos_le(a, b) -- a <= b in (line, character) order
+  return a.line < b.line or (a.line == b.line and a.character <= b.character)
+end
+local node = sel[1]
+if not (pos_le(node.range.start, at) and pos_le(at, node.range["end"])) then
+  fail("selectionRange innermost range does not contain the anchor: " .. vim.inspect(node.range))
+end
+local depth = 0
+while node.parent do
+  local outer = node.parent
+  if not (pos_le(outer.range.start, node.range.start) and pos_le(node.range["end"], outer.range["end"])) then
+    fail("selectionRange parent does not contain its child: " .. vim.inspect(outer.range))
+  end
+  node = outer
+  depth = depth + 1
+end
+if depth < 1 then
+  fail("selectionRange chain has no parent level at the anchor")
+end
+pass("selectionRange chain widens over " .. (depth + 1) .. " levels at the anchor")
+
+-- inlayHint: the request must round-trip cleanly over the whole file. Hints
+-- may legitimately be empty depending on the server's default category flags
+-- and the file's content — assert no error and the list shape only.
+local hints = request("textDocument/inlayHint", {
+  textDocument = doc_at.textDocument,
+  range = {
+    start = { line = 0, character = 0 },
+    ["end"] = { line = vim.api.nvim_buf_line_count(buf), character = 0 },
+  },
+}, 120000)
+if type(hints) ~= "table" then
+  fail("inlayHint did not return a list: " .. vim.inspect(hints))
+end
+for _, hint in ipairs(hints) do
+  if hint.position == nil or hint.label == nil then
+    fail("inlayHint returned a malformed hint: " .. vim.inspect(hint))
+  end
+end
+pass("inlayHint round-trips (" .. #hints .. " hints)")
+
 -- Definition, bisected across the three navigation shapes: in-buffer (pure
 -- PC span), cross-target (PC symbol -> index resolver, the shape the gated
 -- real-BSP suites prove), and same-target-cross-file (informational: its

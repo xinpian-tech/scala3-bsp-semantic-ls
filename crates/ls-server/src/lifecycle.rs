@@ -75,6 +75,9 @@ pub enum Method {
     Hover,
     SignatureHelp,
     PrepareRename,
+    InlayHint,
+    SelectionRange,
+    FoldingRange,
 }
 
 /// What a method answers before the workspace is ready.
@@ -91,8 +94,11 @@ pub enum PreReadyOutcome {
 
 /// The per-method pre-ready fallback, matching the server's dispatch: references
 /// and rename fail typed; document highlight, workspace symbol, completion,
-/// definition, and type definition answer empty; hover, signature help, and
-/// prepare rename answer null.
+/// definition, type definition, inlay hint, and folding range answer empty;
+/// hover, signature help, prepare rename, and selection range answer null
+/// (selection range because the spec ties `result[i]` to `positions[i]` — an
+/// empty array against a non-empty position list would break that
+/// correspondence, exactly as its ready-path gate fallback answers null).
 pub fn pre_ready_outcome(method: Method) -> PreReadyOutcome {
     match method {
         Method::References | Method::Rename => PreReadyOutcome::NotReadyError,
@@ -100,8 +106,12 @@ pub fn pre_ready_outcome(method: Method) -> PreReadyOutcome {
         | Method::WorkspaceSymbol
         | Method::Completion
         | Method::Definition
-        | Method::TypeDefinition => PreReadyOutcome::Empty,
-        Method::Hover | Method::SignatureHelp | Method::PrepareRename => PreReadyOutcome::Null,
+        | Method::TypeDefinition
+        | Method::InlayHint
+        | Method::FoldingRange => PreReadyOutcome::Empty,
+        Method::Hover | Method::SignatureHelp | Method::PrepareRename | Method::SelectionRange => {
+            PreReadyOutcome::Null
+        }
     }
 }
 
@@ -188,6 +198,8 @@ mod tests {
             Method::Completion,
             Method::Definition,
             Method::TypeDefinition,
+            Method::InlayHint,
+            Method::FoldingRange,
         ] {
             assert_eq!(pre_ready_outcome(m), PreReadyOutcome::Empty, "{m:?}");
         }
@@ -195,7 +207,12 @@ mod tests {
 
     #[test]
     fn nullable_methods_are_null_before_ready() {
-        for m in [Method::Hover, Method::SignatureHelp, Method::PrepareRename] {
+        for m in [
+            Method::Hover,
+            Method::SignatureHelp,
+            Method::PrepareRename,
+            Method::SelectionRange,
+        ] {
             assert_eq!(pre_ready_outcome(m), PreReadyOutcome::Null, "{m:?}");
         }
     }

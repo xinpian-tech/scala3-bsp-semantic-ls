@@ -14,16 +14,19 @@ from conftest import CORE, DOCTOR, PC_PLUGIN_STATUS, await_ready, execute, sourc
 
 
 async def test_an_unimplemented_method_is_a_typed_error(client):
+    # `textDocument/documentColor` is the still-unimplemented probe
+    # (foldingRange graduated to a real handler — its positive blackbox test
+    # lives in test_pc_payload.py).
     await await_ready(client)
     with pytest.raises(Exception) as excinfo:
-        await client.text_document_folding_range_async(
-            types.FoldingRangeParams(
+        await client.text_document_document_color_async(
+            types.DocumentColorParams(
                 text_document=types.TextDocumentIdentifier(uri=source_uri(CORE))
             )
         )
     # The wire answer is the METHOD_NOT_FOUND (-32601) typed error from the
     # dispatch layer, surfaced by pygls as JsonRpcMethodNotFound.
-    assert "unhandled request: textDocument/foldingRange" in str(excinfo.value)
+    assert "unhandled request: textDocument/documentColor" in str(excinfo.value)
     assert type(excinfo.value).__name__ == "JsonRpcMethodNotFound"
 
 

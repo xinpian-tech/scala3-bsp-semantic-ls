@@ -333,11 +333,14 @@ server for `scala` whose command is the binary and whose root is the workspace.
 | Rename (with `prepareProvider`)                  | cross-file                                   |
 | DocumentHighlight                                |                                              |
 | workspace/symbol                                 | over the index (+ PC-only unsaved symbols)   |
-| executeCommand (3 command IDs — §4.6)            |                                              |
+| InlayHint (`resolveProvider: false`)             | presentation-compiler hints over the open buffer; the server's fixed default category set (inferred types, implicit params, by-name params, implicit conversions, named params — type params / xray / pattern-match / closing labels off); every hint ships complete, there is no `inlayHint/resolve` |
+| SelectionRange                                   | pure syntax over the open buffer (no SemanticDB needed); `null` for a buffer the PC does not hold |
+| FoldingRange                                     | the parser-only folding walker over the open buffer (kinds `comment`/`imports`/`region`); `[]` for a buffer the PC does not hold |
+| executeCommand (4 command IDs — §4.6)            |                                              |
 | **Diagnostics: push-only**                       | BSP `build/publishDiagnostics` is forwarded live as `textDocument/publishDiagnostics` (per-URI merge across targets, per-target reset); **no** pull `diagnosticProvider` |
 
-**Not advertised** (do not enable client-side): semanticTokens, inlayHint,
-codeAction, formatting/rangeFormatting, folding, and pull diagnostics.
+**Not advertised** (do not enable client-side): semanticTokens, codeAction,
+formatting/rangeFormatting, and pull diagnostics.
 Diagnostics appear only after bootstrap connects to a BSP build and a compile
 runs.
 

@@ -1,0 +1,37 @@
+---
+source: crates/ls-server/tests/pc_wire.rs
+expression: scrub(&inlay)
+---
+[
+  {
+    "data": {
+      "symbol": "fake/Symbol#"
+    },
+    "kind": 1,
+    "label": [
+      {
+        "location": {
+          "range": {
+            "end": {
+              "character": 21,
+              "line": 4
+            },
+            "start": {
+              "character": 0,
+              "line": 0
+            }
+          },
+          "uri": "[SOURCES]/a/src/pkga/Core.scala"
+        },
+        "tooltip": "fake inferred type",
+        "value": ": Int"
+      }
+    ],
+    "paddingLeft": true,
+    "paddingRight": false,
+    "position": {
+      "character": 2,
+      "line": 0
+    }
+  }
+]

@@ -1,0 +1,13 @@
+---
+source: crates/ls-server/tests/pc_wire.rs
+expression: scrub(&folding)
+---
+[
+  {
+    "endCharacter": 1,
+    "endLine": 3,
+    "kind": "imports",
+    "startCharacter": 0,
+    "startLine": 0
+  }
+]

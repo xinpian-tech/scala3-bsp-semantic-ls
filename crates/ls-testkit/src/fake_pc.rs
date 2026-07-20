@@ -259,7 +259,10 @@ impl PcQueryService for FakePcService {
             padding_left: true,
             padding_right: false,
             text_edits: None,
-            data: Some(FAKE_SYMBOL.as_bytes().to_vec()),
+            // Canonical JSON bytes, exactly like the real island (which writes
+            // the lsp4j hint's `data` as gson JSON) — so the wire suite pins
+            // the verbatim JSON pass-through on the LSP edge.
+            data: Some(format!("{{\"symbol\":\"{FAKE_SYMBOL}\"}}").into_bytes()),
         }]
     }
 

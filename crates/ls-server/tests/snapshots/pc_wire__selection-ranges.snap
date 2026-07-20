@@ -1,0 +1,54 @@
+---
+source: crates/ls-server/tests/pc_wire.rs
+expression: scrub(&selection)
+---
+[
+  {
+    "parent": {
+      "range": {
+        "end": {
+          "character": 0,
+          "line": 3
+        },
+        "start": {
+          "character": 0,
+          "line": 2
+        }
+      }
+    },
+    "range": {
+      "end": {
+        "character": 8,
+        "line": 2
+      },
+      "start": {
+        "character": 6,
+        "line": 2
+      }
+    }
+  },
+  {
+    "parent": {
+      "range": {
+        "end": {
+          "character": 0,
+          "line": 4
+        },
+        "start": {
+          "character": 0,
+          "line": 3
+        }
+      }
+    },
+    "range": {
+      "end": {
+        "character": 8,
+        "line": 3
+      },
+      "start": {
+        "character": 6,
+        "line": 3
+      }
+    }
+  }
+]

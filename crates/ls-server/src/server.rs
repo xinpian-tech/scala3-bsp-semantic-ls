@@ -1020,6 +1020,9 @@ fn readiness_method(method: &str) -> Option<Method> {
         "textDocument/documentHighlight" => Some(Method::DocumentHighlight),
         "textDocument/prepareRename" => Some(Method::PrepareRename),
         "textDocument/rename" => Some(Method::Rename),
+        "textDocument/inlayHint" => Some(Method::InlayHint),
+        "textDocument/selectionRange" => Some(Method::SelectionRange),
+        "textDocument/foldingRange" => Some(Method::FoldingRange),
         "workspace/symbol" => Some(Method::WorkspaceSymbol),
         _ => None,
     }

@@ -228,9 +228,13 @@ completion_resolve, hover, signature_help, definition, type_definition,
 prepare_rename, plugin_status, restart_instances, shutdown, spawn_dispatch`,
 plus the ABI-v2 payload-in/payload-out queries `inlay_hints, semantic_tokens,
 selection_range, code_action, auto_imports, pc_diagnostics, folding_range`
-(one shared `PcPayloadQueryFn` slot shape; each island provider is a typed
-`STATUS_NOT_YET` stub until its feature task lands, which the Rust side
-degrades to the query's empty fallback).
+(one shared `PcPayloadQueryFn` slot shape; every island provider is live — a
+transport-first future op would answer the typed `STATUS_NOT_YET`, which the
+Rust side degrades to the query's empty fallback). Three payload ops are
+LSP-exposed today — `textDocument/inlayHint`, `textDocument/selectionRange`,
+`textDocument/foldingRange` — bridged to `lsp-types` protocol shapes in
+`crates/ls-server/src/pc_lsp.rs` (selection/folding are pure syntax and skip
+the SemanticDB gate; inlayHint keeps the full hover-style gate discipline).
 
 stdout protection: the JVM and any PC plugin can write to fd 1, which would
 corrupt the LSP stream. Before boot, the server's `StdoutGuard` duplicates the

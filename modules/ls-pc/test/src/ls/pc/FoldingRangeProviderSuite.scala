@@ -128,6 +128,65 @@ class FoldingRangeProviderSuite extends munit.FunSuite:
     val got = folds(text)
     assertEquals(got.filter(_._5 == Imports), Vector((2, 0, 4, 10, Imports)))
 
+  // A blank line breaks an import run: each side must independently reach the
+  // >= 2 threshold (found while wiring the LSP foldingRange probe — real
+  // sources often separate import groups with blank lines, and a lone import
+  // on either side must not fold).
+  test("blank-line-separated import runs fold separately, each needing >= 2"):
+    val text =
+      """package p
+        |
+        |import a.b
+        |
+        |import c.d
+        |import e.f
+        |
+        |val v = 1
+        |""".stripMargin
+    assertEquals(folds(text).filter(_._5 == Imports), Vector((4, 0, 5, 10, Imports)))
+
+  // Scala 3 fewer-braces colon-lambda argument blocks (`.map: entry =>`) fold
+  // like their brace equivalents (the real-project e2e buffer uses them).
+  test("fewer-braces colon-lambda argument blocks fold"):
+    val text =
+      """object D:
+        |  val xs = List(1, 2).map: entry =>
+        |    val doubled = entry * 2
+        |    doubled
+        |""".stripMargin
+    assertEquals(
+      folds(text),
+      Vector(
+        (0, 0, 3, 11, None_), // object D body
+        (1, 25, 3, 11, None_), // the colon-lambda argument block after `.map:`
+        (2, 4, 3, 11, None_) // the lambda's indented body
+      )
+    )
+
+  // Scala 3 declaration bodies: enum, trait, and `given ... with` bodies fold.
+  test("scala 3 declaration bodies fold: enum, trait, and given-with"):
+    val text =
+      """object S:
+        |  enum Color:
+        |    case Red
+        |    case Green
+        |  trait Show[T]:
+        |    def show(t: T): String
+        |  given Show[Int] with
+        |    def show(t: Int): String =
+        |      t.toString
+        |""".stripMargin
+    assertEquals(
+      folds(text),
+      Vector(
+        (0, 0, 8, 16, None_), // object S body
+        (1, 2, 3, 14, None_), // enum Color body
+        (4, 2, 5, 26, None_), // trait Show body
+        (6, 2, 8, 16, None_), // given ... with body
+        (7, 4, 8, 16, None_) // def show body
+      )
+    )
+
   test("region markers pair up and nest via a stack"):
     val text =
       """// region outer

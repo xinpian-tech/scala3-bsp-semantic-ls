@@ -16,6 +16,7 @@ pub mod jsonrpc;
 pub mod lifecycle;
 pub mod pc;
 mod pc_convert;
+mod pc_lsp;
 pub mod pc_overlay;
 pub mod protocol;
 pub mod server;

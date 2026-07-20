@@ -2,8 +2,9 @@
  * Harness ported from the Scala 3 ("dotty") presentation-compiler test suite,
  * version 3.8.4 (presentation-compiler/test/dotty/tools/pc/base/BasePCSuite.scala,
  * BaseCompletionSuite.scala, BaseHoverSuite.scala, BaseSignatureHelpSuite.scala,
- * BasePcDefinitionSuite.scala and utils/{TestHovers,TestCompletions,TextEdits,
- * RangeReplace,TestExtensions}.scala):
+ * BasePcDefinitionSuite.scala, BaseInlayHintsSuite.scala,
+ * BaseSelectionRangeSuite.scala and utils/{TestHovers,TestCompletions,TextEdits,
+ * RangeReplace,TestExtensions,TestInlayHints}.scala):
  *   https://github.com/scala/scala3/tree/3.8.4/presentation-compiler
  * Copyright 2002-2026 EPFL and Lightbend, Inc. dba Akka
  * Licensed under the Apache License, Version 2.0:
@@ -19,7 +20,8 @@ import java.util.Collections
 import scala.concurrent.duration.*
 import scala.jdk.CollectionConverters.*
 
-import com.google.gson.{Gson, JsonElement}
+import com.google.gson.{Gson, JsonElement, JsonParser}
+import ls.pc.{PcInlayHint, PcInlayHintFlags}
 import org.eclipse.lsp4j.{
   CompletionItem,
   Hover,
@@ -30,7 +32,7 @@ import org.eclipse.lsp4j.{
   TextEdit
 }
 import org.eclipse.lsp4j.jsonrpc.messages.Either as JEither
-import scala.meta.internal.pc.{CompletionItemData, HoverMarkup}
+import scala.meta.internal.pc.{CompletionItemData, HoverMarkup, InlayHints}
 
 /** Base of all ported corpus suites: cursor-marker parsing, offset/position
   * conversion, text-edit application and shared rendering helpers.
@@ -420,6 +422,115 @@ abstract class CorpusSignatureHelpHarness extends CorpusSuiteBase:
         val expectedSorted = sortLines(stableOrder, expected)
         assertCorpusNoDiff(obtainedSorted, expectedSorted)
       finally CorpusPc.facade.didClose(uri)
+    }
+
+/** Ported `BaseInlayHintsSuite` + `TestInlayHints`: hints for the whole
+  * buffer render as inline `/*...*/` decorations at their positions; each
+  * label part's data — a SemanticDB symbol for global symbols or a `(line:
+  * char)` definition position for local ones, carried in the hint's opaque
+  * `data` JSON — renders as `<<...>>` after the label, exactly like dotty's
+  * `TestInlayHints.decorationString`.
+  */
+abstract class CorpusInlayHintsHarness extends CorpusSuiteBase:
+
+  /** The dotty base suite enables EVERY hint category (`inferredTypes`,
+    * `typeParameters`, `implicitParameters`, `hintsXRayMode`,
+    * `byNameParameters`, `implicitConversions`, `namedParameters`); the two
+    * per-case booleans add their bits on top. The matching facade bitset.
+    */
+  private def flags(hintsInPatternMatch: Boolean, closingLabels: Boolean): Int =
+    var bits = PcInlayHintFlags.InferredTypes | PcInlayHintFlags.TypeParameters |
+      PcInlayHintFlags.ImplicitParameters | PcInlayHintFlags.ByNameParameters |
+      PcInlayHintFlags.ImplicitConversions | PcInlayHintFlags.NamedParameters |
+      PcInlayHintFlags.HintsXRayMode
+    if hintsInPatternMatch then bits |= PcInlayHintFlags.HintsInPatternMatch
+    if closingLabels then bits |= PcInlayHintFlags.ClosingLabels
+    bits
+
+  /** Dotty `TestInlayHints.readData`: an empty entry renders nothing, a
+    * symbol renders `<<symbol>>`, a local definition position renders
+    * `<<(line:char)>>`.
+    */
+  private def readData(data: Either[String, Position]): List[String] =
+    data match
+      case Left("") => Nil
+      case Left(symbol) => List("<<", symbol, ">>")
+      case Right(pos) => List("<<", s"(${pos.getLine}:${pos.getCharacter})", ">>")
+
+  /** Dotty `TestInlayHints.decorationString` over the facade carrier: the
+    * label-part texts zipped with the per-part data decoded from the hint's
+    * opaque JSON bytes (the exact gson JSON the island carried verbatim).
+    */
+  private def decoration(hint: PcInlayHint): String =
+    val labels = hint.labelParts.map(_.text).toList
+    val data = hint.data match
+      case Some(bytes) =>
+        val json = JsonParser.parseString(
+          new String(bytes.toArray, java.nio.charset.StandardCharsets.UTF_8)
+        )
+        InlayHints.fromData(json)._2
+      case None => Nil
+    val out = new StringBuilder("/*")
+    labels.zip(data).foreach { (label, d) =>
+      out.append(label)
+      readData(d).foreach(out.append)
+    }
+    out.append("*/").toString
+
+  def check(
+      name: String,
+      base: String,
+      expected: String,
+      hintsInPatternMatch: Boolean = false,
+      closingLabels: Boolean = false
+  )(implicit loc: munit.Location): Unit =
+    test(name) {
+      def pkgWrap(text: String) =
+        if text.contains("package") then text else s"package test\n$text"
+      val withPkg = pkgWrap(base)
+      val uri = CorpusPc.openBuffer(withPkg, "InlayHints.scala")
+      try
+        val (endLine, endChar) = offsetToLsp(withPkg, withPkg.length)
+        val range = new Range(new Position(0, 0), new Position(endLine, endChar))
+        val hints =
+          CorpusPc.facade.inlayHints(uri, range, flags(hintsInPatternMatch, closingLabels))
+        val edits = hints.toList.map { hint =>
+          new TextEdit(new Range(hint.position, hint.position), decoration(hint))
+        }
+        assertCorpusNoDiff(applyEdits(withPkg, edits), pkgWrap(expected))
+      finally CorpusPc.closeBuffer(uri)
+    }
+
+/** Ported `BaseSelectionRangeSuite`: the cursor's innermost-first chain of
+  * enclosing selection ranges renders each expected step with
+  * `>>region>>...<<region<<` markers. Like the dotty base (mimicking how VS
+  * Code walks the parents client-side), only as many chain steps as the
+  * expectation lists are compared — the chain may extend wider.
+  */
+abstract class CorpusSelectionRangeHarness extends CorpusSuiteBase:
+
+  def check(
+      name: String,
+      original: String,
+      expectedRanges: List[String]
+  )(implicit loc: munit.Location): Unit =
+    test(name) {
+      val (code, offset) = params(original)
+      val uri = CorpusPc.openBuffer(code, "SelectionRange.scala")
+      try
+        val (line, col) = offsetToLsp(code, offset)
+        val chains = CorpusPc.facade.selectionRanges(uri, Vector(new Position(line, col)))
+        val chain = chains.headOption.getOrElse(Vector.empty)
+        assert(chain.nonEmpty, "no selection chain at the cursor")
+        expectedRanges.zipWithIndex.foreach { (expected, i) =>
+          assert(
+            i < chain.size,
+            s"selection chain ended after ${chain.size} ranges; expected at least ${expectedRanges.size}"
+          )
+          val obtained = replaceInRange(code, chain(i), ">>region>>", "<<region<<")
+          assertCorpusNoDiff(obtained, expected)
+        }
+      finally CorpusPc.closeBuffer(uri)
     }
 
 /** Ported `BasePcDefinitionSuite`: same-file definition ranges render as

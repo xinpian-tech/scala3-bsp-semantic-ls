@@ -203,6 +203,14 @@ fn initialize_advertises_exactly_the_implemented_capability_set() {
     assert_eq!(caps["renameProvider"]["prepareProvider"], true);
     assert_eq!(caps["documentHighlightProvider"], true);
     assert_eq!(caps["workspaceSymbolProvider"], true);
+    // The payload-backed providers: inlay hints without resolve (every hint
+    // ships complete), selection range and folding range as plain booleans.
+    assert_eq!(
+        caps["inlayHintProvider"],
+        json!({ "resolveProvider": false })
+    );
+    assert_eq!(caps["selectionRangeProvider"], true);
+    assert_eq!(caps["foldingRangeProvider"], true);
     assert_eq!(
         caps["executeCommandProvider"]["commands"],
         json!([
@@ -215,7 +223,6 @@ fn initialize_advertises_exactly_the_implemented_capability_set() {
 
     // Deliberately ABSENT surfaces (never advertised-and-broken).
     assert!(caps.get("semanticTokensProvider").is_none(), "{caps}");
-    assert!(caps.get("inlayHintProvider").is_none(), "{caps}");
     let commands = caps["executeCommandProvider"]["commands"].to_string();
     assert!(commands.contains("pcPluginStatus"), "{commands}");
 

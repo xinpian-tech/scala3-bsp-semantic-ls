@@ -1,10 +1,11 @@
 """Lifecycle over real stdio: initialize capabilities, readiness, doctor.
 
 The capability assertions mirror `crates/ls-server/src/capabilities.rs` — the
-advertised set is exactly the implemented surface, and `semanticTokens` /
-`inlayHint` are deliberately absent. Here the payload additionally round-trips
-through lsprotocol's INDEPENDENT typed model, so a serialization drift in the
-hand-rolled serde layer fails loudly in a client this repo did not write.
+advertised set is exactly the implemented surface (inlayHint / selectionRange /
+foldingRange included), and `semanticTokens` is deliberately absent. Here the
+payload additionally round-trips through lsprotocol's INDEPENDENT typed model,
+so a serialization drift in the serde layer (hand-rolled or lsp-types-bridged)
+fails loudly in a client this repo did not write.
 """
 
 from lsprotocol import types
@@ -35,6 +36,12 @@ async def test_initialize_advertises_the_exact_capability_surface(client):
     assert caps.rename_provider.prepare_provider is True
     assert caps.document_highlight_provider is True
     assert caps.workspace_symbol_provider is True
+    # The payload-backed providers: inlay hints without resolve (every hint
+    # ships complete), selection range and folding range as plain booleans.
+    assert caps.inlay_hint_provider is not None
+    assert caps.inlay_hint_provider.resolve_provider is False
+    assert caps.selection_range_provider is True
+    assert caps.folding_range_provider is True
     assert list(caps.execute_command_provider.commands) == [
         DOCTOR,
         REINDEX,
@@ -44,7 +51,6 @@ async def test_initialize_advertises_the_exact_capability_surface(client):
 
     # Deliberately absent: not implemented, so never advertised.
     assert caps.semantic_tokens_provider is None
-    assert caps.inlay_hint_provider is None
 
 
 async def test_initialize_reports_the_server_identity(client):

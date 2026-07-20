@@ -4,8 +4,9 @@
 //! everywhere); completion (trigger `.`, resolve); hover; signature help
 //! (triggers `(`, `,`); definition;
 //! type-definition; references; rename (prepare); document highlight; workspace
-//! symbol; and the execute-command set. `semanticTokens` and `inlayHint` are
-//! deliberately absent.
+//! symbol; inlay hint (no resolve — every hint ships complete, the
+//! `lsp_types::InlayHintOptions` shape); selection range; folding range; and
+//! the execute-command set. `semanticTokens` is deliberately absent.
 
 use serde::Serialize;
 
@@ -85,8 +86,11 @@ pub struct ExecuteCommandOptions {
 }
 
 /// The `ServerCapabilities` payload. Fields serialize to the LSP camelCase
-/// spelling; the absence of `semanticTokensProvider`/`inlayHintProvider` is
-/// intentional (they are not implemented).
+/// spelling; the absence of `semanticTokensProvider` is intentional (it is not
+/// implemented). The three payload-backed providers added on the lsp-types
+/// edge (`inlayHintProvider`/`selectionRangeProvider`/`foldingRangeProvider`)
+/// use the upstream `lsp_types` options shape where the capability carries
+/// options, and a plain `true` where it is boolean.
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ServerCapabilities {
@@ -105,6 +109,11 @@ pub struct ServerCapabilities {
     pub rename_provider: RenameOptions,
     pub document_highlight_provider: bool,
     pub workspace_symbol_provider: bool,
+    /// `{resolveProvider: false}` — every hint ships complete; there is no
+    /// `inlayHint/resolve` handler, so lazy-resolve must not be advertised.
+    pub inlay_hint_provider: lsp_types::InlayHintOptions,
+    pub selection_range_provider: bool,
+    pub folding_range_provider: bool,
     pub execute_command_provider: ExecuteCommandOptions,
 }
 
@@ -142,6 +151,12 @@ pub fn server_capabilities() -> ServerCapabilities {
         },
         document_highlight_provider: true,
         workspace_symbol_provider: true,
+        inlay_hint_provider: lsp_types::InlayHintOptions {
+            work_done_progress_options: Default::default(),
+            resolve_provider: Some(false),
+        },
+        selection_range_provider: true,
+        folding_range_provider: true,
         execute_command_provider: ExecuteCommandOptions {
             commands: commands::all(),
         },
@@ -191,6 +206,21 @@ mod tests {
         assert!(json.contains("\"typeDefinitionProvider\":true"), "{json}");
     }
 
+    // The three payload-backed providers on the lsp-types edge: inlay hints
+    // advertise the lsp_types::InlayHintOptions shape with resolve OFF (there
+    // is no inlayHint/resolve handler), selection range and folding range are
+    // plain booleans.
+    #[test]
+    fn advertises_the_payload_backed_providers() {
+        let json = initialize_json();
+        assert!(
+            json.contains("\"inlayHintProvider\":{\"resolveProvider\":false}"),
+            "{json}"
+        );
+        assert!(json.contains("\"selectionRangeProvider\":true"), "{json}");
+        assert!(json.contains("\"foldingRangeProvider\":true"), "{json}");
+    }
+
     #[test]
     fn registers_incremental_text_document_sync() {
         assert!(initialize_json().contains("\"textDocumentSync\":2"));
@@ -228,9 +258,8 @@ mod tests {
     }
 
     #[test]
-    fn semantic_tokens_and_inlay_hint_are_absent() {
+    fn semantic_tokens_stays_absent() {
         let json = initialize_json();
         assert!(!json.contains("semanticTokensProvider"), "{json}");
-        assert!(!json.contains("inlayHintProvider"), "{json}");
     }
 }

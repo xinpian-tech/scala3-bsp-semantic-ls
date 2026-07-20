@@ -1,12 +1,14 @@
 //! The PC-backed LSP wire surface, JVM-free: completion, `completionItem/resolve`,
-//! hover, signature help, and the definition family driven over the framed wire
+//! hover, signature help, the definition family, and the payload-backed
+//! inlayHint/selectionRange/foldingRange methods driven over the framed wire
 //! through the REAL `serve` loop and the REAL `IndexBootstrap` — with the
 //! embedded island replaced by the testkit's scriptable [`FakePcService`]
 //! through the `IndexBootstrap::with_pc` seam. Until this suite, these methods
 //! were wire-testable only against real mill + a real JVM (`real_bsp_pc.rs`);
-//! here the routing, gating (`require_semanticdb`, the `withPcBuffer` fallback,
-//! the resolve target gate), and response mapping are pinned hermetically with
-//! insta snapshots.
+//! here the routing, gating (`require_semanticdb` where it applies, the
+//! `withPcBuffer` fallback, the resolve target gate, the selection/folding
+//! no-SemanticDB-gate split), and response mapping are pinned hermetically
+//! with insta snapshots.
 
 use std::sync::Arc;
 
@@ -162,6 +164,161 @@ fn the_document_lifecycle_mirrors_into_the_pc_service() {
         "a PC query on a closed buffer takes the empty withPcBuffer fallback"
     );
     assert!(!pc.is_open(&uri), "didClose must drop the mirrored buffer");
+    client.shutdown();
+}
+
+// The payload-backed wire surface (inlayHint / selectionRange / foldingRange)
+// over the same JVM-free session: each method routes to the injected PC
+// service's payload op and maps the decoded carrier through the lsp-types
+// bridge — the exact LSP shapes (label parts with location/tooltip, verbatim
+// `data`, the linked selection parents, the folding kind strings) pinned by
+// snapshot.
+#[test]
+fn the_payload_backed_wire_surface_is_served_jvm_free() {
+    assert!(
+        !ls_server::libjvm_mapped(),
+        "the embedded JVM must be unmapped before the session"
+    );
+    let (mut client, pc) = boot();
+    client.initialize();
+    client.await_ready();
+
+    let uri = core_uri();
+    client.did_open_uri(&uri, DIRTY);
+
+    let inlay = client.result(
+        "textDocument/inlayHint",
+        json!({
+            "textDocument": { "uri": uri },
+            "range": {
+                "start": { "line": 0, "character": 0 },
+                "end": { "line": 4, "character": 21 }
+            }
+        }),
+    );
+    insta::assert_json_snapshot!("inlay-hints", scrub(&inlay));
+
+    let selection = client.result(
+        "textDocument/selectionRange",
+        json!({
+            "textDocument": { "uri": uri },
+            "positions": [
+                { "line": 2, "character": 6 },
+                { "line": 3, "character": 6 }
+            ]
+        }),
+    );
+    insta::assert_json_snapshot!("selection-ranges", scrub(&selection));
+
+    let folding = client.result(
+        "textDocument/foldingRange",
+        json!({ "textDocument": { "uri": uri } }),
+    );
+    insta::assert_json_snapshot!("folding-ranges", scrub(&folding));
+
+    let calls = pc.calls();
+    for expected in ["inlay_hints", "selection_range", "folding_range"] {
+        assert!(
+            calls.iter().any(|c| c.starts_with(expected)),
+            "no {expected} call reached the PC service: {calls:?}"
+        );
+    }
+    // The server's default hint-category bitset reached the seam verbatim
+    // (inferredTypes + implicitParameters + byNameParameters +
+    // implicitConversions + namedParameters = 0b111101 = 61).
+    assert!(
+        calls
+            .iter()
+            .any(|c| c.starts_with("inlay_hints") && c.ends_with("flags=61")),
+        "the default inlay-hint flag set must reach the PC seam: {calls:?}"
+    );
+    assert!(
+        !ls_server::libjvm_mapped(),
+        "the payload-backed wire surface must stay JVM-free with the injected fake"
+    );
+    client.shutdown();
+}
+
+// The payload methods' gates over the wire. Closed buffer (the `withPcBuffer`
+// fallback): empty hints, null selection (never a position-count-mismatched
+// array), empty folds. And the deliberate gate SPLIT on a no-SemanticDB
+// source with an OPEN buffer: inlayHint keeps the hard `require_semanticdb`
+// error while selectionRange/foldingRange — pure syntax — answer normally.
+#[test]
+fn payload_methods_gate_on_the_buffer_and_split_on_semanticdb() {
+    let (mut client, _pc) = boot();
+    client.initialize();
+    client.await_ready();
+
+    // Closed buffer: each method's graceful fallback, never an error.
+    let uri = core_uri();
+    let inlay = client.result(
+        "textDocument/inlayHint",
+        json!({
+            "textDocument": { "uri": uri },
+            "range": {
+                "start": { "line": 0, "character": 0 },
+                "end": { "line": 1, "character": 0 }
+            }
+        }),
+    );
+    assert_eq!(inlay, json!([]));
+    let selection = client.result(
+        "textDocument/selectionRange",
+        json!({
+            "textDocument": { "uri": uri },
+            "positions": [{ "line": 0, "character": 0 }]
+        }),
+    );
+    assert_eq!(selection, Value::Null);
+    let folding = client.result(
+        "textDocument/foldingRange",
+        json!({ "textDocument": { "uri": uri } }),
+    );
+    assert_eq!(folding, json!([]));
+
+    // The no-SemanticDB source, buffer OPEN: the semantic method hard-errors,
+    // the syntax methods answer from the (fake) island.
+    let nosdb = client.file_uri("nosdb/NoSdb.scala");
+    client.did_open_uri(&nosdb, "class NoSdb\n");
+    let error = client.error_message(
+        "textDocument/inlayHint",
+        json!({
+            "textDocument": { "uri": nosdb },
+            "range": {
+                "start": { "line": 0, "character": 0 },
+                "end": { "line": 1, "character": 0 }
+            }
+        }),
+    );
+    assert!(
+        error.contains("has no SemanticDB output"),
+        "inlayHint must keep the hard NoSemanticdb error, got: {error}"
+    );
+    let selection = client.result(
+        "textDocument/selectionRange",
+        json!({
+            "textDocument": { "uri": nosdb },
+            "positions": [{ "line": 0, "character": 6 }]
+        }),
+    );
+    assert_eq!(
+        selection[0]["range"],
+        json!({
+            "start": { "line": 0, "character": 6 },
+            "end": { "line": 0, "character": 8 }
+        }),
+        "selectionRange must answer on a no-SemanticDB source: {selection}"
+    );
+    let folding = client.result(
+        "textDocument/foldingRange",
+        json!({ "textDocument": { "uri": nosdb } }),
+    );
+    assert_eq!(
+        folding[0]["kind"],
+        json!("imports"),
+        "foldingRange must answer on a no-SemanticDB source: {folding}"
+    );
     client.shutdown();
 }
 

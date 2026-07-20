@@ -21,7 +21,11 @@
 //! resolve` enriches the item through the presentation compiler when it carries a
 //! SemanticDB symbol and the last completion's target is still registered,
 //! echoing the item back unchanged otherwise (the Scala `case _ => item`
-//! fallback).
+//! fallback). The payload-backed `inlayHint`/`selectionRange`/`foldingRange`
+//! methods follow the same dispatch discipline (`require_semanticdb` where it
+//! applies, the `withPcBuffer` gate, empty/null fallbacks) with their LSP
+//! shapes bridged through `lsp_types` models (`crate::pc_lsp`), not hand-rolled
+//! serde.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -368,6 +372,9 @@ impl Handlers<CoreServices> for CoreHandlers {
             "textDocument/completion" => completion(id, cx.services, &cx.request.params),
             "textDocument/hover" => hover(id, cx.services, &cx.request.params),
             "textDocument/signatureHelp" => signature_help(id, cx.services, &cx.request.params),
+            "textDocument/inlayHint" => inlay_hint(id, cx.services, &cx.request.params),
+            "textDocument/selectionRange" => selection_range(id, cx.services, &cx.request.params),
+            "textDocument/foldingRange" => folding_range(id, cx.services, &cx.request.params),
             "completionItem/resolve" => {
                 resolve_completion_item(id, cx.services, &cx.request.params)
             }
@@ -813,6 +820,133 @@ fn pc_value(
         return Response::success(id, fallback);
     }
     Response::success(id, run(services, &uri, pos.line, pos.character))
+}
+
+/// The server's default inlay-hint category bitset, passed to every
+/// `textDocument/inlayHint` request (the LSP request carries no category
+/// choice; the flag set is server policy).
+///
+/// ON: `inferredTypes` (the `val x/*: Int*/` annotations — the headline
+/// feature), plus the call-site adornments that surface INVISIBLE code —
+/// `implicitParameters`, `byNameParameters`, `implicitConversions` — and
+/// `namedParameters` (Metals' `hints-in-arguments` style default set: high
+/// signal, low churn).
+///
+/// OFF: `typeParameters` and `hintsXRayMode` (every polymorphic apply/chain
+/// gains bracket runs — noisy on idiomatic Scala and off by default in Metals
+/// too), `hintsInPatternMatch` (pattern binders churn while a match is being
+/// typed), and `closingLabels` (a Metals-custom rendering extension placed
+/// AFTER closing braces that standard LSP clients cannot render as inlay
+/// hints).
+const INLAY_HINT_FLAGS: u32 = ls_pc_abi::payloads::inlay_hint_flags::INFERRED_TYPES
+    | ls_pc_abi::payloads::inlay_hint_flags::IMPLICIT_PARAMETERS
+    | ls_pc_abi::payloads::inlay_hint_flags::BY_NAME_PARAMETERS
+    | ls_pc_abi::payloads::inlay_hint_flags::IMPLICIT_CONVERSIONS
+    | ls_pc_abi::payloads::inlay_hint_flags::NAMED_PARAMETERS;
+
+/// `textDocument/inlayHint`: presentation-compiler inlay hints for the request
+/// range of the open buffer, with the server's default category set
+/// ([`INLAY_HINT_FLAGS`]). Follows the hover/completion dispatch discipline:
+/// `requireSemanticdb` runs FIRST and outside the buffer fallback (an unowned
+/// URI is a hard `NoSemanticdb` error), then a missing/unparseable range or a
+/// buffer the PC mirror does not hold (`withPcBuffer`) answers the empty hint
+/// list — as does the island yielding nothing. The result is mapped through
+/// `lsp_types::InlayHint` (label parts with location/tooltip, kind, padding,
+/// text edits, `data` passed through verbatim). `inlayHint/resolve` is not
+/// advertised (`resolveProvider: false`): every hint ships complete.
+fn inlay_hint(id: RequestId, services: &CoreServices, params: &Value) -> Response {
+    let Some(raw) = text_document_uri(params) else {
+        return Response::success(id, json!([]));
+    };
+    if let Err(error) = services.require_semanticdb(&raw) {
+        return request_failed(id, &error);
+    }
+    let Some(range) = params
+        .get("range")
+        .and_then(|range| serde_json::from_value::<lsp_types::Range>(range.clone()).ok())
+    else {
+        return Response::success(id, json!([]));
+    };
+    let uri = normalize_uri(&raw);
+    if !services.pc.is_open(&uri) {
+        return Response::success(id, json!([]));
+    }
+    let hints: Vec<lsp_types::InlayHint> = services
+        .pc
+        .inlay_hints(&uri, crate::pc_lsp::abi_rng(&range), INLAY_HINT_FLAGS)
+        .iter()
+        .map(crate::pc_lsp::inlay_hint)
+        .collect();
+    ok_json(id, &hints)
+}
+
+/// `textDocument/selectionRange`: the chain of enclosing selection ranges per
+/// query position, as the linked `lsp_types::SelectionRange` structure.
+///
+/// Deliberately NO `require_semanticdb` gate: selection ranges are pure syntax
+/// — the island parses the mirrored buffer text and never consults SemanticDB
+/// — so a source outside the indexable model (e.g. a target compiled without
+/// `-Xsemanticdb`) still gets structural selections. The `withPcBuffer`
+/// `is_open` gate stays: the island can only parse a buffer its mirror holds.
+/// The gate fallback is `null` (spec: `SelectionRange[] | null`) rather than
+/// an empty array, because the spec ties `result[i]` to `positions[i]` — an
+/// empty array against a non-empty position list would break that
+/// correspondence.
+fn selection_range(id: RequestId, services: &CoreServices, params: &Value) -> Response {
+    let Some(raw) = text_document_uri(params) else {
+        return Response::success(id, Value::Null);
+    };
+    let Some(positions) = params
+        .get("positions")
+        .and_then(|p| serde_json::from_value::<Vec<lsp_types::Position>>(p.clone()).ok())
+    else {
+        return Response::success(id, Value::Null);
+    };
+    let uri = normalize_uri(&raw);
+    if !services.pc.is_open(&uri) {
+        return Response::success(id, Value::Null);
+    }
+    let query: Vec<ls_pc_abi::payloads::Pos> =
+        positions.iter().map(crate::pc_lsp::abi_pos).collect();
+    let chains = services.pc.selection_range(&uri, &query);
+    // The island degraded to nothing (a boot failure / boundary error): null,
+    // like the gate fallback — never a position-count-mismatched array.
+    if chains.is_empty() && !positions.is_empty() {
+        return Response::success(id, Value::Null);
+    }
+    let result: Vec<lsp_types::SelectionRange> = positions
+        .iter()
+        .enumerate()
+        .map(|(i, position)| {
+            let chain = chains.get(i).map(Vec::as_slice).unwrap_or(&[]);
+            crate::pc_lsp::selection_chain(chain, position)
+        })
+        .collect();
+    ok_json(id, &result)
+}
+
+/// `textDocument/foldingRange`: the open buffer's folding ranges as
+/// `lsp_types::FoldingRange` (kind ordinals mapped to `comment`/`imports`/
+/// `region`; the island's `0` "none" omits the kind field). Pure syntax like
+/// [`selection_range`] — the island's provider is a parser-only walk over the
+/// mirrored buffer text, so there is NO `require_semanticdb` gate; only the
+/// `withPcBuffer` `is_open` gate applies, and its fallback is the empty list
+/// (no positions to stay in correspondence with).
+fn folding_range(id: RequestId, services: &CoreServices, params: &Value) -> Response {
+    let Some(raw) = text_document_uri(params) else {
+        return Response::success(id, json!([]));
+    };
+    let uri = normalize_uri(&raw);
+    if !services.pc.is_open(&uri) {
+        return Response::success(id, json!([]));
+    }
+    let ranges: Vec<lsp_types::FoldingRange> = services
+        .pc
+        .folding_range(&uri)
+        .iter()
+        .map(crate::pc_lsp::folding_range)
+        .collect();
+    ok_json(id, &ranges)
 }
 
 /// `completionItem/resolve`: enrich the item through the presentation compiler.
@@ -1690,6 +1824,8 @@ mod tests {
 
     // A ready method with no handler branch answers a typed error through the
     // production handler dispatch — never a silent empty result.
+    // (`textDocument/documentColor` is the still-unimplemented example;
+    // foldingRange graduated to a real handler.)
     #[test]
     fn an_unwired_ready_method_answers_a_typed_placeholder_error() {
         let dir = tempfile::tempdir().unwrap();
@@ -1697,7 +1833,7 @@ mod tests {
         let documents = DocumentStore::new();
         let request = Request {
             id: RequestId::Number(1),
-            method: "textDocument/foldingRange".to_string(),
+            method: "textDocument/documentColor".to_string(),
             params: json!({}),
         };
         let response = CoreHandlers.handle(RequestContext {
@@ -1830,14 +1966,15 @@ mod tests {
     }
 
     // `requireSemanticdb` runs first and *outside* the buffer fallback for the PC
-    // query methods too, so completion/hover/signatureHelp over a URI the model
-    // does not own are hard NoSemanticdb errors, not the empty/null fallback.
+    // query methods too, so completion/hover/signatureHelp — and inlayHint,
+    // which follows the same discipline — over a URI the model does not own are
+    // hard NoSemanticdb errors, not the empty/null fallback.
     #[test]
     fn pc_query_methods_over_an_unowned_uri_are_hard_errors() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("A.scala"), "object A").unwrap();
         let services = unindexed_services(dir.path());
-        for handler in [completion, hover, signature_help] {
+        for handler in [completion, hover, signature_help, inlay_hint] {
             let value = serde_json::to_value(handler(
                 RequestId::Number(1),
                 &services,
@@ -1850,6 +1987,122 @@ mod tests {
                 .unwrap()
                 .contains("has no SemanticDB output"));
         }
+    }
+
+    // selectionRange and foldingRange are pure syntax: deliberately NO
+    // `require_semanticdb` gate, so the same unowned URI that hard-errors the
+    // semantic methods above answers the graceful fallback here (the FakePc
+    // holds every buffer open but its payload ops default to empty, so the
+    // island-yields-nothing path is what shapes the answer: null for
+    // selectionRange — never a position-count-mismatched array — and the empty
+    // list for foldingRange).
+    #[test]
+    fn selection_and_folding_over_an_unowned_uri_are_not_semanticdb_gated() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("A.scala"), "object A").unwrap();
+        let services = unindexed_services(dir.path());
+        let file_uri = path_to_uri(&dir.path().join("A.scala"));
+
+        let selection = selection_range(
+            RequestId::Number(1),
+            &services,
+            &json!({
+                "textDocument": { "uri": file_uri },
+                "positions": [{ "line": 0, "character": 7 }]
+            }),
+        );
+        let value = serde_json::to_value(&selection).unwrap();
+        assert!(value.get("error").is_none(), "{value}");
+        assert_eq!(value["result"], Value::Null);
+
+        let folding = folding_range(
+            RequestId::Number(2),
+            &services,
+            &json!({ "textDocument": { "uri": file_uri } }),
+        );
+        let value = serde_json::to_value(&folding).unwrap();
+        assert!(value.get("error").is_none(), "{value}");
+        assert_eq!(value["result"], json!([]));
+    }
+
+    // The `withPcBuffer` gate for the payload methods: a buffer the PC mirror
+    // does not hold answers each method's fallback — null selection, empty
+    // folds — never an error and never a PC call. (inlayHint's copy of the
+    // same gate needs a semanticdb-owned URI to reach it, so it is pinned over
+    // the wire in `tests/pc_wire.rs` against the fixture corpus.)
+    #[test]
+    fn payload_methods_on_an_unheld_buffer_take_their_fallbacks() {
+        /// A fake whose mirror holds nothing (`is_open` false); any payload-op
+        /// call would still answer the default empties, but the gate must
+        /// answer first.
+        struct ClosedPc;
+        impl PcQueryService for ClosedPc {
+            fn did_open(&self, _t: &str, _u: &str, _x: &str) {}
+            fn did_change(&self, _u: &str, _x: &str) {}
+            fn did_close(&self, _u: &str) {}
+            fn is_open(&self, _u: &str) -> bool {
+                false
+            }
+            fn definition(&self, _u: &str, _l: u32, _c: u32) -> Vec<PcLocation> {
+                Vec::new()
+            }
+            fn type_definition(&self, _u: &str, _l: u32, _c: u32) -> Vec<PcLocation> {
+                Vec::new()
+            }
+            fn completion(&self, _u: &str, _l: u32, _c: u32) -> Value {
+                Value::Null
+            }
+            fn hover(&self, _u: &str, _l: u32, _c: u32) -> Value {
+                Value::Null
+            }
+            fn signature_help(&self, _u: &str, _l: u32, _c: u32) -> Value {
+                Value::Null
+            }
+            fn is_registered(&self, _t: &str) -> bool {
+                false
+            }
+            fn resolve_completion_item(&self, _t: &str, _s: &str, item: &Value) -> Value {
+                item.clone()
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let overlay = crate::pc_overlay::PcOverlay::new();
+        let pc_overlay = overlay.handle();
+        let orchestrator = Arc::new(QueryOrchestrator::new(store, Box::new(overlay), true));
+        let services = CoreServices::new(
+            orchestrator,
+            WorkspaceUris::new(&[dir.path().to_path_buf()]),
+            Some(dir.path().to_path_buf()),
+            HashMap::new(),
+            Arc::new(UnavailableCompiler),
+            Arc::new(ClosedPc),
+            true,
+            pc_overlay,
+            DoctorTargets::default(),
+        );
+        let file_uri = path_to_uri(&dir.path().join("A.scala"));
+
+        let selection = selection_range(
+            RequestId::Number(1),
+            &services,
+            &json!({
+                "textDocument": { "uri": file_uri },
+                "positions": [{ "line": 0, "character": 0 }]
+            }),
+        );
+        assert_eq!(
+            serde_json::to_value(&selection).unwrap()["result"],
+            Value::Null
+        );
+
+        let folding = folding_range(
+            RequestId::Number(2),
+            &services,
+            &json!({ "textDocument": { "uri": file_uri } }),
+        );
+        assert_eq!(serde_json::to_value(&folding).unwrap()["result"], json!([]));
     }
 
     #[test]
