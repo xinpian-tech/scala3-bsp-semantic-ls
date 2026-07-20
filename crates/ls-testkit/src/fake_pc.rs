@@ -42,6 +42,11 @@ pub struct FakePcService {
     /// that should have been cancelled but wrongly reaches the PC answers
     /// normally (a clean assertion failure) instead of deadlocking the suite.
     gates: Mutex<HashMap<String, Arc<Barrier>>>,
+    /// A scripted `semantic_tokens` answer ([`FakePcService::script_semantic_tokens`]):
+    /// when set, every `semantic_tokens` call answers it instead of the default
+    /// canned node set — so a delta wire suite can serve two DIFFERENT streams
+    /// across consecutive requests. Persistent until re-scripted.
+    scripted_semantic_tokens: Mutex<Option<Vec<SemanticNode>>>,
 }
 
 impl FakePcService {
@@ -86,6 +91,14 @@ impl FakePcService {
     /// is in flight, do its work, then release via `gate.wait()`.
     pub fn gate_method(&self, method: &str, gate: Arc<Barrier>) {
         self.gates.lock().unwrap().insert(method.to_string(), gate);
+    }
+
+    /// Script the `semantic_tokens` answer: every subsequent call returns
+    /// `nodes` (for any uri) until re-scripted. The delta wire suite scripts
+    /// one set before `/full` and another before `/full/delta`, so the server
+    /// has a genuine two-stream diff to answer.
+    pub fn script_semantic_tokens(&self, nodes: Vec<SemanticNode>) {
+        *self.scripted_semantic_tokens.lock().unwrap() = Some(nodes);
     }
 
     fn record(&self, call: String) {
@@ -269,9 +282,13 @@ impl PcQueryService for FakePcService {
     /// Offset nodes shaped for the pc_wire `DIRTY` buffer ("package pkga\n\n
     /// class Core…"): two line-0 tokens, one on line 2 (so the wire snapshot
     /// pins a cross-line delta), and one `-1` unclassified node (the dotty
-    /// `makeNode` fallthrough) the encoder must drop.
+    /// `makeNode` fallthrough) the encoder must drop. A scripted answer
+    /// ([`FakePcService::script_semantic_tokens`]) replaces the canned set.
     fn semantic_tokens(&self, uri: &str) -> Vec<SemanticNode> {
         self.record(format!("semantic_tokens {uri}"));
+        if let Some(scripted) = self.scripted_semantic_tokens.lock().unwrap().clone() {
+            return scripted;
+        }
         vec![
             SemanticNode {
                 start: 0,

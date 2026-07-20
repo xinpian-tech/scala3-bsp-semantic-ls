@@ -220,10 +220,11 @@ abstract class CorpusCompletionHarness extends CorpusSuiteBase:
   protected def getItems(
       original: String,
       filename: String = "A.scala",
-      workspaceMethods: Seq[CorpusPc.WorkspaceMethod] = Nil
+      workspaceMethods: Seq[CorpusPc.WorkspaceMethod] = Nil,
+      mockToplevels: Map[String, Vector[String]] = Map.empty
   ): Seq[CompletionItem] =
     val (code, offset) = params(original)
-    val uri = CorpusPc.openBuffer(code, filename, workspaceMethods)
+    val uri = CorpusPc.openBuffer(code, filename, workspaceMethods, mockToplevels)
     try
       val (line, col) = offsetToLsp(code, offset)
       val result = CorpusPc.facade.completion(uri, line, col)
@@ -257,13 +258,14 @@ abstract class CorpusCompletionHarness extends CorpusSuiteBase:
       filename: String = "A.scala",
       filter: String => Boolean = _ => true,
       enablePackageWrap: Boolean = true,
-      workspaceMethods: Seq[CorpusPc.WorkspaceMethod] = Nil
+      workspaceMethods: Seq[CorpusPc.WorkspaceMethod] = Nil,
+      mockToplevels: Map[String, Vector[String]] = Map.empty
   )(implicit loc: munit.Location): Unit =
     test(name) {
       val withPkg =
         if original.contains("package") || !enablePackageWrap then original
         else s"package test\n$original"
-      val baseItems = getItems(withPkg, filename, workspaceMethods)
+      val baseItems = getItems(withPkg, filename, workspaceMethods, mockToplevels)
       val items = topLines match
         case Some(top) => baseItems.take(top)
         case None => baseItems
@@ -320,10 +322,11 @@ abstract class CorpusCompletionHarness extends CorpusSuiteBase:
       command: Option[String] = None,
       itemIndex: Int = 0,
       filename: String = "A.scala",
-      workspaceMethods: Seq[CorpusPc.WorkspaceMethod] = Nil
+      workspaceMethods: Seq[CorpusPc.WorkspaceMethod] = Nil,
+      mockToplevels: Map[String, Vector[String]] = Map.empty
   )(implicit loc: munit.Location): Unit =
     test(name) {
-      val items = getItems(original, filename, workspaceMethods)
+      val items = getItems(original, filename, workspaceMethods, mockToplevels)
         .filter(item => filter(item.getLabel))
       assert(items.nonEmpty, "Obtained empty completions, can't check for edits.")
       if assertSingleItem && items.length != 1 then

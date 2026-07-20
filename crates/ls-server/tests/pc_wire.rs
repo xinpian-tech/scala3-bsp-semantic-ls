@@ -14,6 +14,7 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 
+use ls_pc_abi::payloads::SemanticNode;
 use ls_server::{IndexBootstrap, PcQueryService};
 use ls_testkit::client::WireClient;
 use ls_testkit::fake_bsp::FakeBsp;
@@ -463,10 +464,12 @@ fn the_semantic_tokens_wire_surface_is_served_jvm_free() {
         json!({ "textDocument": { "uri": uri } }),
     );
     insta::assert_json_snapshot!("semantic-tokens-full", scrub(&full));
-    // The stream is well-formed: five words per token, no resultId.
+    // The stream is well-formed: five words per token, and the response
+    // carries the resultId the delta-capable client would hand back to
+    // `full/delta` (the URI's monotonic counter, first result -> "1").
     let data = full["data"].as_array().expect("a data array");
     assert_eq!(data.len() % 5, 0, "{full}");
-    assert!(full.get("resultId").is_none(), "{full}");
+    assert_eq!(full["resultId"], json!("1"), "{full}");
 
     // The range slice: only line 0 — the line-2 "Core" token drops, and the
     // kept tokens re-encode from the document origin.
@@ -498,6 +501,128 @@ fn the_semantic_tokens_wire_surface_is_served_jvm_free() {
     client.shutdown();
 }
 
+// The full/delta round trip over two scripted token streams: `/full` hands out
+// resultId "1" and caches the encoded stream; the fake then answers a CHANGED
+// node set, and `/full/delta` with previousResultId "1" answers the single
+// minimal prefix/suffix splice (start/deleteCount in raw u32 units, ×5) under
+// the bumped id — while a stale/unknown previousResultId answers a FULL
+// SemanticTokens result (the spec-legal union arm), and an unchanged stream
+// deltas to the empty edit list.
+#[test]
+fn the_semantic_tokens_full_delta_round_trip_is_served_jvm_free() {
+    let (mut client, pc) = boot();
+    client.initialize();
+    client.await_ready();
+
+    let uri = core_uri();
+    client.did_open_uri(&uri, DIRTY);
+
+    // Stream A: two line-0 tokens.
+    pc.script_semantic_tokens(vec![
+        SemanticNode {
+            start: 0,
+            end: 4,
+            token_type: 3,
+            token_modifier: 1,
+        },
+        SemanticNode {
+            start: 8,
+            end: 12,
+            token_type: 15,
+            token_modifier: 0,
+        },
+    ]);
+    let full = client.result(
+        "textDocument/semanticTokens/full",
+        json!({ "textDocument": { "uri": uri } }),
+    );
+    assert_eq!(full["resultId"], json!("1"), "{full}");
+    assert_eq!(
+        full["data"],
+        json!([0, 0, 4, 3, 1, 0, 8, 4, 15, 0]),
+        "{full}"
+    );
+
+    // Stream B: same first token, changed second, appended third (line 2).
+    pc.script_semantic_tokens(vec![
+        SemanticNode {
+            start: 0,
+            end: 4,
+            token_type: 3,
+            token_modifier: 1,
+        },
+        SemanticNode {
+            start: 8,
+            end: 12,
+            token_type: 15,
+            token_modifier: 2,
+        },
+        SemanticNode {
+            start: 20,
+            end: 24,
+            token_type: 2,
+            token_modifier: 2,
+        },
+    ]);
+    let delta = client.result(
+        "textDocument/semanticTokens/full/delta",
+        json!({ "textDocument": { "uri": uri }, "previousResultId": "1" }),
+    );
+    // The splice: the common one-token prefix held, the changed tail replaced
+    // — start/deleteCount count raw u32 words of the encoded stream.
+    assert_eq!(
+        delta,
+        json!({
+            "resultId": "2",
+            "edits": [{
+                "start": 5,
+                "deleteCount": 5,
+                "data": [0, 8, 4, 15, 2, 2, 6, 4, 2, 2]
+            }]
+        })
+    );
+
+    // A stale previousResultId ("1" was superseded by "2"): the answer is a
+    // FULL SemanticTokens result under a fresh id — the client resyncs
+    // wholesale, never a mis-based splice.
+    let resync = client.result(
+        "textDocument/semanticTokens/full/delta",
+        json!({ "textDocument": { "uri": uri }, "previousResultId": "1" }),
+    );
+    assert_eq!(resync["resultId"], json!("3"), "{resync}");
+    assert_eq!(
+        resync["data"],
+        json!([0, 0, 4, 3, 1, 0, 8, 4, 15, 2, 2, 6, 4, 2, 2]),
+        "{resync}"
+    );
+    assert!(resync.get("edits").is_none(), "{resync}");
+
+    // An unchanged stream deltas to the empty edit list (the client keeps its
+    // highlighting as-is).
+    let unchanged = client.result(
+        "textDocument/semanticTokens/full/delta",
+        json!({ "textDocument": { "uri": uri }, "previousResultId": "3" }),
+    );
+    assert_eq!(unchanged, json!({ "resultId": "4", "edits": [] }));
+
+    // didClose drops the cached base: reopening and delta'ing against the
+    // last pre-close id must answer the FULL resync shape (counter restarted).
+    client.did_close_uri(&uri);
+    client.did_open_uri(&uri, DIRTY);
+    let reopened = client.result(
+        "textDocument/semanticTokens/full/delta",
+        json!({ "textDocument": { "uri": uri }, "previousResultId": "4" }),
+    );
+    assert_eq!(reopened["resultId"], json!("1"), "{reopened}");
+    assert!(reopened.get("data").is_some(), "{reopened}");
+
+    assert!(
+        !ls_server::libjvm_mapped(),
+        "the delta round trip must stay JVM-free with the injected fake"
+    );
+    client.shutdown();
+}
+
 // The semantic-tokens gates: a buffer the PC mirror does not hold answers null
 // (`SemanticTokens | null` — never an empty stream that would wipe client
 // highlighting), and a no-SemanticDB source keeps the hard `require_semanticdb`
@@ -514,6 +639,11 @@ fn semantic_tokens_gate_on_the_buffer_and_semanticdb() {
         json!({ "textDocument": { "uri": uri } }),
     );
     assert_eq!(full, Value::Null);
+    let delta = client.result(
+        "textDocument/semanticTokens/full/delta",
+        json!({ "textDocument": { "uri": uri }, "previousResultId": "1" }),
+    );
+    assert_eq!(delta, Value::Null, "full/delta keeps the same buffer gate");
     let range = client.result(
         "textDocument/semanticTokens/range",
         json!({
@@ -528,14 +658,16 @@ fn semantic_tokens_gate_on_the_buffer_and_semanticdb() {
 
     let nosdb = client.file_uri("nosdb/NoSdb.scala");
     client.did_open_uri(&nosdb, "class NoSdb\n");
-    let error = client.error_message(
+    for method in [
         "textDocument/semanticTokens/full",
-        json!({ "textDocument": { "uri": nosdb } }),
-    );
-    assert!(
-        error.contains("has no SemanticDB output"),
-        "semanticTokens/full must keep the hard NoSemanticdb error, got: {error}"
-    );
+        "textDocument/semanticTokens/full/delta",
+    ] {
+        let error = client.error_message(method, json!({ "textDocument": { "uri": nosdb } }));
+        assert!(
+            error.contains("has no SemanticDB output"),
+            "{method} must keep the hard NoSemanticdb error, got: {error}"
+        );
+    }
     client.shutdown();
 }
 

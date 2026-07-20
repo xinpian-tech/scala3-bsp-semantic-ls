@@ -224,11 +224,12 @@ fn initialize_advertises_exactly_the_implemented_capability_set() {
             "resolveProvider": false
         })
     );
-    // semanticTokens: full + range as plain booleans (no full.delta — no delta
-    // handler exists), over the PC-vendored 23-type / 10-modifier legend with
-    // the golden anchors at their pinned indices.
+    // semanticTokens: range as a plain boolean, full as `{delta: true}` (the
+    // full/delta handler exists and /full responses carry its resultId), over
+    // the PC-vendored 23-type / 10-modifier legend with the golden anchors at
+    // their pinned indices.
     let tokens = &caps["semanticTokensProvider"];
-    assert_eq!(tokens["full"], true, "{tokens}");
+    assert_eq!(tokens["full"], json!({ "delta": true }), "{tokens}");
     assert_eq!(tokens["range"], true, "{tokens}");
     assert_eq!(tokens["legend"]["tokenTypes"].as_array().unwrap().len(), 23);
     assert_eq!(

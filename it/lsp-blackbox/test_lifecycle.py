@@ -65,11 +65,14 @@ async def test_initialize_advertises_the_exact_capability_surface(client):
         PC_PLUGIN_STATUS,
     ]
 
-    # semanticTokens: full + range as plain booleans over the vendored legend
-    # (the exact legend lists are pinned in test_semantic_tokens.py); no
-    # full.delta — delta requests are not implemented.
+    # semanticTokens: range as a plain boolean, full as {delta: true} — the
+    # server answers textDocument/semanticTokens/full/delta and /full
+    # responses carry the resultId it deltas against (the exact legend lists
+    # are pinned in test_semantic_tokens.py).
     assert caps.semantic_tokens_provider is not None
-    assert caps.semantic_tokens_provider.full is True
+    assert caps.semantic_tokens_provider.full == types.SemanticTokensFullDelta(
+        delta=True
+    )
     assert caps.semantic_tokens_provider.range is True
 
 

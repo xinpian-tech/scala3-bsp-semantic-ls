@@ -103,6 +103,33 @@ object CorpusPc:
   private val workspaceMethods =
     TrieMap.empty[String, Vector[(String, WorkspaceMethodHit)]]
 
+  /** Live registry backing [[MockResolver.definitionSourceToplevels]] — the
+    * port of dotty `MockEntries.definitionSourceTopLevels` (e.g.
+    * `scala/Option#` -> [`scala/Some.`, `scala/None.`]): per seeding buffer
+    * uri, the sealed parent's SemanticDB symbol -> the HAND-ORDERED toplevel
+    * child list. The PC's exhaustive-match sorter
+    * (`CaseKeywordCompletion.sortSubclasses`) consults the seam through
+    * `SymbolSearch.definitionSourceToplevels` only when the parent's children
+    * carry no compiler source positions, and must respect this order. Keyed
+    * by uri because the sorter passes the COMPLETION buffer's uri as the
+    * `sourceUri`, which scopes each case's seed to its own buffer.
+    */
+  private val mockToplevels =
+    TrieMap.empty[String, Map[String, Vector[String]]]
+
+  /** Every [[MockResolver.definitionSourceToplevels]] consultation in arrival
+    * order (`(semanticdbSymbol, sourceUri)`), so a corpus case can assert the
+    * seam WAS consulted (the mock-driven ordering cases) or was NOT (the
+    * source-position-ordered shapes). Append-only across the shared facade;
+    * assert by filtering on your own buffer uri.
+    */
+  private val toplevelsLog =
+    new java.util.concurrent.ConcurrentLinkedQueue[(String, String)]
+
+  def toplevelsQueries: Vector[(String, String)] =
+    import scala.jdk.CollectionConverters.*
+    toplevelsLog.iterator.asScala.toVector
+
   /** Range of `name` at its definition site (`def`/`val`/`var`/`class name`)
     * in `text`; the corpus registers real definition coordinates even though
     * the PC's `CompilerSearchVisitor` re-resolves hits purely by symbol.
@@ -141,6 +168,20 @@ object CorpusPc:
         case (name, hit) if Fuzzy.matches(query, name) => hit
       }
 
+    /** The dotty `MockEntries.definitionSourceTopLevels` seam: answer the
+      * hand-ordered child list the querying buffer seeded (empty otherwise —
+      * the trait default the index-less embedders keep), recording every
+      * consultation for the corpus ordering cases.
+      */
+    override def definitionSourceToplevels(
+        semanticdbSymbol: String,
+        sourceUri: String
+    ): Vector[String] =
+      toplevelsLog.add(semanticdbSymbol -> sourceUri)
+      mockToplevels
+        .getOrElse(sourceUri, Map.empty)
+        .getOrElse(semanticdbSymbol, Vector.empty)
+
   lazy val facade: PcFacade =
     val pm = new PcPluginManager(PcPluginInitContext(None, generatedSourcesRoot))
     val f = new PcFacade(
@@ -171,18 +212,23 @@ object CorpusPc:
   def openBuffer(
       text: String,
       filename: String = "A.scala",
-      methods: Seq[WorkspaceMethod] = Nil
+      methods: Seq[WorkspaceMethod] = Nil,
+      toplevels: Map[String, Vector[String]] = Map.empty
   ): String =
-    openBufferFor(targetId, text, filename, methods)
+    openBufferFor(targetId, text, filename, methods, toplevels)
 
   /** [[openBuffer]] under an explicit registered target (the `-explain`
-    * diagnostics corpus opens under [[explainTargetId]]).
+    * diagnostics corpus opens under [[explainTargetId]]). `toplevels` seeds
+    * the definitionSourceToplevels seam for this buffer (the dotty
+    * `MockEntries.definitionSourceTopLevels` map: sealed parent symbol ->
+    * hand-ordered toplevel children).
     */
   def openBufferFor(
       target: String,
       text: String,
       filename: String = "A.scala",
-      methods: Seq[WorkspaceMethod] = Nil
+      methods: Seq[WorkspaceMethod] = Nil,
+      toplevels: Map[String, Vector[String]] = Map.empty
   ): String =
     val uri = s"file:///ls-pc-corpus/${counter.incrementAndGet()}/$filename"
     if methods.nonEmpty then
@@ -197,10 +243,14 @@ object CorpusPc:
           )
         }.toVector
       )
+    if toplevels.nonEmpty then mockToplevels.put(uri, toplevels)
     facade.didOpen(target, uri, text)
     uri
 
-  /** Close a corpus buffer and drop any workspace methods it registered. */
+  /** Close a corpus buffer and drop any workspace methods or mock toplevels
+    * it registered.
+    */
   def closeBuffer(uri: String): Unit =
     workspaceMethods.remove(uri)
+    mockToplevels.remove(uri)
     facade.didClose(uri)

@@ -445,9 +445,15 @@ impl WireClient {
     }
 
     pub fn did_close(&mut self, rel: &str) {
+        let uri = self.file_uri(rel);
+        self.did_close_uri(&uri);
+    }
+
+    /// `didClose` with a full URI (see [`WireClient::did_open_uri`]).
+    pub fn did_close_uri(&mut self, uri: &str) {
         self.notify(
             "textDocument/didClose",
-            json!({"textDocument": {"uri": self.file_uri(rel)}}),
+            json!({"textDocument": {"uri": uri}}),
         );
     }
 

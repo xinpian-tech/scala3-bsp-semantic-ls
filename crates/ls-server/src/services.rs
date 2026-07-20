@@ -124,6 +124,74 @@ pub struct CoreServices {
     /// The debounced per-URI `pc_diagnostics` pull worker (`didChange` -> the
     /// PC-overlay publish). Dropping the services stops and joins it.
     pc_diagnostics_scheduler: PcDiagnosticsScheduler,
+    /// The per-URI `semanticTokens/full` result cache backing `full/delta`:
+    /// the latest encoded stream per URI with its monotonic result id, LRU
+    /// across URIs (see [`SemanticTokensCache`]). Dropped per URI on didClose.
+    semantic_tokens_cache: Mutex<SemanticTokensCache>,
+}
+
+/// The number of URIs whose latest `/full` stream is retained for `full/delta`
+/// diffing. LRU across URIs; 32 comfortably covers an editor's open-tab set
+/// while bounding the retained streams.
+const SEMANTIC_TOKENS_CACHE_CAP: usize = 32;
+
+/// The `semanticTokens/full` delta base: per URI, the LATEST encoded stream the
+/// client was handed, with the monotonic per-URI counter that names it (the
+/// `resultId`). Only the latest result per URI is kept — a client deltas
+/// against the last response it received, so an older base could never match —
+/// and at most [`SEMANTIC_TOKENS_CACHE_CAP`] URIs are retained, least recently
+/// stored evicted first. A didClose drops the URI's entry (its counter restarts
+/// on reopen; safe, because the cache always holds exactly the stream the
+/// current id was handed out with, and a miss answers a FULL result).
+#[derive(Default)]
+struct SemanticTokensCache {
+    /// LRU order: front is the least recently stored, back the most recent.
+    entries: Vec<(String, SemanticTokensCacheEntry)>,
+}
+
+struct SemanticTokensCacheEntry {
+    /// The monotonic per-URI counter; `counter.to_string()` is the resultId.
+    counter: u64,
+    /// The encoded stream handed out under that id — the delta base.
+    data: Vec<lsp_types::SemanticToken>,
+}
+
+impl SemanticTokensCache {
+    /// Cache `data` as the URI's latest stream and return the fresh resultId
+    /// (the bumped per-URI counter). Moves the URI to the LRU back and evicts
+    /// the front past the cap.
+    fn store(&mut self, uri: &str, data: Vec<lsp_types::SemanticToken>) -> String {
+        let counter = match self.entries.iter().position(|(u, _)| u == uri) {
+            Some(i) => self.entries.remove(i).1.counter + 1,
+            None => 1,
+        };
+        self.entries
+            .push((uri.to_string(), SemanticTokensCacheEntry { counter, data }));
+        if self.entries.len() > SEMANTIC_TOKENS_CACHE_CAP {
+            self.entries.remove(0);
+        }
+        counter.to_string()
+    }
+
+    /// The cached stream IF `previous_result_id` names the URI's current entry;
+    /// `None` (unknown URI, evicted, or stale id) tells the caller to answer a
+    /// FULL result instead of a delta.
+    fn previous(
+        &self,
+        uri: &str,
+        previous_result_id: &str,
+    ) -> Option<Vec<lsp_types::SemanticToken>> {
+        self.entries
+            .iter()
+            .find(|(u, _)| u == uri)
+            .filter(|(_, entry)| entry.counter.to_string() == previous_result_id)
+            .map(|(_, entry)| entry.data.clone())
+    }
+
+    /// Drop the URI's entry (didClose: a closed buffer can never be a delta base).
+    fn drop_uri(&mut self, uri: &str) {
+        self.entries.retain(|(u, _)| u != uri);
+    }
 }
 
 /// The retained build capability: a [`CompileService`] that can also refetch the
@@ -170,7 +238,16 @@ impl CoreServices {
             doctor_targets,
             pc_diagnostics,
             pc_diagnostics_scheduler,
+            semantic_tokens_cache: Mutex::new(SemanticTokensCache::default()),
         }
+    }
+
+    /// didClose: drop the URI's cached `semanticTokens/full` delta base.
+    pub(crate) fn drop_semantic_tokens(&self, uri: &str) {
+        self.semantic_tokens_cache
+            .lock()
+            .expect("semantic tokens cache mutex")
+            .drop_uri(uri);
     }
 
     /// Install the PC-backed dirty-buffer overlay's late-bound environment (the
@@ -422,6 +499,9 @@ impl Handlers<CoreServices> for CoreHandlers {
             "textDocument/semanticTokens/full" => {
                 semantic_tokens_full(id, cx.services, cx.documents, &cx.request.params)
             }
+            "textDocument/semanticTokens/full/delta" => {
+                semantic_tokens_full_delta(id, cx.services, cx.documents, &cx.request.params)
+            }
             "textDocument/semanticTokens/range" => {
                 semantic_tokens_range(id, cx.services, cx.documents, &cx.request.params)
             }
@@ -460,11 +540,14 @@ impl Handlers<CoreServices> for CoreHandlers {
     }
 
     /// A buffer closed: drop it from the mirror (ports `TextDocs.didClose`'s
-    /// unconditional `s.pc.didClose(uri)`) and clear its live-typing
-    /// diagnostics overlay — a closed buffer shows BSP truth only.
+    /// unconditional `s.pc.didClose(uri)`), clear its live-typing
+    /// diagnostics overlay — a closed buffer shows BSP truth only — and drop
+    /// its cached semantic-tokens delta base (a closed buffer can never be
+    /// delta'd against; a reopen starts from a fresh `/full`).
     fn on_did_close(&self, services: &CoreServices, uri: &str) {
         services.pc.did_close(uri);
         services.clear_pc_diagnostics(uri);
+        services.drop_semantic_tokens(uri);
     }
 
     /// A buffer saved: schedule the compile-first build job AND clear the
@@ -1591,15 +1674,77 @@ fn semantic_tokens_full(
     documents: &DocumentStore,
     params: &Value,
 ) -> Response {
-    semantic_tokens_response(id, services, documents, params, |nodes, text| {
-        crate::pc_lsp::semantic_tokens(nodes, text)
-    })
+    let (uri, nodes, text) = match semantic_tokens_gate(&id, services, documents, params) {
+        Ok(computed) => computed,
+        Err(response) => return *response,
+    };
+    let mut tokens = crate::pc_lsp::semantic_tokens(&nodes, &text);
+    // Cache the stream as the URI's delta base and stamp the fresh resultId so
+    // a delta-capable client can ask `full/delta` next.
+    tokens.result_id = Some(
+        services
+            .semantic_tokens_cache
+            .lock()
+            .expect("semantic tokens cache mutex")
+            .store(&uri, tokens.data.clone()),
+    );
+    ok_json(id, &tokens)
+}
+
+/// `textDocument/semanticTokens/full/delta`: recompute the buffer's CURRENT
+/// stream, then answer the single minimal splice against the cached stream
+/// `previousResultId` names ([`crate::pc_lsp::semantic_tokens_edits`] — the
+/// prefix/suffix diff rust-analyzer uses), as `SemanticTokensDelta {resultId,
+/// edits}`. When the id does not name the URI's cached entry (never issued,
+/// evicted, superseded, or dropped by didClose) the answer is a FULL
+/// `SemanticTokens` result instead — spec-legal via the union return type —
+/// so the client resynchronizes wholesale. Either way the recomputed stream
+/// becomes the new cached base under a fresh id. The gate ladder is exactly
+/// `/full`'s: `require_semanticdb` hard-errors first, then a missing/unheld
+/// buffer answers `null`.
+fn semantic_tokens_full_delta(
+    id: RequestId,
+    services: &CoreServices,
+    documents: &DocumentStore,
+    params: &Value,
+) -> Response {
+    let (uri, nodes, text) = match semantic_tokens_gate(&id, services, documents, params) {
+        Ok(computed) => computed,
+        Err(response) => return *response,
+    };
+    let mut tokens = crate::pc_lsp::semantic_tokens(&nodes, &text);
+    // One lock scope for lookup + store, so the base consulted and the base
+    // replaced cannot interleave with another token request for the same URI.
+    let mut cache = services
+        .semantic_tokens_cache
+        .lock()
+        .expect("semantic tokens cache mutex");
+    let previous = params
+        .get("previousResultId")
+        .and_then(Value::as_str)
+        .and_then(|previous_id| cache.previous(&uri, previous_id));
+    let result_id = cache.store(&uri, tokens.data.clone());
+    drop(cache);
+    match previous {
+        Some(previous_data) => ok_json(
+            id,
+            &lsp_types::SemanticTokensDelta {
+                result_id: Some(result_id),
+                edits: crate::pc_lsp::semantic_tokens_edits(&previous_data, &tokens.data),
+            },
+        ),
+        None => {
+            tokens.result_id = Some(result_id);
+            ok_json(id, &tokens)
+        }
+    }
 }
 
 /// `textDocument/semanticTokens/range`: the same operation, with the node list
 /// sliced server-side to the tokens overlapping the requested range BEFORE the
 /// delta encoding ([`crate::pc_lsp::semantic_tokens_range`]). A missing or
-/// unparseable `range` answers `null` like the other gates.
+/// unparseable `range` answers `null` like the other gates. Range results are
+/// never cached and carry no resultId — a range slice cannot be a delta base.
 fn semantic_tokens_range(
     id: RequestId,
     services: &CoreServices,
@@ -1612,37 +1757,49 @@ fn semantic_tokens_range(
     else {
         return Response::success(id, Value::Null);
     };
-    semantic_tokens_response(id, services, documents, params, move |nodes, text| {
-        crate::pc_lsp::semantic_tokens_range(nodes, text, &range)
-    })
+    let (_, nodes, text) = match semantic_tokens_gate(&id, services, documents, params) {
+        Ok(computed) => computed,
+        Err(response) => return *response,
+    };
+    ok_json(
+        id,
+        &crate::pc_lsp::semantic_tokens_range(&nodes, &text, &range),
+    )
 }
 
-/// The shared gate ladder + encode of the two semantic-tokens methods.
-fn semantic_tokens_response(
-    id: RequestId,
+/// The shared gate ladder of the semantic-tokens methods: `require_semanticdb`
+/// hard-errors FIRST (the hover discipline), then a missing URI or a buffer
+/// the PC mirror does not hold answers `null` — `Err` carries the finished
+/// fallback response (boxed: the happy path should not pay the fallback's
+/// size), `Ok` the normalized URI, the island's nodes, and the open-buffer
+/// text to encode against.
+type SemanticTokensGate =
+    Result<(String, Vec<ls_pc_abi::payloads::SemanticNode>, String), Box<Response>>;
+
+fn semantic_tokens_gate(
+    id: &RequestId,
     services: &CoreServices,
     documents: &DocumentStore,
     params: &Value,
-    encode: impl Fn(&[ls_pc_abi::payloads::SemanticNode], &str) -> lsp_types::SemanticTokens,
-) -> Response {
+) -> SemanticTokensGate {
     let Some(raw) = text_document_uri(params) else {
-        return Response::success(id, Value::Null);
+        return Err(Box::new(Response::success(id.clone(), Value::Null)));
     };
     if let Err(error) = services.require_semanticdb(&raw) {
-        return request_failed(id, &error);
+        return Err(Box::new(request_failed(id.clone(), &error)));
     }
     let uri = normalize_uri(&raw);
     if !services.pc.is_open(&uri) {
-        return Response::success(id, Value::Null);
+        return Err(Box::new(Response::success(id.clone(), Value::Null)));
     }
     // The open-buffer text; the PC mirror holding the buffer implies the
     // document store does too (both are fed by the same loop), so a miss here
     // is a defensive null, not an expected path.
     let Some(text) = documents.text(&uri) else {
-        return Response::success(id, Value::Null);
+        return Err(Box::new(Response::success(id.clone(), Value::Null)));
     };
     let nodes = services.pc.semantic_tokens(&uri);
-    ok_json(id, &encode(&nodes, &text))
+    Ok((uri, nodes, text))
 }
 
 /// `completionItem/resolve`: enrich the item through the presentation compiler.
@@ -3732,5 +3889,69 @@ mod tests {
             "ingest: segment 3, 25 docs (1 shared, 0 stale, 2 skipped), \
              100 symbols, 40 ref groups, 30 rename groups in 12ms"
         );
+    }
+
+    // --- the semanticTokens/full delta-base cache ----------------------------
+
+    /// A one-token stream tagged by `length`, so entries compare distinct.
+    fn stream(tag: u32) -> Vec<lsp_types::SemanticToken> {
+        vec![lsp_types::SemanticToken {
+            delta_line: 0,
+            delta_start: 0,
+            length: tag,
+            token_type: 8,
+            token_modifiers_bitset: 0,
+        }]
+    }
+
+    // The resultId is a monotonic per-URI counter: each store bumps the URI's
+    // counter, other URIs count independently, and only the CURRENT id answers
+    // a base — a superseded id is stale and must trigger the full-resync path.
+    #[test]
+    fn semantic_tokens_cache_ids_are_monotonic_per_uri_and_stale_ids_miss() {
+        let mut cache = SemanticTokensCache::default();
+        assert_eq!(cache.store("file:///a", stream(1)), "1");
+        assert_eq!(cache.store("file:///b", stream(2)), "1");
+        assert_eq!(cache.store("file:///a", stream(3)), "2");
+        // The current id answers the exact stream handed out under it.
+        assert_eq!(cache.previous("file:///a", "2"), Some(stream(3)));
+        assert_eq!(cache.previous("file:///b", "1"), Some(stream(2)));
+        // Stale (superseded) id, unknown id, unknown URI: all miss.
+        assert_eq!(cache.previous("file:///a", "1"), None);
+        assert_eq!(cache.previous("file:///a", "99"), None);
+        assert_eq!(cache.previous("file:///c", "1"), None);
+    }
+
+    // didClose drops the URI's entry; a reopened buffer restarts its counter
+    // (safe: the cache then again holds exactly the stream the fresh id was
+    // handed out with).
+    #[test]
+    fn semantic_tokens_cache_drop_uri_forgets_the_base_and_restarts_the_counter() {
+        let mut cache = SemanticTokensCache::default();
+        assert_eq!(cache.store("file:///a", stream(1)), "1");
+        cache.drop_uri("file:///a");
+        assert_eq!(cache.previous("file:///a", "1"), None);
+        assert_eq!(cache.store("file:///a", stream(2)), "1");
+        assert_eq!(cache.previous("file:///a", "1"), Some(stream(2)));
+    }
+
+    // The cache is LRU across URIs with the pinned cap: storing one past the
+    // cap evicts the least recently STORED uri, and re-storing an existing uri
+    // refreshes its recency instead of growing the map.
+    #[test]
+    fn semantic_tokens_cache_evicts_the_least_recently_stored_past_the_cap() {
+        let mut cache = SemanticTokensCache::default();
+        for i in 0..SEMANTIC_TOKENS_CACHE_CAP {
+            cache.store(&format!("file:///{i}"), stream(i as u32));
+        }
+        // Refresh uri 0's recency: it moves to the LRU back...
+        cache.store("file:///0", stream(100));
+        assert_eq!(cache.entries.len(), SEMANTIC_TOKENS_CACHE_CAP);
+        // ...so the store past the cap evicts uri 1 (now the oldest), not 0.
+        cache.store("file:///fresh", stream(200));
+        assert_eq!(cache.entries.len(), SEMANTIC_TOKENS_CACHE_CAP);
+        assert_eq!(cache.previous("file:///1", "1"), None, "evicted");
+        assert_eq!(cache.previous("file:///0", "2"), Some(stream(100)));
+        assert_eq!(cache.previous("file:///fresh", "1"), Some(stream(200)));
     }
 }

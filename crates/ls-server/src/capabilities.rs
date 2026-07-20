@@ -14,9 +14,10 @@
 //! — quickfix, refactor.rewrite, refactor.extract, refactor.inline — with no
 //! resolve: every action carries its edit inline); selection range; folding
 //! range;
-//! semantic tokens (`full` + `range` over the PC-vendored legend, no
-//! `full.delta` — delta requests are not implemented so they must not be
-//! advertised); and the execute-command set.
+//! semantic tokens (`full` with `delta` + `range` over the PC-vendored legend
+//! — `/full` responses carry a `resultId` and the server answers
+//! `textDocument/semanticTokens/full/delta` with the minimal splice against
+//! the cached previous stream); and the execute-command set.
 //!
 //! Semantic tokens are advertised UNCONDITIONALLY, without reading the
 //! client's `textDocument.semanticTokens` capability: every mainstream client
@@ -144,18 +145,19 @@ pub struct ServerCapabilities {
     pub code_action_provider: lsp_types::CodeActionOptions,
     pub selection_range_provider: bool,
     pub folding_range_provider: bool,
-    /// `{legend, full: true, range: true}` — the legend is EXACTLY the
-    /// PC-vendored `scala.meta.internal.pc.SemanticTokens` lists
+    /// `{legend, full: {delta: true}, range: true}` — the legend is EXACTLY
+    /// the PC-vendored `scala.meta.internal.pc.SemanticTokens` lists
     /// ([`crate::pc_lsp::legend`]), because the island's node type/modifier
-    /// ints index those lists. `full` is the plain boolean — `full.delta` must
-    /// NOT be advertised (no delta handler exists; `resultId` is never
-    /// emitted).
+    /// ints index those lists. `full.delta` is advertised: `/full` responses
+    /// carry a `resultId` and `textDocument/semanticTokens/full/delta` answers
+    /// the splice against the cached previous stream.
     pub semantic_tokens_provider: lsp_types::SemanticTokensOptions,
     pub execute_command_provider: ExecuteCommandOptions,
 }
 
-/// The advertised semantic-tokens capability: the vendored legend, `full` and
-/// `range` both plain `true`.
+/// The advertised semantic-tokens capability: the vendored legend, `full`
+/// with `delta: true` (the `full/delta` handler exists and `/full` responses
+/// carry the `resultId` it deltas against), `range` plain `true`.
 pub fn semantic_tokens_options() -> lsp_types::SemanticTokensOptions {
     // The golden anchors of the cross-language legend contract, re-checked at
     // the point the legend is advertised (debug builds; the release value is
@@ -181,7 +183,7 @@ pub fn semantic_tokens_options() -> lsp_types::SemanticTokensOptions {
                 .collect(),
         },
         range: Some(true),
-        full: Some(lsp_types::SemanticTokensFullOptions::Bool(true)),
+        full: Some(lsp_types::SemanticTokensFullOptions::Delta { delta: Some(true) }),
     }
 }
 
@@ -375,15 +377,19 @@ mod tests {
     }
 
     // semanticTokensProvider: the PC-vendored legend verbatim (23 types, 10
-    // modifiers, the golden anchors at their pinned indices), full and range
-    // as plain `true` — and NO `full.delta` (no delta handler exists, so
-    // advertising it would invite requests the server cannot answer).
+    // modifiers, the golden anchors at their pinned indices), range as plain
+    // `true`, and full as `{delta: true}` — the `full/delta` handler exists
+    // and `/full` responses carry the `resultId` it deltas against.
     #[test]
     fn advertises_semantic_tokens_with_the_vendored_legend() {
         let value: serde_json::Value =
             serde_json::from_str(&initialize_json()).expect("initialize result is JSON");
         let provider = &value["capabilities"]["semanticTokensProvider"];
-        assert_eq!(provider["full"], serde_json::json!(true), "{provider}");
+        assert_eq!(
+            provider["full"],
+            serde_json::json!({ "delta": true }),
+            "{provider}"
+        );
         assert_eq!(provider["range"], serde_json::json!(true), "{provider}");
         let token_types: Vec<&str> = provider["legend"]["tokenTypes"]
             .as_array()

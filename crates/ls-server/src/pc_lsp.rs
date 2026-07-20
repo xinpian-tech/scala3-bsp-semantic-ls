@@ -175,7 +175,9 @@ fn positioned(nodes: &[SemanticNode], lines: &Utf16Lines) -> Vec<PositionedToken
 
 /// Delta-encodes positioned tokens into the LSP `SemanticTokens` data stream
 /// (`deltaLine`/`deltaStart`/`length`/`tokenType`/`tokenModifiers`, five words
-/// per token). No `resultId`: delta requests are not advertised.
+/// per token). No `resultId` here: the dispatch layer stamps one onto the
+/// `/full` (and `/full/delta`) responses when it caches the stream — `/range`
+/// responses stay id-less (a range slice is never a delta base).
 fn delta_encode(tokens: &[PositionedToken]) -> lsp_types::SemanticTokens {
     let mut data = Vec::with_capacity(tokens.len());
     let (mut prev_line, mut prev_start) = (0u32, 0u32);
@@ -228,6 +230,45 @@ pub fn semantic_tokens_range(
         (token.line, token.start) < to && (token.line, token.start + token.length) > from
     });
     delta_encode(&tokens)
+}
+
+/// The `full/delta` edit list between two encoded token streams: the single
+/// minimal splice of the standard LSP delta algorithm (the same prefix/suffix
+/// diff rust-analyzer's `semantic_tokens::diff_tokens` computes). The common
+/// prefix, then the common suffix of the remainders, are counted in whole
+/// five-word tokens — so the spliced `data` stays token-aligned — while the
+/// wire `start`/`deleteCount` are in raw u32 units of the encoded stream (×5),
+/// as the spec requires. Identical streams answer the empty edit list; a pure
+/// deletion carries an empty `data` (never a missing one, so the client-side
+/// splice arithmetic stays uniform).
+pub fn semantic_tokens_edits(
+    prev: &[lsp_types::SemanticToken],
+    next: &[lsp_types::SemanticToken],
+) -> Vec<lsp_types::SemanticTokensEdit> {
+    let prefix = prev
+        .iter()
+        .zip(next.iter())
+        .take_while(|(p, n)| p == n)
+        .count();
+    let (prev_rest, next_rest) = (&prev[prefix..], &next[prefix..]);
+    // Over the remainders only, so an element common to both prefix and suffix
+    // is never double-counted (the splice bounds cannot overlap).
+    let suffix = prev_rest
+        .iter()
+        .rev()
+        .zip(next_rest.iter().rev())
+        .take_while(|(p, n)| p == n)
+        .count();
+    let deleted = prev_rest.len() - suffix;
+    let inserted = &next_rest[..next_rest.len() - suffix];
+    if deleted == 0 && inserted.is_empty() {
+        return Vec::new();
+    }
+    vec![lsp_types::SemanticTokensEdit {
+        start: 5 * prefix as u32,
+        delete_count: 5 * deleted as u32,
+        data: Some(inserted.to_vec()),
+    }]
 }
 
 /// ABI position (zero-based UTF-16, as LSP) -> `lsp_types::Position`.
@@ -655,7 +696,8 @@ mod tests {
 
     // Multi-token, multi-line delta encoding over plain ASCII: absolute first
     // token, same-line column delta, cross-line line delta with an absolute
-    // column restart. No resultId is emitted (deltas are not advertised).
+    // column restart. The pure encoder emits no resultId — the dispatch layer
+    // stamps one when it caches a `/full` stream.
     #[test]
     fn semantic_tokens_delta_encode_across_lines() {
         //          0123456789012345
@@ -768,6 +810,105 @@ mod tests {
     fn semantic_tokens_of_no_nodes_is_the_empty_stream() {
         let tokens = semantic_tokens(&[], "val a = 1\n");
         assert_eq!(data_of(&tokens), Vec::<u32>::new());
+    }
+
+    // --- the full/delta prefix/suffix diff -----------------------------------
+
+    /// A distinct five-word token: `length` carries `tag` so tokens compare
+    /// unequal exactly when their tags differ.
+    fn tok(tag: u32) -> lsp_types::SemanticToken {
+        lsp_types::SemanticToken {
+            delta_line: 1,
+            delta_start: 0,
+            length: tag,
+            token_type: 8,
+            token_modifiers_bitset: 0,
+        }
+    }
+
+    /// The single splice (or none) between two tagged streams, as
+    /// `(start, deleteCount, inserted tags)`.
+    fn splice_of(prev: &[u32], next: &[u32]) -> Option<(u32, u32, Vec<u32>)> {
+        let prev: Vec<_> = prev.iter().copied().map(tok).collect();
+        let next: Vec<_> = next.iter().copied().map(tok).collect();
+        let edits = semantic_tokens_edits(&prev, &next);
+        assert!(edits.len() <= 1, "at most one splice: {edits:?}");
+        edits.first().map(|edit| {
+            (
+                edit.start,
+                edit.delete_count,
+                edit.data
+                    .as_ref()
+                    .expect("data is always Some")
+                    .iter()
+                    .map(|t| t.length)
+                    .collect(),
+            )
+        })
+    }
+
+    // Identical streams (both empty and non-empty) diff to NO edits — the
+    // client keeps its stream as-is. The empty→empty case is exactly what a
+    // cold-island blackbox round trip produces.
+    #[test]
+    fn tokens_diff_of_identical_streams_is_empty() {
+        assert_eq!(splice_of(&[], &[]), None);
+        assert_eq!(splice_of(&[1, 2, 3], &[1, 2, 3]), None);
+    }
+
+    // A mid-stream change splices exactly the changed window: the common
+    // prefix and suffix are held, start/deleteCount are in raw u32 units (×5).
+    #[test]
+    fn tokens_diff_splices_a_mid_stream_change() {
+        assert_eq!(
+            splice_of(&[1, 2, 3, 4], &[1, 9, 9, 4]),
+            Some((5, 10, vec![9, 9]))
+        );
+    }
+
+    // Pure insertion (append and prepend): nothing deleted, the new tokens
+    // carried in `data` at the splice point.
+    #[test]
+    fn tokens_diff_splices_pure_insertions() {
+        assert_eq!(splice_of(&[1, 2], &[1, 2, 3]), Some((10, 0, vec![3])));
+        assert_eq!(splice_of(&[1, 2], &[0, 1, 2]), Some((0, 0, vec![0])));
+        assert_eq!(splice_of(&[], &[7]), Some((0, 0, vec![7])));
+    }
+
+    // Pure deletion: `data` is Some([]) — present but empty — so the client
+    // splice stays uniform (rust-analyzer emits the same shape).
+    #[test]
+    fn tokens_diff_splices_pure_deletions() {
+        assert_eq!(splice_of(&[1, 2, 3], &[1, 3]), Some((5, 5, vec![])));
+        assert_eq!(splice_of(&[1, 2], &[]), Some((0, 10, vec![])));
+    }
+
+    // Repeated tokens: the prefix is consumed greedily and the suffix is
+    // counted over the REMAINDERS only, so a token shared by both never
+    // double-counts (prev [A] -> next [A, A] inserts one A after the prefix,
+    // not zero or two).
+    #[test]
+    fn tokens_diff_never_overlaps_prefix_and_suffix() {
+        assert_eq!(splice_of(&[1], &[1, 1]), Some((5, 0, vec![1])));
+        assert_eq!(splice_of(&[1, 1], &[1]), Some((5, 5, vec![])));
+    }
+
+    // A full replacement spans the whole streams.
+    #[test]
+    fn tokens_diff_replaces_disjoint_streams_whole() {
+        assert_eq!(splice_of(&[1, 2], &[3, 4, 5]), Some((0, 10, vec![3, 4, 5])));
+    }
+
+    // The wire shape of an edit: camelCase `deleteCount`, `data` flattened to
+    // the raw five-words-per-token integer array (the same lsp-types
+    // serializer the /full stream uses).
+    #[test]
+    fn tokens_diff_edit_serializes_to_the_flat_wire_shape() {
+        let edits = semantic_tokens_edits(&[tok(1)], &[tok(2)]);
+        assert_eq!(
+            serde_json::to_value(&edits).unwrap(),
+            json!([{ "start": 0, "deleteCount": 5, "data": [1, 0, 2, 8, 0] }])
+        );
     }
 
     // The code-action assembly's inline edit: one buffer's island edits become

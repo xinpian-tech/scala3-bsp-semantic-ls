@@ -82,6 +82,7 @@ pub enum Method {
     SelectionRange,
     FoldingRange,
     SemanticTokensFull,
+    SemanticTokensFullDelta,
     SemanticTokensRange,
 }
 
@@ -102,7 +103,7 @@ pub enum PreReadyOutcome {
 /// symbol, implementation, completion,
 /// definition, type definition, inlay hint, code action, and folding range
 /// answer empty;
-/// hover, signature help, prepare rename, selection range, and the two
+/// hover, signature help, prepare rename, selection range, and the three
 /// semantic-tokens methods answer null (selection range because the spec ties
 /// `result[i]` to `positions[i]` — an empty array against a non-empty position
 /// list would break that correspondence, exactly as its ready-path gate
@@ -127,6 +128,7 @@ pub fn pre_ready_outcome(method: Method) -> PreReadyOutcome {
         | Method::PrepareRename
         | Method::SelectionRange
         | Method::SemanticTokensFull
+        | Method::SemanticTokensFullDelta
         | Method::SemanticTokensRange => PreReadyOutcome::Null,
     }
 }
@@ -232,6 +234,7 @@ mod tests {
             Method::PrepareRename,
             Method::SelectionRange,
             Method::SemanticTokensFull,
+            Method::SemanticTokensFullDelta,
             Method::SemanticTokensRange,
         ] {
             assert_eq!(pre_ready_outcome(m), PreReadyOutcome::Null, "{m:?}");

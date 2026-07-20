@@ -379,6 +379,48 @@ for i = 1, #tokens.data, 5 do
 end
 pass("semanticTokens/full streams " .. (#tokens.data / 5) .. " tokens within the legend")
 
+-- semanticTokens full/delta: the server advertises full = {delta: true}, the
+-- /full response above carried the resultId to delta against, and a delta
+-- request over the UNCHANGED buffer must answer the empty edit list under a
+-- fresh resultId (nvim's client:request_sync carries arbitrary methods, so the
+-- probe drives the raw wire method exactly like its own semantic-tokens
+-- engine would).
+local full_option = (client.server_capabilities.semanticTokensProvider or {}).full
+if type(full_option) ~= "table" or full_option.delta ~= true then
+  fail("semanticTokensProvider.full does not advertise {delta = true}: " .. vim.inspect(full_option))
+end
+if type(tokens.resultId) ~= "string" or tokens.resultId == "" then
+  fail("semanticTokens/full carried no resultId: " .. vim.inspect(tokens.resultId))
+end
+local delta = request("textDocument/semanticTokens/full/delta", {
+  textDocument = doc_at.textDocument,
+  previousResultId = tokens.resultId,
+}, 120000)
+if type(delta) ~= "table" then
+  fail("semanticTokens/full/delta did not return a result: " .. vim.inspect(delta))
+end
+if type(delta.resultId) ~= "string" or delta.resultId == tokens.resultId then
+  fail("full/delta must answer a fresh resultId: " .. vim.inspect(delta.resultId))
+end
+if type(delta.edits) ~= "table" then
+  fail("full/delta over a valid previousResultId must answer the delta arm (edits): " .. vim.inspect(delta))
+end
+if #delta.edits ~= 0 then
+  fail("an unchanged buffer must delta to zero edits, got " .. #delta.edits)
+end
+-- A stale previousResultId resyncs with the FULL arm (a data array).
+local resync = request("textDocument/semanticTokens/full/delta", {
+  textDocument = doc_at.textDocument,
+  previousResultId = "e2e-stale-result-id",
+}, 120000)
+if type(resync) ~= "table" or type(resync.data) ~= "table" then
+  fail("full/delta with a stale id must resync with a full data array: " .. vim.inspect(resync))
+end
+if #resync.data ~= #tokens.data then
+  fail("the stale-id resync must re-stream the unchanged buffer (" .. #tokens.data .. " words), got " .. #resync.data)
+end
+pass("semanticTokens/full/delta round-trips (empty delta, then a stale-id full resync)")
+
 -- Definition, bisected across the three navigation shapes: in-buffer (pure
 -- PC span), cross-target (PC symbol -> index resolver, the shape the gated
 -- real-BSP suites prove), and same-target-cross-file (informational: its

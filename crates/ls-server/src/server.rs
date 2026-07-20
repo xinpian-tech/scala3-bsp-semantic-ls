@@ -1027,6 +1027,7 @@ fn readiness_method(method: &str) -> Option<Method> {
         "textDocument/selectionRange" => Some(Method::SelectionRange),
         "textDocument/foldingRange" => Some(Method::FoldingRange),
         "textDocument/semanticTokens/full" => Some(Method::SemanticTokensFull),
+        "textDocument/semanticTokens/full/delta" => Some(Method::SemanticTokensFullDelta),
         "textDocument/semanticTokens/range" => Some(Method::SemanticTokensRange),
         "workspace/symbol" => Some(Method::WorkspaceSymbol),
         _ => None,
