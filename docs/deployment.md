@@ -80,13 +80,14 @@ result/share/scala3-bsp-semantic-ls/zaozi-pcplugin.jar           # shipped PC co
 result/share/scala3-bsp-semantic-ls/default-plugin-schema.json   # JSON schema for pc-plugins.json (data, not required to run)
 ```
 
-The wrapper bakes exactly two defaults, both via `--set-default` (so any value
+The wrapper bakes exactly three defaults, all via `--set-default` (so any value
 already in the caller's environment wins):
 
 | Wrapper setting                          | Purpose                                                       |
 |------------------------------------------|---------------------------------------------------------------|
 | `--set-default JAVA_HOME <jdk25>`        | the Java home the embedded island boots from, if nothing else is configured |
 | `--set-default PC_HOST_AGENT_JAR <share/…/pc-host-agent.jar>` | the island host agent assembly loaded as `-javaagent` |
+| `--set-default LS_SCALAFMT <scalafmt>/bin/scalafmt` | the scalafmt CLI `textDocument/formatting` shells out to (§4.9) |
 
 There are no JVM launch flags in the wrapper — the binary is native. The island
 JVM's own flags (`--enable-native-access=ALL-UNNAMED`,
@@ -339,12 +340,18 @@ server for `scala` whose command is the binary and whose root is the workspace.
 | CodeAction (kinds: `quickfix`, `refactor.rewrite`, `refactor.extract`, `refactor.inline`; `resolveProvider: false`) | the assembly layer over the presentation-compiler ops: the missing-symbol import quickfix (dotty `Not found: (type )?X` diagnostics → auto-import candidates) plus the refactor probes (insert inferred type, implement all members, convert to named arguments, inline value, create method from usage, extract method — non-empty selection only, convert to named lambda parameters). EAGERLY RESOLVED: every offered action ran its PC op during assembly and carries its `WorkspaceEdit` inline — a refused (`DisplayableException`-as-data) or empty op is dropped, and there is no `codeAction/resolve` and no executeCommand round trip. `[]` for a buffer the PC does not hold; capped at 20 actions |
 | SelectionRange                                   | pure syntax over the open buffer (no SemanticDB needed); `null` for a buffer the PC does not hold |
 | FoldingRange                                     | the parser-only folding walker over the open buffer (kinds `comment`/`imports`/`region`); `[]` for a buffer the PC does not hold |
+| DocumentFormatting                               | the scalafmt COMMAND LINE over the **open buffer** (`scalafmt --stdin --config <ws>/.scalafmt.conf --non-interactive`, cwd = workspace root), answered as MINIMAL `TextEdit`s (the `dissimilar` diff→edits fold, UTF-16 positions over the original text; an already-formatted buffer answers `[]`). Requires a workspace-root `.scalafmt.conf` with a pinned `version` (typed error without one); a not-open file is a typed error; the LSP `options` field is ignored — `.scalafmt.conf` is the single style authority. 10 s deadline (kill + typed error); a non-zero exit is a typed error carrying the stderr tail. Binary resolution + offline stance in §4.9 |
 | SemanticTokens (`full: {delta: true}`, `range: true`) | presentation-compiler symbol tokens over the open buffer; the legend is EXACTLY the PC-vendored `scala.meta.internal.pc.SemanticTokens` lists (23 types / 10 modifiers). Advertised unconditionally (every mainstream client sends the standard token capability; one that lacks it simply never asks). Every `/full` response carries a `resultId` (monotonic per-URI counter) and the server caches the encoded stream (latest per URI, dropped on didClose, LRU across URIs cap 32); `textDocument/semanticTokens/full/delta` answers the minimal single-splice edit list against the cached base (the rust-analyzer prefix/suffix diff), or a FULL result on an unknown/stale `previousResultId` (spec-legal union). `/range` responses carry no `resultId` (a range slice is never a delta base). `null` for a buffer the PC does not hold. NOTE: a client that auto-requests semantic tokens on open (VS Code, nvim 0.10+) thereby issues a PC query, which boots the embedded JVM island |
 | executeCommand (4 command IDs — §4.6)            |                                              |
 | **Diagnostics: push-only**                       | BSP `build/publishDiagnostics` is forwarded live as `textDocument/publishDiagnostics` (per-URI merge across targets, per-target reset); **no** pull `diagnosticProvider`. PLUS live-typing diagnostics: on `didChange` a debounced (300ms) presentation-compiler pull publishes secondary diagnostics under the source tag `scala3-pc (typing)` for the open **dirty** buffer only — merged after the BSP set, cleared on save/close or when a compile publish arrives for the file. The pull never boots a cold island: typing diagnostics activate once some PC query (hover, completion, semantic tokens) has booted it |
 
 **Not advertised** (do not enable client-side):
-formatting/rangeFormatting, and pull diagnostics.
+rangeFormatting/onTypeFormatting, and pull diagnostics. Range formatting is a
+deliberate refusal, not an omission: the scalafmt CLI's hidden `--range from=to`
+option is experimental and demonstrably skips lines inside multi-line ranges
+(probed on the shipped scalafmt: `--range 3=4` leaves line 4 untouched where
+`--range 4=4` alone formats it), and a partially formatted selection is worse
+than no provider.
 Compile diagnostics appear only after bootstrap connects to a BSP build and a
 compile runs; typing diagnostics appear only once the PC island is booted.
 
@@ -371,7 +378,7 @@ root:
   segments/segment-NNNNNN/       # immutable index segment: the postings files
                                  # (ref/definition/rename/doc postings) + tables
   pc-plugins.json                # OPTIONAL, user-authored: PC plugin config (§4.8)
-  config.json                    # OPTIONAL, user-authored: {"javaHome": "..."} override (§2.2)
+  config.json                    # OPTIONAL, user-authored: {"javaHome": "...", "scalafmt": "..."} overrides (§2.2, §4.9)
 ```
 
 The `manifest.json` / `workspace-state` / `segments` tree is the immutable-
@@ -418,7 +425,52 @@ zaozi's dynamic `io.field` bundle accesses to the real field declaration (see
 [plugin-spi.md §2.1](plugin-spi.md)). It keys strictly on the zaozi API and is
 inert on every other codebase.
 
-### 4.9 Lifecycle & behaviors worth knowing
+### 4.9 Formatting (the scalafmt command line)
+
+`textDocument/formatting` shells out to the **scalafmt CLI** — the server
+never links scalafmt-core. Per request it runs
+
+```bash
+scalafmt --stdin --config <workspaceRoot>/.scalafmt.conf --non-interactive   # cwd = workspace root
+```
+
+over the **open buffer** text and folds the output into minimal `TextEdit`s
+(the `dissimilar` diff rust-analyzer uses for formatting diffs; positions
+UTF-16 over the original text). Facts an operator needs:
+
+- **Binary resolution — config > env > nix-baked**, mirroring the Java home
+  (§2.2), first hit wins:
+  1. **Workspace config** — `.scala3-bsp-semantic-ls/config.json` with
+     `{"scalafmt": "/abs/path/to/scalafmt"}`.
+  2. **Environment** — `LS_SCALAFMT`, else the first executable `scalafmt` on
+     `PATH` (the dev shell provides one).
+  3. **Nix-baked** — the wrapper's `--set-default LS_SCALAFMT
+     <scalafmt>/bin/scalafmt` (§2.1), applied only when the caller's
+     environment sets nothing.
+- **`.scalafmt.conf` is mandatory, workspace root only.** scalafmt requires a
+  pinned `version` in the config; without the root file the request fails with
+  the typed `no .scalafmt.conf in the workspace (scalafmt requires a pinned
+  version)`. Nested-config semantics (`project.*` includes, `fileOverride`)
+  are scalafmt's own business — the server hands it the one root config.
+- **Offline stance: the shipped scalafmt is ONE fixed version and never
+  downloads another.** The scalafmt CLI is the "dynamic" flavor that would
+  fetch a `.scalafmt.conf`-pinned core version from Maven Central; the server
+  spawns it with `COURSIER_MODE=offline`, so a workspace pinning a different
+  version fails **fast and typed** (the error's stderr tail names the
+  unresolvable `scalafmt-core` artifact) instead of downloading jars behind
+  the editor's back. Fix: set the conf's `version` to the shipped scalafmt's
+  (`scalafmt --version`), or point the `scalafmt` config key / `LS_SCALAFMT`
+  at a binary of the pinned version.
+- **Open buffers only.** A file the editor has not opened is a typed
+  `… is not open` error — the server formats what you see, never the disk
+  file behind the editor's back.
+- **10-second deadline.** The spawn is killed past it and the request fails
+  typed. The format request blocks the request loop while scalafmt runs (the
+  same accepted class as a PC cold boot); it stays cancellable while queued.
+- The request's LSP `options` (tab size, insert-spaces) are **ignored** —
+  `.scalafmt.conf` governs.
+
+### 4.10 Lifecycle & behaviors worth knowing
 
 - **Async bootstrap** on `initialized`; `initialize` returns capabilities
   synchronously.
@@ -559,3 +611,6 @@ The full CI command set is in [nix-build.md §7](nix-build.md).
 | `error: mill not found on PATH`                                            | ran `./mill` (or a script) outside the dev shell                    | run inside `nix develop`, or prefix commands with `nix develop -c`                       |
 | Offline island build / `check-ivy-lock.sh` fails after a dep change        | `nix/ivy-lock.nix` not regenerated                                  | `nix develop -c ./scripts/regen-ivy-lock.sh` and commit the lock                         |
 | Zaozi `io.field` go-to lands on `selectDynamic`                            | the zaozi PC plugin is not configured for the workspace              | point `pc-plugins.json` `compilerPlugins` at `share/…/zaozi-pcplugin.jar` (§4.8)        |
+| `no .scalafmt.conf in the workspace (scalafmt requires a pinned version)`  | the workspace root has no `.scalafmt.conf`                           | add one with `version = "<scalafmt --version>"` and `runner.dialect = scala3` (§4.9)    |
+| Formatting fails with `scalafmt failed …` naming a `scalafmt-core` version | `.scalafmt.conf` pins a version other than the shipped scalafmt; the offline stance never downloads it | pin the conf's `version` to the shipped scalafmt's, or point config `scalafmt` / `LS_SCALAFMT` at a matching binary (§4.9) |
+| `formatting: <uri> is not open`                                            | the client requested formatting for a file it never opened           | formatting serves the open buffer only — open the file in the editor first (§4.9)       |

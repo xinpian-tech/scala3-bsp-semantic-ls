@@ -215,6 +215,14 @@ fn initialize_advertises_exactly_the_implemented_capability_set() {
     );
     assert_eq!(caps["selectionRangeProvider"], true);
     assert_eq!(caps["foldingRangeProvider"], true);
+    // formatting: the scalafmt-CLI handler as a plain boolean; range
+    // formatting is deliberately NOT advertised (the CLI's hidden `--range`
+    // skips lines inside multi-line ranges).
+    assert_eq!(caps["documentFormattingProvider"], true);
+    assert!(
+        caps.get("documentRangeFormattingProvider").is_none(),
+        "{caps}"
+    );
     // codeAction: exactly the four assembly kinds, resolve OFF (every action
     // ships its WorkspaceEdit inline — eager resolution).
     assert_eq!(
@@ -325,6 +333,11 @@ fn pre_ready_methods_take_their_per_method_fallbacks() {
             "textDocument/semanticTokens/full",
             json!({ "textDocument": { "uri": uri } }),
         ),
+        request(
+            6,
+            "textDocument/formatting",
+            json!({ "textDocument": { "uri": uri }, "options": { "tabSize": 2 } }),
+        ),
         notification("exit", json!({})),
     ]
     .concat();
@@ -361,6 +374,9 @@ fn pre_ready_methods_take_their_per_method_fallbacks() {
         Value::Null,
         "semanticTokens/full → null"
     );
+    // Pre-ready formatting is the harmless empty edit list, so an editor's
+    // format-on-save does not fail loudly during bootstrap.
+    assert_eq!(by_id(&out, 6)["result"], json!([]), "formatting → []");
 }
 
 // After `initialized` the same queries resolve over the freshly ingested index.

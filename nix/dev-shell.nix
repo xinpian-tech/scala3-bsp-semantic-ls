@@ -26,6 +26,10 @@ pkgs.mkShell {
     # Headless editor client for the project-level e2e
     # (scripts/it-nvim-zaozi.sh + it/nvim/e2e.lua).
     neovim
+    # The formatter the server shells out to for textDocument/formatting
+    # (resolved via the PATH tier in the dev shell; the packaged wrapper bakes
+    # its own store copy as the LS_SCALAFMT default — nix/package.nix).
+    scalafmt
   ] ++ pkgs.lib.optional (pythonEnv != null) pythonEnv;
 
   JAVA_HOME = "${jdk}";

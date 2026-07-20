@@ -31,6 +31,9 @@
 //! `code_action`/`auto_imports` ops: literal actions with inline
 //! `WorkspaceEdit`s, eagerly resolved at assembly time so a refused or empty
 //! op never reaches the client menu (see [`code_action`]).
+//! `textDocument/formatting` shells out to the scalafmt COMMAND LINE over the
+//! open buffer text and answers minimal dissimilar-diff `TextEdit`s
+//! ([`formatting`], mechanics in [`crate::formatting`]).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -495,6 +498,9 @@ impl Handlers<CoreServices> for CoreHandlers {
             "textDocument/foldingRange" => folding_range(id, cx.services, &cx.request.params),
             "textDocument/codeAction" => {
                 code_action(id, cx.services, cx.documents, &cx.request.params)
+            }
+            "textDocument/formatting" => {
+                formatting(id, cx.services, cx.documents, &cx.request.params)
             }
             "textDocument/semanticTokens/full" => {
                 semantic_tokens_full(id, cx.services, cx.documents, &cx.request.params)
@@ -1221,6 +1227,72 @@ fn folding_range(id: RequestId, services: &CoreServices, params: &Value) -> Resp
         .map(crate::pc_lsp::folding_range)
         .collect();
     ok_json(id, &ranges)
+}
+
+/// `textDocument/formatting`: the OPEN buffer text through the scalafmt
+/// COMMAND LINE (`crate::formatting` owns the mechanics — resolution, the
+/// spawn with the 10s deadline and the offline stance, the dissimilar
+/// diff→edits fold). Pure syntax like [`folding_range`], so there is NO
+/// `require_semanticdb` gate — but unlike the PC methods the gate is the
+/// DOCUMENT STORE's openness, not the PC mirror's: formatting needs only the
+/// buffer text, and a not-open document is a typed error (formatting a stale
+/// disk file behind the editor's back would be worse than refusing). The
+/// request's `options` field (tab size, insert-spaces, …) is deliberately
+/// ignored: `.scalafmt.conf` at the workspace root is the single style
+/// authority, and its absence is the typed no-config error (scalafmt requires
+/// a pinned `version`). The spawn blocks the loop for up to
+/// [`crate::formatting::SCALAFMT_TIMEOUT`] — accepted for an explicit format
+/// request (the same class as a PC cold boot), and the request stays
+/// cancellable-by-queue like every other handler because nothing here leaves
+/// the loop thread.
+fn formatting(
+    id: RequestId,
+    services: &CoreServices,
+    documents: &DocumentStore,
+    params: &Value,
+) -> Response {
+    let Some(raw) = text_document_uri(params) else {
+        return invalid_params(id, "formatting: missing textDocument.uri");
+    };
+    let uri = normalize_uri(&raw);
+    let Some(text) = documents.text(&uri) else {
+        return formatting_failed(id, format!("formatting: {uri} is not open"));
+    };
+    let Some(workspace_root) = services.workspace_root.as_deref() else {
+        return formatting_failed(id, "formatting: the workspace has no root".to_string());
+    };
+    let Some(conf) = crate::formatting::scalafmt_conf(workspace_root) else {
+        return formatting_failed(
+            id,
+            "no .scalafmt.conf in the workspace (scalafmt requires a pinned version)".to_string(),
+        );
+    };
+    let Some(bin) =
+        crate::formatting::resolve_scalafmt(workspace_root, &|key| std::env::var(key).ok())
+    else {
+        return formatting_failed(
+            id,
+            "no scalafmt binary: set scalafmt in .scala3-bsp-semantic-ls/config.json, or \
+             LS_SCALAFMT in the environment, or put scalafmt on PATH"
+                .to_string(),
+        );
+    };
+    match crate::formatting::run_scalafmt(
+        &bin,
+        &conf,
+        workspace_root,
+        &text,
+        crate::formatting::SCALAFMT_TIMEOUT,
+    ) {
+        Ok(formatted) => ok_json(id, &crate::formatting::minimal_edits(&text, &formatted)),
+        Err(detail) => formatting_failed(id, detail),
+    }
+}
+
+/// A typed `RequestFailed` formatting error (the formatting failures are
+/// strings from the scalafmt seam, not `LsError` variants).
+fn formatting_failed(id: RequestId, detail: String) -> Response {
+    Response::failure(id, ResponseError::new(error_codes::REQUEST_FAILED, detail))
 }
 
 /// The cap on assembled code actions per request: the quickfix imports plus
@@ -3210,6 +3282,69 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("not yet available"));
+    }
+
+    // `textDocument/formatting` gates on the DOCUMENT STORE's openness (no
+    // SemanticDB gate — formatting is pure syntax): a closed file is the typed
+    // "not open" error through the real handler dispatch, never a silent
+    // empty edit list and never a disk-file format behind the editor's back.
+    #[test]
+    fn formatting_a_not_open_buffer_is_a_typed_not_open_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let services = unindexed_services(dir.path());
+        let documents = DocumentStore::new();
+        let request = Request {
+            id: RequestId::Number(1),
+            method: "textDocument/formatting".to_string(),
+            params: position_params(dir.path()),
+        };
+        let response = CoreHandlers.handle(RequestContext {
+            request: &request,
+            services: &services,
+            workspace_root: None,
+            documents: &documents,
+            shutting_down: false,
+        });
+        let value = serde_json::to_value(&response).unwrap();
+        assert_eq!(value["error"]["code"], error_codes::REQUEST_FAILED);
+        assert!(
+            value["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("is not open"),
+            "{value}"
+        );
+    }
+
+    // With the buffer open but no `.scalafmt.conf` at the workspace root, the
+    // answer is the typed no-config error — scalafmt requires a pinned
+    // version, so the server refuses BEFORE resolving or spawning a binary
+    // (the case runs without any scalafmt installed).
+    #[test]
+    fn formatting_without_a_workspace_scalafmt_conf_is_a_typed_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let services = unindexed_services(dir.path());
+        let documents = DocumentStore::new();
+        let uri = path_to_uri(&dir.path().join("A.scala"));
+        documents.open(&uri, "object   A\n");
+        let request = Request {
+            id: RequestId::Number(1),
+            method: "textDocument/formatting".to_string(),
+            params: json!({ "textDocument": { "uri": uri }, "options": { "tabSize": 2 } }),
+        };
+        let response = CoreHandlers.handle(RequestContext {
+            request: &request,
+            services: &services,
+            workspace_root: None,
+            documents: &documents,
+            shutting_down: false,
+        });
+        let value = serde_json::to_value(&response).unwrap();
+        assert_eq!(value["error"]["code"], error_codes::REQUEST_FAILED);
+        assert_eq!(
+            value["error"]["message"],
+            "no .scalafmt.conf in the workspace (scalafmt requires a pinned version)"
+        );
     }
 
     // A ready `completionItem/resolve` with no recorded `lastCompletionTarget`

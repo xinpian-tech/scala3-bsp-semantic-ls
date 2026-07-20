@@ -1029,6 +1029,7 @@ fn readiness_method(method: &str) -> Option<Method> {
         "textDocument/semanticTokens/full" => Some(Method::SemanticTokensFull),
         "textDocument/semanticTokens/full/delta" => Some(Method::SemanticTokensFullDelta),
         "textDocument/semanticTokens/range" => Some(Method::SemanticTokensRange),
+        "textDocument/formatting" => Some(Method::Formatting),
         "workspace/symbol" => Some(Method::WorkspaceSymbol),
         _ => None,
     }
@@ -1640,6 +1641,7 @@ mod tests {
             ("textDocument/inlayHint", Shape::Empty(json!([]))),
             ("textDocument/codeAction", Shape::Empty(json!([]))),
             ("textDocument/foldingRange", Shape::Empty(json!([]))),
+            ("textDocument/formatting", Shape::Empty(json!([]))),
             ("textDocument/prepareRename", Shape::Null),
             ("textDocument/hover", Shape::Null),
             ("textDocument/signatureHelp", Shape::Null),

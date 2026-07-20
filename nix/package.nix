@@ -8,12 +8,20 @@
 # `.scala3-bsp-semantic-ls/config.json` `javaHome` wins, then the caller's
 # environment, then these baked defaults. An index-only session never touches
 # them: the JVM boots lazily on the first presentation-compiler query.
+#
+# The same discipline bakes `LS_SCALAFMT` (the nixpkgs scalafmt CLI) for
+# `textDocument/formatting`: workspace config `scalafmt` > the caller's
+# `LS_SCALAFMT` > this baked default. The baked scalafmt is ONE fixed version
+# and the server spawns it with `COURSIER_MODE=offline`, so a workspace
+# `.scalafmt.conf` pinning a different version fails typed instead of
+# downloading jars (the offline stance, docs/deployment.md).
 { lib
 , stdenvNoCC
 , jdk
 , rustWorkspace
 , pcHostAgentJar
 , zaoziPcpluginJar
+, scalafmt
 , makeWrapper
 }:
 
@@ -38,7 +46,8 @@ stdenvNoCC.mkDerivation {
 
     makeWrapper ${rustWorkspace}/bin/ls-server $out/bin/scala3-bsp-semantic-ls \
       --set-default JAVA_HOME "${jdk.home}" \
-      --set-default PC_HOST_AGENT_JAR "$out/share/scala3-bsp-semantic-ls/pc-host-agent.jar"
+      --set-default PC_HOST_AGENT_JAR "$out/share/scala3-bsp-semantic-ls/pc-host-agent.jar" \
+      --set-default LS_SCALAFMT "${scalafmt}/bin/scalafmt"
 
     runHook postInstall
   '';

@@ -12,6 +12,7 @@ pub mod convert;
 pub mod diagnostics;
 pub mod doctor;
 pub mod documents;
+mod formatting;
 pub mod jsonrpc;
 pub mod lifecycle;
 pub mod pc;

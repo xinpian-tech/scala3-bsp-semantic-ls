@@ -84,6 +84,7 @@ pub enum Method {
     SemanticTokensFull,
     SemanticTokensFullDelta,
     SemanticTokensRange,
+    Formatting,
 }
 
 /// What a method answers before the workspace is ready.
@@ -101,8 +102,10 @@ pub enum PreReadyOutcome {
 /// The per-method pre-ready fallback, matching the server's dispatch: references
 /// and rename fail typed; document highlight, workspace symbol, document
 /// symbol, implementation, completion,
-/// definition, type definition, inlay hint, code action, and folding range
-/// answer empty;
+/// definition, type definition, inlay hint, code action, folding range, and
+/// formatting answer empty (formatting because "nothing to change yet" is a
+/// valid, harmless answer while the workspace warms up — a not-ready error
+/// would make an editor's format-on-save fail loudly during bootstrap);
 /// hover, signature help, prepare rename, selection range, and the three
 /// semantic-tokens methods answer null (selection range because the spec ties
 /// `result[i]` to `positions[i]` — an empty array against a non-empty position
@@ -122,7 +125,8 @@ pub fn pre_ready_outcome(method: Method) -> PreReadyOutcome {
         | Method::TypeDefinition
         | Method::InlayHint
         | Method::CodeAction
-        | Method::FoldingRange => PreReadyOutcome::Empty,
+        | Method::FoldingRange
+        | Method::Formatting => PreReadyOutcome::Empty,
         Method::Hover
         | Method::SignatureHelp
         | Method::PrepareRename
@@ -221,6 +225,7 @@ mod tests {
             Method::InlayHint,
             Method::CodeAction,
             Method::FoldingRange,
+            Method::Formatting,
         ] {
             assert_eq!(pre_ready_outcome(m), PreReadyOutcome::Empty, "{m:?}");
         }

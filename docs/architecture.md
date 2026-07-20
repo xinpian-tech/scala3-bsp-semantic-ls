@@ -320,6 +320,16 @@ general capability model — the server registers three client-side file
 watchers after `initialized` (the reingest-triggers paragraph in §5.2 has the
 globs and reactions).
 
+One capability is additive over v1: `textDocument/formatting` shells out to
+the scalafmt COMMAND LINE (`ls-server::formatting` — never a scalafmt-core
+link) over the open buffer text and answers minimal `dissimilar`-diff
+`TextEdit`s; binary resolution follows the Java-home config > env > nix-baked
+precedence (`LS_SCALAFMT`), the workspace-root `.scalafmt.conf` is mandatory,
+and the spawn is pinned offline (`COURSIER_MODE=offline`) so the one nix-baked
+scalafmt version never downloads another. Range formatting is deliberately
+not advertised — the CLI's hidden experimental `--range` skips lines inside
+multi-line ranges. The operator contract is `docs/deployment.md` §4.9.
+
 ## 4. Query orchestrator: three paths, three consistency levels
 
 Every request is routed through exactly one of three paths

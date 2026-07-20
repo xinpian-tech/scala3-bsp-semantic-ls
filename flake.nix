@@ -189,9 +189,11 @@
         # did not write) spawns the crane-built ls-server binary over REAL stdio
         # against the scriptable Python fake BSP server, which advertises the
         # committed ls-engine SemanticDB fixture corpus — hermetic (no mill, no
-        # JVM, no network), so it runs inside `nix flake check`.
+        # network; the only JVM is the nix scalafmt CLI the formatting round
+        # trip shells out to, provided on PATH so test_formatting.py runs for
+        # real instead of skipping), so it runs inside `nix flake check`.
         lsp-blackbox-check = pkgs.runCommand "check-lsp-blackbox"
-          { nativeBuildInputs = [ pythonTools.pythonEnv ]; } ''
+          { nativeBuildInputs = [ pythonTools.pythonEnv pkgs.scalafmt ]; } ''
           export LS_SERVER_BIN="${rust.package}/bin/ls-server"
           export HOME="$TMPDIR"
           cd "$TMPDIR"

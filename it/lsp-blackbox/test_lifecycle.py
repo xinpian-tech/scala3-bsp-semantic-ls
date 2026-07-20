@@ -48,6 +48,12 @@ async def test_initialize_advertises_the_exact_capability_surface(client):
     assert caps.inlay_hint_provider.resolve_provider is False
     assert caps.selection_range_provider is True
     assert caps.folding_range_provider is True
+    # formatting: the scalafmt-CLI handler as a plain boolean; range and
+    # on-type formatting are deliberately NOT advertised (the CLI's hidden
+    # `--range` skips lines inside multi-line ranges).
+    assert caps.document_formatting_provider is True
+    assert caps.document_range_formatting_provider is None
+    assert caps.document_on_type_formatting_provider is None
     # codeAction: exactly the four assembly kinds, resolve OFF (every action
     # carries its WorkspaceEdit inline — there is no codeAction/resolve).
     assert caps.code_action_provider is not None

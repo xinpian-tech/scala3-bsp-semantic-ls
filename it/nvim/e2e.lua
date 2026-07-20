@@ -602,6 +602,77 @@ for _, loc in ipairs(impls) do
 end
 pass("implementation finds " .. #impls .. " override def site(s) for BitSet#overlap")
 
+-- textDocument/formatting via the scalafmt COMMAND LINE. Capability first:
+-- documentFormatting is advertised, rangeFormatting deliberately is not (the
+-- CLI's hidden --range skips lines inside multi-line ranges). Then the probe
+-- branches on whether the workspace .scalafmt.conf pins exactly the shipped
+-- scalafmt version: matching → a real format round-trips a TextEdit list over
+-- the open buffer; mismatching → the server's offline stance (the one fixed
+-- nix scalafmt, COURSIER_MODE=offline — never a download) makes it a typed
+-- RequestFailed error.
+if client.server_capabilities.documentFormattingProvider ~= true then
+  fail("documentFormattingProvider is not advertised")
+end
+if client.server_capabilities.documentRangeFormattingProvider ~= nil then
+  fail("documentRangeFormattingProvider must not be advertised")
+end
+local conf_file = io.open(ws .. "/.scalafmt.conf", "r")
+if not conf_file then
+  fail("the zaozi workspace has no .scalafmt.conf (the pinned repo ships one)")
+end
+local conf_text = conf_file:read("*a")
+conf_file:close()
+local conf_version = conf_text:match('version%s*=%s*"([^"]+)"')
+local cli_version = tostring(vim.fn.system({ "scalafmt", "--version" })):match("scalafmt (%S+)")
+local fmt_response, fmt_err = client:request_sync("textDocument/formatting", {
+  textDocument = { uri = vim.uri_from_fname(file) },
+  options = { tabSize = 2, insertSpaces = true },
+}, 120000, buf)
+if fmt_err or not fmt_response then
+  fail("formatting request did not complete: " .. vim.inspect(fmt_err))
+end
+if conf_version ~= nil and conf_version == cli_version then
+  if fmt_response.err then
+    fail("formatting errored despite the matching scalafmt " .. cli_version .. ": " .. vim.inspect(fmt_response.err))
+  end
+  if type(fmt_response.result) ~= "table" then
+    fail("formatting did not answer a TextEdit list: " .. vim.inspect(fmt_response.result))
+  end
+  pass(
+    "formatting round-trips over the real buffer ("
+      .. #fmt_response.result
+      .. " edits; conf "
+      .. conf_version
+      .. " == cli "
+      .. cli_version
+      .. ")"
+  )
+else
+  if not fmt_response.err then
+    fail(
+      "formatting must fail typed on the version mismatch (conf "
+        .. tostring(conf_version)
+        .. " vs cli "
+        .. tostring(cli_version)
+        .. "); got: "
+        .. vim.inspect(fmt_response.result)
+    )
+  end
+  if fmt_response.err.code ~= -32803 then
+    fail("expected RequestFailed (-32803): " .. vim.inspect(fmt_response.err))
+  end
+  if not tostring(fmt_response.err.message):find("scalafmt", 1, true) then
+    fail("the typed error must name scalafmt: " .. vim.inspect(fmt_response.err))
+  end
+  pass(
+    "formatting answers the typed version-mismatch error (conf "
+      .. tostring(conf_version)
+      .. " vs cli "
+      .. tostring(cli_version)
+      .. ")"
+  )
+end
+
 -- Live-typing (PC) diagnostics: edit the real buffer to introduce a type
 -- error; nvim's incremental didChange arms the server's debounced
 -- pc_diagnostics pull (the island is already booted by the probes above), and

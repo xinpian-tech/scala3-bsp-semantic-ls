@@ -17,7 +17,10 @@
 //! semantic tokens (`full` with `delta` + `range` over the PC-vendored legend
 //! — `/full` responses carry a `resultId` and the server answers
 //! `textDocument/semanticTokens/full/delta` with the minimal splice against
-//! the cached previous stream); and the execute-command set.
+//! the cached previous stream); document formatting (the scalafmt COMMAND
+//! LINE over the open buffer — `crate::formatting`; range formatting is
+//! deliberately NOT advertised: the CLI's hidden `--range` is experimental
+//! and skips lines inside multi-line ranges); and the execute-command set.
 //!
 //! Semantic tokens are advertised UNCONDITIONALLY, without reading the
 //! client's `textDocument.semanticTokens` capability: every mainstream client
@@ -152,6 +155,10 @@ pub struct ServerCapabilities {
     /// carry a `resultId` and `textDocument/semanticTokens/full/delta` answers
     /// the splice against the cached previous stream.
     pub semantic_tokens_provider: lsp_types::SemanticTokensOptions,
+    /// Plain `true` — `textDocument/formatting` over the scalafmt CLI.
+    /// `documentRangeFormattingProvider` is deliberately absent (see the
+    /// module doc and `crate::formatting`).
+    pub document_formatting_provider: bool,
     pub execute_command_provider: ExecuteCommandOptions,
 }
 
@@ -246,6 +253,7 @@ pub fn server_capabilities() -> ServerCapabilities {
         selection_range_provider: true,
         folding_range_provider: true,
         semantic_tokens_provider: semantic_tokens_options(),
+        document_formatting_provider: true,
         execute_command_provider: ExecuteCommandOptions {
             commands: commands::all(),
         },
@@ -313,6 +321,21 @@ mod tests {
         );
         assert!(json.contains("\"selectionRangeProvider\":true"), "{json}");
         assert!(json.contains("\"foldingRangeProvider\":true"), "{json}");
+    }
+
+    // documentFormatting: a plain boolean (the scalafmt-CLI handler), with
+    // rangeFormatting deliberately NOT advertised — the CLI's hidden
+    // `--range` skips lines inside multi-line ranges, and a partially
+    // formatted selection is worse than no provider.
+    #[test]
+    fn advertises_document_formatting_without_range_formatting() {
+        let json = initialize_json();
+        assert!(
+            json.contains("\"documentFormattingProvider\":true"),
+            "{json}"
+        );
+        assert!(!json.contains("documentRangeFormattingProvider"), "{json}");
+        assert!(!json.contains("documentOnTypeFormattingProvider"), "{json}");
     }
 
     // codeActionProvider: exactly the four assembly kinds, in order, with
