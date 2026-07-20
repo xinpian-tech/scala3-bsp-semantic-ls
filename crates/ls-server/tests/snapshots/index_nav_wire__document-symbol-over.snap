@@ -1,0 +1,129 @@
+---
+source: crates/ls-server/tests/index_nav_wire.rs
+assertion_line: 78
+expression: scrub(&over)
+---
+[
+  {
+    "children": [
+      {
+        "kind": 6,
+        "name": "fmt",
+        "range": {
+          "end": {
+            "character": 9,
+            "line": 3
+          },
+          "start": {
+            "character": 6,
+            "line": 3
+          }
+        },
+        "selectionRange": {
+          "end": {
+            "character": 9,
+            "line": 3
+          },
+          "start": {
+            "character": 6,
+            "line": 3
+          }
+        }
+      },
+      {
+        "kind": 6,
+        "name": "fmt",
+        "range": {
+          "end": {
+            "character": 9,
+            "line": 4
+          },
+          "start": {
+            "character": 6,
+            "line": 4
+          }
+        },
+        "selectionRange": {
+          "end": {
+            "character": 9,
+            "line": 4
+          },
+          "start": {
+            "character": 6,
+            "line": 4
+          }
+        }
+      },
+      {
+        "kind": 6,
+        "name": "a",
+        "range": {
+          "end": {
+            "character": 7,
+            "line": 5
+          },
+          "start": {
+            "character": 6,
+            "line": 5
+          }
+        },
+        "selectionRange": {
+          "end": {
+            "character": 7,
+            "line": 5
+          },
+          "start": {
+            "character": 6,
+            "line": 5
+          }
+        }
+      },
+      {
+        "kind": 6,
+        "name": "b",
+        "range": {
+          "end": {
+            "character": 7,
+            "line": 6
+          },
+          "start": {
+            "character": 6,
+            "line": 6
+          }
+        },
+        "selectionRange": {
+          "end": {
+            "character": 7,
+            "line": 6
+          },
+          "start": {
+            "character": 6,
+            "line": 6
+          }
+        }
+      }
+    ],
+    "kind": 19,
+    "name": "Over",
+    "range": {
+      "end": {
+        "character": 11,
+        "line": 2
+      },
+      "start": {
+        "character": 7,
+        "line": 2
+      }
+    },
+    "selectionRange": {
+      "end": {
+        "character": 11,
+        "line": 2
+      },
+      "start": {
+        "character": 7,
+        "line": 2
+      }
+    }
+  }
+]

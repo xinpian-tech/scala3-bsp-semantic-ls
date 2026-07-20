@@ -132,6 +132,8 @@ snapshot publish / recovery / janitor
 workspace symbol (segment-resident search)
 references
 rename
+document symbol (index-backed nested outline)
+implementation (index-backed method override families)
 diagnostics forwarding
 project state
 index state
@@ -529,6 +531,39 @@ use), but *rename* is conservatively **rejected**
 companion and uses cannot be proven safe. This matches the `override` /
 `exported` / synthetic families, which also reject. The opaque property is read
 from SemanticDB (`sym_props` Opaque bit) at ingest.
+
+### 7.1 What the groups do NOT model: override edges and type hierarchies
+
+Override families are a *flag*, not an edge set: at group build the SemanticDB
+`overridden_symbols` lists are consumed only to set the per-rename-group
+`has_override_family` bit (base and override land in **different** groups —
+pinned by `override_family_flags_both_groups`), and the edges themselves are
+not persisted anywhere in the segment. No sealed-subtype/type-hierarchy edge
+exists either — dotty's SemanticDB emits `overridden_symbols` for **methods
+only** (type symbols carry none), so the information does not even reach the
+ingest.
+
+Two index-backed navigation methods live within exactly this truth:
+
+- **`textDocument/documentSymbol`** — the nested outline is rebuilt from the
+  doc postings (source-order definition scan, nesting by SemanticDB owner
+  chain with a companion fallback so enum cases land under the enum class
+  node). The index stores definition **name spans only**, so the LSP `range`
+  equals `selectionRange` on every node (spec-legal — containment includes
+  equality; a synthetic extent was rejected as a guess the index cannot
+  back). A dirty buffer still answers index truth: the outline lags until
+  save, never an error.
+- **`textDocument/implementation`** — scoped to METHOD override families: the
+  index supplies the candidates (same method name, override-flagged rename
+  groups — the flag makes the no-family answer free) and each candidate is
+  verified against the `overridden_symbols` edges read from its defining
+  document's raw `.semanticdb` (the RawSemanticDBPath discipline; dotty lists
+  the full transitive chain, so deep overrides resolve without graph walks).
+  Def sites answer through the `symbol_definition` exactness + forward-closure
+  visibility rules. A trait/class TYPE symbol answers the honest `[]`:
+  implementors are not enumerable from any persisted truth, and inferring
+  them from member overrides would silently miss every subtype that overrides
+  nothing.
 
 ## 8. References flow
 

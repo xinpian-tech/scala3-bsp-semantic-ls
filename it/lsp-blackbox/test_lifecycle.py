@@ -37,6 +37,11 @@ async def test_initialize_advertises_the_exact_capability_surface(client):
     assert caps.rename_provider.prepare_provider is True
     assert caps.document_highlight_provider is True
     assert caps.workspace_symbol_provider is True
+    # The index-backed navigation pair: plain booleans. documentSymbol always
+    # answers the NESTED DocumentSymbol shape (hierarchical support is not
+    # negotiated); implementation is the override-family query.
+    assert caps.document_symbol_provider is True
+    assert caps.implementation_provider is True
     # The payload-backed providers: inlay hints without resolve (every hint
     # ships complete), selection range and folding range as plain booleans.
     assert caps.inlay_hint_provider is not None

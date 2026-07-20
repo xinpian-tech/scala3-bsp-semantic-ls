@@ -49,6 +49,55 @@ async def test_references_highlight_and_prepare_rename(client):
     assert span.start.line == at["position"].line
 
 
+async def test_document_symbol_outlines_core_as_a_nested_tree(client):
+    """The index-backed outline through lsprotocol's typed model: nested
+    DocumentSymbol nodes (never the flat SymbolInformation shape), the known
+    Core.scala declarations at the expected levels, and the documented
+    range == selectionRange limitation (the index knows only name spans)."""
+    await await_ready(client)
+    symbols = await client.text_document_document_symbol_async(
+        types.DocumentSymbolParams(
+            text_document=types.TextDocumentIdentifier(uri=source_uri(CORE))
+        )
+    )
+    assert symbols, "documentSymbol returned nothing for Core.scala"
+    assert all(isinstance(s, types.DocumentSymbol) for s in symbols), (
+        "the server must send the nested DocumentSymbol shape"
+    )
+    roots = {s.name for s in symbols}
+    assert {"Core", "Greeter", "Color"} <= roots, f"unexpected roots: {roots}"
+    core_class = next(s for s in symbols if s.kind == types.SymbolKind.Class and s.name == "Core")
+    assert {c.name for c in core_class.children} == {"label", "ping"}
+    color = next(s for s in symbols if s.name == "Color")
+    assert {c.name for c in color.children} == {"Red", "Green", "Blue"}, (
+        "enum cases nest under the enum class node"
+    )
+    for symbol in symbols:
+        assert symbol.range == symbol.selection_range, (
+            f"{symbol.name}: the index carries only name spans"
+        )
+
+
+async def test_implementation_resolves_the_override_family(client):
+    """textDocument/implementation on the `Greeter#greet` declaration answers
+    the overrider's def site in Impl.scala (the index override-family query);
+    the leaf overrider itself answers the honest empty."""
+    await await_ready(client)
+    at = doc_position(CORE, "greet")
+    locations = await client.text_document_implementation_async(
+        types.ImplementationParams(**at)
+    )
+    assert locations, "expected the Greeter#greet overrider"
+    assert any(loc.uri.endswith("a/src/pkga/Impl.scala") for loc in locations), (
+        f"expected Impl.scala in {[loc.uri for loc in locations]}"
+    )
+
+    leaf = await client.text_document_implementation_async(
+        types.ImplementationParams(**doc_position("a/src/pkga/Impl.scala", "greet"))
+    )
+    assert not leaf, f"a leaf override answers empty, got {leaf}"
+
+
 async def test_a_no_semanticdb_source_is_a_hard_error(client):
     await await_ready(client)
     uri = (client.workspace / "nosdb" / "NoSdb.scala").as_uri()

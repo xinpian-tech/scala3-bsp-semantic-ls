@@ -1,0 +1,20 @@
+---
+source: crates/ls-server/tests/index_nav_wire.rs
+assertion_line: 126
+expression: scrub(&result)
+---
+[
+  {
+    "range": {
+      "end": {
+        "character": 11,
+        "line": 3
+      },
+      "start": {
+        "character": 6,
+        "line": 3
+      }
+    },
+    "uri": "[SOURCES]/a/src/pkga/Impl.scala"
+  }
+]

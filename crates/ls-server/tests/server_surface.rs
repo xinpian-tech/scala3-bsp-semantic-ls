@@ -203,6 +203,10 @@ fn initialize_advertises_exactly_the_implemented_capability_set() {
     assert_eq!(caps["renameProvider"]["prepareProvider"], true);
     assert_eq!(caps["documentHighlightProvider"], true);
     assert_eq!(caps["workspaceSymbolProvider"], true);
+    // The index-backed navigation pair: plain booleans (nested DocumentSymbol
+    // trees always sent; implementation = the override-family query).
+    assert_eq!(caps["documentSymbolProvider"], true);
+    assert_eq!(caps["implementationProvider"], true);
     // The payload-backed providers: inlay hints without resolve (every hint
     // ships complete), selection range and folding range as plain booleans.
     assert_eq!(

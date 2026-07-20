@@ -1018,6 +1018,8 @@ fn readiness_method(method: &str) -> Option<Method> {
         "textDocument/typeDefinition" => Some(Method::TypeDefinition),
         "textDocument/references" => Some(Method::References),
         "textDocument/documentHighlight" => Some(Method::DocumentHighlight),
+        "textDocument/documentSymbol" => Some(Method::DocumentSymbol),
+        "textDocument/implementation" => Some(Method::Implementation),
         "textDocument/prepareRename" => Some(Method::PrepareRename),
         "textDocument/rename" => Some(Method::Rename),
         "textDocument/inlayHint" => Some(Method::InlayHint),
@@ -1626,6 +1628,8 @@ mod tests {
             ("textDocument/rename", Shape::Error),
             ("textDocument/documentHighlight", Shape::Empty(json!([]))),
             ("workspace/symbol", Shape::Empty(json!([]))),
+            ("textDocument/documentSymbol", Shape::Empty(json!([]))),
+            ("textDocument/implementation", Shape::Empty(json!([]))),
             ("textDocument/definition", Shape::Empty(json!([]))),
             ("textDocument/typeDefinition", Shape::Empty(json!([]))),
             (

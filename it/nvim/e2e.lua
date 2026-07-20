@@ -207,6 +207,52 @@ if type(symbols) ~= "table" or #symbols == 0 then
 end
 pass("workspace/symbol finds '" .. token .. "' (" .. #symbols .. " hits)")
 
+-- documentSymbol: the index-backed nested outline over the real buffer. The
+-- anchor is dynamic (the first `class`/`object`/`trait` declaration found in
+-- the buffer text), so upstream source drift cannot invalidate the probe.
+-- The server always sends the NESTED DocumentSymbol shape, with the
+-- documented range == selectionRange limitation (the index knows name spans
+-- only). Index-backed: this must answer without booting the PC island.
+local decl_name
+for _, line in ipairs(lines) do
+  local name = line:match("^%s*class%s+([%w_]+)")
+    or line:match("^%s*object%s+([%w_]+)")
+    or line:match("^%s*trait%s+([%w_]+)")
+  if name then
+    decl_name = name
+    break
+  end
+end
+if not decl_name then
+  fail("no class/object/trait declaration found in " .. rel .. " for the documentSymbol probe")
+end
+local outline = request("textDocument/documentSymbol", {
+  textDocument = { uri = vim.uri_from_fname(file) },
+})
+if type(outline) ~= "table" or #outline == 0 then
+  fail("documentSymbol returned no outline for " .. rel)
+end
+local found_decl = false
+local function walk(nodes)
+  for _, node in ipairs(nodes) do
+    if node.selectionRange == nil then
+      fail("documentSymbol returned a non-nested node (no selectionRange): " .. vim.inspect(node))
+    end
+    if not vim.deep_equal(node.range, node.selectionRange) then
+      fail("outline node '" .. node.name .. "' range must equal selectionRange (name spans only)")
+    end
+    if node.name == decl_name then
+      found_decl = true
+    end
+    walk(node.children or {})
+  end
+end
+walk(outline)
+if not found_decl then
+  fail("documentSymbol tree does not contain the '" .. decl_name .. "' declaration")
+end
+pass("documentSymbol outlines " .. rel .. " (" .. #outline .. " roots, contains '" .. decl_name .. "')")
+
 local doc_at = {
   textDocument = { uri = vim.uri_from_fname(file) },
   position = at,
@@ -485,6 +531,34 @@ pass(
     .. table.concat(titles, ", ")
     .. ")"
 )
+
+-- textDocument/implementation over a real override family: BitSet.scala's
+-- `trait BitSet` declares `def overlap(that: BitSet)`, overridden in
+-- `trait BitPat` (`override def overlap`) — the index override-family query
+-- must answer at least one def site inside BitSet.scala. The probe anchors on
+-- the first `def overlap` (the trait declaration precedes the override in the
+-- file), cursor placed on the method NAME (start + 4).
+local overlap_at = find_pos(ca_buf, "def overlap", 1)
+if not overlap_at then
+  fail("token 'def overlap' not found in decoder/src/BitSet.scala for the implementation probe")
+end
+local impl_response, impl_err = client:request_sync("textDocument/implementation", {
+  textDocument = { uri = vim.uri_from_bufnr(ca_buf) },
+  position = { line = overlap_at.line, character = overlap_at.character + 4 },
+}, 120000, ca_buf)
+if impl_err or not impl_response or impl_response.err then
+  fail("implementation failed: " .. vim.inspect(impl_err or (impl_response and impl_response.err)))
+end
+local impls = impl_response.result
+if type(impls) ~= "table" or #impls == 0 then
+  fail("implementation returned nothing for BitSet#overlap (the BitPat override must answer)")
+end
+for _, loc in ipairs(impls) do
+  if not (loc.uri or ""):find("BitSet%.scala$") then
+    fail("implementation answered outside BitSet.scala: " .. vim.inspect(loc))
+  end
+end
+pass("implementation finds " .. #impls .. " override def site(s) for BitSet#overlap")
 
 -- Live-typing (PC) diagnostics: edit the real buffer to introduce a type
 -- error; nvim's incremental didChange arms the server's debounced

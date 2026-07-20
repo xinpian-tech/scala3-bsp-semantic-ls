@@ -7,7 +7,9 @@
 //! `requireSemanticdb` gate). [`CoreHandlers`] is the production [`Handlers`]
 //! impl. It wires the ready methods that the engine + retained build compiler
 //! answer without the PC island — `references`, `documentHighlight`,
-//! `workspace/symbol`, `prepareRename`, `rename` (the FreshRequired compile
+//! `workspace/symbol`, `documentSymbol` (the index-backed nested outline),
+//! `implementation` (the index-backed method override-family query),
+//! `prepareRename`, `rename` (the FreshRequired compile
 //! ladder), and the `scala3SemanticLs.reindex`, `scala3SemanticLs.compile`,
 //! and `scala3SemanticLs.pcPluginStatus` executeCommand actions — over the
 //! engine's [`ReferencesEngine`] /
@@ -402,6 +404,8 @@ impl Handlers<CoreServices> for CoreHandlers {
                 document_highlight(id, cx.services, &cx.request.params)
             }
             "workspace/symbol" => workspace_symbol(id, cx.services, &cx.request.params),
+            "textDocument/documentSymbol" => document_symbol(id, cx.services, &cx.request.params),
+            "textDocument/implementation" => implementation(id, cx.services, &cx.request.params),
             "textDocument/prepareRename" => prepare_rename(id, cx.services, &cx.request.params),
             "textDocument/rename" => rename(id, cx.services, &cx.request.params),
             "textDocument/definition" => definition(id, cx.services, &cx.request.params),
@@ -682,6 +686,136 @@ fn pc_only_workspace_symbol(symbol: &PcOnlySymbol) -> WorkspaceSymbol {
         kind,
         location: convert::location(&symbol.file_uri, symbol.span),
         container_name: Some(PC_ONLY_CONTAINER.to_string()),
+    }
+}
+
+/// `textDocument/documentSymbol`: the document's nested outline from the
+/// index doc-postings (`QueryOrchestrator::document_symbols`), as
+/// `lsp_types::DocumentSymbol` trees. Gate ladder: `require_semanticdb` runs
+/// first as a hard error; an unmappable URI is `NotIndexed`. Deliberately NOT
+/// gated on `is_open` — the index knows closed files, so an outline is
+/// served for any indexed source, open or not; and a DIRTY buffer still
+/// answers index truth (the outline lags the buffer until save — documented
+/// at the engine, never an error). The client capability
+/// `hierarchicalDocumentSymbolSupport` is not modeled: the nested
+/// `DocumentSymbol[]` shape is always sent (the modern shape every mainstream
+/// client supports; the flat `SymbolInformation[]` fallback is deliberately
+/// skipped — see `capabilities.rs`). The index stores only definition NAME
+/// spans, so `range == selectionRange` on every node (the documented outline
+/// limitation; spec-legal since equality is containment).
+fn document_symbol(id: RequestId, services: &CoreServices, params: &Value) -> Response {
+    let Some(raw) = text_document_uri(params) else {
+        return invalid_params(id, "documentSymbol: missing textDocument.uri");
+    };
+    if let Err(error) = services.require_semanticdb(&raw) {
+        return request_failed(id, &error);
+    }
+    let uri = normalize_uri(&raw);
+    let Some(sdb_uri) = services.to_sdb_uri(&uri) else {
+        return request_failed(id, &LsError::NotIndexed { uri });
+    };
+    let symbols: Vec<lsp_types::DocumentSymbol> = services
+        .orchestrator
+        .document_symbols(&sdb_uri)
+        .iter()
+        .map(document_symbol_of)
+        .collect();
+    ok_json(id, &symbols)
+}
+
+/// An engine outline node -> the nested `lsp_types::DocumentSymbol`. The one
+/// span the index knows (the definition NAME span) serves as BOTH `range` and
+/// `selectionRange` (see [`document_symbol`]).
+pub fn document_symbol_of(entry: &ls_engine::DocSymbolEntry) -> lsp_types::DocumentSymbol {
+    let range = lsp_types::Range {
+        start: lsp_types::Position {
+            line: entry.span.start_line,
+            character: entry.span.start_char,
+        },
+        end: lsp_types::Position {
+            line: entry.span.end_line,
+            character: entry.span.end_char,
+        },
+    };
+    let children: Vec<lsp_types::DocumentSymbol> =
+        entry.children.iter().map(document_symbol_of).collect();
+    // `deprecated` is the LSP 3.15-deprecated field of the upstream model; the
+    // struct literal must still name it.
+    #[allow(deprecated)]
+    lsp_types::DocumentSymbol {
+        name: entry.name.clone(),
+        detail: None,
+        kind: lsp_symbol_kind(entry.kind),
+        tags: None,
+        deprecated: None,
+        range,
+        selection_range: range,
+        children: (!children.is_empty()).then_some(children),
+    }
+}
+
+/// Index [`SymKind`] -> `lsp_types::SymbolKind`, arm-for-arm the same mapping
+/// as [`convert::symbol_kind`] (the hand-rolled serde twin used by
+/// `workspace/symbol`); a unit test pins the two against each other so they
+/// cannot drift.
+fn lsp_symbol_kind(kind: ls_index_model::SymKind) -> lsp_types::SymbolKind {
+    use ls_index_model::SymKind;
+    match kind {
+        SymKind::Class => lsp_types::SymbolKind::CLASS,
+        SymKind::Trait | SymKind::Interface => lsp_types::SymbolKind::INTERFACE,
+        SymKind::Object | SymKind::PackageObject => lsp_types::SymbolKind::OBJECT,
+        SymKind::Method | SymKind::Macro => lsp_types::SymbolKind::METHOD,
+        SymKind::Constructor => lsp_types::SymbolKind::CONSTRUCTOR,
+        SymKind::Type => lsp_types::SymbolKind::CLASS,
+        SymKind::TypeParameter => lsp_types::SymbolKind::TYPE_PARAMETER,
+        SymKind::Field => lsp_types::SymbolKind::FIELD,
+        SymKind::Package => lsp_types::SymbolKind::PACKAGE,
+        SymKind::LocalValue | SymKind::LocalVariable => lsp_types::SymbolKind::VARIABLE,
+        SymKind::Parameter | SymKind::SelfParameter => lsp_types::SymbolKind::VARIABLE,
+        SymKind::UnknownKind => lsp_types::SymbolKind::NULL,
+    }
+}
+
+/// `textDocument/implementation`: the def sites of the cursor method's
+/// overriders, from the index override-family query
+/// (`QueryOrchestrator::implementations` — method override families only;
+/// type symbols answer the honest `[]` because the index models no
+/// type-hierarchy edges). Hover-free dispatch ladder like `references`:
+/// `require_semanticdb` first (hard error), an unmappable URI is
+/// `NotIndexed`, and every cursor-resolution failure maps to a typed
+/// `RequestFailed` — never a silent empty. Result locations are mapped
+/// through `to_file_uri`, dropping any hit that no longer resolves to a file
+/// (the `references_locations` discipline).
+fn implementation(id: RequestId, services: &CoreServices, params: &Value) -> Response {
+    let Some(raw) = text_document_uri(params) else {
+        return invalid_params(id, "implementation: missing textDocument.uri");
+    };
+    if let Err(error) = services.require_semanticdb(&raw) {
+        return request_failed(id, &error);
+    }
+    let uri = normalize_uri(&raw);
+    let Some(sdb_uri) = services.to_sdb_uri(&uri) else {
+        return request_failed(id, &LsError::NotIndexed { uri });
+    };
+    let Some(pos) = position(params) else {
+        return invalid_params(id, "implementation: missing position");
+    };
+    match services
+        .orchestrator
+        .implementations(&sdb_uri, pos.line, pos.character)
+    {
+        Ok(locs) => {
+            let locations: Vec<Location> = locs
+                .iter()
+                .filter_map(|loc| {
+                    services
+                        .to_file_uri(&loc.uri)
+                        .map(|file_uri| convert::location(&file_uri, loc.span))
+                })
+                .collect();
+            ok_json(id, &locations)
+        }
+        Err(error) => request_failed(id, &error),
     }
 }
 
@@ -2559,6 +2693,71 @@ mod tests {
             config_changes.load(std::sync::atomic::Ordering::SeqCst),
             0,
             ".bsp/unrelated events must not touch the PC config"
+        );
+    }
+
+    // The lsp-types twin of convert::symbol_kind cannot drift: every SymKind
+    // arm serializes to the same LSP integer code through both mappings.
+    #[test]
+    fn lsp_symbol_kind_matches_the_convert_mapping_for_every_arm() {
+        for kind in [
+            SymKind::Class,
+            SymKind::Trait,
+            SymKind::Interface,
+            SymKind::Object,
+            SymKind::PackageObject,
+            SymKind::Method,
+            SymKind::Macro,
+            SymKind::Constructor,
+            SymKind::Type,
+            SymKind::TypeParameter,
+            SymKind::Field,
+            SymKind::Package,
+            SymKind::LocalValue,
+            SymKind::LocalVariable,
+            SymKind::Parameter,
+            SymKind::SelfParameter,
+            SymKind::UnknownKind,
+        ] {
+            assert_eq!(
+                serde_json::to_value(lsp_symbol_kind(kind)).unwrap(),
+                serde_json::json!(convert::symbol_kind(kind).code()),
+                "{kind:?}"
+            );
+        }
+    }
+
+    // document_symbol_of: the one indexed span serves as BOTH range and
+    // selectionRange (the documented outline limitation), children nest, and
+    // an empty child list is omitted from the JSON entirely.
+    #[test]
+    fn document_symbol_of_equates_ranges_and_omits_empty_children() {
+        let entry = ls_engine::DocSymbolEntry {
+            name: "Core".to_string(),
+            kind: SymKind::Class,
+            span: Span::new(2, 6, 2, 10),
+            children: vec![ls_engine::DocSymbolEntry {
+                name: "ping".to_string(),
+                kind: SymKind::Method,
+                span: Span::new(3, 6, 3, 10),
+                children: Vec::new(),
+            }],
+        };
+        let symbol = document_symbol_of(&entry);
+        assert_eq!(symbol.range, symbol.selection_range);
+        let children = symbol.children.as_ref().expect("nested child");
+        assert_eq!(children[0].name, "ping");
+        assert_eq!(children[0].range, children[0].selection_range);
+        let json = serde_json::to_value(&symbol).unwrap();
+        assert_eq!(json["kind"], 5, "Class -> LSP 5");
+        assert_eq!(json["children"][0]["kind"], 6, "Method -> LSP 6");
+        assert!(
+            json["children"][0].get("children").is_none(),
+            "an empty child list is omitted: {json}"
+        );
+        assert!(
+            json.get("deprecated").is_none() && json.get("detail").is_none(),
+            "absent optionals are omitted: {json}"
         );
     }
 

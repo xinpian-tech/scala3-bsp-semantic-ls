@@ -69,6 +69,8 @@ pub enum Method {
     Rename,
     DocumentHighlight,
     WorkspaceSymbol,
+    DocumentSymbol,
+    Implementation,
     Completion,
     Definition,
     TypeDefinition,
@@ -96,7 +98,8 @@ pub enum PreReadyOutcome {
 }
 
 /// The per-method pre-ready fallback, matching the server's dispatch: references
-/// and rename fail typed; document highlight, workspace symbol, completion,
+/// and rename fail typed; document highlight, workspace symbol, document
+/// symbol, implementation, completion,
 /// definition, type definition, inlay hint, code action, and folding range
 /// answer empty;
 /// hover, signature help, prepare rename, selection range, and the two
@@ -111,6 +114,8 @@ pub fn pre_ready_outcome(method: Method) -> PreReadyOutcome {
         Method::References | Method::Rename => PreReadyOutcome::NotReadyError,
         Method::DocumentHighlight
         | Method::WorkspaceSymbol
+        | Method::DocumentSymbol
+        | Method::Implementation
         | Method::Completion
         | Method::Definition
         | Method::TypeDefinition
@@ -206,6 +211,8 @@ mod tests {
         for m in [
             Method::DocumentHighlight,
             Method::WorkspaceSymbol,
+            Method::DocumentSymbol,
+            Method::Implementation,
             Method::Completion,
             Method::Definition,
             Method::TypeDefinition,

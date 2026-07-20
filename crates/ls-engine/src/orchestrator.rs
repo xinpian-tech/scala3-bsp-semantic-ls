@@ -19,8 +19,11 @@ use ls_index_model::uri;
 use ls_index_model::{
     occ_flags, Loc, LsError, NormalizedDocument, Occurrence, Role, Span, SymKind, TargetBitset,
 };
-use ls_semanticdb::{md5, normalize, parse_file, SemanticdbLocator};
-use ls_store::{GroupRecord, SearchIndex, Snapshot, Store, StoreResult, WorkspaceSymbolHit};
+use ls_semanticdb::symbols::Descriptor;
+use ls_semanticdb::{md5, normalize, parse_file, SdbDocument, SemanticdbLocator};
+use ls_store::{
+    GroupRecord, SearchIndex, SegmentReader, Snapshot, Store, StoreResult, WorkspaceSymbolHit,
+};
 
 use crate::hash::doc_id_for;
 use crate::ingest::{self, IngestReport};
@@ -51,6 +54,29 @@ pub struct MethodHit {
     pub symbol: String,
     pub kind: i32,
     pub span: Span,
+}
+
+/// One `textDocument/documentSymbol` outline node: the display name, the index
+/// [`SymKind`], the NAME span, and the children nested by SemanticDB owner
+/// chain.
+///
+/// The index stores only definition NAME spans (`docs/index-format.md` — no
+/// full declaration extents), so the node carries a single span: the LSP
+/// mapping sets `range == selectionRange`. This is the documented outline
+/// limitation: spec-legal (`selectionRange` must be CONTAINED in `range`, and
+/// equality is containment), and outline/breadcrumb clients tolerate equal
+/// ranges — enclosure detection merely degrades to the name line. A synthetic
+/// extent (name span to the next same-or-shallower sibling) was considered and
+/// rejected as LESS honest: it would claim source extents the index does not
+/// know, misattributing trailing non-definition code (comments, expressions
+/// after the last member) to the preceding symbol in breadcrumbs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DocSymbolEntry {
+    pub name: String,
+    pub kind: SymKind,
+    /// The definition NAME span — both the LSP `range` and `selectionRange`.
+    pub span: Span,
+    pub children: Vec<DocSymbolEntry>,
 }
 
 /// Where a cursor resolution came from.
@@ -846,6 +872,338 @@ impl QueryOrchestrator {
             }
         });
         out
+    }
+
+    /// Index-backed `textDocument/documentSymbol`: the nested outline of an
+    /// INDEXED document, from the doc's postings in source order
+    /// (`SegmentReader::scan_doc` — the `definition_source_toplevels`
+    /// enumeration discipline).
+    ///
+    /// Node selection: DEFINITION occurrences whose decoded symbol is global
+    /// and whose last descriptor is a Term, Type, or Method — parameters, type
+    /// parameters and packages never surface, and neither do constructors
+    /// (`<init>` duplicates its class node at the same name span) nor setters
+    /// (`x_=` duplicates the `var x` node — the alias-group setter/getter
+    /// merge, applied to the outline). The first definition occurrence of a
+    /// symbol wins; display name and kind come from `symbol_meta` (the
+    /// `WorkspaceSymbolEntry` source), falling back to the descriptor name for
+    /// a symbol the batch carried no info for.
+    ///
+    /// Nesting: by SemanticDB OWNER CHAIN (`ls_semanticdb::symbols`), a child
+    /// attaching under its NEAREST enclosing symbol that has a node in the
+    /// SAME document — or, when an owner has no node of its own, under that
+    /// owner's COMPANION node (an enum's cases are owned by the synthetic
+    /// companion object `Color.`, which has no definition occurrence; they
+    /// belong under the `enum Color` class node `Color#`). With no enclosing
+    /// node the symbol is a toplevel. Source order is preserved at every
+    /// level.
+    ///
+    /// Index-truth-only, by decision: a DIRTY buffer still answers from the
+    /// index — the outline lags the buffer until save (never an error, never a
+    /// PC parse). A uri the current snapshot does not hold (or no snapshot at
+    /// all) answers the empty outline.
+    pub fn document_symbols(&self, uri: &str) -> Vec<DocSymbolEntry> {
+        let Some(snap) = self.current_snapshot() else {
+            return Vec::new();
+        };
+        let Some(doc_ord) = self.doc_ord_of(&snap, uri) else {
+            return Vec::new();
+        };
+        let seg = snap.segment();
+        // Arena of nodes in first-seen (source) order; the tree is index-linked
+        // so children can be attached while later records are still streaming.
+        struct Node {
+            entry: DocSymbolEntry,
+            children: Vec<usize>,
+        }
+        let mut nodes: Vec<Node> = Vec::new();
+        let mut node_of: HashMap<String, usize> = HashMap::new();
+        let mut roots: Vec<usize> = Vec::new();
+        seg.scan_doc(doc_ord, false, &mut |rec| {
+            if !occ_flags::has(rec.flags as u32, occ_flags::DEFINITION) {
+                return;
+            }
+            let sym_ord = rec.symbol_ord as u32;
+            let (raw, local_doc) = symbol_encoding::decode(seg.semantic_symbol_of(sym_ord));
+            // Locals never surface in the outline (document-scoped bodies).
+            if local_doc.is_some() {
+                return;
+            }
+            let descriptor = match ls_semanticdb::symbols::descriptor_of(&raw) {
+                Some(d @ (Descriptor::Term(_) | Descriptor::Type(_) | Descriptor::Method(..))) => d,
+                _ => return,
+            };
+            if let Descriptor::Method(name, _) = &descriptor {
+                if name == ls_semanticdb::symbols::CONSTRUCTOR_NAME
+                    || ls_semanticdb::symbols::is_setter(&raw)
+                {
+                    return;
+                }
+            }
+            if node_of.contains_key(&raw) {
+                return; // first definition occurrence wins
+            }
+            let meta = seg.symbol_meta(sym_ord);
+            let name = if meta.display.is_empty() {
+                descriptor.name().to_string()
+            } else {
+                meta.display
+            };
+            let ps = rec.packed_start as u32;
+            let pe = rec.packed_end as u32;
+            let entry = DocSymbolEntry {
+                name,
+                kind: SymKind::from_code(meta.kind),
+                span: Span::new(
+                    Span::unpack_line(ps),
+                    Span::unpack_char(ps),
+                    Span::unpack_line(pe),
+                    Span::unpack_char(pe),
+                ),
+                children: Vec::new(),
+            };
+            // Nearest enclosing node: walk the proper ancestors innermost-first,
+            // trying each ancestor and then its companion.
+            let chain = ls_semanticdb::symbols::owner_chain(&raw);
+            let parent = chain[..chain.len().saturating_sub(1)]
+                .iter()
+                .rev()
+                .find_map(|ancestor| {
+                    node_of.get(ancestor).copied().or_else(|| {
+                        ls_semanticdb::symbols::companion(ancestor)
+                            .and_then(|c| node_of.get(&c).copied())
+                    })
+                });
+            let idx = nodes.len();
+            nodes.push(Node {
+                entry,
+                children: Vec::new(),
+            });
+            node_of.insert(raw, idx);
+            match parent {
+                Some(p) => nodes[p].children.push(idx),
+                None => roots.push(idx),
+            }
+        });
+        // Materialize bottom-up: children were always pushed AFTER their parent
+        // (source order — an owner's name precedes its members'), so a reverse
+        // walk completes every child before its parent takes it.
+        for i in (0..nodes.len()).rev() {
+            let children = std::mem::take(&mut nodes[i].children);
+            for c in children {
+                let child = std::mem::replace(
+                    &mut nodes[c].entry,
+                    DocSymbolEntry {
+                        name: String::new(),
+                        kind: SymKind::UnknownKind,
+                        span: Span::new(0, 0, 0, 0),
+                        children: Vec::new(),
+                    },
+                );
+                nodes[i].entry.children.push(child);
+            }
+        }
+        roots
+            .into_iter()
+            .map(|r| {
+                std::mem::replace(
+                    &mut nodes[r].entry,
+                    DocSymbolEntry {
+                        name: String::new(),
+                        kind: SymKind::UnknownKind,
+                        span: Span::new(0, 0, 0, 0),
+                        children: Vec::new(),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// Index-backed `textDocument/implementation`: the DEFINITION locations of
+    /// the members of the cursor symbol's METHOD OVERRIDE FAMILY that override
+    /// it — an abstract (or overridable) method's implementations are its
+    /// overriders' def sites. Locations are SemanticDB-relative (`Loc.uri` is
+    /// the sdb uri, as `references` emits), deduped and sorted.
+    ///
+    /// What the store supports (the honest scope): the alias groups do NOT
+    /// union override families — the `overridden_symbols` edges are consumed
+    /// at group build only to set the per-rename-group `has_override_family`
+    /// FLAG (`ls_semanticdb::groups`), and no type-hierarchy/sealed-subtype
+    /// edge exists anywhere in the index (dotty's SemanticDB carries
+    /// `overridden_symbols` for METHODS only; type symbols carry none). So:
+    ///
+    /// - METHOD cursor: candidates are the segment's global method symbols
+    ///   sharing the cursor's method NAME whose rename group is
+    ///   override-flagged (the index pre-filter — an unflagged group can
+    ///   belong to no family); each candidate is then VERIFIED against the
+    ///   `overridden_symbols` edges read from its defining document's raw
+    ///   `.semanticdb` (the RawSemanticDBPath discipline — the same files the
+    ///   ingest read; dotty lists the full transitive override chain, so a
+    ///   deep override still names the queried base directly). Verified
+    ///   overriders answer their def sites via the `symbol_definition`
+    ///   def-group scan with the `symbol_at` exactness filter, pruned to the
+    ///   requesting buffer's forward closure (`requesting_forward_closure` —
+    ///   a disconnected duplicate never leaks; downstream-only implementors
+    ///   are invisible from an upstream buffer, the shared visibility rule).
+    /// - TYPE (trait/class) cursor: the honest EMPTY — subtype edges are not
+    ///   modeled, and inferring implementors from member overrides would miss
+    ///   every subtype that overrides nothing.
+    /// - Locals, terms, constructors: empty (nothing overrides them).
+    ///
+    /// Cursor-resolution failures are typed errors exactly like `references`
+    /// (`NoSymbolAtCursor`, `StaleIndex`, `PcOnlySymbol`); a resolved cursor
+    /// never errors — an unknown family answers `[]`. A best-effort raw read
+    /// that fails (a vanished or re-compiled `.semanticdb`) skips that
+    /// candidate rather than failing the query.
+    pub fn implementations(
+        &self,
+        uri: &str,
+        line: u32,
+        character: u32,
+    ) -> Result<Vec<Loc>, LsError> {
+        let cursor = self.symbol_at_cursor(uri, line, character)?;
+        if cursor.pc_only {
+            return Err(LsError::PcOnlySymbol);
+        }
+        if cursor.is_local() {
+            return Ok(Vec::new());
+        }
+        let Some(snap) = self.current_snapshot() else {
+            return Err(LsError::NotIndexed {
+                uri: uri.to_string(),
+            });
+        };
+        let seg = snap.segment();
+        // Method override families only (see above): a non-method cursor —
+        // types included, subtype edges being absent — answers the honest [].
+        let method_name = match ls_semanticdb::symbols::descriptor_of(&cursor.semantic_symbol) {
+            Some(Descriptor::Method(name, _))
+                if name != ls_semanticdb::symbols::CONSTRUCTOR_NAME =>
+            {
+                name
+            }
+            _ => return Ok(Vec::new()),
+        };
+        let Some(ord) =
+            seg.find_symbol_ord(&symbol_encoding::encode(&cursor.semantic_symbol, None))
+        else {
+            // A fresh symbol the snapshot has not seen (RawSemanticDBPath): the
+            // index knows no family yet; production write-through heals inline.
+            return Ok(Vec::new());
+        };
+        // The index pre-filter: a cursor whose rename group is not
+        // override-flagged participates in NO override family — answer []
+        // without touching a single `.semanticdb`.
+        if !Self::group_has_override_family(seg, ord) {
+            return Ok(Vec::new());
+        }
+        // The bsp ids the requesting buffer's target can see, or None (unscoped).
+        let allowed = self
+            .absolute_source_path(uri)
+            .map(|p| uri::path_to_uri(&uri::normalize(&p)))
+            .and_then(|file_uri| self.requesting_forward_closure(&file_uri));
+        // Same-name override-flagged method candidates, grouped by defining doc
+        // so each candidate doc's raw `.semanticdb` is read once.
+        let mut by_doc: HashMap<u32, Vec<(u32, String)>> = HashMap::new();
+        for cand in 0..seg.symbol_count() as u32 {
+            if cand == ord {
+                continue;
+            }
+            let (raw, local_doc) = symbol_encoding::decode(seg.semantic_symbol_of(cand));
+            if local_doc.is_some() {
+                continue;
+            }
+            match ls_semanticdb::symbols::descriptor_of(&raw) {
+                Some(Descriptor::Method(name, _)) if name == method_name => {}
+                _ => continue,
+            }
+            if !Self::group_has_override_family(seg, cand) {
+                continue;
+            }
+            let def_doc = seg.symbol_meta(cand).def_doc_ord;
+            if def_doc < 0 {
+                continue;
+            }
+            by_doc.entry(def_doc as u32).or_default().push((cand, raw));
+        }
+        let mut out: Vec<Loc> = Vec::new();
+        for (doc_ord, candidates) in by_doc {
+            let Some(sdb) = self.raw_sdb_document_of(seg, doc_ord) else {
+                continue; // best-effort: an unreadable doc skips its candidates
+            };
+            for (cand, raw) in candidates {
+                let overrides_cursor =
+                    sdb.symbols
+                        .iter()
+                        .find(|s| s.symbol == raw)
+                        .is_some_and(|s| {
+                            s.overridden_symbols
+                                .iter()
+                                .any(|o| o == &cursor.semantic_symbol)
+                        });
+                if !overrides_cursor {
+                    continue;
+                }
+                let ref_group = seg.symbol_view(cand).ref_group_ord;
+                if ref_group < 0 {
+                    continue;
+                }
+                seg.scan_def_group(ref_group as u32, &mut |rec: GroupRecord| {
+                    if rec.target_ord < 0 {
+                        return;
+                    }
+                    let ps = rec.packed_start as u32;
+                    let pe = rec.packed_end as u32;
+                    let sl = Span::unpack_line(ps);
+                    let sc = Span::unpack_char(ps);
+                    let rec_doc = rec.doc_ord as u32;
+                    // Keep only occurrences that define EXACTLY the candidate,
+                    // not the other members of its ref group (the
+                    // `symbol_definition` exactness filter).
+                    if seg.symbol_at(rec_doc, sl, sc).map(|h| h.symbol_ord) != Some(cand as i32) {
+                        return;
+                    }
+                    let meta = seg.target_meta(rec.target_ord as u32);
+                    let visible = allowed
+                        .as_ref()
+                        .map(|ids| ids.contains(&meta.bsp_id))
+                        .unwrap_or(true);
+                    if !visible {
+                        return;
+                    }
+                    let span = Span::new(sl, sc, Span::unpack_line(pe), Span::unpack_char(pe));
+                    out.push(Loc::new(seg.uri_of(rec_doc).to_string(), span));
+                });
+            }
+        }
+        Ok(dedupe_and_sort_locs(out))
+    }
+
+    /// Whether `sym_ord`'s rename group carries the `has_override_family`
+    /// flag — the store's only override-family fact (the edges themselves are
+    /// not persisted; see [`QueryOrchestrator::implementations`]).
+    fn group_has_override_family(seg: &SegmentReader, sym_ord: u32) -> bool {
+        let rename_group = seg.symbol_view(sym_ord).rename_group_ord;
+        rename_group >= 0 && seg.rename_profile(rename_group as u32).has_override_family
+    }
+
+    /// The raw `.semanticdb` TextDocument of an indexed doc, located through
+    /// the doc's OWN target (its `target_ord`, not the workspace-order
+    /// primary), best-effort: `None` when the file is gone or unreadable. No
+    /// md5 gate — the caller reads advisory `overridden_symbols` edges for
+    /// candidates the index already names, so a stale file merely fails the
+    /// edge check for the affected candidates.
+    fn raw_sdb_document_of(&self, seg: &SegmentReader, doc_ord: u32) -> Option<SdbDocument> {
+        let uri = seg.uri_of(doc_ord).to_string();
+        let target_ord = seg.target_ord_of_doc(doc_ord);
+        if target_ord < 0 {
+            return None;
+        }
+        let root = PathBuf::from(seg.target_meta(target_ord as u32).semanticdb_root);
+        let locator = SemanticdbLocator::new(root);
+        let file = locator.semanticdb_file_for(&uri).ok()?;
+        let docs = parse_file(&file).ok()?;
+        docs.documents.into_iter().find(|d| d.uri == uri)
     }
 
     /// Forward dependency closure (bsp ids) of the target owning `from_uri`,

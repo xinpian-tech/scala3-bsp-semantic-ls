@@ -4,7 +4,12 @@
 //! everywhere); completion (trigger `.`, resolve); hover; signature help
 //! (triggers `(`, `,`); definition;
 //! type-definition; references; rename (prepare); document highlight; workspace
-//! symbol; inlay hint (no resolve — every hint ships complete, the
+//! symbol; document symbol (nested `DocumentSymbol` trees are ALWAYS sent —
+//! the client capability `hierarchicalDocumentSymbolSupport` is deliberately
+//! not modeled, keeping the narrow no-client-negotiation policy below; the
+//! flat `SymbolInformation[]` fallback for pre-3.10 clients is skipped);
+//! implementation (index-backed method override families);
+//! inlay hint (no resolve — every hint ships complete, the
 //! `lsp_types::InlayHintOptions` shape); code action (the four assembly kinds
 //! — quickfix, refactor.rewrite, refactor.extract, refactor.inline — with no
 //! resolve: every action carries its edit inline); selection range; folding
@@ -120,6 +125,14 @@ pub struct ServerCapabilities {
     pub rename_provider: RenameOptions,
     pub document_highlight_provider: bool,
     pub workspace_symbol_provider: bool,
+    /// Plain `true`. The server always answers the NESTED
+    /// `DocumentSymbol[]` shape — `hierarchicalDocumentSymbolSupport` is not
+    /// read (see the module doc), and the flat `SymbolInformation[]` fallback
+    /// is deliberately not implemented.
+    pub document_symbol_provider: bool,
+    /// Plain `true` — index-backed `textDocument/implementation` over method
+    /// override families.
+    pub implementation_provider: bool,
     /// `{resolveProvider: false}` — every hint ships complete; there is no
     /// `inlayHint/resolve` handler, so lazy-resolve must not be advertised.
     pub inlay_hint_provider: lsp_types::InlayHintOptions,
@@ -221,6 +234,8 @@ pub fn server_capabilities() -> ServerCapabilities {
         },
         document_highlight_provider: true,
         workspace_symbol_provider: true,
+        document_symbol_provider: true,
+        implementation_provider: true,
         inlay_hint_provider: lsp_types::InlayHintOptions {
             work_done_progress_options: Default::default(),
             resolve_provider: Some(false),
@@ -269,6 +284,11 @@ mod tests {
             json.contains("\"documentHighlightProvider\":true"),
             "{json}"
         );
+        // The two index-backed navigation providers: plain booleans (nested
+        // DocumentSymbol trees are always sent; implementation is the
+        // index-backed override-family query).
+        assert!(json.contains("\"documentSymbolProvider\":true"), "{json}");
+        assert!(json.contains("\"implementationProvider\":true"), "{json}");
         assert!(json.contains("\"executeCommandProvider\""), "{json}");
         assert!(json.contains("\"completionProvider\""), "{json}");
         assert!(json.contains("\"resolveProvider\":true"), "{json}");
