@@ -1,0 +1,18 @@
+---
+source: crates/ls-server/tests/pc_wire.rs
+expression: scrub(&range)
+---
+{
+  "data": [
+    0,
+    0,
+    4,
+    3,
+    1,
+    0,
+    8,
+    4,
+    15,
+    0
+  ]
+}

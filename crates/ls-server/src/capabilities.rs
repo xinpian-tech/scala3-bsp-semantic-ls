@@ -5,8 +5,17 @@
 //! (triggers `(`, `,`); definition;
 //! type-definition; references; rename (prepare); document highlight; workspace
 //! symbol; inlay hint (no resolve — every hint ships complete, the
-//! `lsp_types::InlayHintOptions` shape); selection range; folding range; and
-//! the execute-command set. `semanticTokens` is deliberately absent.
+//! `lsp_types::InlayHintOptions` shape); selection range; folding range;
+//! semantic tokens (`full` + `range` over the PC-vendored legend, no
+//! `full.delta` — delta requests are not implemented so they must not be
+//! advertised); and the execute-command set.
+//!
+//! Semantic tokens are advertised UNCONDITIONALLY, without reading the
+//! client's `textDocument.semanticTokens` capability: every mainstream client
+//! (VS Code, Neovim 0.10+) sends the standard token capability, a client that
+//! lacks it simply never issues the request, and the server keeps its narrow
+//! typed-flag policy (see `watched_files_dynamic_registration`) instead of
+//! growing a general client-capability negotiation model.
 
 use serde::Serialize;
 
@@ -86,11 +95,10 @@ pub struct ExecuteCommandOptions {
 }
 
 /// The `ServerCapabilities` payload. Fields serialize to the LSP camelCase
-/// spelling; the absence of `semanticTokensProvider` is intentional (it is not
-/// implemented). The three payload-backed providers added on the lsp-types
-/// edge (`inlayHintProvider`/`selectionRangeProvider`/`foldingRangeProvider`)
-/// use the upstream `lsp_types` options shape where the capability carries
-/// options, and a plain `true` where it is boolean.
+/// spelling. The payload-backed providers added on the lsp-types edge
+/// (`inlayHintProvider`/`selectionRangeProvider`/`foldingRangeProvider`/
+/// `semanticTokensProvider`) use the upstream `lsp_types` options shape where
+/// the capability carries options, and a plain `true` where it is boolean.
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ServerCapabilities {
@@ -114,7 +122,45 @@ pub struct ServerCapabilities {
     pub inlay_hint_provider: lsp_types::InlayHintOptions,
     pub selection_range_provider: bool,
     pub folding_range_provider: bool,
+    /// `{legend, full: true, range: true}` — the legend is EXACTLY the
+    /// PC-vendored `scala.meta.internal.pc.SemanticTokens` lists
+    /// ([`crate::pc_lsp::legend`]), because the island's node type/modifier
+    /// ints index those lists. `full` is the plain boolean — `full.delta` must
+    /// NOT be advertised (no delta handler exists; `resultId` is never
+    /// emitted).
+    pub semantic_tokens_provider: lsp_types::SemanticTokensOptions,
     pub execute_command_provider: ExecuteCommandOptions,
+}
+
+/// The advertised semantic-tokens capability: the vendored legend, `full` and
+/// `range` both plain `true`.
+pub fn semantic_tokens_options() -> lsp_types::SemanticTokensOptions {
+    // The golden anchors of the cross-language legend contract, re-checked at
+    // the point the legend is advertised (debug builds; the release value is
+    // the same constant the tests pin).
+    debug_assert_eq!(
+        crate::pc_lsp::legend::TOKEN_TYPES[crate::pc_lsp::legend::METHOD_TYPE_INDEX],
+        "method"
+    );
+    debug_assert_eq!(
+        crate::pc_lsp::legend::TOKEN_MODIFIERS[crate::pc_lsp::legend::DECLARATION_MODIFIER_INDEX],
+        "declaration"
+    );
+    lsp_types::SemanticTokensOptions {
+        work_done_progress_options: Default::default(),
+        legend: lsp_types::SemanticTokensLegend {
+            token_types: crate::pc_lsp::legend::TOKEN_TYPES
+                .iter()
+                .map(|&name| lsp_types::SemanticTokenType::new(name))
+                .collect(),
+            token_modifiers: crate::pc_lsp::legend::TOKEN_MODIFIERS
+                .iter()
+                .map(|&name| lsp_types::SemanticTokenModifier::new(name))
+                .collect(),
+        },
+        range: Some(true),
+        full: Some(lsp_types::SemanticTokensFullOptions::Bool(true)),
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -157,6 +203,7 @@ pub fn server_capabilities() -> ServerCapabilities {
         },
         selection_range_provider: true,
         folding_range_provider: true,
+        semantic_tokens_provider: semantic_tokens_options(),
         execute_command_provider: ExecuteCommandOptions {
             commands: commands::all(),
         },
@@ -257,9 +304,38 @@ mod tests {
         );
     }
 
+    // semanticTokensProvider: the PC-vendored legend verbatim (23 types, 10
+    // modifiers, the golden anchors at their pinned indices), full and range
+    // as plain `true` — and NO `full.delta` (no delta handler exists, so
+    // advertising it would invite requests the server cannot answer).
     #[test]
-    fn semantic_tokens_stays_absent() {
-        let json = initialize_json();
-        assert!(!json.contains("semanticTokensProvider"), "{json}");
+    fn advertises_semantic_tokens_with_the_vendored_legend() {
+        let value: serde_json::Value =
+            serde_json::from_str(&initialize_json()).expect("initialize result is JSON");
+        let provider = &value["capabilities"]["semanticTokensProvider"];
+        assert_eq!(provider["full"], serde_json::json!(true), "{provider}");
+        assert_eq!(provider["range"], serde_json::json!(true), "{provider}");
+        let token_types: Vec<&str> = provider["legend"]["tokenTypes"]
+            .as_array()
+            .expect("tokenTypes array")
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        let token_modifiers: Vec<&str> = provider["legend"]["tokenModifiers"]
+            .as_array()
+            .expect("tokenModifiers array")
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(token_types, crate::pc_lsp::legend::TOKEN_TYPES);
+        assert_eq!(token_modifiers, crate::pc_lsp::legend::TOKEN_MODIFIERS);
+        assert_eq!(
+            token_types[crate::pc_lsp::legend::METHOD_TYPE_INDEX],
+            "method"
+        );
+        assert_eq!(
+            token_modifiers[crate::pc_lsp::legend::DECLARATION_MODIFIER_INDEX],
+            "declaration"
+        );
     }
 }

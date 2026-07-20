@@ -78,6 +78,8 @@ pub enum Method {
     InlayHint,
     SelectionRange,
     FoldingRange,
+    SemanticTokensFull,
+    SemanticTokensRange,
 }
 
 /// What a method answers before the workspace is ready.
@@ -95,10 +97,13 @@ pub enum PreReadyOutcome {
 /// The per-method pre-ready fallback, matching the server's dispatch: references
 /// and rename fail typed; document highlight, workspace symbol, completion,
 /// definition, type definition, inlay hint, and folding range answer empty;
-/// hover, signature help, prepare rename, and selection range answer null
-/// (selection range because the spec ties `result[i]` to `positions[i]` — an
-/// empty array against a non-empty position list would break that
-/// correspondence, exactly as its ready-path gate fallback answers null).
+/// hover, signature help, prepare rename, selection range, and the two
+/// semantic-tokens methods answer null (selection range because the spec ties
+/// `result[i]` to `positions[i]` — an empty array against a non-empty position
+/// list would break that correspondence, exactly as its ready-path gate
+/// fallback answers null; semantic tokens because the spec result is
+/// `SemanticTokens | null` and null — "no answer yet" — lets the client keep
+/// whatever highlighting it has instead of wiping it with an empty stream).
 pub fn pre_ready_outcome(method: Method) -> PreReadyOutcome {
     match method {
         Method::References | Method::Rename => PreReadyOutcome::NotReadyError,
@@ -109,9 +114,12 @@ pub fn pre_ready_outcome(method: Method) -> PreReadyOutcome {
         | Method::TypeDefinition
         | Method::InlayHint
         | Method::FoldingRange => PreReadyOutcome::Empty,
-        Method::Hover | Method::SignatureHelp | Method::PrepareRename | Method::SelectionRange => {
-            PreReadyOutcome::Null
-        }
+        Method::Hover
+        | Method::SignatureHelp
+        | Method::PrepareRename
+        | Method::SelectionRange
+        | Method::SemanticTokensFull
+        | Method::SemanticTokensRange => PreReadyOutcome::Null,
     }
 }
 
@@ -212,6 +220,8 @@ mod tests {
             Method::SignatureHelp,
             Method::PrepareRename,
             Method::SelectionRange,
+            Method::SemanticTokensFull,
+            Method::SemanticTokensRange,
         ] {
             assert_eq!(pre_ready_outcome(m), PreReadyOutcome::Null, "{m:?}");
         }

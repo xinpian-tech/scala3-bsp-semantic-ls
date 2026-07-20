@@ -3,8 +3,9 @@
  * version 3.8.4 (presentation-compiler/test/dotty/tools/pc/base/BasePCSuite.scala,
  * BaseCompletionSuite.scala, BaseHoverSuite.scala, BaseSignatureHelpSuite.scala,
  * BasePcDefinitionSuite.scala, BaseInlayHintsSuite.scala,
- * BaseSelectionRangeSuite.scala and utils/{TestHovers,TestCompletions,TextEdits,
- * RangeReplace,TestExtensions,TestInlayHints}.scala):
+ * BaseSelectionRangeSuite.scala, BaseSemanticTokensSuite.scala,
+ * BaseDiagnosticsSuite.scala and utils/{TestHovers,TestCompletions,TextEdits,
+ * RangeReplace,TestExtensions,TestInlayHints,TestSemanticTokens}.scala):
  *   https://github.com/scala/scala3/tree/3.8.4/presentation-compiler
  * Copyright 2002-2026 EPFL and Lightbend, Inc. dba Akka
  * Licensed under the Apache License, Version 2.0:
@@ -21,9 +22,11 @@ import scala.concurrent.duration.*
 import scala.jdk.CollectionConverters.*
 
 import com.google.gson.{Gson, JsonElement, JsonParser}
-import ls.pc.{PcInlayHint, PcInlayHintFlags}
+import ls.pc.{PcInlayHint, PcInlayHintFlags, PcSemanticNode, Utf16Text}
 import org.eclipse.lsp4j.{
   CompletionItem,
+  Diagnostic,
+  DiagnosticSeverity,
   Hover,
   Location,
   Position,
@@ -32,7 +35,8 @@ import org.eclipse.lsp4j.{
   TextEdit
 }
 import org.eclipse.lsp4j.jsonrpc.messages.Either as JEither
-import scala.meta.internal.pc.{CompletionItemData, HoverMarkup, InlayHints}
+import scala.collection.mutable.ListBuffer
+import scala.meta.internal.pc.{CompletionItemData, HoverMarkup, InlayHints, SemanticTokens}
 
 /** Base of all ported corpus suites: cursor-marker parsing, offset/position
   * conversion, text-edit application and shared rendering helpers.
@@ -530,6 +534,136 @@ abstract class CorpusSelectionRangeHarness extends CorpusSuiteBase:
           val obtained = replaceInRange(code, chain(i), ">>region>>", "<<region<<")
           assertCorpusNoDiff(obtained, expected)
         }
+      finally CorpusPc.closeBuffer(uri)
+    }
+
+/** Ported `BaseSemanticTokensSuite` + `TestSemanticTokens.pcSemanticString`:
+  * the expected string carries `<<name>>/*type,modifiers*/` markers over the
+  * symbol tokens the COMPILER contributes (keyword/literal tokens are added
+  * outside the compiler and are not asserted, exactly like the dotty base
+  * suite). `check` strips the markers, runs the facade's whole-buffer
+  * `semanticTokens` (offset nodes), and re-renders the markers with the same
+  * node-selection walk the dotty test util applies — including the
+  * `SemanticTokens.getTypePriority` tie-break for same-start candidates.
+  */
+abstract class CorpusSemanticTokensHarness extends CorpusSuiteBase:
+
+  /** Dotty `TestSemanticTokens.decorationString`: the type name (when
+    * classified) followed by every set modifier bit's name, comma-joined.
+    */
+  private def decorationString(typeInd: Int, modInd: Int): String =
+    val buffer = ListBuffer.empty[String]
+    if typeInd != -1 then buffer += SemanticTokens.TokenTypes(typeInd)
+    val wkList = modInd.toBinaryString.toCharArray().toList.reverse
+    for i <- 0 to wkList.size - 1 do
+      if wkList(i).toString == "1" then buffer += SemanticTokens.TokenModifiers(i)
+    buffer.toList.mkString(",")
+
+  /** Dotty `TestSemanticTokens.pcSemanticString` over the facade's
+    * [[PcSemanticNode]] carrier: walk the (provider-ordered) nodes, keep the
+    * identifier-shaped, non-overlapped ones, pick the highest-priority node
+    * among same-start candidates, and wrap each pick in its markers.
+    */
+  private def pcSemanticString(fileContent: String, nodes: List[PcSemanticNode]): String =
+    val wkStr = new StringBuilder
+
+    def isIdentifier(start: Int, end: Int) =
+      fileContent.slice(start, end).matches("^[\\d\\w`+-_!@]+$")
+
+    def iter(nodes: List[PcSemanticNode], curr: Int): Int =
+      nodes match
+        case head :: rest
+            if (curr <= head.start && head.start != head.end) && isIdentifier(head.start, head.end) =>
+          val isValid = rest
+            .takeWhile(node =>
+              node.end < head.end || (node.end == head.end && node.start > head.start)
+            )
+            .isEmpty
+          if isValid then
+            val candidates = head :: rest.takeWhile(nxt =>
+              nxt.start == head.start && isIdentifier(nxt.start, nxt.end)
+            )
+            val node = candidates.maxBy(n => SemanticTokens.getTypePriority(n.tokenType))
+            wkStr ++= fileContent.slice(curr, node.start)
+            wkStr ++= "<<"
+            wkStr ++= fileContent.slice(node.start, node.end)
+            wkStr ++= ">>/*"
+            wkStr ++= decorationString(node.tokenType, node.tokenModifier)
+            wkStr ++= "*/"
+            iter(rest, node.end)
+          else iter(rest, curr)
+        case _ :: rest => iter(rest, curr)
+        case Nil => curr
+    val curr = iter(nodes, 0)
+    wkStr ++= fileContent.slice(curr, fileContent.size)
+    wkStr.mkString
+
+  def check(name: String, expected: String)(implicit loc: munit.Location): Unit =
+    test(name) {
+      val base = expected
+        .replaceAll(raw"/\*[\w,]+\*/", "")
+        .replaceAll(raw"\<\<|\>\>", "")
+      val uri = CorpusPc.openBuffer(base, "Tokens.scala")
+      try
+        val nodes = CorpusPc.facade.semanticTokens(uri)
+        val obtained = pcSemanticString(base, nodes.toList)
+        assertCorpusNoDiff(obtained, expected)
+      finally CorpusPc.closeBuffer(uri)
+    }
+
+/** Ported `BaseDiagnosticsSuite`: `check` pushes the buffer through the
+  * facade's `diagnostics` path (the PC `didChange` with diagnostics on — the
+  * island's `pc_diagnostics` op) and compares the `(startOffset, endOffset,
+  * message, severity)` tuples exactly; `additionalChecks` receives the raw
+  * lsp4j diagnostics for data assertions (the attached quick-fix actions).
+  */
+abstract class CorpusDiagnosticsHarness extends CorpusSuiteBase:
+
+  case class TestDiagnostic(
+      startIndex: Int,
+      endIndex: Int,
+      msg: String,
+      severity: DiagnosticSeverity
+  )
+
+  /** Open the buffer under this target id — the plain corpus target by
+    * default; the explain suite overrides with the `-explain` target.
+    */
+  def diagnosticsTargetId: String = CorpusPc.targetId
+
+  private def diagnosticMessageAsString(d: Diagnostic): String =
+    val msg = d.getMessage()
+    if msg == null then ""
+    else if msg.isLeft then msg.getLeft
+    else msg.getRight.getValue
+
+  private def offsetOf(text: String, position: Position): Int =
+    Utf16Text.offsetAt(text, position.getLine, position.getCharacter)
+
+  def check(
+      name: String,
+      text: String,
+      expected: List[TestDiagnostic],
+      additionalChecks: List[Diagnostic] => Unit = _ => ()
+  )(implicit loc: munit.Location): Unit =
+    test(name) {
+      val uri = CorpusPc.openBufferFor(diagnosticsTargetId, text, "Diagnostic.scala")
+      try
+        val diagnostics = CorpusPc.facade.diagnostics(uri).toList
+        val actual = diagnostics.map(d =>
+          TestDiagnostic(
+            offsetOf(text, d.getRange().getStart()),
+            offsetOf(text, d.getRange().getEnd()),
+            diagnosticMessageAsString(d),
+            d.getSeverity()
+          )
+        )
+        assertEquals(
+          actual,
+          expected,
+          s"Expected [${expected.mkString(", ")}] but got [${actual.mkString(", ")}]"
+        )
+        additionalChecks(diagnostics)
       finally CorpusPc.closeBuffer(uri)
     }
 

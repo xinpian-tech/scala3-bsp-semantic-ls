@@ -367,6 +367,18 @@ impl WireClient {
         what: &str,
     ) -> Vec<Value> {
         let uri = self.file_uri(rel);
+        self.await_publish_uri(&uri, pred, what)
+    }
+
+    /// [`WireClient::await_publish`] with a full URI (fixture-corpus sources
+    /// live outside the workspace root).
+    pub fn await_publish_uri(
+        &mut self,
+        uri: &str,
+        pred: impl Fn(&[Value]) -> bool,
+        what: &str,
+    ) -> Vec<Value> {
+        let uri = uri.to_string();
         let deadline = Instant::now() + Duration::from_secs(180);
         loop {
             if let Some(hit) = take_publish(&mut self.pending, &uri, &pred) {

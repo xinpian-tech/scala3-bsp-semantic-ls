@@ -16,6 +16,7 @@ pub mod jsonrpc;
 pub mod lifecycle;
 pub mod pc;
 mod pc_convert;
+pub mod pc_diagnostics;
 mod pc_lsp;
 pub mod pc_overlay;
 pub mod protocol;
@@ -54,6 +55,7 @@ pub use pc::{
     PcPluginStatusReport, PcQueryService, PcServicePluginStatus, SearchMethodsResolver,
     SymbolResolver, ToplevelsResolver,
 };
+pub use pc_diagnostics::{PcDiagnosticsLayer, PC_DIAGNOSTICS_SOURCE};
 pub use protocol::{Diagnostic, DiagnosticCode, Position, PublishDiagnosticsParams, Range};
 pub use server::{
     serve, Bootstrap, Handlers, OutputSink, RequestContext, ServerCore, WatchedFileEvent,

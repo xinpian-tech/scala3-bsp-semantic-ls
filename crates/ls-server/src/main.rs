@@ -16,7 +16,8 @@ use ls_bsp::protocol::PublishDiagnosticsParams as BspPublishDiagnosticsParams;
 use ls_server::doctor::DoctorReport;
 use ls_server::{
     dump_report, parse_args, resolve_doctor_dir, serve, CliAction, CoreHandlers, DiagnosticRouter,
-    IndexBootstrap, LiveBspModelSource, OutputSink, ServerCore, SERVER_NAME, SERVER_VERSION,
+    IndexBootstrap, LiveBspModelSource, OutputSink, PcDiagnosticsLayer, PublishDiagnosticsParams,
+    ServerCore, SERVER_NAME, SERVER_VERSION,
 };
 
 fn main() -> ExitCode {
@@ -99,21 +100,32 @@ fn serve_stdio() {
     // The build server's `build/publishDiagnostics` (delivered on the session
     // reader thread) is routed through one `DiagnosticRouter` (per-URI merge across
     // targets, per-target reset, clear-once suppression); each accepted LSP publish
-    // is written straight to the sink as a `textDocument/publishDiagnostics`.
+    // then flows through the shared PC-diagnostics merge layer — which records the
+    // BSP set, drops the URI's live-typing overlay, and writes the merged
+    // `textDocument/publishDiagnostics` to the sink. The SAME layer is handed to
+    // the bootstrap, so the ready bundle's debounced live-typing pull publishes
+    // into the same merged stream (BSP primary, PC-tagged overlay second).
     let router = Arc::new(Mutex::new(DiagnosticRouter::new()));
+    let pc_diagnostics = PcDiagnosticsLayer::new({
+        let sink = Arc::clone(&sink);
+        Arc::new(move |publish: &PublishDiagnosticsParams| {
+            let _ = sink.publish_diagnostics(publish);
+        })
+    });
     let on_diagnostics: Arc<dyn Fn(BspPublishDiagnosticsParams) + Send + Sync> = {
         let router = Arc::clone(&router);
-        let sink = Arc::clone(&sink);
+        let layer = Arc::clone(&pc_diagnostics);
         Arc::new(move |params| {
             if let Some(publish) = router.lock().unwrap().accept(&params) {
-                let _ = sink.publish_diagnostics(&publish);
+                layer.bsp_published(publish);
             }
         })
     };
     let bootstrap = IndexBootstrap::new(LiveBspModelSource::new(
         on_build_targets_changed,
         on_diagnostics,
-    ));
+    ))
+    .with_pc_diagnostics(pc_diagnostics);
     if let Err(error) = serve(&mut reader, &sink, &mut core, &CoreHandlers, bootstrap) {
         eprintln!("{SERVER_NAME}: serve loop ended: {error}");
     }

@@ -2,9 +2,11 @@
 -- scala3-bsp-semantic-ls to a real workspace (the pinned zaozi repo by
 -- default), opens a real source, and exercises the editor-visible surface —
 -- readiness (doctor), reindex ingest, workspace/symbol, definition,
--- references, and PC-backed hover (which boots the embedded JVM island for
--- real). Assertions are token-anchored so upstream source drift does not
--- invalidate positions.
+-- references, PC-backed hover (which boots the embedded JVM island for
+-- real), the payload probes (foldingRange/selectionRange/inlayHint,
+-- semanticTokens/full), and the live-typing PC diagnostics flow (edit ->
+-- "scala3-pc (typing)" publish -> revert -> clear). Assertions are
+-- token-anchored so upstream source drift does not invalidate positions.
 --
 -- Usage: nvim --headless -l it/nvim/e2e.lua <workspace> <server_bin> <rel_file> <token>
 -- Exits 0 on success; prints "E2E FAIL: ..." and exits 1 on the first failure.
@@ -68,6 +70,12 @@ capabilities.workspace.didChangeWatchedFiles.dynamicRegistration = true
 local watched_registrations = {}
 local default_register_handler = vim.lsp.handlers["client/registerCapability"]
 
+-- Record every publishDiagnostics (in arrival order) before delegating to
+-- nvim's REAL default handler, so the live-typing diagnostics probe can await
+-- the PC-tagged publish and its clear without polling editor-side state.
+local recorded_publishes = {}
+local default_publish_handler = vim.lsp.handlers["textDocument/publishDiagnostics"]
+
 local client_id = vim.lsp.start({
   name = "scala3-bsp-semantic-ls",
   cmd = { bin },
@@ -81,6 +89,12 @@ local client_id = vim.lsp.start({
         end
       end
       return default_register_handler(err, params, ctx)
+    end,
+    ["textDocument/publishDiagnostics"] = function(err, params, ctx)
+      table.insert(recorded_publishes, params)
+      if default_publish_handler then
+        return default_publish_handler(err, params, ctx)
+      end
     end,
   },
 }, { bufnr = buf })
@@ -282,6 +296,41 @@ for _, hint in ipairs(hints) do
 end
 pass("inlayHint round-trips (" .. #hints .. " hints)")
 
+-- semanticTokens/full over the real buffer: the island's whole-buffer node
+-- walk, offset-converted and delta-encoded server-side. The stream must be
+-- non-empty (a real source file names plenty of symbols) and well-formed
+-- (five words per token); every token type/modifier index must be in legend
+-- range, so the advertised legend and the emitted stream cannot drift apart.
+local tokens = request("textDocument/semanticTokens/full", {
+  textDocument = doc_at.textDocument,
+}, 120000)
+if type(tokens) ~= "table" or type(tokens.data) ~= "table" then
+  fail("semanticTokens/full did not return a data array: " .. vim.inspect(tokens))
+end
+if #tokens.data == 0 then
+  fail("semanticTokens/full returned an empty stream over a real buffer")
+end
+if #tokens.data % 5 ~= 0 then
+  fail("semanticTokens/full data length " .. #tokens.data .. " is not a multiple of 5")
+end
+local legend = (client.server_capabilities.semanticTokensProvider or {}).legend or {}
+local n_types = #(legend.tokenTypes or {})
+local n_mods = #(legend.tokenModifiers or {})
+if n_types ~= 23 or n_mods ~= 10 then
+  fail("advertised legend is not the pinned 23/10 lists: " .. n_types .. "/" .. n_mods)
+end
+for i = 1, #tokens.data, 5 do
+  local token_type = tokens.data[i + 3]
+  local modifiers = tokens.data[i + 4]
+  if token_type >= n_types then
+    fail("token type index " .. token_type .. " outside the advertised legend")
+  end
+  if modifiers >= 2 ^ n_mods then
+    fail("token modifier bitset " .. modifiers .. " outside the advertised legend")
+  end
+end
+pass("semanticTokens/full streams " .. (#tokens.data / 5) .. " tokens within the legend")
+
 -- Definition, bisected across the three navigation shapes: in-buffer (pure
 -- PC span), cross-target (PC symbol -> index resolver, the shape the gated
 -- real-BSP suites prove), and same-target-cross-file (informational: its
@@ -364,6 +413,77 @@ if type(references) ~= "table" or #references == 0 then
   fail("references returned nothing")
 end
 pass("references finds " .. #references .. " sites")
+
+-- Live-typing (PC) diagnostics: edit the real buffer to introduce a type
+-- error; nvim's incremental didChange arms the server's debounced
+-- pc_diagnostics pull (the island is already booted by the probes above), and
+-- a publishDiagnostics tagged "scala3-pc (typing)" must arrive for this
+-- buffer. Reverting the edit must then clear the PC-tagged diagnostics.
+local main_uri = vim.uri_from_bufnr(buf)
+
+local function pc_tagged_count(params)
+  local n = 0
+  for _, d in ipairs(params.diagnostics or {}) do
+    if d.source == "scala3-pc (typing)" then
+      n = n + 1
+    end
+  end
+  return n
+end
+
+-- The LATEST recorded publish for the buffer (publish replaces per URI).
+local function last_publish_for(uri)
+  for i = #recorded_publishes, 1, -1 do
+    if recorded_publishes[i].uri == uri then
+      return recorded_publishes[i]
+    end
+  end
+  return nil
+end
+
+local probe_line = 'val __ls_e2e_probe: Int = ""'
+local end_line = vim.api.nvim_buf_line_count(buf)
+vim.api.nvim_buf_set_lines(buf, end_line, end_line, false, { probe_line })
+
+if not vim.wait(120000, function()
+  local p = last_publish_for(main_uri)
+  return p ~= nil and pc_tagged_count(p) > 0
+end, 500) then
+  fail(
+    "no PC-tagged typing diagnostic arrived after introducing a type error; last publish: "
+      .. vim.inspect(last_publish_for(main_uri))
+  )
+end
+local publish = last_publish_for(main_uri)
+local tagged
+for _, d in ipairs(publish.diagnostics) do
+  if d.source == "scala3-pc (typing)" then
+    tagged = d
+  end
+end
+if tagged.range.start.line ~= end_line then
+  fail(
+    "the typing diagnostic does not point at the probe line "
+      .. end_line
+      .. ": "
+      .. vim.inspect(tagged.range)
+  )
+end
+pass('live-typing diagnostics: "' .. (tagged.message:gsub("\n.*", "")) .. '" tagged scala3-pc (typing)')
+
+-- Revert the edit: the next debounced pull sees a buffer whose PC diagnostics
+-- are gone, and the overlay publish clears the tag.
+vim.api.nvim_buf_set_lines(buf, end_line, end_line + 1, false, {})
+if not vim.wait(120000, function()
+  local p = last_publish_for(main_uri)
+  return p ~= nil and pc_tagged_count(p) == 0
+end, 500) then
+  fail(
+    "the PC-tagged diagnostics never cleared after reverting; last publish: "
+      .. vim.inspect(last_publish_for(main_uri))
+  )
+end
+pass("live-typing diagnostics clear on revert")
 
 pass("all project-level checks")
 os.exit(0)

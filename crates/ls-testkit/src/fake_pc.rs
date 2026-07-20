@@ -266,6 +266,10 @@ impl PcQueryService for FakePcService {
         }]
     }
 
+    /// Offset nodes shaped for the pc_wire `DIRTY` buffer ("package pkga\n\n
+    /// class Core…"): two line-0 tokens, one on line 2 (so the wire snapshot
+    /// pins a cross-line delta), and one `-1` unclassified node (the dotty
+    /// `makeNode` fallthrough) the encoder must drop.
     fn semantic_tokens(&self, uri: &str) -> Vec<SemanticNode> {
         self.record(format!("semantic_tokens {uri}"));
         vec![
@@ -279,6 +283,18 @@ impl PcQueryService for FakePcService {
                 start: 8,
                 end: 12,
                 token_type: 15,
+                token_modifier: 0,
+            },
+            SemanticNode {
+                start: 20,
+                end: 24,
+                token_type: 2,
+                token_modifier: 2,
+            },
+            SemanticNode {
+                start: 25,
+                end: 27,
+                token_type: -1,
                 token_modifier: 0,
             },
         ]

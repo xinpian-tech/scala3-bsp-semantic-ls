@@ -2,10 +2,11 @@
 
 The capability assertions mirror `crates/ls-server/src/capabilities.rs` — the
 advertised set is exactly the implemented surface (inlayHint / selectionRange /
-foldingRange included), and `semanticTokens` is deliberately absent. Here the
-payload additionally round-trips through lsprotocol's INDEPENDENT typed model,
-so a serialization drift in the serde layer (hand-rolled or lsp-types-bridged)
-fails loudly in a client this repo did not write.
+foldingRange / semanticTokens included). Here the payload additionally
+round-trips through lsprotocol's INDEPENDENT typed model, so a serialization
+drift in the serde layer (hand-rolled or lsp-types-bridged) fails loudly in a
+client this repo did not write. The semantic-tokens LEGEND itself is pinned in
+test_semantic_tokens.py.
 """
 
 from lsprotocol import types
@@ -49,8 +50,12 @@ async def test_initialize_advertises_the_exact_capability_surface(client):
         PC_PLUGIN_STATUS,
     ]
 
-    # Deliberately absent: not implemented, so never advertised.
-    assert caps.semantic_tokens_provider is None
+    # semanticTokens: full + range as plain booleans over the vendored legend
+    # (the exact legend lists are pinned in test_semantic_tokens.py); no
+    # full.delta — delta requests are not implemented.
+    assert caps.semantic_tokens_provider is not None
+    assert caps.semantic_tokens_provider.full is True
+    assert caps.semantic_tokens_provider.range is True
 
 
 async def test_initialize_reports_the_server_identity(client):

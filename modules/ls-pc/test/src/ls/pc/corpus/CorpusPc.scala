@@ -33,6 +33,12 @@ object CorpusPc:
 
   val targetId = "corpusTarget"
 
+  /** A second target sharing the classpath but compiled with `-explain`, for
+    * the ported ExplainDiagnosticProviderSuite (dotty's `options =
+    * List("-explain")` override).
+    */
+  val explainTargetId = "corpusExplainTarget"
+
   lazy val generatedSourcesRoot: Path =
     Files.createTempDirectory("ls-pc-corpus-gen")
 
@@ -148,6 +154,9 @@ object CorpusPc:
       MockResolver
     )
     f.registerTarget(PcTargetConfig(targetId, SharedPc.libraryClasspath, Vector.empty))
+    f.registerTarget(
+      PcTargetConfig(explainTargetId, SharedPc.libraryClasspath, Vector("-explain"))
+    )
     f
 
   private val counter = new AtomicInteger(0)
@@ -160,6 +169,17 @@ object CorpusPc:
     * case source itself; close with [[closeBuffer]] to unregister them.
     */
   def openBuffer(
+      text: String,
+      filename: String = "A.scala",
+      methods: Seq[WorkspaceMethod] = Nil
+  ): String =
+    openBufferFor(targetId, text, filename, methods)
+
+  /** [[openBuffer]] under an explicit registered target (the `-explain`
+    * diagnostics corpus opens under [[explainTargetId]]).
+    */
+  def openBufferFor(
+      target: String,
       text: String,
       filename: String = "A.scala",
       methods: Seq[WorkspaceMethod] = Nil
@@ -177,7 +197,7 @@ object CorpusPc:
           )
         }.toVector
       )
-    facade.didOpen(targetId, uri, text)
+    facade.didOpen(target, uri, text)
     uri
 
   /** Close a corpus buffer and drop any workspace methods it registered. */

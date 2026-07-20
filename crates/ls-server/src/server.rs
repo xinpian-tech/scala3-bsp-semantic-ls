@@ -1023,6 +1023,8 @@ fn readiness_method(method: &str) -> Option<Method> {
         "textDocument/inlayHint" => Some(Method::InlayHint),
         "textDocument/selectionRange" => Some(Method::SelectionRange),
         "textDocument/foldingRange" => Some(Method::FoldingRange),
+        "textDocument/semanticTokens/full" => Some(Method::SemanticTokensFull),
+        "textDocument/semanticTokens/range" => Some(Method::SemanticTokensRange),
         "workspace/symbol" => Some(Method::WorkspaceSymbol),
         _ => None,
     }

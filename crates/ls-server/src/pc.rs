@@ -154,6 +154,18 @@ pub trait PcQueryService: Send + Sync {
     /// `pc.bufferText(uri).isDefined`, the `withPcBuffer` precondition.
     fn is_open(&self, uri: &str) -> bool;
 
+    /// Whether a PC query would run against an ALREADY-RUNNING island — i.e.
+    /// this call itself never boots anything. The live-typing diagnostics
+    /// scheduler gates its debounced `pc_diagnostics` pull on this, so a
+    /// `didChange` alone NEVER boots the embedded JVM (preserving the
+    /// index-only zero-JVM invariant and the blackbox suite's hermeticity);
+    /// live diagnostics activate once some real PC query (hover, completion,
+    /// semantic tokens, …) has booted the island. Default `true`: a fake or
+    /// PC-less bundle has nothing to boot, so its pulls always run.
+    fn booted(&self) -> bool {
+        true
+    }
+
     /// Go-to-definition of the symbol at `(line, character)` in the mirrored
     /// buffer `uri`. Empty when the presentation compiler yields nothing.
     fn definition(&self, uri: &str, line: u32, character: u32) -> Vec<PcLocation>;
@@ -641,6 +653,17 @@ impl PcQueryService for IslandPcService {
             .expect("pc island state mutex")
             .buffers
             .contains_key(uri)
+    }
+
+    fn booted(&self) -> bool {
+        // Only inspects the driver slot — NEVER takes the boot path (the same
+        // pre-boot invariant `plugin_status` keeps): a cold island reads as
+        // not booted, so a debounced diagnostics pull skips it.
+        self.state
+            .lock()
+            .expect("pc island state mutex")
+            .driver
+            .is_some()
     }
 
     fn definition(&self, uri: &str, line: u32, character: u32) -> Vec<PcLocation> {

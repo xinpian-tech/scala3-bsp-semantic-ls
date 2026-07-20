@@ -41,6 +41,7 @@ use crate::pc::{
     pc_options, IslandPcService, PcQueryService, SearchMethodsResolver, SymbolResolver,
     ToplevelsResolver,
 };
+use crate::pc_diagnostics::PcDiagnosticsLayer;
 use crate::pc_overlay::PcOverlay;
 use crate::server::Bootstrap;
 use crate::services::{BuildCompiler, CoreServices, UnavailableCompiler};
@@ -286,6 +287,11 @@ where
 pub struct IndexBootstrap<M> {
     model_source: M,
     pc_factory: PcServiceFactory,
+    /// The PC/BSP diagnostics merge layer the ready bundle's live-typing pull
+    /// publishes through. `main` (and the wire harness) hands in the layer it
+    /// also routes BSP publishes through; the default is disconnected —
+    /// injected bundles that wire no sink publish nowhere.
+    pc_diagnostics: Arc<PcDiagnosticsLayer>,
 }
 
 /// Builds the ready bundle's PC capability from the workspace root, the model's
@@ -332,7 +338,16 @@ impl<M: ModelSource> IndexBootstrap<M> {
         IndexBootstrap {
             model_source,
             pc_factory,
+            pc_diagnostics: PcDiagnosticsLayer::disconnected(),
         }
+    }
+
+    /// Wire the shared PC/BSP diagnostics merge layer (the one the caller also
+    /// routes `DiagnosticRouter` publishes through), so the ready bundle's
+    /// live-typing pull publishes into the same merged stream.
+    pub fn with_pc_diagnostics(mut self, pc_diagnostics: Arc<PcDiagnosticsLayer>) -> Self {
+        self.pc_diagnostics = pc_diagnostics;
+        self
     }
 
     /// Loads the model, ingests it into a fresh store under the root, and returns
@@ -451,6 +466,7 @@ impl<M: ModelSource> IndexBootstrap<M> {
             true,
             pc_overlay,
             doctor_targets,
+            Arc::clone(&self.pc_diagnostics),
         ))
     }
 }
@@ -551,6 +567,9 @@ pub fn reload_build_model(
         true,
         old.pc_overlay, // reused: same overlay inside the reused orchestrator
         doctor_targets, // refreshed from the reloaded model
+        // Reused: the same merge layer the BSP session's on_diagnostics route
+        // feeds, so live-typing publishes keep merging with compile truth.
+        old.pc_diagnostics,
     );
     // Re-install the overlay environment with the refreshed URI mapping (the
     // sourceroots may have changed) before replaying the open buffers.

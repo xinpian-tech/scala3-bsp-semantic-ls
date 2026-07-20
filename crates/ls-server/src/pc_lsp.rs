@@ -1,7 +1,7 @@
 //! Bridges the island's decoded payload carriers (`ls_pc_abi::payloads`) to the
 //! `lsp-types` protocol shapes for the payload-backed LSP methods
 //! (`textDocument/inlayHint`, `textDocument/selectionRange`,
-//! `textDocument/foldingRange`).
+//! `textDocument/foldingRange`, `textDocument/semanticTokens/full` + `/range`).
 //!
 //! Unlike the hand-rolled serde layer the original 12-method surface uses
 //! (`crate::convert`/`crate::pc_convert`), every NEW protocol shape on this
@@ -9,12 +9,226 @@
 //! The bridge only maps the flat ABI carriers into those models; the dispatch
 //! layer serializes them into the existing `serde_json` response path
 //! (`Response::success(id, serde_json::to_value(..))`).
+//!
+//! It also owns the semantic-tokens [`legend`] contract and the offset→delta
+//! encoder ([`semantic_tokens`] / [`semantic_tokens_range`]): the island's
+//! nodes carry `[start, end)` UTF-16 offsets into the OPEN BUFFER TEXT plus
+//! type/modifier ints that index the PC-vendored legend, and the encoder turns
+//! them into the LSP `SemanticTokens` delta stream.
 
+use line_index::{LineIndex, WideEncoding};
 use ls_pc_abi::payloads::{
     FoldingRange as AbiFoldingRange, InlayHint as AbiInlayHint, InlayLabelPart, Pos, Rng,
-    TextEdit as AbiTextEdit,
+    SemanticNode, TextEdit as AbiTextEdit,
 };
 use serde_json::Value;
+
+/// The semantic-tokens legend contract: the island's `Node.tokenType()` /
+/// `tokenModifier()` ints are INDICES into the PC-vendored
+/// `scala.meta.internal.pc.SemanticTokens.TokenTypes` / `TokenModifiers` lists
+/// (scala3-presentation-compiler 3.8.4, vendored in the island's PC jar), so
+/// the legend the server advertises must be EXACTLY those lists, in order.
+/// Pinned here as Rust constants; the island-side munit suite
+/// `modules/ls-pc/test/src/ls/pc/SemanticTokensLegendSuite.scala` pins the same
+/// lists (and the same golden anchors) against the vendored object itself, so
+/// legend drift on either side of the boundary breaks a build.
+pub mod legend {
+    /// `scala.meta.internal.pc.SemanticTokens.TokenTypes`, verbatim and in
+    /// order (23 entries — the LSP 3.17 standard token types minus none).
+    pub const TOKEN_TYPES: [&str; 23] = [
+        "namespace",
+        "type",
+        "class",
+        "enum",
+        "interface",
+        "struct",
+        "typeParameter",
+        "parameter",
+        "variable",
+        "property",
+        "enumMember",
+        "event",
+        "function",
+        "method",
+        "macro",
+        "keyword",
+        "modifier",
+        "comment",
+        "string",
+        "number",
+        "regexp",
+        "operator",
+        "decorator",
+    ];
+
+    /// `scala.meta.internal.pc.SemanticTokens.TokenModifiers`, verbatim and in
+    /// order (10 entries).
+    pub const TOKEN_MODIFIERS: [&str; 10] = [
+        "declaration",
+        "definition",
+        "readonly",
+        "static",
+        "deprecated",
+        "abstract",
+        "async",
+        "modification",
+        "documentation",
+        "defaultLibrary",
+    ];
+
+    /// Golden anchor, pinned on BOTH sides of the boundary: `"method"` is
+    /// token-type index 13.
+    pub const METHOD_TYPE_INDEX: usize = 13;
+
+    /// Golden anchor, pinned on BOTH sides of the boundary: `"declaration"` is
+    /// token-modifier bit 0.
+    pub const DECLARATION_MODIFIER_INDEX: usize = 0;
+}
+
+/// The UTF-16 line-start table of a buffer: `starts[i]` is the UTF-16 offset
+/// of line `i`'s first unit, with one trailing sentinel at the total UTF-16
+/// length. Built over `line-index`'s line split (so `\n`/`\r\n` terminator
+/// handling is the same as the document store's), it maps the island's global
+/// UTF-16 node offsets to `(line, UTF-16 column)` by binary search.
+struct Utf16Lines {
+    starts: Vec<u32>,
+}
+
+impl Utf16Lines {
+    fn new(text: &str) -> Utf16Lines {
+        let index = LineIndex::new(text);
+        let mut starts = vec![0u32];
+        let mut total = 0u32;
+        let mut line = 0u32;
+        while let Some(range) = index.line(line) {
+            let slice = &text[usize::from(range.start())..usize::from(range.end())];
+            total += WideEncoding::Utf16.measure(slice) as u32;
+            starts.push(total);
+            line += 1;
+        }
+        Utf16Lines { starts }
+    }
+
+    fn total(&self) -> u32 {
+        *self.starts.last().expect("at least the sentinel")
+    }
+
+    /// `(line, UTF-16 column)` of a global UTF-16 offset, clamped into the
+    /// text (an out-of-range offset lands at the end of the last line).
+    fn position(&self, offset: u32) -> (u32, u32) {
+        let offset = offset.min(self.total());
+        let line = match self.starts.binary_search(&offset) {
+            Ok(i) => i,
+            Err(i) => i - 1,
+        }
+        // The total-length sentinel (and an offset exactly at it) belongs to
+        // the last real line.
+        .min(self.starts.len().saturating_sub(2));
+        (line as u32, offset - self.starts[line])
+    }
+}
+
+/// One positioned token: absolute `(line, UTF-16 start column)`, UTF-16
+/// length, and the legend type/modifier ints.
+struct PositionedToken {
+    line: u32,
+    start: u32,
+    length: u32,
+    token_type: u32,
+    modifiers: u32,
+}
+
+/// Positions the island's offset nodes against the open buffer text, dropping
+/// the nodes the LSP stream cannot (or must not) carry:
+/// - `token_type < 0`: the dotty provider's "no classification" sentinel
+///   (`makeNode`'s `else -1` branch) — the node names a symbol the legend has
+///   no type for, so it is dropped exactly as Metals' encoder drops it;
+/// - `start >= end`: a zero-width node highlights nothing;
+/// - a node whose end lands on a later line: dotty nodes are symbol-name spans
+///   and are single-line by construction (pinned by test); a multi-line node
+///   would need the multiline-token client capability, so a hypothetical one
+///   is dropped rather than emitted corrupt.
+fn positioned(nodes: &[SemanticNode], lines: &Utf16Lines) -> Vec<PositionedToken> {
+    let mut tokens: Vec<PositionedToken> = nodes
+        .iter()
+        .filter(|node| node.token_type >= 0 && node.start < node.end)
+        .filter_map(|node| {
+            let (line, start) = lines.position(node.start);
+            let (end_line, end_col) = lines.position(node.end);
+            if end_line != line {
+                return None;
+            }
+            Some(PositionedToken {
+                line,
+                start,
+                length: end_col - start,
+                token_type: node.token_type as u32,
+                modifiers: u32::try_from(node.token_modifier).unwrap_or(0),
+            })
+        })
+        .collect();
+    // The provider already sorts by (start, end); re-sort defensively — the
+    // delta encoding is only valid over a position-sorted stream.
+    tokens.sort_by_key(|t| (t.line, t.start, t.length));
+    tokens
+}
+
+/// Delta-encodes positioned tokens into the LSP `SemanticTokens` data stream
+/// (`deltaLine`/`deltaStart`/`length`/`tokenType`/`tokenModifiers`, five words
+/// per token). No `resultId`: delta requests are not advertised.
+fn delta_encode(tokens: &[PositionedToken]) -> lsp_types::SemanticTokens {
+    let mut data = Vec::with_capacity(tokens.len());
+    let (mut prev_line, mut prev_start) = (0u32, 0u32);
+    for token in tokens {
+        let delta_line = token.line - prev_line;
+        let delta_start = if delta_line == 0 {
+            token.start - prev_start
+        } else {
+            token.start
+        };
+        data.push(lsp_types::SemanticToken {
+            delta_line,
+            delta_start,
+            length: token.length,
+            token_type: token.token_type,
+            token_modifiers_bitset: token.modifiers,
+        });
+        prev_line = token.line;
+        prev_start = token.start;
+    }
+    lsp_types::SemanticTokens {
+        result_id: None,
+        data,
+    }
+}
+
+/// The island's offset nodes for the whole buffer -> the LSP `SemanticTokens`
+/// delta stream, positioned against `text` (the OPEN BUFFER TEXT the island
+/// mirrored — offsets and columns are UTF-16 units, the advertised encoding).
+pub fn semantic_tokens(nodes: &[SemanticNode], text: &str) -> lsp_types::SemanticTokens {
+    let lines = Utf16Lines::new(text);
+    delta_encode(&positioned(nodes, &lines))
+}
+
+/// The `/range` variant: the node list is sliced server-side to the tokens
+/// overlapping `range` (a token strictly before or after the range is
+/// dropped; one straddling a range edge is kept whole) BEFORE the delta
+/// encoding, so the first emitted token's deltas are absolute from the
+/// document origin, as the spec requires of every `SemanticTokens` stream.
+pub fn semantic_tokens_range(
+    nodes: &[SemanticNode],
+    text: &str,
+    range: &lsp_types::Range,
+) -> lsp_types::SemanticTokens {
+    let lines = Utf16Lines::new(text);
+    let from = (range.start.line, range.start.character);
+    let to = (range.end.line, range.end.character);
+    let mut tokens = positioned(nodes, &lines);
+    tokens.retain(|token| {
+        (token.line, token.start) < to && (token.line, token.start + token.length) > from
+    });
+    delta_encode(&tokens)
+}
 
 /// ABI position (zero-based UTF-16, as LSP) -> `lsp_types::Position`.
 pub fn lsp_position(pos: &Pos) -> lsp_types::Position {
@@ -311,6 +525,209 @@ mod tests {
                 "range": { "start": { "line": 3, "character": 7 }, "end": { "line": 3, "character": 7 } }
             })
         );
+    }
+
+    // --- the semantic-tokens legend contract ---------------------------------
+
+    // The legend is EXACTLY the PC-vendored
+    // `scala.meta.internal.pc.SemanticTokens` lists (scala3-presentation-
+    // compiler 3.8.4), pinned verbatim; the island-side
+    // SemanticTokensLegendSuite pins the same lists from the vendored object,
+    // so drift breaks both sides.
+    #[test]
+    fn the_legend_is_the_pc_vendored_token_lists() {
+        assert_eq!(
+            legend::TOKEN_TYPES,
+            [
+                "namespace",
+                "type",
+                "class",
+                "enum",
+                "interface",
+                "struct",
+                "typeParameter",
+                "parameter",
+                "variable",
+                "property",
+                "enumMember",
+                "event",
+                "function",
+                "method",
+                "macro",
+                "keyword",
+                "modifier",
+                "comment",
+                "string",
+                "number",
+                "regexp",
+                "operator",
+                "decorator",
+            ]
+        );
+        assert_eq!(
+            legend::TOKEN_MODIFIERS,
+            [
+                "declaration",
+                "definition",
+                "readonly",
+                "static",
+                "deprecated",
+                "abstract",
+                "async",
+                "modification",
+                "documentation",
+                "defaultLibrary",
+            ]
+        );
+    }
+
+    // The golden anchors, shared verbatim with the island-side parity suite.
+    #[test]
+    fn the_legend_golden_anchors_hold() {
+        assert_eq!(legend::TOKEN_TYPES[legend::METHOD_TYPE_INDEX], "method");
+        assert_eq!(
+            legend::TOKEN_MODIFIERS[legend::DECLARATION_MODIFIER_INDEX],
+            "declaration"
+        );
+    }
+
+    // --- the offset -> delta encoder -----------------------------------------
+
+    fn node(start: u32, end: u32, token_type: i32, token_modifier: i32) -> SemanticNode {
+        SemanticNode {
+            start,
+            end,
+            token_type,
+            token_modifier,
+        }
+    }
+
+    /// The raw five-words-per-token integer stream of an encoded result (the
+    /// exact array the wire carries).
+    fn data_of(tokens: &lsp_types::SemanticTokens) -> Vec<u32> {
+        serde_json::to_value(tokens).unwrap()["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_u64().unwrap() as u32)
+            .collect()
+    }
+
+    // Multi-token, multi-line delta encoding over plain ASCII: absolute first
+    // token, same-line column delta, cross-line line delta with an absolute
+    // column restart. No resultId is emitted (deltas are not advertised).
+    #[test]
+    fn semantic_tokens_delta_encode_across_lines() {
+        //          0123456789012345
+        let text = "class A:\n  def m = 1\n";
+        // "class"=[0,5) keyword; "A"=[6,7) class+definition(bit1);
+        // "m"=[15,16) method+definition.
+        let tokens = semantic_tokens(
+            &[node(0, 5, 15, 0), node(6, 7, 2, 2), node(15, 16, 13, 2)],
+            text,
+        );
+        assert_eq!(
+            data_of(&tokens),
+            vec![
+                0, 0, 5, 15, 0, // line 0 col 0 "class"
+                0, 6, 1, 2, 2, // same line, +6 cols, "A"
+                1, 6, 1, 13, 2, // next line, absolute col 6, "m"
+            ]
+        );
+        let value = serde_json::to_value(&tokens).unwrap();
+        assert!(value.get("resultId").is_none(), "{value}");
+    }
+
+    // Astral characters occupy TWO UTF-16 units: the island's offsets already
+    // count them as two, and the encoder's columns/lengths must stay in the
+    // same UTF-16 space (the advertised `positionEncoding`).
+    #[test]
+    fn semantic_tokens_columns_count_utf16_units_around_astral_chars() {
+        // "𐐀" (U+10400) is 2 UTF-16 units: `val` starts the line, the name
+        // "a𐐀b" spans units [6, 10) on line 1.
+        let text = "// 😀\nval a\u{10400}b = 1\n";
+        let tokens = semantic_tokens(&[node(10, 14, 8, 4)], text);
+        assert_eq!(data_of(&tokens), vec![1, 4, 4, 8, 4]);
+    }
+
+    // The drop rules: a `-1` unclassified node (dotty's `makeNode` fallthrough),
+    // a zero-width node, and a hypothetical multi-line node are all dropped —
+    // never emitted corrupt. Dotty nodes are symbol-NAME spans, single-line by
+    // construction; this pins the defensive boundary for anything else.
+    #[test]
+    fn semantic_tokens_drop_unclassified_empty_and_multiline_nodes() {
+        let text = "val a = 1\nval b = 2\n";
+        let tokens = semantic_tokens(
+            &[
+                node(4, 5, -1, 0), // unclassified: dropped
+                node(4, 4, 8, 0),  // zero-width: dropped
+                node(4, 15, 8, 0), // spans the line break: dropped
+                node(14, 15, 8, 4),
+            ],
+            text,
+        );
+        assert_eq!(data_of(&tokens), vec![1, 4, 1, 8, 4]);
+    }
+
+    // The encoder re-sorts defensively: an out-of-order node list (the ABI does
+    // not guarantee provider order) still yields a valid, monotone delta stream.
+    #[test]
+    fn semantic_tokens_sort_nodes_before_encoding() {
+        let text = "a b\n";
+        let tokens = semantic_tokens(&[node(2, 3, 8, 0), node(0, 1, 8, 2)], text);
+        assert_eq!(data_of(&tokens), vec![0, 0, 1, 8, 2, 0, 2, 1, 8, 0]);
+    }
+
+    // Offsets past the buffer end clamp to the last line's end instead of
+    // panicking (a stale node against a raced edit is truncated, not fatal).
+    #[test]
+    fn semantic_tokens_clamp_offsets_past_the_buffer_end() {
+        let text = "ab";
+        let tokens = semantic_tokens(&[node(1, 99, 8, 0)], text);
+        assert_eq!(data_of(&tokens), vec![0, 1, 1, 8, 0]);
+    }
+
+    // CRLF line breaks: the terminator is part of the line's UTF-16 width for
+    // offset accounting, and columns stay relative to each line start.
+    #[test]
+    fn semantic_tokens_position_across_crlf_terminators() {
+        let text = "ab\r\ncd\r\n";
+        let tokens = semantic_tokens(&[node(0, 2, 8, 0), node(4, 6, 8, 0)], text);
+        assert_eq!(data_of(&tokens), vec![0, 0, 2, 8, 0, 1, 0, 2, 8, 0]);
+    }
+
+    // `/range` slices server-side BEFORE encoding: tokens strictly outside the
+    // range drop, one straddling an edge is kept whole, and the first kept
+    // token's deltas are absolute from the document origin.
+    #[test]
+    fn semantic_tokens_range_slices_overlapping_tokens_and_restarts_deltas() {
+        let text = "aa bb\ncc dd\nee ff\n";
+        let nodes = [
+            node(0, 2, 8, 0),   // line 0 "aa"
+            node(3, 5, 8, 0),   // line 0 "bb" — straddles the range start
+            node(6, 8, 13, 0),  // line 1 "cc"
+            node(12, 14, 8, 0), // line 2 "ee" — starts exactly at range end
+        ];
+        let range = lsp_types::Range::new(
+            lsp_types::Position::new(0, 4),
+            lsp_types::Position::new(2, 0),
+        );
+        let tokens = semantic_tokens_range(&nodes, text, &range);
+        assert_eq!(
+            data_of(&tokens),
+            vec![
+                0, 3, 2, 8, 0, // "bb": absolute (0, 3) — straddling token kept whole
+                1, 0, 2, 13, 0, // "cc"
+            ]
+        );
+    }
+
+    // An empty node list (a cold island's degrade, or a genuinely token-free
+    // buffer) encodes to the empty stream — a valid SemanticTokens, not null.
+    #[test]
+    fn semantic_tokens_of_no_nodes_is_the_empty_stream() {
+        let tokens = semantic_tokens(&[], "val a = 1\n");
+        assert_eq!(data_of(&tokens), Vec::<u32>::new());
     }
 
     // Folding kinds map the boundary ordinals to the LSP kind strings; 0

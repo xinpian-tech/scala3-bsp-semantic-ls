@@ -21,7 +21,10 @@ use ls_bsp::protocol::PublishDiagnosticsParams as BspPublishDiagnosticsParams;
 use ls_bsp::uri::path_to_uri;
 use ls_bsp::wire::{read_message, write_message};
 use ls_bsp::{BspClientHandlers, BspSession, BspSessionConfig};
-use ls_server::{ready_model_from_session, DiagnosticRouter, LoadOutcome, ModelSource, OutputSink};
+use ls_server::{
+    ready_model_from_session, DiagnosticRouter, LoadOutcome, ModelSource, OutputSink,
+    PcDiagnosticsLayer, PublishDiagnosticsParams,
+};
 
 use crate::fixtures::{default_targets, fixtures_root, sources_root, target_id};
 
@@ -318,8 +321,13 @@ pub struct FakeBspModelSource<W: Write + Send + Sync + 'static> {
     streams: Arc<Mutex<Option<Streams>>>,
     reload_flag: Arc<AtomicBool>,
     /// Production diagnostics plumbing: the session's `on_diagnostics` routes
-    /// each BSP publish through this router straight to the shared output sink.
+    /// each BSP publish through this router, then through the shared PC merge
+    /// layer to the output sink (exactly like `main`).
     router: Arc<Mutex<DiagnosticRouter>>,
+    /// The shared PC/BSP diagnostics merge layer over the sink. Hand it to the
+    /// bootstrap (`IndexBootstrap::with_pc_diagnostics`) so live-typing pulls
+    /// publish into the same merged stream a real server would.
+    pub pc_diagnostics: Arc<PcDiagnosticsLayer>,
     pub sink: Arc<OutputSink<W>>,
 }
 
@@ -330,6 +338,7 @@ impl<W: Write + Send + Sync + 'static> Clone for FakeBspModelSource<W> {
             streams: Arc::clone(&self.streams),
             reload_flag: Arc::clone(&self.reload_flag),
             router: Arc::clone(&self.router),
+            pc_diagnostics: Arc::clone(&self.pc_diagnostics),
             sink: Arc::clone(&self.sink),
         }
     }
@@ -345,12 +354,12 @@ impl<W: Write + Send + Sync + 'static> ModelSource for FakeBspModelSource<W> {
             .ok_or_else(|| "fake BSP streams already consumed".to_string())?;
         let reload = Arc::clone(&self.reload_flag);
         let router = Arc::clone(&self.router);
-        let sink = Arc::clone(&self.sink);
+        let layer = Arc::clone(&self.pc_diagnostics);
         let handlers = BspClientHandlers::new()
             .on_did_change_build_target(move |_| reload.store(true, Ordering::SeqCst))
             .on_diagnostics(move |params: BspPublishDiagnosticsParams| {
                 if let Some(publish) = router.lock().unwrap().accept(&params) {
-                    let _ = sink.publish_diagnostics(&publish);
+                    layer.bsp_published(publish);
                 }
             });
         let session = BspSession::connect(
@@ -399,11 +408,18 @@ impl FakeBsp {
 
         let input: Box<dyn Read + Send> = Box::new(client.try_clone().unwrap());
         let output: Box<dyn Write + Send> = Box::new(client);
+        let pc_diagnostics = PcDiagnosticsLayer::new({
+            let sink = Arc::clone(&sink);
+            Arc::new(move |publish: &PublishDiagnosticsParams| {
+                let _ = sink.publish_diagnostics(publish);
+            })
+        });
         let source = FakeBspModelSource {
             workspace_root: workspace_root.clone(),
             streams: Arc::new(Mutex::new(Some((input, output)))),
             reload_flag,
             router: Arc::new(Mutex::new(DiagnosticRouter::new())),
+            pc_diagnostics,
             sink,
         };
         (

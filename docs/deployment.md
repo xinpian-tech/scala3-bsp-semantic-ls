@@ -336,13 +336,14 @@ server for `scala` whose command is the binary and whose root is the workspace.
 | InlayHint (`resolveProvider: false`)             | presentation-compiler hints over the open buffer; the server's fixed default category set (inferred types, implicit params, by-name params, implicit conversions, named params — type params / xray / pattern-match / closing labels off); every hint ships complete, there is no `inlayHint/resolve` |
 | SelectionRange                                   | pure syntax over the open buffer (no SemanticDB needed); `null` for a buffer the PC does not hold |
 | FoldingRange                                     | the parser-only folding walker over the open buffer (kinds `comment`/`imports`/`region`); `[]` for a buffer the PC does not hold |
+| SemanticTokens (`full: true`, `range: true`)     | presentation-compiler symbol tokens over the open buffer; the legend is EXACTLY the PC-vendored `scala.meta.internal.pc.SemanticTokens` lists (23 types / 10 modifiers). Advertised unconditionally (every mainstream client sends the standard token capability; one that lacks it simply never asks). **No** `full.delta` — delta requests are not implemented, `resultId` is never emitted. `null` for a buffer the PC does not hold. NOTE: a client that auto-requests semantic tokens on open (VS Code, nvim 0.10+) thereby issues a PC query, which boots the embedded JVM island |
 | executeCommand (4 command IDs — §4.6)            |                                              |
-| **Diagnostics: push-only**                       | BSP `build/publishDiagnostics` is forwarded live as `textDocument/publishDiagnostics` (per-URI merge across targets, per-target reset); **no** pull `diagnosticProvider` |
+| **Diagnostics: push-only**                       | BSP `build/publishDiagnostics` is forwarded live as `textDocument/publishDiagnostics` (per-URI merge across targets, per-target reset); **no** pull `diagnosticProvider`. PLUS live-typing diagnostics: on `didChange` a debounced (300ms) presentation-compiler pull publishes secondary diagnostics under the source tag `scala3-pc (typing)` for the open **dirty** buffer only — merged after the BSP set, cleared on save/close or when a compile publish arrives for the file. The pull never boots a cold island: typing diagnostics activate once some PC query (hover, completion, semantic tokens) has booted it |
 
-**Not advertised** (do not enable client-side): semanticTokens, codeAction,
+**Not advertised** (do not enable client-side): codeAction,
 formatting/rangeFormatting, and pull diagnostics.
-Diagnostics appear only after bootstrap connects to a BSP build and a compile
-runs.
+Compile diagnostics appear only after bootstrap connects to a BSP build and a
+compile runs; typing diagnostics appear only once the PC island is booted.
 
 ### 4.6 Server commands (`workspace/executeCommand`)
 

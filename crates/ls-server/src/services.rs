@@ -51,6 +51,7 @@ use crate::doctor::{
 use crate::documents::DocumentStore;
 use crate::jsonrpc::{error_codes, RequestId, Response, ResponseError};
 use crate::pc::{PcLocation, PcPluginStatusReport, PcQueryService};
+use crate::pc_diagnostics::{PcDiagnosticsLayer, PcDiagnosticsScheduler};
 use crate::pc_overlay::{PcOnlySymbol, PcOverlayInner};
 use crate::protocol::Position;
 use crate::server::{Handlers, RequestContext, WatchedFileEvent};
@@ -111,6 +112,13 @@ pub struct CoreServices {
     /// without SemanticDB output is counted and surfaced (the Scala doctor's
     /// `model.targets`/`model.unavailableTargets`).
     doctor_targets: DoctorTargets,
+    /// The PC/BSP diagnostics merge layer (shared with the BSP session's
+    /// `on_diagnostics` route, which feeds it the routed publishes). Retained
+    /// so a build-model reload can hand the SAME layer to the rebuilt bundle.
+    pub(crate) pc_diagnostics: Arc<PcDiagnosticsLayer>,
+    /// The debounced per-URI `pc_diagnostics` pull worker (`didChange` -> the
+    /// PC-overlay publish). Dropping the services stops and joins it.
+    pc_diagnostics_scheduler: PcDiagnosticsScheduler,
 }
 
 /// The retained build capability: a [`CompileService`] that can also refetch the
@@ -138,8 +146,11 @@ impl CoreServices {
         bsp_connected: bool,
         pc_overlay: Arc<PcOverlayInner>,
         doctor_targets: DoctorTargets,
+        pc_diagnostics: Arc<PcDiagnosticsLayer>,
     ) -> CoreServices {
         let scheduler = BuildScheduler::new(Arc::clone(&orchestrator), Arc::clone(&compiler));
+        let pc_diagnostics_scheduler =
+            PcDiagnosticsScheduler::new(Arc::clone(&pc), Arc::clone(&pc_diagnostics));
         CoreServices {
             orchestrator,
             uris,
@@ -152,6 +163,8 @@ impl CoreServices {
             scheduler,
             pc_overlay,
             doctor_targets,
+            pc_diagnostics,
+            pc_diagnostics_scheduler,
         }
     }
 
@@ -178,8 +191,29 @@ impl CoreServices {
                 .upgrade()
                 .is_none_or(|orch| orch.workspace_symbol_name_exists(name))
         });
-        self.pc_overlay
-            .install(docs, Arc::clone(&self.pc), to_file_uri, is_indexed_name);
+        self.pc_overlay.install(
+            docs.clone(),
+            Arc::clone(&self.pc),
+            to_file_uri,
+            is_indexed_name,
+        );
+        // The live-typing diagnostics pull reads the same shared store for its
+        // open/dirty gate.
+        self.pc_diagnostics_scheduler.install_docs(docs);
+    }
+
+    /// `didChange` arrived for an open buffer (the PC mirror already updated):
+    /// arm (or coalesce into) the URI's debounced `pc_diagnostics` pull.
+    pub(crate) fn schedule_pc_diagnostics(&self, uri: &str) {
+        self.pc_diagnostics_scheduler.schedule(uri);
+    }
+
+    /// `didSave`/`didClose`: the buffer is clean (or gone) — disarm any
+    /// pending pull and clear the URI's PC overlay (republishing BSP-only
+    /// truth if typing diagnostics were showing).
+    pub(crate) fn clear_pc_diagnostics(&self, uri: &str) {
+        self.pc_diagnostics_scheduler.cancel(uri);
+        self.pc_diagnostics.clear_pc(uri);
     }
 
     /// PC-only unsaved top-level symbols matching `query` (the overlay's
@@ -375,6 +409,12 @@ impl Handlers<CoreServices> for CoreHandlers {
             "textDocument/inlayHint" => inlay_hint(id, cx.services, &cx.request.params),
             "textDocument/selectionRange" => selection_range(id, cx.services, &cx.request.params),
             "textDocument/foldingRange" => folding_range(id, cx.services, &cx.request.params),
+            "textDocument/semanticTokens/full" => {
+                semantic_tokens_full(id, cx.services, cx.documents, &cx.request.params)
+            }
+            "textDocument/semanticTokens/range" => {
+                semantic_tokens_range(id, cx.services, cx.documents, &cx.request.params)
+            }
             "completionItem/resolve" => {
                 resolve_completion_item(id, cx.services, &cx.request.params)
             }
@@ -395,23 +435,34 @@ impl Handlers<CoreServices> for CoreHandlers {
     /// An open buffer changed: update the mirror if the PC already holds the
     /// buffer, otherwise open it (a change that arrives before the PC has the
     /// buffer). Ports `TextDocs.didChange`'s `if bufferText(uri).isDefined then
-    /// didChange else uriToTarget.get(uri).foreach(didOpen)`.
+    /// didChange else uriToTarget.get(uri).foreach(didOpen)`. After the mirror
+    /// update, arm the debounced live-typing diagnostics pull — a background
+    /// job, never blocking the loop (and never booting a cold island).
     fn on_did_change(&self, services: &CoreServices, uri: &str, text: &str) {
         if services.pc.is_open(uri) {
             services.pc.did_change(uri, text);
         } else if let Some(target_id) = services.uri_to_target.get(uri) {
             services.pc.did_open(target_id, uri, text);
         }
+        if services.pc.is_open(uri) {
+            services.schedule_pc_diagnostics(uri);
+        }
     }
 
-    /// A buffer closed: drop it from the mirror. Ports `TextDocs.didClose`'s
-    /// unconditional `s.pc.didClose(uri)`.
+    /// A buffer closed: drop it from the mirror (ports `TextDocs.didClose`'s
+    /// unconditional `s.pc.didClose(uri)`) and clear its live-typing
+    /// diagnostics overlay — a closed buffer shows BSP truth only.
     fn on_did_close(&self, services: &CoreServices, uri: &str) {
         services.pc.did_close(uri);
+        services.clear_pc_diagnostics(uri);
     }
 
+    /// A buffer saved: schedule the compile-first build job AND clear the
+    /// live-typing diagnostics overlay — the buffer is clean again, so the
+    /// (re)compile's BSP diagnostics are the authority for it.
     fn on_did_save(&self, services: &CoreServices, uri: &str) {
         services.schedule_save_build(uri);
+        services.clear_pc_diagnostics(uri);
     }
 
     /// `workspace/didChangeConfiguration`: the notification's `settings` payload
@@ -947,6 +998,81 @@ fn folding_range(id: RequestId, services: &CoreServices, params: &Value) -> Resp
         .map(crate::pc_lsp::folding_range)
         .collect();
     ok_json(id, &ranges)
+}
+
+/// `textDocument/semanticTokens/full`: the open buffer's semantic tokens as
+/// the LSP delta stream. Gated exactly like hover (the semantic family's
+/// dispatch discipline): `requireSemanticdb` runs FIRST and outside the buffer
+/// fallback — a URI the model does not own via an indexable target is a hard
+/// `NoSemanticdb` error — then a missing URI or a buffer the PC mirror does
+/// not hold (`withPcBuffer`) answers `null` (spec: `SemanticTokens | null`;
+/// null — "no answer" — lets the client keep its current highlighting, where
+/// an empty stream would wipe it). An OPEN buffer always answers a
+/// `SemanticTokens` value, even when the island yields no nodes (a token-free
+/// buffer, or a cold-island degrade): an empty `data` stream.
+///
+/// The island's nodes carry `[start, end)` UTF-16 OFFSETS into the mirrored
+/// text; the conversion to line/character positions runs against the OPEN
+/// BUFFER TEXT from the shared [`DocumentStore`] — the same text the loop fed
+/// the PC mirror, so offsets and positions cannot disagree about the document.
+fn semantic_tokens_full(
+    id: RequestId,
+    services: &CoreServices,
+    documents: &DocumentStore,
+    params: &Value,
+) -> Response {
+    semantic_tokens_response(id, services, documents, params, |nodes, text| {
+        crate::pc_lsp::semantic_tokens(nodes, text)
+    })
+}
+
+/// `textDocument/semanticTokens/range`: the same operation, with the node list
+/// sliced server-side to the tokens overlapping the requested range BEFORE the
+/// delta encoding ([`crate::pc_lsp::semantic_tokens_range`]). A missing or
+/// unparseable `range` answers `null` like the other gates.
+fn semantic_tokens_range(
+    id: RequestId,
+    services: &CoreServices,
+    documents: &DocumentStore,
+    params: &Value,
+) -> Response {
+    let Some(range) = params
+        .get("range")
+        .and_then(|range| serde_json::from_value::<lsp_types::Range>(range.clone()).ok())
+    else {
+        return Response::success(id, Value::Null);
+    };
+    semantic_tokens_response(id, services, documents, params, move |nodes, text| {
+        crate::pc_lsp::semantic_tokens_range(nodes, text, &range)
+    })
+}
+
+/// The shared gate ladder + encode of the two semantic-tokens methods.
+fn semantic_tokens_response(
+    id: RequestId,
+    services: &CoreServices,
+    documents: &DocumentStore,
+    params: &Value,
+    encode: impl Fn(&[ls_pc_abi::payloads::SemanticNode], &str) -> lsp_types::SemanticTokens,
+) -> Response {
+    let Some(raw) = text_document_uri(params) else {
+        return Response::success(id, Value::Null);
+    };
+    if let Err(error) = services.require_semanticdb(&raw) {
+        return request_failed(id, &error);
+    }
+    let uri = normalize_uri(&raw);
+    if !services.pc.is_open(&uri) {
+        return Response::success(id, Value::Null);
+    }
+    // The open-buffer text; the PC mirror holding the buffer implies the
+    // document store does too (both are fed by the same loop), so a miss here
+    // is a defensive null, not an expected path.
+    let Some(text) = documents.text(&uri) else {
+        return Response::success(id, Value::Null);
+    };
+    let nodes = services.pc.semantic_tokens(&uri);
+    ok_json(id, &encode(&nodes, &text))
 }
 
 /// `completionItem/resolve`: enrich the item through the presentation compiler.
@@ -1636,6 +1762,7 @@ mod tests {
             true,
             pc_overlay,
             DoctorTargets::default(),
+            PcDiagnosticsLayer::disconnected(),
         )
     }
 
@@ -1758,6 +1885,7 @@ mod tests {
             true,
             pc_overlay,
             DoctorTargets::default(),
+            PcDiagnosticsLayer::disconnected(),
         )
         .with_scheduler_debounce(std::time::Duration::from_millis(2));
         (services, calls)
@@ -2081,6 +2209,7 @@ mod tests {
             true,
             pc_overlay,
             DoctorTargets::default(),
+            PcDiagnosticsLayer::disconnected(),
         );
         let file_uri = path_to_uri(&dir.path().join("A.scala"));
 

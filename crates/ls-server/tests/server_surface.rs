@@ -211,6 +211,19 @@ fn initialize_advertises_exactly_the_implemented_capability_set() {
     );
     assert_eq!(caps["selectionRangeProvider"], true);
     assert_eq!(caps["foldingRangeProvider"], true);
+    // semanticTokens: full + range as plain booleans (no full.delta — no delta
+    // handler exists), over the PC-vendored 23-type / 10-modifier legend with
+    // the golden anchors at their pinned indices.
+    let tokens = &caps["semanticTokensProvider"];
+    assert_eq!(tokens["full"], true, "{tokens}");
+    assert_eq!(tokens["range"], true, "{tokens}");
+    assert_eq!(tokens["legend"]["tokenTypes"].as_array().unwrap().len(), 23);
+    assert_eq!(
+        tokens["legend"]["tokenModifiers"].as_array().unwrap().len(),
+        10
+    );
+    assert_eq!(tokens["legend"]["tokenTypes"][13], "method");
+    assert_eq!(tokens["legend"]["tokenModifiers"][0], "declaration");
     assert_eq!(
         caps["executeCommandProvider"]["commands"],
         json!([
@@ -220,9 +233,6 @@ fn initialize_advertises_exactly_the_implemented_capability_set() {
             "scala3SemanticLs.pcPluginStatus"
         ])
     );
-
-    // Deliberately ABSENT surfaces (never advertised-and-broken).
-    assert!(caps.get("semanticTokensProvider").is_none(), "{caps}");
     let commands = caps["executeCommandProvider"]["commands"].to_string();
     assert!(commands.contains("pcPluginStatus"), "{commands}");
 
@@ -296,6 +306,11 @@ fn pre_ready_methods_take_their_per_method_fallbacks() {
             "textDocument/prepareRename",
             json!({ "textDocument": { "uri": uri }, "position": { "line": 2, "character": 6 } }),
         ),
+        request(
+            5,
+            "textDocument/semanticTokens/full",
+            json!({ "textDocument": { "uri": uri } }),
+        ),
         notification("exit", json!({})),
     ]
     .concat();
@@ -323,6 +338,14 @@ fn pre_ready_methods_take_their_per_method_fallbacks() {
         by_id(&out, 4)["result"],
         Value::Null,
         "prepareRename → null"
+    );
+    // The spec result is `SemanticTokens | null`: pre-ready answers null (a
+    // client that auto-requests tokens on open must not see an error or an
+    // empty stream that wipes its highlighting).
+    assert_eq!(
+        by_id(&out, 5)["result"],
+        Value::Null,
+        "semanticTokens/full → null"
     );
 }
 
