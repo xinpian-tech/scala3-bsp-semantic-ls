@@ -25,7 +25,10 @@
 //! methods follow the same dispatch discipline (`require_semanticdb` where it
 //! applies, the `withPcBuffer` gate, empty/null fallbacks) with their LSP
 //! shapes bridged through `lsp_types` models (`crate::pc_lsp`), not hand-rolled
-//! serde.
+//! serde. `textDocument/codeAction` is the ASSEMBLY layer over the island's
+//! `code_action`/`auto_imports` ops: literal actions with inline
+//! `WorkspaceEdit`s, eagerly resolved at assembly time so a refused or empty
+//! op never reaches the client menu (see [`code_action`]).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -409,6 +412,9 @@ impl Handlers<CoreServices> for CoreHandlers {
             "textDocument/inlayHint" => inlay_hint(id, cx.services, &cx.request.params),
             "textDocument/selectionRange" => selection_range(id, cx.services, &cx.request.params),
             "textDocument/foldingRange" => folding_range(id, cx.services, &cx.request.params),
+            "textDocument/codeAction" => {
+                code_action(id, cx.services, cx.documents, &cx.request.params)
+            }
             "textDocument/semanticTokens/full" => {
                 semantic_tokens_full(id, cx.services, cx.documents, &cx.request.params)
             }
@@ -1000,6 +1006,436 @@ fn folding_range(id: RequestId, services: &CoreServices, params: &Value) -> Resp
     ok_json(id, &ranges)
 }
 
+/// The cap on assembled code actions per request: the quickfix imports plus
+/// the seven refactor probes stay well under it in practice; a pathological
+/// diagnostic set (many missing symbols, many candidates each) is truncated
+/// rather than flooding the client menu.
+const CODE_ACTION_CAP: usize = 20;
+
+/// The widest argument-index set the convert-to-named-arguments probe passes
+/// to the island. The LSP request carries no per-argument selection, so the
+/// assembly asks the provider to name EVERY argument (dotty's provider simply
+/// ignores indices past the actual argument count) and then drops the inserts
+/// whose argument is already named ([`drop_already_named_inserts`]).
+const NAMED_ARGS_PROBE_INDICES: i32 = 64;
+
+/// `textDocument/codeAction`: assemble literal `lsp_types::CodeAction`s over
+/// the island's PC ops. The ASSEMBLY is new Rust logic; every EDIT comes from
+/// the presentation compiler (`code_action` with the action-id enum, and
+/// `auto_imports` for the missing-symbol quickfix).
+///
+/// Dispatch follows the hover ladder: `require_semanticdb` runs FIRST and
+/// outside the buffer fallback (a URI the model does not own via an indexable
+/// target is a hard `NoSemanticdb` error — insert-type/implement-members are
+/// typer-backed, so the semantic gate applies), then a missing/unparseable
+/// range or a buffer the PC mirror does not hold (`withPcBuffer`) answers the
+/// empty action list.
+///
+/// EAGER RESOLUTION, by decision: each action's edit is computed DURING
+/// assembly and attached inline on the action (`edit: WorkspaceEdit` — no
+/// `workspace/executeCommand` round trip, no `codeAction/resolve`), because
+/// the island's refusal-as-data contract only surfaces when an op actually
+/// RUNS — a refusal (or an empty edit list) DROPS the action, so the client
+/// menu never offers an action that would then do nothing. The cost is up to
+/// eight single-position PC queries per request; they are cheap point queries
+/// against the already-mirrored buffer, and assembly happens only on an
+/// explicit client request (typically on cursor rest), so the trade is taken
+/// deliberately and documented here.
+fn code_action(
+    id: RequestId,
+    services: &CoreServices,
+    documents: &DocumentStore,
+    params: &Value,
+) -> Response {
+    let Some(raw) = text_document_uri(params) else {
+        return Response::success(id, json!([]));
+    };
+    if let Err(error) = services.require_semanticdb(&raw) {
+        return request_failed(id, &error);
+    }
+    let Some(range) = params
+        .get("range")
+        .and_then(|range| serde_json::from_value::<lsp_types::Range>(range.clone()).ok())
+    else {
+        return Response::success(id, json!([]));
+    };
+    let uri = normalize_uri(&raw);
+    if !services.pc.is_open(&uri) {
+        return Response::success(id, json!([]));
+    }
+    let context = params.get("context");
+    let diagnostics: Vec<lsp_types::Diagnostic> = context
+        .and_then(|context| context.get("diagnostics"))
+        .and_then(|diagnostics| serde_json::from_value(diagnostics.clone()).ok())
+        .unwrap_or_default();
+    let only: Option<Vec<lsp_types::CodeActionKind>> = context
+        .and_then(|context| context.get("only"))
+        .and_then(|only| serde_json::from_value(only.clone()).ok());
+    let text = documents.text(&uri);
+    let actions = assemble_code_actions(
+        services.pc.as_ref(),
+        &uri,
+        text.as_deref(),
+        &range,
+        &diagnostics,
+        only.as_deref(),
+    );
+    ok_json(id, &actions)
+}
+
+/// The missing-symbol name of a dotty missing-symbol diagnostic message, or
+/// `None` when the message is not one. Matched patterns (the documented
+/// contract of the import quickfix):
+///
+/// - `Not found: X` (dotty `MissingIdent`)
+/// - `Not found: type X` (the type-position variant)
+///
+/// The name is the leading identifier run (`[A-Za-z0-9_$]+`) after the prefix,
+/// so a message with trailing prose (e.g. an `-explain` addendum on following
+/// lines) still parses. The `value X is not a member of Y` family is
+/// deliberately NOT parsed: it names an extension-method/member candidate that
+/// would need `isExtension = true` auto-imports plus receiver-type analysis
+/// this assembly does not attempt.
+fn missing_symbol_name(message: &str) -> Option<String> {
+    let rest = message.strip_prefix("Not found: ")?;
+    let rest = rest.strip_prefix("type ").unwrap_or(rest);
+    let name: String = rest
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '$')
+        .collect();
+    (!name.is_empty()).then_some(name)
+}
+
+/// Whether a diagnostic message is dotty's not-implemented-members error — the
+/// context that flips "Implement all members" from `refactor.rewrite` to a
+/// `quickfix` attached to the diagnostic. Matches the two dotty spellings:
+/// `... needs to be abstract ...` (a class missing implementations) and
+/// `object creation impossible ...` (the object/anonymous-class variant).
+fn is_not_implemented_message(message: &str) -> bool {
+    message.contains("needs to be abstract") || message.contains("object creation impossible")
+}
+
+/// LSP `context.only` kind filtering: a kind passes when some requested filter
+/// equals it or is a hierarchical prefix (`refactor` matches
+/// `refactor.rewrite`; the spec's kinds form a `.`-separated hierarchy). An
+/// absent `only` passes everything; the empty-string filter is the hierarchy
+/// root and also passes everything.
+fn kind_allowed(
+    kind: &lsp_types::CodeActionKind,
+    only: Option<&[lsp_types::CodeActionKind]>,
+) -> bool {
+    let Some(only) = only else {
+        return true;
+    };
+    only.iter().any(|filter| {
+        let filter = filter.as_str();
+        let kind = kind.as_str();
+        filter.is_empty()
+            || kind == filter
+            || (kind.starts_with(filter) && kind.as_bytes().get(filter.len()) == Some(&b'.'))
+    })
+}
+
+/// The byte offset of a zero-based (line, UTF-16 character) position in
+/// `text`, clamped to the line end. `None` when the line does not exist.
+fn byte_offset_at(text: &str, line: u32, character: u32) -> Option<usize> {
+    let index = line_index::LineIndex::new(text);
+    let range = index.line(line)?;
+    let slice = &text[usize::from(range.start())..usize::from(range.end())];
+    let mut units = 0u32;
+    let mut offset = usize::from(range.start());
+    for ch in slice.chars() {
+        if units >= character {
+            break;
+        }
+        units += ch.len_utf16() as u32;
+        offset += ch.len_utf8();
+    }
+    Some(offset)
+}
+
+/// Drops convert-to-named-arguments inserts whose argument is ALREADY named.
+/// The assembly probes the provider with every argument index
+/// ([`NAMED_ARGS_PROBE_INDICES`] — the LSP request names none), and dotty's
+/// provider prepends `param = ` to whatever argument sits at an index it was
+/// given, INCLUDING one that is already a named argument (its callers are
+/// expected to pass unnamed indices only). Each insert is independent (a
+/// zero-width `param = ` insert at the argument start), so filtering the
+/// already-named ones — the buffer text at the insert position already reads
+/// `param =` (and not `==`) — leaves exactly the correct conversion of the
+/// unnamed arguments.
+fn drop_already_named_inserts(
+    edits: Vec<ls_pc_abi::payloads::TextEdit>,
+    text: &str,
+) -> Vec<ls_pc_abi::payloads::TextEdit> {
+    edits
+        .into_iter()
+        .filter(|edit| {
+            let Some(param) = edit.new_text.strip_suffix(" = ") else {
+                return true;
+            };
+            let Some(offset) =
+                byte_offset_at(text, edit.range.start_line, edit.range.start_character)
+            else {
+                return true;
+            };
+            let Some(rest) = text[offset..].strip_prefix(param) else {
+                return true;
+            };
+            let rest = rest.trim_start();
+            !rest.starts_with('=') || rest.starts_with("==")
+        })
+        .collect()
+}
+
+/// Assembles the literal code-action list for one request. New Rust logic on
+/// top of the island ops; see [`code_action`] for the eager-resolution
+/// decision. Assembly order (also the response order): the missing-symbol
+/// import quickfixes (context-diagnostic order, candidates best-first), then
+/// the refactor probes — insert inferred type, implement abstract members,
+/// convert to named arguments, inline value, create method from usage,
+/// extract method, convert to named lambda parameters. `only` filtering is
+/// applied BEFORE each probe (a filtered-out kind costs no PC query) and the
+/// total is capped at [`CODE_ACTION_CAP`].
+fn assemble_code_actions(
+    pc: &dyn PcQueryService,
+    uri: &str,
+    text: Option<&str>,
+    range: &lsp_types::Range,
+    diagnostics: &[lsp_types::Diagnostic],
+    only: Option<&[lsp_types::CodeActionKind]>,
+) -> Vec<lsp_types::CodeAction> {
+    use ls_pc_abi::payloads::code_action_id;
+
+    let mut actions: Vec<lsp_types::CodeAction> = Vec::new();
+    let start = crate::pc_lsp::abi_pos(&range.start);
+    let end = crate::pc_lsp::abi_pos(&range.end);
+
+    // A literal action with its inline edit; `None` when the URI does not
+    // yield a WorkspaceEdit (defensive; see `pc_lsp::workspace_edit`).
+    let literal = |title: &str,
+                   kind: lsp_types::CodeActionKind,
+                   diagnostic: Option<&lsp_types::Diagnostic>,
+                   is_preferred: Option<bool>,
+                   edits: &[ls_pc_abi::payloads::TextEdit]|
+     -> Option<lsp_types::CodeAction> {
+        Some(lsp_types::CodeAction {
+            title: title.to_string(),
+            kind: Some(kind),
+            diagnostics: diagnostic.map(|diagnostic| vec![diagnostic.clone()]),
+            edit: Some(crate::pc_lsp::workspace_edit(uri, edits)?),
+            command: None,
+            is_preferred,
+            disabled: None,
+            data: None,
+        })
+    };
+
+    // (a) Quickfix — import the missing symbol: one action per auto-import
+    // candidate of each missing-symbol diagnostic in the request context,
+    // marked preferred when the diagnostic has exactly one candidate.
+    if kind_allowed(&lsp_types::CodeActionKind::QUICKFIX, only) {
+        for diagnostic in diagnostics {
+            if actions.len() >= CODE_ACTION_CAP {
+                break;
+            }
+            let Some(name) = missing_symbol_name(&diagnostic.message) else {
+                continue;
+            };
+            let imports = pc.auto_imports(
+                uri,
+                crate::pc_lsp::abi_pos(&diagnostic.range.start),
+                &name,
+                false,
+            );
+            let sole = imports.len() == 1;
+            for import in imports {
+                if actions.len() >= CODE_ACTION_CAP {
+                    break;
+                }
+                if import.edits.is_empty() {
+                    continue;
+                }
+                let title = format!("Import '{name}' from '{}'", import.package_name);
+                actions.extend(literal(
+                    &title,
+                    lsp_types::CodeActionKind::QUICKFIX,
+                    Some(diagnostic),
+                    sole.then_some(true),
+                    &import.edits,
+                ));
+            }
+        }
+    }
+
+    // (b) The refactor probes: each op runs eagerly at assembly time and the
+    // action is included only when the island answered edits without a
+    // refusal (a refusal, or an empty edit list, drops the action).
+    let probe = |action: i32,
+                 position: ls_pc_abi::payloads::Pos,
+                 extraction_end: Option<ls_pc_abi::payloads::Pos>,
+                 arg_indices: Option<Vec<i32>>|
+     -> Option<Vec<ls_pc_abi::payloads::TextEdit>> {
+        let result = pc.code_action(uri, action, position, extraction_end, arg_indices);
+        (result.refusal.is_none() && !result.edits.is_empty()).then_some(result.edits)
+    };
+    let push = |actions: &mut Vec<lsp_types::CodeAction>, action: Option<lsp_types::CodeAction>| {
+        if actions.len() < CODE_ACTION_CAP {
+            actions.extend(action);
+        }
+    };
+
+    // Insert inferred type — at the cursor (range start).
+    let rewrite = lsp_types::CodeActionKind::REFACTOR_REWRITE;
+    if kind_allowed(&rewrite, only) && actions.len() < CODE_ACTION_CAP {
+        let action =
+            probe(code_action_id::INSERT_INFERRED_TYPE, start, None, None).and_then(|edits| {
+                literal(
+                    "Insert type annotation",
+                    rewrite.clone(),
+                    None,
+                    None,
+                    &edits,
+                )
+            });
+        push(&mut actions, action);
+    }
+
+    // Implement all members — a quickfix attached to the not-implemented
+    // diagnostic when the context carries one, else a rewrite refactor.
+    let not_implemented = diagnostics
+        .iter()
+        .find(|diagnostic| is_not_implemented_message(&diagnostic.message));
+    let implement_kind = if not_implemented.is_some() {
+        lsp_types::CodeActionKind::QUICKFIX
+    } else {
+        rewrite.clone()
+    };
+    if kind_allowed(&implement_kind, only) && actions.len() < CODE_ACTION_CAP {
+        let action = probe(
+            code_action_id::IMPLEMENT_ABSTRACT_MEMBERS,
+            start,
+            None,
+            None,
+        )
+        .and_then(|edits| {
+            literal(
+                "Implement all members",
+                implement_kind,
+                not_implemented,
+                None,
+                &edits,
+            )
+        });
+        push(&mut actions, action);
+    }
+
+    // Convert to named arguments — the dotty provider resolves the call from
+    // the position IN FRONT of the cursor (its own test harness puts the
+    // cursor at the END of the call), so range.start over a whole-call or
+    // zero-width-at-the-start range often misses the apply. Probed at
+    // range.start first, then at range.end (the finding: the END probe is
+    // what resolves a selected call; see the wire/unit pins). The already-
+    // named guard needs the open-buffer text; without it the action is
+    // skipped rather than offered unverified.
+    if kind_allowed(&rewrite, only) && actions.len() < CODE_ACTION_CAP {
+        if let Some(text) = text {
+            let indices: Vec<i32> = (0..NAMED_ARGS_PROBE_INDICES).collect();
+            let edits = probe(
+                code_action_id::CONVERT_TO_NAMED_ARGUMENTS,
+                start,
+                None,
+                Some(indices.clone()),
+            )
+            .or_else(|| {
+                if end == start {
+                    return None;
+                }
+                probe(
+                    code_action_id::CONVERT_TO_NAMED_ARGUMENTS,
+                    end,
+                    None,
+                    Some(indices),
+                )
+            })
+            .map(|edits| drop_already_named_inserts(edits, text))
+            .filter(|edits| !edits.is_empty());
+            let action = edits.and_then(|edits| {
+                literal(
+                    "Convert to named arguments",
+                    rewrite.clone(),
+                    None,
+                    None,
+                    &edits,
+                )
+            });
+            push(&mut actions, action);
+        }
+    }
+
+    // Inline value — at the cursor.
+    let inline = lsp_types::CodeActionKind::REFACTOR_INLINE;
+    if kind_allowed(&inline, only) && actions.len() < CODE_ACTION_CAP {
+        let action = probe(code_action_id::INLINE_VALUE, start, None, None)
+            .and_then(|edits| literal("Inline value", inline, None, None, &edits));
+        push(&mut actions, action);
+    }
+
+    // Create method from usage — a quickfix offered only against a Not-found
+    // diagnostic in the context (the op scaffolds the unresolved call the
+    // diagnostic names; without one there is no usage to create from).
+    let not_found = diagnostics
+        .iter()
+        .find(|diagnostic| missing_symbol_name(&diagnostic.message).is_some());
+    if kind_allowed(&lsp_types::CodeActionKind::QUICKFIX, only) && actions.len() < CODE_ACTION_CAP {
+        if let Some(diagnostic) = not_found {
+            let action = probe(code_action_id::INSERT_INFERRED_METHOD, start, None, None).and_then(
+                |edits| {
+                    literal(
+                        "Create method from usage",
+                        lsp_types::CodeActionKind::QUICKFIX,
+                        Some(diagnostic),
+                        None,
+                        &edits,
+                    )
+                },
+            );
+            push(&mut actions, action);
+        }
+    }
+
+    // Extract method — only for a non-empty range; the selection is
+    // [range.start, range.end] with the extraction anchored at its start.
+    let extract = lsp_types::CodeActionKind::REFACTOR_EXTRACT;
+    if kind_allowed(&extract, only) && actions.len() < CODE_ACTION_CAP && end != start {
+        let action = probe(code_action_id::EXTRACT_METHOD, start, Some(end), None)
+            .and_then(|edits| literal("Extract method", extract, None, None, &edits));
+        push(&mut actions, action);
+    }
+
+    // Convert to named lambda parameters — at the cursor.
+    if kind_allowed(&rewrite, only) && actions.len() < CODE_ACTION_CAP {
+        let action = probe(
+            code_action_id::CONVERT_TO_NAMED_LAMBDA_PARAMETERS,
+            start,
+            None,
+            None,
+        )
+        .and_then(|edits| {
+            literal(
+                "Convert to named lambda parameters",
+                rewrite.clone(),
+                None,
+                None,
+                &edits,
+            )
+        });
+        push(&mut actions, action);
+    }
+
+    actions
+}
+
 /// `textDocument/semanticTokens/full`: the open buffer's semantic tokens as
 /// the LSP delta stream. Gated exactly like hover (the semantic family's
 /// dispatch discipline): `requireSemanticdb` runs FIRST and outside the buffer
@@ -1498,6 +1934,17 @@ mod tests {
         /// Counts `on_config_changed` calls (shared so the test observes them
         /// after the fake moves into the services bundle).
         config_changes: Arc<std::sync::atomic::AtomicUsize>,
+        /// Scripted `code_action` answers: `(action id, only-at-position,
+        /// result)` — a `Some` position gates the entry on the exact probe
+        /// position (the convert-to-named-arguments end-probe test), `None`
+        /// answers at any position. Unscripted ids answer the empty default.
+        code_actions: Vec<(
+            i32,
+            Option<ls_pc_abi::payloads::Pos>,
+            ls_pc_abi::payloads::CodeActionResult,
+        )>,
+        /// Scripted `auto_imports` candidates, returned for every query.
+        auto_imports: Vec<ls_pc_abi::payloads::AutoImport>,
     }
 
     impl PcQueryService for FakePc {
@@ -1535,6 +1982,436 @@ mod tests {
             self.config_changes
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
+        fn code_action(
+            &self,
+            _u: &str,
+            action: i32,
+            position: ls_pc_abi::payloads::Pos,
+            _e: Option<ls_pc_abi::payloads::Pos>,
+            _a: Option<Vec<i32>>,
+        ) -> ls_pc_abi::payloads::CodeActionResult {
+            self.code_actions
+                .iter()
+                .find(|(id, at, _)| *id == action && at.is_none_or(|p| p == position))
+                .map(|(_, _, result)| result.clone())
+                .unwrap_or_default()
+        }
+        fn auto_imports(
+            &self,
+            _u: &str,
+            _p: ls_pc_abi::payloads::Pos,
+            _n: &str,
+            _x: bool,
+        ) -> Vec<ls_pc_abi::payloads::AutoImport> {
+            self.auto_imports.clone()
+        }
+    }
+
+    // --- textDocument/codeAction: the assembly layer ------------------------
+
+    use ls_pc_abi::payloads::{code_action_id, Pos as AbiPos, Rng as AbiRng};
+
+    fn abi_insert(line: u32, character: u32, new_text: &str) -> ls_pc_abi::payloads::TextEdit {
+        ls_pc_abi::payloads::TextEdit {
+            range: AbiRng {
+                start_line: line,
+                start_character: character,
+                end_line: line,
+                end_character: character,
+            },
+            new_text: new_text.to_string(),
+        }
+    }
+
+    fn edits_result(
+        edits: Vec<ls_pc_abi::payloads::TextEdit>,
+    ) -> ls_pc_abi::payloads::CodeActionResult {
+        ls_pc_abi::payloads::CodeActionResult {
+            edits,
+            refusal: None,
+        }
+    }
+
+    fn refusal_result(message: &str) -> ls_pc_abi::payloads::CodeActionResult {
+        ls_pc_abi::payloads::CodeActionResult {
+            edits: Vec::new(),
+            refusal: Some(message.to_string()),
+        }
+    }
+
+    fn import_candidate(package: &str, name: &str) -> ls_pc_abi::payloads::AutoImport {
+        ls_pc_abi::payloads::AutoImport {
+            package_name: package.to_string(),
+            edits: vec![abi_insert(0, 0, &format!("import {package}.{name}\n"))],
+            symbol: None,
+        }
+    }
+
+    fn lsp_diag(message: &str) -> lsp_types::Diagnostic {
+        lsp_types::Diagnostic {
+            range: lsp_types::Range::new(
+                lsp_types::Position::new(2, 6),
+                lsp_types::Position::new(2, 10),
+            ),
+            message: message.to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn cursor_range() -> lsp_types::Range {
+        lsp_types::Range::new(
+            lsp_types::Position::new(2, 6),
+            lsp_types::Position::new(2, 6),
+        )
+    }
+
+    fn titles(actions: &[lsp_types::CodeAction]) -> Vec<String> {
+        actions.iter().map(|a| a.title.clone()).collect()
+    }
+
+    // The documented message-parsing contract: the two `Not found` shapes
+    // parse (identifier prefix only, trailing prose tolerated); everything
+    // else — the `is not a member` family included, by decision — does not.
+    #[test]
+    fn missing_symbol_name_parses_exactly_the_not_found_shapes() {
+        assert_eq!(
+            missing_symbol_name("Not found: Future"),
+            Some("Future".to_string())
+        );
+        assert_eq!(
+            missing_symbol_name("Not found: type Future"),
+            Some("Future".to_string())
+        );
+        assert_eq!(
+            missing_symbol_name("Not found: Futur\nlonger explanation follows"),
+            Some("Futur".to_string())
+        );
+        assert_eq!(
+            missing_symbol_name("value map is not a member of Foo"),
+            None
+        );
+        assert_eq!(missing_symbol_name("not found: lowercase prefix"), None);
+        assert_eq!(missing_symbol_name("Not found: "), None);
+        assert_eq!(missing_symbol_name("Not found: ???"), None);
+        assert_eq!(missing_symbol_name("type mismatch"), None);
+    }
+
+    // A missing-symbol diagnostic assembles one quickfix per auto-import
+    // candidate, preferred only when the candidate is unique, carrying the
+    // diagnostic and the inline WorkspaceEdit.
+    #[test]
+    #[allow(clippy::mutable_key_type)] // lsp_types::Uri key, read-only map
+    fn a_not_found_diagnostic_assembles_preferred_import_quickfixes() {
+        let pc = FakePc {
+            auto_imports: vec![import_candidate("scala.concurrent", "Future")],
+            ..FakePc::default()
+        };
+        let diags = vec![lsp_diag("Not found: Future")];
+        let actions = assemble_code_actions(
+            &pc,
+            "file:///ws/A.scala",
+            Some("object A\n"),
+            &cursor_range(),
+            &diags,
+            None,
+        );
+        assert_eq!(
+            titles(&actions),
+            vec!["Import 'Future' from 'scala.concurrent'"]
+        );
+        let action = &actions[0];
+        assert_eq!(action.kind, Some(lsp_types::CodeActionKind::QUICKFIX));
+        assert_eq!(action.is_preferred, Some(true));
+        assert_eq!(action.diagnostics.as_deref(), Some(&diags[..]));
+        let edit = action.edit.as_ref().expect("an inline edit");
+        let changes = edit.changes.as_ref().expect("changes-keyed edit");
+        let edits = &changes[&"file:///ws/A.scala".parse::<lsp_types::Uri>().unwrap()];
+        assert_eq!(edits[0].new_text, "import scala.concurrent.Future\n");
+
+        // Two candidates: two actions, neither preferred.
+        let pc = FakePc {
+            auto_imports: vec![
+                import_candidate("scala.concurrent", "Future"),
+                import_candidate("java.util.concurrent", "Future"),
+            ],
+            ..FakePc::default()
+        };
+        let actions = assemble_code_actions(
+            &pc,
+            "file:///ws/A.scala",
+            Some("object A\n"),
+            &cursor_range(),
+            &diags,
+            None,
+        );
+        assert_eq!(actions.len(), 2);
+        assert!(
+            actions.iter().all(|a| a.is_preferred.is_none()),
+            "{actions:?}"
+        );
+    }
+
+    // Eager resolution: only the op that answered edits without a refusal
+    // yields an action — the refused inline-value and every empty probe are
+    // DROPPED at assembly time, never reaching the client menu.
+    #[test]
+    fn eager_resolution_drops_refused_and_empty_probes() {
+        let pc = FakePc {
+            code_actions: vec![
+                (
+                    code_action_id::INSERT_INFERRED_TYPE,
+                    None,
+                    edits_result(vec![abi_insert(2, 7, ": Int")]),
+                ),
+                (
+                    code_action_id::INLINE_VALUE,
+                    None,
+                    refusal_result("Non-local value cannot be inlined."),
+                ),
+            ],
+            ..FakePc::default()
+        };
+        let actions = assemble_code_actions(
+            &pc,
+            "file:///ws/A.scala",
+            Some("object A\n"),
+            &cursor_range(),
+            &[],
+            None,
+        );
+        assert_eq!(titles(&actions), vec!["Insert type annotation"]);
+        assert_eq!(
+            actions[0].kind,
+            Some(lsp_types::CodeActionKind::REFACTOR_REWRITE)
+        );
+    }
+
+    // `context.only` filters hierarchically ("refactor" covers
+    // "refactor.rewrite") and a filtered-out kind is never probed.
+    #[test]
+    fn the_only_filter_selects_kinds_hierarchically() {
+        let pc = FakePc {
+            code_actions: vec![(
+                code_action_id::INSERT_INFERRED_TYPE,
+                None,
+                edits_result(vec![abi_insert(2, 7, ": Int")]),
+            )],
+            auto_imports: vec![import_candidate("scala.concurrent", "Future")],
+            ..FakePc::default()
+        };
+        let diags = vec![lsp_diag("Not found: Future")];
+        let refactor_only = vec![lsp_types::CodeActionKind::REFACTOR];
+        let actions = assemble_code_actions(
+            &pc,
+            "file:///ws/A.scala",
+            Some("object A\n"),
+            &cursor_range(),
+            &diags,
+            Some(&refactor_only),
+        );
+        assert_eq!(titles(&actions), vec!["Insert type annotation"]);
+        let quickfix_only = vec![lsp_types::CodeActionKind::QUICKFIX];
+        let actions = assemble_code_actions(
+            &pc,
+            "file:///ws/A.scala",
+            Some("object A\n"),
+            &cursor_range(),
+            &diags,
+            Some(&quickfix_only),
+        );
+        assert_eq!(
+            titles(&actions),
+            vec!["Import 'Future' from 'scala.concurrent'"]
+        );
+        // The hierarchy is `.`-separated, not a plain prefix: "refactor.rew"
+        // must NOT cover "refactor.rewrite".
+        assert!(!kind_allowed(
+            &lsp_types::CodeActionKind::REFACTOR_REWRITE,
+            Some(&[lsp_types::CodeActionKind::new("refactor.rew")])
+        ));
+        // The empty-string filter is the hierarchy root: everything passes.
+        assert!(kind_allowed(
+            &lsp_types::CodeActionKind::QUICKFIX,
+            Some(&[lsp_types::CodeActionKind::new("")])
+        ));
+    }
+
+    // A pathological candidate flood truncates at the cap instead of flooding
+    // the client menu.
+    #[test]
+    fn the_assembled_action_list_is_capped() {
+        let pc = FakePc {
+            auto_imports: (0..30)
+                .map(|i| import_candidate(&format!("pkg{i}"), "Future"))
+                .collect(),
+            code_actions: vec![(
+                code_action_id::INSERT_INFERRED_TYPE,
+                None,
+                edits_result(vec![abi_insert(2, 7, ": Int")]),
+            )],
+            ..FakePc::default()
+        };
+        let diags = vec![lsp_diag("Not found: Future")];
+        let actions = assemble_code_actions(
+            &pc,
+            "file:///ws/A.scala",
+            Some("object A\n"),
+            &cursor_range(),
+            &diags,
+            None,
+        );
+        assert_eq!(actions.len(), CODE_ACTION_CAP);
+    }
+
+    // "Implement all members" flips kind on the diagnostic context: a
+    // not-implemented diagnostic makes it a quickfix carrying the diagnostic;
+    // otherwise it is a plain rewrite refactor.
+    #[test]
+    fn implement_all_members_is_a_quickfix_only_with_the_diagnostic_context() {
+        let pc = FakePc {
+            code_actions: vec![(
+                code_action_id::IMPLEMENT_ABSTRACT_MEMBERS,
+                None,
+                edits_result(vec![abi_insert(3, 0, "  def f: Int = ???\n")]),
+            )],
+            ..FakePc::default()
+        };
+        let actions = assemble_code_actions(
+            &pc,
+            "file:///ws/A.scala",
+            Some("object A\n"),
+            &cursor_range(),
+            &[],
+            None,
+        );
+        assert_eq!(titles(&actions), vec!["Implement all members"]);
+        assert_eq!(
+            actions[0].kind,
+            Some(lsp_types::CodeActionKind::REFACTOR_REWRITE)
+        );
+        assert!(actions[0].diagnostics.is_none());
+
+        let diags = vec![lsp_diag(
+            "class Concrete needs to be abstract, since def foo(x: Int): Int is not defined",
+        )];
+        let actions = assemble_code_actions(
+            &pc,
+            "file:///ws/A.scala",
+            Some("object A\n"),
+            &cursor_range(),
+            &diags,
+            None,
+        );
+        assert_eq!(actions[0].kind, Some(lsp_types::CodeActionKind::QUICKFIX));
+        assert_eq!(actions[0].diagnostics.as_deref(), Some(&diags[..]));
+        // The object variant matches too.
+        assert!(is_not_implemented_message(
+            "object creation impossible, since def f: Int is not defined"
+        ));
+    }
+
+    // The convert-to-named-arguments cursor finding: dotty resolves the call
+    // from the position in front of the cursor, so a probe at the start of a
+    // selected call misses and the END probe is what answers — and the
+    // already-named guard drops the insert for the argument that is already
+    // named, keeping the rest.
+    #[test]
+    #[allow(clippy::mutable_key_type)] // lsp_types::Uri key, read-only map
+    fn convert_to_named_arguments_probes_the_range_end_and_drops_named_args() {
+        //          0123456789012
+        let text = "m(1, b = 2)\n";
+        let end = AbiPos {
+            line: 0,
+            character: 11,
+        };
+        let pc = FakePc {
+            code_actions: vec![(
+                code_action_id::CONVERT_TO_NAMED_ARGUMENTS,
+                Some(end), // answers ONLY at the end probe
+                edits_result(vec![abi_insert(0, 2, "a = "), abi_insert(0, 5, "b = ")]),
+            )],
+            ..FakePc::default()
+        };
+        let range = lsp_types::Range::new(
+            lsp_types::Position::new(0, 0),
+            lsp_types::Position::new(0, 11),
+        );
+        let actions =
+            assemble_code_actions(&pc, "file:///ws/A.scala", Some(text), &range, &[], None);
+        assert_eq!(titles(&actions), vec!["Convert to named arguments"]);
+        let changes = actions[0].edit.as_ref().unwrap().changes.as_ref().unwrap();
+        let edits = &changes[&"file:///ws/A.scala".parse::<lsp_types::Uri>().unwrap()];
+        assert_eq!(edits.len(), 1, "the already-named `b` insert is dropped");
+        assert_eq!(edits[0].new_text, "a = ");
+        assert_eq!(edits[0].range.start.character, 2);
+    }
+
+    // The already-named guard does not misread `==`: an insert in front of a
+    // comparison expression is a real conversion and is kept.
+    #[test]
+    fn the_already_named_guard_keeps_an_equality_argument() {
+        let kept = drop_already_named_inserts(vec![abi_insert(0, 2, "a = ")], "m(a == 1)\n");
+        assert_eq!(kept.len(), 1);
+        // And a genuinely named argument is dropped even with extra spacing.
+        let dropped = drop_already_named_inserts(vec![abi_insert(0, 2, "a = ")], "m(a  = 1)\n");
+        assert!(dropped.is_empty());
+    }
+
+    // "Create method from usage" exists only against a Not-found diagnostic in
+    // the context; "Extract method" only for a non-empty range.
+    #[test]
+    fn create_method_and_extract_method_need_their_contexts() {
+        let pc = FakePc {
+            code_actions: vec![
+                (
+                    code_action_id::INSERT_INFERRED_METHOD,
+                    None,
+                    edits_result(vec![abi_insert(1, 0, "def missing(arg0: Int) = ???\n")]),
+                ),
+                (
+                    code_action_id::EXTRACT_METHOD,
+                    None,
+                    edits_result(vec![abi_insert(1, 0, "def newMethod() = ...\n")]),
+                ),
+            ],
+            ..FakePc::default()
+        };
+        // Zero-width range, no diagnostics: neither action.
+        let actions = assemble_code_actions(
+            &pc,
+            "file:///ws/A.scala",
+            Some("object A\n"),
+            &cursor_range(),
+            &[],
+            None,
+        );
+        assert_eq!(titles(&actions), Vec::<String>::new());
+
+        // A Not-found diagnostic enables the quickfix; a non-empty range
+        // enables the extract refactor with the selection as [start, end].
+        let diags = vec![lsp_diag("Not found: missing")];
+        let range = lsp_types::Range::new(
+            lsp_types::Position::new(2, 4),
+            lsp_types::Position::new(2, 15),
+        );
+        let actions = assemble_code_actions(
+            &pc,
+            "file:///ws/A.scala",
+            Some("object A\n"),
+            &range,
+            &diags,
+            None,
+        );
+        assert_eq!(
+            titles(&actions),
+            vec!["Create method from usage", "Extract method"]
+        );
+        assert_eq!(actions[0].kind, Some(lsp_types::CodeActionKind::QUICKFIX));
+        assert_eq!(actions[0].diagnostics.as_deref(), Some(&diags[..]));
+        assert_eq!(
+            actions[1].kind,
+            Some(lsp_types::CodeActionKind::REFACTOR_EXTRACT)
+        );
     }
 
     // `workspace/didChangeConfiguration` reaches the PC service through the

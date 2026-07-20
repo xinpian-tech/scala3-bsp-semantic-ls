@@ -4,7 +4,9 @@
  * BaseCompletionSuite.scala, BaseHoverSuite.scala, BaseSignatureHelpSuite.scala,
  * BasePcDefinitionSuite.scala, BaseInlayHintsSuite.scala,
  * BaseSelectionRangeSuite.scala, BaseSemanticTokensSuite.scala,
- * BaseDiagnosticsSuite.scala and utils/{TestHovers,TestCompletions,TextEdits,
+ * BaseDiagnosticsSuite.scala, BaseCodeActionSuite.scala,
+ * BaseAutoImportsSuite.scala, BaseExtractMethodSuite.scala and
+ * utils/{TestHovers,TestCompletions,TextEdits,
  * RangeReplace,TestExtensions,TestInlayHints,TestSemanticTokens}.scala):
  *   https://github.com/scala/scala3/tree/3.8.4/presentation-compiler
  * Copyright 2002-2026 EPFL and Lightbend, Inc. dba Akka
@@ -22,7 +24,15 @@ import scala.concurrent.duration.*
 import scala.jdk.CollectionConverters.*
 
 import com.google.gson.{Gson, JsonElement, JsonParser}
-import ls.pc.{PcInlayHint, PcInlayHintFlags, PcSemanticNode, Utf16Text}
+import ls.pc.{
+  PcAutoImport,
+  PcCodeActionId,
+  PcCodeActionResult,
+  PcInlayHint,
+  PcInlayHintFlags,
+  PcSemanticNode,
+  Utf16Text
+}
 import org.eclipse.lsp4j.{
   CompletionItem,
   Diagnostic,
@@ -115,7 +125,20 @@ abstract class CorpusSuiteBase extends munit.FunSuite:
     else
       val positions = edits
         .flatMap(edit => Option(edit.getRange).map(edit -> _))
-        .sortBy((_, range) => (range.getStart.getLine, range.getStart.getCharacter))
+        // The end position joins the sort key (the one departure from the
+        // dotty original, which sorts by start only): at a TIED start the
+        // zero-width insert applies before the replacement — the LSP
+        // ordering rule for an insert and a replace at the same position.
+        // The extract-method carrier produces exactly that pair when the
+        // extraction anchors at the selection's own statement.
+        .sortBy((_, range) =>
+          (
+            range.getStart.getLine,
+            range.getStart.getCharacter,
+            range.getEnd.getLine,
+            range.getEnd.getCharacter
+          )
+        )
       var curr = 0
       val out = new java.lang.StringBuilder()
       positions.foreach { case (edit, pos) =>
@@ -665,6 +688,196 @@ abstract class CorpusDiagnosticsHarness extends CorpusSuiteBase:
         )
         additionalChecks(diagnostics)
       finally CorpusPc.closeBuffer(uri)
+    }
+
+/** Ported `BaseCodeActionSuite`: the single `<<target>>` marker parse — the
+  * cursor sits at the END of the target, the dotty edit-suite convention —
+  * shared by every code-action-family corpus harness below. Drives the facade
+  * `codeAction`/`autoImports` carriers (LSP positions instead of offsets) and
+  * applies the returned edits with the shared [[CorpusSuiteBase.applyEdits]]
+  * renderer.
+  */
+abstract class CorpusCodeActionBase extends CorpusSuiteBase:
+
+  /** Dotty `BaseCodeActionSuite.params`: strip the one `<<target>>` and
+    * return `(code, target, offset)` with the offset at the target's end.
+    */
+  def codeActionParams(code: String): (String, String, Int) =
+    val targetRegex = "<<(.+)>>".r
+    val target = targetRegex.findAllMatchIn(code).toList match
+      case Nil => fail("Missing <<target>>")
+      case t :: Nil => t.group(1)
+      case _ => fail("Multiple <<targets>> found")
+    val code2 = code.replace("<<", "").replace(">>", "")
+    val offset = code.indexOf("<<") + target.length
+    (code2, target, offset)
+
+  /** Run `actionId` at the `<<target>>` cursor; a dotty `DisplayableException`
+    * comes back as the result's refusal (data, not an error).
+    */
+  def runCodeAction(
+      actionId: Int,
+      original: String,
+      argIndices: Option[Vector[Int]] = None
+  ): (String, PcCodeActionResult) =
+    val (code, _, offset) = codeActionParams(original)
+    val uri = CorpusPc.openBuffer(code)
+    try
+      val (line, col) = offsetToLsp(code, offset)
+      val result =
+        CorpusPc.facade.codeAction(uri, actionId, new Position(line, col), None, argIndices)
+      (code, result)
+    finally CorpusPc.closeBuffer(uri)
+
+/** The ported edit-suite check DSL for the single-position code actions
+  * (InsertInferredType / AutoImplementAbstractMembers / InlineValue /
+  * InsertInferredMethod / ConvertToNamedLambdaParameters): `checkEdit` runs
+  * the op at the `<<target>>` cursor, applies the returned edits and asserts
+  * the edited text; `checkRefusal` ports the dotty `checkError` shape onto
+  * the facade's refusal-as-data carrier.
+  */
+abstract class CorpusCodeActionEditHarness(actionId: Int) extends CorpusCodeActionBase:
+
+  def checkEdit(
+      name: String,
+      original: String,
+      expected: String
+  )(implicit loc: munit.Location): Unit =
+    test(name) {
+      val (code, result) = runCodeAction(actionId, original)
+      assertEquals(result.refusal, None)
+      assert(result.edits.nonEmpty, "expected code-action edits")
+      assertCorpusNoDiff(applyEdits(code, result.edits.toList), expected)
+    }
+
+  def checkRefusal(
+      name: String,
+      original: String,
+      expectedRefusal: String
+  )(implicit loc: munit.Location): Unit =
+    test(name) {
+      val (_, result) = runCodeAction(actionId, original)
+      assertEquals(result.edits, Vector.empty[TextEdit])
+      assertEquals(result.refusal, Some(expectedRefusal))
+    }
+
+/** Ported `ConvertToNamedArgumentsSuite` check DSL: the op additionally
+  * carries the explicit argument-index list (the dotty tests name them per
+  * case; the LSP assembly layer instead passes every index — that policy is
+  * pinned Rust-side, not here).
+  */
+abstract class CorpusConvertToNamedArgumentsHarness extends CorpusCodeActionBase:
+
+  def checkEdit(
+      name: String,
+      original: String,
+      argIndices: List[Int],
+      expected: String
+  )(implicit loc: munit.Location): Unit =
+    test(name) {
+      val (code, result) = runCodeAction(
+        PcCodeActionId.ConvertToNamedArguments,
+        original,
+        Some(argIndices.toVector)
+      )
+      assertEquals(result.refusal, None)
+      assert(result.edits.nonEmpty, "expected convert-to-named-arguments edits")
+      assertCorpusNoDiff(applyEdits(code, result.edits.toList), expected)
+    }
+
+  def checkRefusal(
+      name: String,
+      original: String,
+      argIndices: List[Int],
+      expectedRefusal: String
+  )(implicit loc: munit.Location): Unit =
+    test(name) {
+      val (_, result) = runCodeAction(
+        PcCodeActionId.ConvertToNamedArguments,
+        original,
+        Some(argIndices.toVector)
+      )
+      assertEquals(result.edits, Vector.empty[TextEdit])
+      assertEquals(result.refusal, Some(expectedRefusal))
+    }
+
+/** Ported `BaseExtractMethodSuite`: `<<...>>` marks the extraction selection.
+  * The dotty harness carries a separate `@@` extraction-anchor position; the
+  * facade carrier anchors the extraction at the SELECTION START (`position` =
+  * selection start, `extractionEnd` = selection end), so the `@@` marker is
+  * stripped and ignored — the ported cases all anchor within the selection's
+  * own enclosing statement, where the two conventions agree.
+  */
+abstract class CorpusExtractMethodHarness extends CorpusSuiteBase:
+
+  def checkEdit(
+      name: String,
+      original: String,
+      expected: String
+  )(implicit loc: munit.Location): Unit =
+    test(name) {
+      val noAnchor = original.replace("@@", "")
+      val onlyClose = noAnchor.replace("<<", "")
+      val code = onlyClose.replace(">>", "")
+      val start = noAnchor.indexOf("<<")
+      val end = onlyClose.indexOf(">>")
+      assert(start >= 0 && end >= 0, "missing <<selection>>")
+      val uri = CorpusPc.openBuffer(code)
+      try
+        val (sl, sc) = offsetToLsp(code, start)
+        val (el, ec) = offsetToLsp(code, end)
+        val result = CorpusPc.facade.codeAction(
+          uri,
+          PcCodeActionId.ExtractMethod,
+          new Position(sl, sc),
+          Some(new Position(el, ec)),
+          None
+        )
+        assertEquals(result.refusal, None)
+        assert(result.edits.nonEmpty, "expected extract-method edits")
+        assertCorpusNoDiff(applyEdits(code, result.edits.toList), expected)
+      finally CorpusPc.closeBuffer(uri)
+    }
+
+/** Ported `BaseAutoImportsSuite`: `check` renders the candidate package list
+  * one per line; `checkEdit` applies the selected candidate's edits. The
+  * candidates come from the island's classpath search over the corpus
+  * target's classpath (scala-library + scala3-library) plus the JDK index —
+  * the same `ClasspathSearch.fromClasspath` seam the dotty base suite mocks.
+  */
+abstract class CorpusAutoImportsHarness extends CorpusCodeActionBase:
+
+  def getAutoImports(original: String): (String, Vector[PcAutoImport]) =
+    val (code, symbol, offset) = codeActionParams(original)
+    val uri = CorpusPc.openBuffer(code)
+    try
+      val (line, col) = offsetToLsp(code, offset)
+      (
+        code,
+        CorpusPc.facade.autoImports(uri, new Position(line, col), symbol, isExtension = false)
+      )
+    finally CorpusPc.closeBuffer(uri)
+
+  def check(
+      name: String,
+      original: String,
+      expected: String
+  )(implicit loc: munit.Location): Unit =
+    test(name) {
+      val (_, imports) = getAutoImports(original)
+      assertCorpusNoDiff(imports.map(_.packageName).mkString("\n"), expected)
+    }
+
+  def checkEdit(
+      name: String,
+      original: String,
+      expected: String,
+      selection: Int = 0
+  )(implicit loc: munit.Location): Unit =
+    test(name) {
+      val (code, imports) = getAutoImports(original)
+      assert(imports.size > selection, "Obtained no expected imports")
+      assertCorpusNoDiff(applyEdits(code, imports(selection).edits.toList), expected)
     }
 
 /** Ported `BasePcDefinitionSuite`: same-file definition ranges render as

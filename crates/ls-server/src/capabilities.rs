@@ -5,7 +5,10 @@
 //! (triggers `(`, `,`); definition;
 //! type-definition; references; rename (prepare); document highlight; workspace
 //! symbol; inlay hint (no resolve — every hint ships complete, the
-//! `lsp_types::InlayHintOptions` shape); selection range; folding range;
+//! `lsp_types::InlayHintOptions` shape); code action (the four assembly kinds
+//! — quickfix, refactor.rewrite, refactor.extract, refactor.inline — with no
+//! resolve: every action carries its edit inline); selection range; folding
+//! range;
 //! semantic tokens (`full` + `range` over the PC-vendored legend, no
 //! `full.delta` — delta requests are not implemented so they must not be
 //! advertised); and the execute-command set.
@@ -120,6 +123,12 @@ pub struct ServerCapabilities {
     /// `{resolveProvider: false}` — every hint ships complete; there is no
     /// `inlayHint/resolve` handler, so lazy-resolve must not be advertised.
     pub inlay_hint_provider: lsp_types::InlayHintOptions,
+    /// `{codeActionKinds: [quickfix, refactor.rewrite, refactor.extract,
+    /// refactor.inline], resolveProvider: false}` — the kinds the assembly
+    /// layer can produce (`services::assemble_code_actions`). Every action is
+    /// literal with its `WorkspaceEdit` inline (eager resolution), so
+    /// `codeAction/resolve` must not be advertised.
+    pub code_action_provider: lsp_types::CodeActionOptions,
     pub selection_range_provider: bool,
     pub folding_range_provider: bool,
     /// `{legend, full: true, range: true}` — the legend is EXACTLY the
@@ -163,6 +172,21 @@ pub fn semantic_tokens_options() -> lsp_types::SemanticTokensOptions {
     }
 }
 
+/// The advertised code-action capability: exactly the four kinds the assembly
+/// produces, no resolve (every action ships its edit inline).
+pub fn code_action_options() -> lsp_types::CodeActionOptions {
+    lsp_types::CodeActionOptions {
+        code_action_kinds: Some(vec![
+            lsp_types::CodeActionKind::QUICKFIX,
+            lsp_types::CodeActionKind::REFACTOR_REWRITE,
+            lsp_types::CodeActionKind::REFACTOR_EXTRACT,
+            lsp_types::CodeActionKind::REFACTOR_INLINE,
+        ]),
+        work_done_progress_options: Default::default(),
+        resolve_provider: Some(false),
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct ServerInfo {
     pub name: String,
@@ -201,6 +225,7 @@ pub fn server_capabilities() -> ServerCapabilities {
             work_done_progress_options: Default::default(),
             resolve_provider: Some(false),
         },
+        code_action_provider: code_action_options(),
         selection_range_provider: true,
         folding_range_provider: true,
         semantic_tokens_provider: semantic_tokens_options(),
@@ -266,6 +291,31 @@ mod tests {
         );
         assert!(json.contains("\"selectionRangeProvider\":true"), "{json}");
         assert!(json.contains("\"foldingRangeProvider\":true"), "{json}");
+    }
+
+    // codeActionProvider: exactly the four assembly kinds, in order, with
+    // resolve OFF — every action ships its `WorkspaceEdit` inline, so a
+    // `codeAction/resolve` handler must not be implied.
+    #[test]
+    fn advertises_code_actions_with_the_four_assembly_kinds_and_no_resolve() {
+        let value: serde_json::Value =
+            serde_json::from_str(&initialize_json()).expect("initialize result is JSON");
+        let provider = &value["capabilities"]["codeActionProvider"];
+        assert_eq!(
+            provider["codeActionKinds"],
+            serde_json::json!([
+                "quickfix",
+                "refactor.rewrite",
+                "refactor.extract",
+                "refactor.inline"
+            ]),
+            "{provider}"
+        );
+        assert_eq!(
+            provider["resolveProvider"],
+            serde_json::json!(false),
+            "{provider}"
+        );
     }
 
     #[test]

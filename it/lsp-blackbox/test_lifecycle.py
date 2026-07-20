@@ -43,6 +43,16 @@ async def test_initialize_advertises_the_exact_capability_surface(client):
     assert caps.inlay_hint_provider.resolve_provider is False
     assert caps.selection_range_provider is True
     assert caps.folding_range_provider is True
+    # codeAction: exactly the four assembly kinds, resolve OFF (every action
+    # carries its WorkspaceEdit inline — there is no codeAction/resolve).
+    assert caps.code_action_provider is not None
+    assert list(caps.code_action_provider.code_action_kinds) == [
+        types.CodeActionKind.QuickFix,
+        types.CodeActionKind.RefactorRewrite,
+        types.CodeActionKind.RefactorExtract,
+        types.CodeActionKind.RefactorInline,
+    ]
+    assert caps.code_action_provider.resolve_provider is False
     assert list(caps.execute_command_provider.commands) == [
         DOCTOR,
         REINDEX,

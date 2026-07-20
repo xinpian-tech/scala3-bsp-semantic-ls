@@ -76,6 +76,7 @@ pub enum Method {
     SignatureHelp,
     PrepareRename,
     InlayHint,
+    CodeAction,
     SelectionRange,
     FoldingRange,
     SemanticTokensFull,
@@ -96,7 +97,8 @@ pub enum PreReadyOutcome {
 
 /// The per-method pre-ready fallback, matching the server's dispatch: references
 /// and rename fail typed; document highlight, workspace symbol, completion,
-/// definition, type definition, inlay hint, and folding range answer empty;
+/// definition, type definition, inlay hint, code action, and folding range
+/// answer empty;
 /// hover, signature help, prepare rename, selection range, and the two
 /// semantic-tokens methods answer null (selection range because the spec ties
 /// `result[i]` to `positions[i]` — an empty array against a non-empty position
@@ -113,6 +115,7 @@ pub fn pre_ready_outcome(method: Method) -> PreReadyOutcome {
         | Method::Definition
         | Method::TypeDefinition
         | Method::InlayHint
+        | Method::CodeAction
         | Method::FoldingRange => PreReadyOutcome::Empty,
         Method::Hover
         | Method::SignatureHelp
@@ -207,6 +210,7 @@ mod tests {
             Method::Definition,
             Method::TypeDefinition,
             Method::InlayHint,
+            Method::CodeAction,
             Method::FoldingRange,
         ] {
             assert_eq!(pre_ready_outcome(m), PreReadyOutcome::Empty, "{m:?}");

@@ -133,10 +133,13 @@ final class PcFacade(
 
   /** Run the PC-backed code action `actionId` (the boundary's action-id enum)
     * at `position`; `extractionEnd` is extract-method's selection end (the
-    * selection is `[position, extractionEnd]` and the extraction anchor is the
-    * selection start), `argIndices` convert-to-named-arguments' argument list.
-    * A refusal the editor should surface (the dotty `DisplayableException`)
-    * comes back as data on the result, not as a thrown error.
+    * selection is `[position, extractionEnd]`; the extraction ANCHOR — the
+    * statement the new method is inserted in front of, dotty's separate
+    * `extractionPos` — is derived as [[extractionAnchor]], since the boundary
+    * carrier has no third position), `argIndices`
+    * convert-to-named-arguments' argument list. A refusal the editor should
+    * surface (the dotty `DisplayableException`) comes back as data on the
+    * result, not as a thrown error.
     */
   def codeAction(
       uri: String,
@@ -158,7 +161,7 @@ final class PcFacade(
             val end = extractionEnd
               .map(p => Utf16Text.offsetAt(text, p.getLine, p.getCharacter))
               .getOrElse(offset)
-            instance.extractMethod(uri, text, offset, end, offset)
+            instance.extractMethod(uri, text, offset, end, extractionAnchor(text, offset))
           case PcCodeActionId.InlineValue =>
             instance.inlineValue(uri, text, offset)
           case PcCodeActionId.InsertInferredType =>
@@ -174,6 +177,24 @@ final class PcFacade(
     catch
       case e: scala.meta.pc.DisplayableException =>
         PcCodeActionResult(Vector.empty, refusal = Option(e.getMessage))
+
+  /** The extract-method extraction anchor derived from the selection start:
+    * the first non-blank column of the selection's FIRST LINE — the innermost
+    * statement that opens the selection (clamped to the selection start for a
+    * selection that begins inside the leading indentation). The dotty
+    * provider inserts the new method in front of the statement enclosing this
+    * anchor; anchoring at the RAW selection start (the previous behavior)
+    * made a mid-line selection's own expression the "enclosing statement",
+    * so the method text landed inside it — invalid code. The dotty test
+    * convention places its `@@` anchor at a statement head; this derivation
+    * matches it whenever the statement starts the selection's line, and a
+    * selection inside a nested block extracts into that innermost block.
+    */
+  private def extractionAnchor(text: String, offset: Int): Int =
+    val lineStart = text.lastIndexOf('\n', math.max(offset - 1, 0)) + 1
+    var i = lineStart
+    while i < text.length && (text.charAt(i) == ' ' || text.charAt(i) == '\t') do i += 1
+    math.min(offset, i)
 
   /** Auto-import candidates for `name` at `position` (`isExtension` requests
     * extension-method imports), best first.

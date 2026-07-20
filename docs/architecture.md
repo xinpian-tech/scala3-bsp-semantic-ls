@@ -230,11 +230,16 @@ plus the ABI-v2 payload-in/payload-out queries `inlay_hints, semantic_tokens,
 selection_range, code_action, auto_imports, pc_diagnostics, folding_range`
 (one shared `PcPayloadQueryFn` slot shape; every island provider is live — a
 transport-first future op would answer the typed `STATUS_NOT_YET`, which the
-Rust side degrades to the query's empty fallback). Three payload ops are
-LSP-exposed today — `textDocument/inlayHint`, `textDocument/selectionRange`,
+Rust side degrades to the query's empty fallback). Five payload ops are
+LSP-exposed today: `textDocument/inlayHint`, `textDocument/selectionRange`,
 `textDocument/foldingRange` — bridged to `lsp-types` protocol shapes in
 `crates/ls-server/src/pc_lsp.rs` (selection/folding are pure syntax and skip
-the SemanticDB gate; inlayHint keeps the full hover-style gate discipline).
+the SemanticDB gate; inlayHint keeps the full hover-style gate discipline) —
+plus `code_action` and `auto_imports`, which back `textDocument/codeAction`'s
+ASSEMBLY layer (`crates/ls-server/src/services.rs`): literal actions with
+inline `WorkspaceEdit`s, each op probed eagerly at assembly time so a typed
+refusal (`DisplayableException`-as-data) or an empty edit list drops the
+action before the client ever sees it.
 
 stdout protection: the JVM and any PC plugin can write to fd 1, which would
 corrupt the LSP stream. Before boot, the server's `StdoutGuard` duplicates the

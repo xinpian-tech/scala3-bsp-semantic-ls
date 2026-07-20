@@ -312,6 +312,46 @@ fn text_edit(edit: &AbiTextEdit) -> lsp_types::TextEdit {
     lsp_types::TextEdit::new(lsp_range(&edit.range), edit.new_text.clone())
 }
 
+/// Island text edits for one buffer -> an inline `lsp_types::WorkspaceEdit`
+/// (`changes: { uri: edits }`). The code-action assembly attaches this edit
+/// directly on each literal action — there is no `workspace/executeCommand`
+/// round trip and no `codeAction/resolve` — so a returned action is complete
+/// the moment the client receives it. A URI that does not parse as an
+/// `lsp_types::Uri` yields `None` (the action is dropped rather than emitted
+/// with a malformed target; the server only feeds `file://` URIs here, so this
+/// is a defensive boundary).
+///
+/// The edits are sorted by (start, end) before emission: the LSP array-order
+/// convention allows a zero-width insert and a replacement at the SAME start
+/// only with the insert first, and the island's extract-method op produces
+/// exactly that tied-start pair (the new-method insert at the selection's own
+/// statement plus the selection replacement), in provider order the spec does
+/// not accept.
+// The `changes` key is the upstream `lsp_types::Uri` (a `fluent-uri` with an
+// internal meta cache Cell); the map is built once and serialized, never
+// mutated through its keys, so clippy's mutable-key lint is a false positive
+// here.
+#[allow(clippy::mutable_key_type)]
+pub fn workspace_edit(uri: &str, edits: &[AbiTextEdit]) -> Option<lsp_types::WorkspaceEdit> {
+    let uri: lsp_types::Uri = uri.parse().ok()?;
+    let mut sorted: Vec<lsp_types::TextEdit> = edits.iter().map(text_edit).collect();
+    sorted.sort_by_key(|edit| {
+        (
+            edit.range.start.line,
+            edit.range.start.character,
+            edit.range.end.line,
+            edit.range.end.character,
+        )
+    });
+    let mut changes = std::collections::HashMap::new();
+    changes.insert(uri, sorted);
+    Some(lsp_types::WorkspaceEdit {
+        changes: Some(changes),
+        document_changes: None,
+        change_annotations: None,
+    })
+}
+
 /// The hint's opaque `data` bytes, passed through verbatim as JSON. The island
 /// writes the lsp4j hint's `data` as its canonical gson JSON bytes, so a plain
 /// parse restores the exact value the presentation compiler attached (the
@@ -728,6 +768,59 @@ mod tests {
     fn semantic_tokens_of_no_nodes_is_the_empty_stream() {
         let tokens = semantic_tokens(&[], "val a = 1\n");
         assert_eq!(data_of(&tokens), Vec::<u32>::new());
+    }
+
+    // The code-action assembly's inline edit: one buffer's island edits become
+    // a `changes`-keyed WorkspaceEdit (never documentChanges — the server
+    // advertises no resource operations), serialized as the exact LSP shape.
+    #[test]
+    fn workspace_edit_wraps_the_buffer_edits_under_changes() {
+        let edits = [AbiTextEdit {
+            range: rng(1, 4, 1, 4),
+            new_text: ": Int".to_string(),
+        }];
+        let edit = workspace_edit("file:///ws/A.scala", &edits).expect("a parseable uri");
+        assert_eq!(
+            serde_json::to_value(edit).unwrap(),
+            json!({
+                "changes": {
+                    "file:///ws/A.scala": [{
+                        "range": { "start": { "line": 1, "character": 4 }, "end": { "line": 1, "character": 4 } },
+                        "newText": ": Int"
+                    }]
+                }
+            })
+        );
+    }
+
+    // A URI that does not parse yields None (the assembly drops the action
+    // instead of emitting a malformed edit target).
+    #[test]
+    fn workspace_edit_refuses_an_unparseable_uri() {
+        assert!(workspace_edit("not a uri", &[]).is_none());
+    }
+
+    // The extract-method tied-start pair in provider order (replacement first,
+    // zero-width insert second) is re-sorted to the LSP array-order rule: the
+    // insert precedes the replacement at the same start position.
+    #[test]
+    #[allow(clippy::mutable_key_type)] // lsp_types::Uri key, read-only map
+    fn workspace_edit_orders_a_tied_start_insert_before_the_replacement() {
+        let edits = [
+            AbiTextEdit {
+                range: rng(3, 10, 3, 25),
+                new_text: "newMethod()".to_string(),
+            },
+            AbiTextEdit {
+                range: rng(3, 10, 3, 10),
+                new_text: "def newMethod(): Int = ...\n  ".to_string(),
+            },
+        ];
+        let edit = workspace_edit("file:///ws/A.scala", &edits).unwrap();
+        let changes = edit.changes.unwrap();
+        let sorted = &changes[&"file:///ws/A.scala".parse::<lsp_types::Uri>().unwrap()];
+        assert!(sorted[0].new_text.starts_with("def newMethod"));
+        assert_eq!(sorted[1].new_text, "newMethod()");
     }
 
     // Folding kinds map the boundary ordinals to the LSP kind strings; 0

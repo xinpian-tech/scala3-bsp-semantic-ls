@@ -4,9 +4,11 @@
 -- readiness (doctor), reindex ingest, workspace/symbol, definition,
 -- references, PC-backed hover (which boots the embedded JVM island for
 -- real), the payload probes (foldingRange/selectionRange/inlayHint,
--- semanticTokens/full), and the live-typing PC diagnostics flow (edit ->
--- "scala3-pc (typing)" publish -> revert -> clear). Assertions are
--- token-anchored so upstream source drift does not invalidate positions.
+-- semanticTokens/full), the code-action assembly (an "Insert type
+-- annotation" action with its inline edit at a real un-annotated val), and
+-- the live-typing PC diagnostics flow (edit -> "scala3-pc (typing)" publish
+-- -> revert -> clear). Assertions are token-anchored so upstream source
+-- drift does not invalidate positions.
 --
 -- Usage: nvim --headless -l it/nvim/e2e.lua <workspace> <server_bin> <rel_file> <token>
 -- Exits 0 on success; prints "E2E FAIL: ..." and exits 1 on the first failure.
@@ -413,6 +415,76 @@ if type(references) ~= "table" or #references == 0 then
   fail("references returned nothing")
 end
 pass("references finds " .. #references .. " sites")
+
+-- codeAction at a `val` with an inferable (un-annotated) type: the assembly
+-- layer must offer an "Insert type annotation" action whose INLINE edit
+-- (eager resolution — no executeCommand round trip) inserts a `": "` type
+-- ascription. The action only has to arrive well-formed; applying it is not
+-- required. The main buffer holds only destructuring vals, so the probe opens
+-- a sibling real source with a plain `val name = ...`.
+local ca_buf = open_attached("decoder/src/BitSet.scala")
+local val_at
+for i, line in ipairs(vim.api.nvim_buf_get_lines(ca_buf, 0, -1, false)) do
+  local s = line:find("val [%w_]+ =")
+  if s then
+    val_at = { line = i - 1, character = s + 3 } -- 0-based start of the name
+    break
+  end
+end
+if not val_at then
+  fail("no un-annotated `val name =` found in decoder/src/BitSet.scala for the codeAction probe")
+end
+local ca_response, ca_err = client:request_sync("textDocument/codeAction", {
+  textDocument = { uri = vim.uri_from_bufnr(ca_buf) },
+  range = { start = val_at, ["end"] = val_at },
+  context = { diagnostics = {} },
+}, 120000, ca_buf)
+if ca_err or not ca_response or ca_response.err then
+  fail("codeAction failed: " .. vim.inspect(ca_err or (ca_response and ca_response.err)))
+end
+local actions = ca_response.result
+if type(actions) ~= "table" then
+  fail("codeAction did not return a list: " .. vim.inspect(actions))
+end
+local insert_type
+local titles = {}
+for _, action in ipairs(actions) do
+  table.insert(titles, action.title)
+  if action.title == "Insert type annotation" then
+    insert_type = action
+  end
+end
+if not insert_type then
+  fail(
+    "no 'Insert type annotation' action at the val (line "
+      .. val_at.line
+      .. ", col "
+      .. val_at.character
+      .. "); offered: "
+      .. vim.inspect(titles)
+  )
+end
+if insert_type.kind ~= "refactor.rewrite" then
+  fail("Insert type annotation has kind " .. tostring(insert_type.kind))
+end
+local has_ascription = false
+for _, edits in pairs((insert_type.edit or {}).changes or {}) do
+  for _, edit in ipairs(edits) do
+    if edit.newText and edit.newText:find(": ", 1, true) then
+      has_ascription = true
+    end
+  end
+end
+if not has_ascription then
+  fail("the inline edit carries no ': ' ascription: " .. vim.inspect(insert_type.edit))
+end
+pass(
+  "codeAction offers 'Insert type annotation' with an inline ': ' edit ("
+    .. #actions
+    .. " actions: "
+    .. table.concat(titles, ", ")
+    .. ")"
+)
 
 -- Live-typing (PC) diagnostics: edit the real buffer to introduce a type
 -- error; nvim's incremental didChange arms the server's debounced

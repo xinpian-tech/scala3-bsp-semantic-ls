@@ -323,6 +323,12 @@ impl PcQueryService for FakePcService {
             .collect()
     }
 
+    /// Canned per-action-id answers shaped for the code-action ASSEMBLY layer:
+    /// `InsertInferredType` answers a `": Int"` insert at the probe position
+    /// (assembled into the "Insert type annotation" action), `InlineValue`
+    /// answers the refusal-as-data case (the assembly must DROP it), and every
+    /// other id answers empty (dropped too) — so a wire suite pins both the
+    /// included and the eagerly-dropped halves against one canned session.
     fn code_action(
         &self,
         uri: &str,
@@ -335,17 +341,24 @@ impl PcQueryService for FakePcService {
             "code_action {uri}:{}:{} action={action}",
             position.line, position.character
         ));
-        CodeActionResult {
-            edits: vec![TextEdit {
-                range: Rng {
-                    start_line: position.line,
-                    start_character: position.character,
-                    end_line: position.line,
-                    end_character: position.character,
-                },
-                new_text: format!("/* fake action {action} */"),
-            }],
-            refusal: None,
+        match action {
+            ls_pc_abi::payloads::code_action_id::INSERT_INFERRED_TYPE => CodeActionResult {
+                edits: vec![TextEdit {
+                    range: Rng {
+                        start_line: position.line,
+                        start_character: position.character,
+                        end_line: position.line,
+                        end_character: position.character,
+                    },
+                    new_text: ": Int".to_string(),
+                }],
+                refusal: None,
+            },
+            ls_pc_abi::payloads::code_action_id::INLINE_VALUE => CodeActionResult {
+                edits: Vec::new(),
+                refusal: Some("fake refusal: cannot inline here".to_string()),
+            },
+            _ => CodeActionResult::default(),
         }
     }
 

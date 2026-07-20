@@ -44,16 +44,19 @@ fn boot() -> (WireClient, Arc<FakePcService>) {
 const DIRTY: &str = "package pkga\n\nclass Core(val label: String):\n  def ping: String = \"core \" + label\n  def extra: Int = 41\n";
 
 /// Replace every occurrence of the machine-dependent corpus URI prefix in
-/// string values so snapshots are host-independent.
+/// string values AND object keys (a `WorkspaceEdit.changes` map is keyed by
+/// URI) so snapshots are host-independent.
 fn scrub(value: &Value) -> Value {
     let sources = ls_testkit::fixtures::source_uri("");
     let prefix = sources.trim_end_matches('/');
     match value {
         Value::String(s) => Value::String(s.replace(prefix, "[SOURCES]")),
         Value::Array(items) => Value::Array(items.iter().map(scrub).collect()),
-        Value::Object(map) => {
-            Value::Object(map.iter().map(|(k, v)| (k.clone(), scrub(v))).collect())
-        }
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(k, v)| (k.replace(prefix, "[SOURCES]"), scrub(v)))
+                .collect(),
+        ),
         other => other.clone(),
     }
 }
@@ -323,6 +326,116 @@ fn payload_methods_gate_on_the_buffer_and_split_on_semanticdb() {
         folding[0]["kind"],
         json!("imports"),
         "foldingRange must answer on a no-SemanticDB source: {folding}"
+    );
+    client.shutdown();
+}
+
+// The code-action ASSEMBLY over the wire, JVM-free: a request whose context
+// carries a dotty `Not found:` diagnostic assembles the import quickfix from
+// the fake island's auto_imports (preferred: the sole candidate) plus the
+// insert-type rewrite from the one probe that answered edits — while the
+// refusal-as-data inline-value probe and every empty probe are DROPPED at
+// assembly time (eager resolution: each offered action ran its PC op during
+// assembly and carries its WorkspaceEdit inline). Pinned by snapshot.
+#[test]
+fn the_code_action_wire_surface_assembles_and_drops_jvm_free() {
+    assert!(
+        !ls_server::libjvm_mapped(),
+        "the embedded JVM must be unmapped before the session"
+    );
+    let (mut client, pc) = boot();
+    client.initialize();
+    client.await_ready();
+
+    let uri = core_uri();
+    client.did_open_uri(&uri, DIRTY);
+    let (line, character) = position_of(DIRTY, "ping", 0);
+    let at = json!({ "line": line, "character": character });
+    let actions = client.result(
+        "textDocument/codeAction",
+        json!({
+            "textDocument": { "uri": uri },
+            "range": { "start": at, "end": at },
+            "context": {
+                "diagnostics": [{
+                    "range": { "start": at, "end": { "line": line, "character": character + 4 } },
+                    "message": "Not found: Slouch"
+                }]
+            }
+        }),
+    );
+    insta::assert_json_snapshot!("code-actions", scrub(&actions));
+
+    // The refused inline-value probe ran but assembled no action.
+    let calls = pc.calls();
+    assert!(
+        calls.iter().any(|c| c.starts_with("auto_imports")),
+        "the import quickfix must query auto_imports: {calls:?}"
+    );
+    assert!(
+        calls
+            .iter()
+            .any(|c| c.starts_with("code_action") && c.ends_with("action=3")),
+        "the inline-value probe must run during assembly: {calls:?}"
+    );
+    let titles: Vec<&str> = actions
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["title"].as_str().unwrap())
+        .collect();
+    assert!(
+        !titles.contains(&"Inline value"),
+        "the refused probe must be dropped: {titles:?}"
+    );
+    assert!(
+        !ls_server::libjvm_mapped(),
+        "the code-action assembly must stay JVM-free with the injected fake"
+    );
+    client.shutdown();
+}
+
+// The code-action gates: a buffer the PC mirror does not hold answers the
+// empty list (never an error — the graceful cold answer the blackbox suite
+// pins over real stdio), and a no-SemanticDB source keeps the hard
+// `require_semanticdb` error even with an open buffer (the hover ladder:
+// insert-type/implement-members are typer-backed).
+#[test]
+fn code_actions_gate_on_the_buffer_and_semanticdb() {
+    let (mut client, _pc) = boot();
+    client.initialize();
+    client.await_ready();
+
+    let uri = core_uri();
+    let empty = client.result(
+        "textDocument/codeAction",
+        json!({
+            "textDocument": { "uri": uri },
+            "range": {
+                "start": { "line": 0, "character": 0 },
+                "end": { "line": 0, "character": 0 }
+            },
+            "context": { "diagnostics": [] }
+        }),
+    );
+    assert_eq!(empty, json!([]));
+
+    let nosdb = client.file_uri("nosdb/NoSdb.scala");
+    client.did_open_uri(&nosdb, "class NoSdb\n");
+    let error = client.error_message(
+        "textDocument/codeAction",
+        json!({
+            "textDocument": { "uri": nosdb },
+            "range": {
+                "start": { "line": 0, "character": 6 },
+                "end": { "line": 0, "character": 6 }
+            },
+            "context": { "diagnostics": [] }
+        }),
+    );
+    assert!(
+        error.contains("has no SemanticDB output"),
+        "codeAction must keep the hard NoSemanticdb error, got: {error}"
     );
     client.shutdown();
 }

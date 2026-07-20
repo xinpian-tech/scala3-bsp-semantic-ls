@@ -1,0 +1,68 @@
+---
+source: crates/ls-server/tests/pc_wire.rs
+expression: scrub(&actions)
+---
+[
+  {
+    "diagnostics": [
+      {
+        "message": "Not found: Slouch",
+        "range": {
+          "end": {
+            "character": 10,
+            "line": 3
+          },
+          "start": {
+            "character": 6,
+            "line": 3
+          }
+        }
+      }
+    ],
+    "edit": {
+      "changes": {
+        "[SOURCES]/a/src/pkga/Core.scala": [
+          {
+            "newText": "import fake.pkg.Slouch\n",
+            "range": {
+              "end": {
+                "character": 0,
+                "line": 0
+              },
+              "start": {
+                "character": 0,
+                "line": 0
+              }
+            }
+          }
+        ]
+      }
+    },
+    "isPreferred": true,
+    "kind": "quickfix",
+    "title": "Import 'Slouch' from 'fake.pkg'"
+  },
+  {
+    "edit": {
+      "changes": {
+        "[SOURCES]/a/src/pkga/Core.scala": [
+          {
+            "newText": ": Int",
+            "range": {
+              "end": {
+                "character": 6,
+                "line": 3
+              },
+              "start": {
+                "character": 6,
+                "line": 3
+              }
+            }
+          }
+        ]
+      }
+    },
+    "kind": "refactor.rewrite",
+    "title": "Insert type annotation"
+  }
+]

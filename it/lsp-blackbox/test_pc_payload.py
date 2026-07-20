@@ -1,6 +1,6 @@
 """The payload-backed PC methods over the real binary: inlayHint,
-selectionRange, and foldingRange round-trip through lsprotocol's independent
-typed model and answer their graceful empty/null fallbacks.
+selectionRange, foldingRange, and codeAction round-trip through lsprotocol's
+independent typed model and answer their graceful empty/null fallbacks.
 
 These methods are PC-backed, and a blackbox session NEVER opens the documents
 it queries, so the `withPcBuffer` gate answers each method's fallback WITHOUT
@@ -86,8 +86,29 @@ async def test_folding_range_on_an_unopened_buffer_is_the_empty_list(client):
     assert list(result) == []
 
 
+async def test_code_action_on_an_unopened_buffer_is_the_empty_list(client):
+    """codeAction assembles over PC ops that only run against an open (dirty)
+    buffer; a cold session's request takes the `withPcBuffer` fallback — the
+    empty action list, never an error and never a JVM boot (the eager
+    assembly probes are gated behind `is_open`, so nothing is queried)."""
+    await await_ready(client)
+    result = await client.text_document_code_action_async(
+        types.CodeActionParams(
+            text_document=types.TextDocumentIdentifier(uri=source_uri(CORE)),
+            range=types.Range(
+                start=types.Position(line=2, character=6),
+                end=types.Position(line=2, character=6),
+            ),
+            context=types.CodeActionContext(diagnostics=[]),
+        )
+    )
+    # The wire answer is `[]`, not null.
+    assert result is not None
+    assert list(result) == []
+
+
 async def test_the_payload_fallbacks_never_boot_the_island(client):
-    """Drive all three methods, then assert the island is STILL cold: the
+    """Drive all four methods, then assert the island is STILL cold: the
     gate fallbacks answered without a PC query, so the blackbox session keeps
     its zero-JVM guarantee."""
     await await_ready(client)
@@ -108,6 +129,16 @@ async def test_the_payload_fallbacks_never_boot_the_island(client):
     )
     await client.text_document_folding_range_async(
         types.FoldingRangeParams(text_document=doc)
+    )
+    await client.text_document_code_action_async(
+        types.CodeActionParams(
+            text_document=doc,
+            range=types.Range(
+                start=types.Position(line=0, character=0),
+                end=types.Position(line=0, character=0),
+            ),
+            context=types.CodeActionContext(diagnostics=[]),
+        )
     )
     status = await execute(client, PC_PLUGIN_STATUS)
     assert "PC island not booted (cold)" in status

@@ -211,6 +211,15 @@ fn initialize_advertises_exactly_the_implemented_capability_set() {
     );
     assert_eq!(caps["selectionRangeProvider"], true);
     assert_eq!(caps["foldingRangeProvider"], true);
+    // codeAction: exactly the four assembly kinds, resolve OFF (every action
+    // ships its WorkspaceEdit inline — eager resolution).
+    assert_eq!(
+        caps["codeActionProvider"],
+        json!({
+            "codeActionKinds": ["quickfix", "refactor.rewrite", "refactor.extract", "refactor.inline"],
+            "resolveProvider": false
+        })
+    );
     // semanticTokens: full + range as plain booleans (no full.delta — no delta
     // handler exists), over the PC-vendored 23-type / 10-modifier legend with
     // the golden anchors at their pinned indices.
