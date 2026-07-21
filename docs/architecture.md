@@ -92,7 +92,7 @@ editor ⇅ LSP (stdio)
 │  ┌─────────────── JVM island (same process) ────────────────┐ │
 │  │ ls-pc-host (premain, FFM stubs/handles, flat marshalling)│ │
 │  │ ls-pc (PcFacade / PcInstance / plugin SPI)               │ │
-│  │ scala3-presentation-compiler + zaozi pc-plugin           │ │
+│  │ scala3-presentation-compiler + pc-plugins.json plugins   │ │
 │  └──────────────────────────────────────────────────────────┘ │
 │  boundary: C function-pointer vtables, both directions        │
 └───────────────────────────────────────────────────────────────┘
@@ -118,7 +118,8 @@ not part of the production binary.)
 Retained JVM island (mill keeps building, see `build.mill`): `ls-pc`
 (facade/instances/plugin SPI — the worker-protocol files are deleted),
 `ls-pc-host` (premain agent, jextract-generated boundary bindings over
-`boundary.h`, flat marshalling), `ls-zaozi-pcplugin`. `docs/plugin-spi.md`
+`boundary.h`, flat marshalling), plus the check-only `ls-pc-navtestplugin`
+test fixture proving the `pc-plugins.json` loading path. `docs/plugin-spi.md`
 remains normative for the island.
 
 ### 3.1 Rust main-process responsibilities

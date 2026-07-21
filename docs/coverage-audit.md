@@ -7,6 +7,17 @@
 > deleted after this mapping was verified. Rows for deleted paths are preserved
 > as the port's evidence record; `scripts/check-audit-inventory.sh` now checks
 > the retained island suites only.
+>
+> **Post-cutover retirement.** The whole `ls-zaozi-pcplugin` module (and its
+> `ZaoziPcNavSuite`, plus the Rust boundary test `live_zaozi.rs` / flake check
+> `pc-zaozi` that proved it live) was later retired: zaozi's own in-build
+> `zaozi-compiler-plugin` now ships the interactive navigation phase, reaching
+> the island via the build's `-Xplugin` scalacOptions (the FULL-workspace e2e
+> runs without any `pc-plugins.json`). The `pc-plugins.json` loading mechanism
+> itself stays a product feature, proven by the generic check-only
+> `pcNavTestPlugin` fixture in `crates/ls-jvm/tests/live_pcplugin.rs` (flake
+> check `pc-plugin-load`). Rows below that cite `live_zaozi.rs` are that era's
+> evidence record; see the zaozi-navigation section for the current state.
 
 This audit maps **every** retained Scala test file under `modules/*/test/` (a
 path-qualified inventory, so duplicate basenames like the two
@@ -24,7 +35,8 @@ retained test-file path appears here.
   `AotTrain`; `ls-tasty` v1.1; the forked PC worker, replaced by the embedded
   island; or a DEC-1/DEC-2 trim). The row states the authority.
 - **ISLAND** — the JVM presentation-compiler island is **not rewritten** (`ls-pc`
-  facade/SPI, `ls-zaozi-pcplugin`; decision table row 1, `rlcr-rust.md:278`).
+  facade/SPI, and at cutover time `ls-zaozi-pcplugin` — since retired to zaozi's
+  own repo; decision table row 1, `rlcr-rust.md:278`).
   These suites stay green on the retained Scala code (**AC-6.5 island parity**);
   the Rust side proves the vtable boundary (named in the row).
 - **TASK22** — strictly docs/deletion/bench work with no runtime behavior to
@@ -47,8 +59,10 @@ retained test-file path appears here.
   oracle itself is inclusion-only (faithful parity, see §18.1 section).
 - **E0–E8: every non-trimmed row ported** over live mill.
 - **Zaozi cross-file navigation re-pointed at the production vtable** in
-  `crates/ls-jvm/tests/live_zaozi.rs` (verified live); the single-buffer
-  plugin-internal steering shapes stay ISLAND (AC-6.5).
+  `live_zaozi.rs` (verified live at cutover; since retired with the plugin —
+  the `pc-plugins.json` boundary proof is now the generic
+  `crates/ls-jvm/tests/live_pcplugin.rs`, and the zaozi obligations moved to
+  the editor-level e2e + zaozi's own repo).
 - Gaps found and closed across R15/R16: `RandomCorpusTest` (differential),
   `IngestJanitorSuite` publish-time auto-reclaim, and the Zaozi normal-member /
   exact-range / hover / missing-field boundary cases.
@@ -98,7 +112,7 @@ retained test-file path appears here.
 | modules/ls-pc-host/test/src/ls/pc/host/MarshalSuite.scala | PORTED | `ls-pc-abi/tests/roundtrip.rs` |
 | modules/ls-pc-host/test/src/ls/pc/host/PcHostConfigSuite.scala | PORTED | `ls-jvm/tests/live_boundary.rs`; `ls-server/src/doctor.rs` PC section |
 | modules/ls-pc-host/test/src/ls/pc/host/PcHostOpsSuite.scala | PORTED | `ls-pc-abi/tests/boundary.rs`; `ls-jvm/tests/live_boundary.rs` |
-| modules/ls-pc/test/src/ls/pc/CompilerPluginConfigSuite.scala | ISLAND | pc-plugins.json compiler-plugin loading proven at the boundary by `ls-jvm/tests/live_zaozi.rs` (boots the island via a real `pc-plugins.json`); island loader unchanged (AC-6.5) |
+| modules/ls-pc/test/src/ls/pc/CompilerPluginConfigSuite.scala | ISLAND | pc-plugins.json compiler-plugin loading proven at the boundary by `ls-jvm/tests/live_pcplugin.rs` (boots the island via a real `pc-plugins.json`, flake check `pc-plugin-load`); island loader unchanged (AC-6.5) |
 | modules/ls-pc/test/src/ls/pc/FoldingRangeProviderSuite.scala | ISLAND | island-only custom provider (no dotty provider exists): the parser-only folding walker pinned by exact ranges+kinds — indentation/brace syntax, CRLF, unterminated-code recovery, comment blocks + `//`-runs, import runs, nested `// region` markers; served over the vtable `folding_range` slot |
 | modules/ls-pc/test/src/ls/pc/PcV2OpsSuite.scala | ISLAND | island-only: the ABI v2 payload-query providers at the facade against the real PC — inlay hints (flag-bit gating, exact position/parts/data), semantic tokens, selection-range chains, every code-action id incl. the `DisplayableException` refusal-as-data case, auto-imports, pc diagnostics, folding wiring; the transport legs are `ls-jvm/tests/live_definition.rs` + `ls-pc-abi/tests/roundtrip.rs` |
 | modules/ls-pc/test/src/ls/pc/ForkedWorkerSuite.scala | NON-PORT | forked PC worker deleted (`worker.scala`/`ForkedPcWorker`); replaced by the embedded island watchdog — `ls-jvm/tests/live_recovery.rs`, `real_bsp_pc_recovery.rs` |
@@ -106,7 +120,7 @@ retained test-file path appears here.
 | modules/ls-pc/test/src/ls/pc/PcSymbolSearchSuite.scala | PORTED | `ls-jvm/tests/live_definition.rs`; `ls-engine/tests/engine.rs::symbol_definition_*` |
 | modules/ls-pc/test/src/ls/pc/PcTestHarness.scala | SUPPORT | PC test fixtures |
 | modules/ls-pc/test/src/ls/pc/PcWorkerManagerSuite.scala | NON-PORT | forked LRU worker manager deleted; the embedded-island supervisor/generation lifecycle is `ls-jvm/tests/{live_boundary,live_recovery}.rs`. The island's own LRU instance cap is unchanged (AC-6.5) |
-| modules/ls-pc/test/src/ls/pc/PluginManagerSuite.scala | ISLAND | plugin SPI/loading unchanged in the island (AC-6.5); the loaded-plugin path is exercised at the boundary by `ls-jvm/tests/live_zaozi.rs` |
+| modules/ls-pc/test/src/ls/pc/PluginManagerSuite.scala | ISLAND | plugin SPI/loading unchanged in the island (AC-6.5); the loaded-plugin path is exercised at the boundary by `ls-jvm/tests/live_pcplugin.rs` |
 | modules/ls-pc/test/src/ls/pc/Utf16TextSuite.scala | ISLAND | UTF-16 conversion unchanged in the island (AC-6.5); exercised via live PC positions in `ls-jvm/tests/live_boundary.rs` + `ls-pc-abi` position payloads |
 | modules/ls-pc/test/src/ls/pc/WorkerProtocolSuite.scala | NON-PORT | forked-worker wire protocol deleted; the vtable protocol is `ls-pc-abi/tests/roundtrip.rs`, `fuzz.rs`, `boundary.rs` |
 | modules/ls-pc/test/src/ls/pc/corpus/CorpusPc.scala | SUPPORT | ported-corpus fixtures: plugin-free shared facade + dotty `MockEntries` definition map, a `TestingWorkspaceSearch`-style workspace-method registry, and a per-buffer `definitionSourceToplevels` registry (the `MockEntries.definitionSourceTopLevels` port, with a consultation log) on the `PcDefinitionResolver` seam (see NOTICE.md) |
@@ -169,9 +183,9 @@ retained test-file path appears here.
 | modules/ls-sqlite-ffm/test/src/ls/sqlite/SchemaSuite.scala | NON-PORT | SQLite schema/migration removed; superseded by the manifest/state pairing tests |
 | modules/ls-sqlite-ffm/test/src/ls/sqlite/Sqlite3Suite.scala | NON-PORT | SQLite FFM binding removed (decision-table row 7) |
 | modules/ls-sqlite-ffm/test/src/ls/sqlite/TempDbFixture.scala | SUPPORT | SQLite test fixture (module removed) |
-| modules/ls-zaozi-pcplugin/test/src/ls/zaozi/pcplugin/ZaoziPcCrossFileSuite.scala | PORTED | boundary re-pointed at the vtable: `ls-jvm/tests/live_zaozi.rs` — Dynamic field + normal member both reach the compiled-dependency library SOURCE through the index-backed `symbol_definition` resolver; the no-resolver baseline is implied by asserting the resolver produced the location |
-| modules/ls-zaozi-pcplugin/test/src/ls/zaozi/pcplugin/ZaoziPcForkedSuite.scala | NON-PORT | tests the forked PC worker transport (`--plugin-config` IPC), which is deleted (embedded island). The still-relevant `pc-plugins.json` compiler-plugin loading is proven at the boundary by `ls-jvm/tests/live_zaozi.rs`; plugin status by the doctor PC-Plugins section |
-| modules/ls-zaozi-pcplugin/test/src/ls/zaozi/pcplugin/ZaoziPcNavSuite.scala | PORTED+ISLAND | cross-file go-to, exact `val a` name range, hover round-trip, missing-field no-crash, and non-zaozi selectivity are re-pointed at the vtable in `ls-jvm/tests/live_zaozi.rs` (verified live). The single-buffer plugin-INTERNAL steering shapes (macro-expanded `getRefViaFieldValName`, nested/optional fields, writable receivers, applyDynamic identity, exact hover text) test the untouched Scala plugin and stay green there (AC-6.5, island) |
+| modules/ls-zaozi-pcplugin/test/src/ls/zaozi/pcplugin/ZaoziPcCrossFileSuite.scala | PORTED | boundary re-pointed at the vtable: `live_zaozi.rs` (cutover-era) — Dynamic field + normal member both reach the compiled-dependency library SOURCE through the index-backed `symbol_definition` resolver; the resolver path stays live in `ls-jvm/tests/live_definition.rs`, and the whole zaozi module was later retired (see the retirement note) |
+| modules/ls-zaozi-pcplugin/test/src/ls/zaozi/pcplugin/ZaoziPcForkedSuite.scala | NON-PORT | tests the forked PC worker transport (`--plugin-config` IPC), which is deleted (embedded island). The still-relevant `pc-plugins.json` compiler-plugin loading is proven at the boundary by `ls-jvm/tests/live_pcplugin.rs`; plugin status by the doctor PC-Plugins section |
+| modules/ls-zaozi-pcplugin/test/src/ls/zaozi/pcplugin/ZaoziPcNavSuite.scala | PORTED+ISLAND | cross-file go-to, exact `val a` name range, hover round-trip, missing-field no-crash, and non-zaozi selectivity were re-pointed at the vtable in `live_zaozi.rs` (verified live, cutover-era). RETIRED with the module: the plugin (and its single-buffer steering suites) now lives in zaozi's own repo as part of `zaozi-compiler-plugin`; the generic vtable equivalents (steered go-to, exact name range, hover round-trip, missing-field no-crash, non-marker selectivity) live in `ls-jvm/tests/live_pcplugin.rs` |
 
 ## §18.1 case coverage
 
@@ -197,15 +211,39 @@ Every non-trimmed row is ported over live mill:
 
 E8's no-BSP warm-restart half is DEC-1/DEC-2 trimmed (task22 deferral note); E9 AOT and E10 CI wiring are out of scope.
 
-## Zaozi navigation: what is re-pointed at the vtable
+## Zaozi navigation: re-pointed at the vtable, then retired to zaozi
 
-The `ls-zaozi-pcplugin` module is **untouched** (decision table row 1). What the rewrite changed is the *transport*: navigation now flows through the embedded-island vtable + the Rust `symbol_definition` resolver instead of the deleted forked worker. So the **cross-file navigation** obligation is re-pointed at the production vtable in `crates/ls-jvm/tests/live_zaozi.rs` (verified live with the mill-built `zaoziPcplugin.jar`): the zaozi Dynamic field `io.a` and the normal member `io2.normalMethod()` both reach the compiled-dependency library SOURCE through the resolver; the definition lands on the exact `val a` name range; the `hover` vtable op round-trips with the plugin loaded; a missing zaozi field does not wedge the island; and a non-zaozi Dynamic access is left unchanged (plugin selectivity). The single-buffer plugin-internal steering shapes stay ISLAND (AC-6.5).
+At cutover the `ls-zaozi-pcplugin` module was untouched (decision table row 1);
+what the rewrite changed was the *transport*: navigation flowed through the
+embedded-island vtable + the Rust `symbol_definition` resolver instead of the
+deleted forked worker, and the **cross-file navigation** obligation was
+re-pointed at the production vtable in `live_zaozi.rs` (verified live with the
+mill-built plugin jar): Dynamic field + normal member to the library SOURCE
+through the resolver, exact `val a` name range, hover round-trip, missing-field
+no-crash, non-zaozi selectivity.
+
+Since then the plugin was RETIRED from this repo: zaozi's `zaozi-compiler-plugin`
+ships the same interactive navigation phase in-build, reaching the island via
+the build's `-Xplugin` scalacOptions (proven by the FULL-workspace editor e2e,
+which runs WITHOUT any `pc-plugins.json` — `scripts/it-nvim-zaozi-full.sh`).
+What this repo still owes — and proves — is the generic machinery:
+
+- `pc-plugins.json` compiler-plugin loading + steered navigation over the live
+  vtable: `crates/ls-jvm/tests/live_pcplugin.rs` (flake check `pc-plugin-load`)
+  with the check-only `pcNavTestPlugin` fixture (`modules/ls-pc-navtestplugin`),
+  covering the generic equivalents of the old boundary cases (steered go-to,
+  exact name range, hover round-trip, missing-field no-crash, non-marker
+  selectivity, plus a `plugin_status` loaded assertion);
+- the compiled-dependency `symbol_definition` resolver path:
+  `crates/ls-jvm/tests/live_definition.rs` (flake check `pc-definition`);
+- the zaozi-specific navigation itself: the editor-level e2e rows
+  (`it/nvim/e2e.lua`, trimmed + FULL), now against zaozi's own plugin.
 
 ## Real gaps (found and closed)
 
 1. **`RandomCorpusTest` → `crates/ls-store/tests/random_corpus.rs`** (R15): a dependency-free `splitmix64` differential (200 docs / 2000 symbols / ~20k occurrences) vs a brute-force oracle across all scans, epoch-stale dropping, both dictionaries, rename profiles, and 2000 `symbol_at` probes.
 2. **`IngestJanitorSuite` publish-time auto-reclaim → `store.rs::publishes_auto_reclaim_drained_superseded_generations`** (R15): the publish-time half (a publish reclaiming a drained, unretained superseded generation) previously had only the gated E8 test.
-3. **Zaozi normal-member cross-file / exact range / hover / missing-field → `live_zaozi.rs`** (R16): the boundary cases `ZaoziPcCrossFileSuite`/`ZaoziPcNavSuite` prove that were not yet re-pointed at the vtable.
+3. **Zaozi normal-member cross-file / exact range / hover / missing-field → `live_zaozi.rs`** (R16): the boundary cases `ZaoziPcCrossFileSuite`/`ZaoziPcNavSuite` prove that were not yet re-pointed at the vtable. (Since the plugin's retirement these live on generically in `crates/ls-jvm/tests/live_pcplugin.rs`; the normal-member resolver leg in `crates/ls-jvm/tests/live_definition.rs`.)
 
 No other mandatory behavior lacks a proving Rust test.
 

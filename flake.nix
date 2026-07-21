@@ -71,9 +71,10 @@
         # offline and is a valid -javaagent (its manifest declares the premain).
         pcHostAgentJar = pkgs.callPackage ./nix/pc-host-agent.nix { inherit mill jdk; };
 
-        # The zaozi PC plugin jar (scalac -Xplugin), loaded by the live
-        # zaozi-navigation check through a workspace pc-plugins.json.
-        zaoziPcpluginJar = pkgs.callPackage ./nix/zaozi-pcplugin.nix { inherit mill jdk; };
+        # The generic PC-navigation test-fixture plugin jar (scalac -Xplugin),
+        # loaded by the live plugin-load check through a workspace
+        # pc-plugins.json. A check input only — never shipped in the package.
+        pcNavTestPluginJar = pkgs.callPackage ./nix/pc-navtest-plugin.nix { inherit mill jdk; };
 
         # The Scala standard-library jars the live-boundary check hands a
         # registered target as its classpath, so the embedded compiler can
@@ -131,20 +132,21 @@
           LS_PC_TARGET_CLASSPATH = "${scalaLibraryJar}:${scala3LibraryJar}";
         });
 
-        # The live zaozi navigation check: boots the production island with the
-        # zaozi PC plugin loaded through a workspace pc-plugins.json, and proves
-        # the plugin steers go-to on a zaozi dynamic field access to the field
-        # declaration through the real vtable (while leaving a non-zaozi Dynamic
-        # access unchanged) — the retained zaozi nav suite re-pointed at the
-        # embedded-JVM boundary.
-        pc-zaozi-check = craneLib.cargoTest (rust.commonArgs // {
+        # The live plugin-load check: boots the production island with the
+        # generic test-fixture compiler plugin loaded through a workspace
+        # pc-plugins.json, asserts the island reports the jar loaded, and
+        # proves the plugin steers go-to on the fixture Dynamic field access to
+        # the field declaration through the real vtable (while leaving a
+        # non-marker Dynamic access unchanged) — the pc-plugins.json product
+        # mechanism proven end-to-end at the embedded-JVM boundary.
+        pc-plugin-load-check = craneLib.cargoTest (rust.commonArgs // {
           inherit (rust) cargoArtifacts;
-          cargoTestExtraArgs = "-p ls-jvm --test live_zaozi";
+          cargoTestExtraArgs = "-p ls-jvm --test live_pcplugin";
           nativeBuildInputs = [ jdk ];
           LS_LIBJVM = "${jdk.home}/lib/server/libjvm.so";
           PC_HOST_AGENT_JAR = "${pcHostAgentJar}/pc-host-agent.jar";
           LS_PC_TARGET_CLASSPATH = "${scalaLibraryJar}:${scala3LibraryJar}";
-          ZAOZI_PCPLUGIN_JAR = "${zaoziPcpluginJar}/zaozi-pcplugin.jar";
+          LS_PC_NAVTEST_JAR = "${pcNavTestPluginJar}/pc-navtest-plugin.jar";
         });
 
         # The live go-to-definition check at the ls-server layer: boots the
@@ -165,7 +167,7 @@
         # pre-bootstrap, and `dump` inspects an absent store gracefully — all
         # without booting a JVM.
         lsPackage = pkgs.callPackage ./nix/package.nix {
-          inherit jdk pcHostAgentJar zaoziPcpluginJar;
+          inherit jdk pcHostAgentJar;
           rustWorkspace = rust.package;
         };
         package-cli-check = pkgs.runCommand "check-package-cli" { } ''
@@ -180,8 +182,6 @@
             || { echo "dump did not report the absent store"; exit 1; }
           [ -f "${lsPackage}/share/scala3-bsp-semantic-ls/pc-host-agent.jar" ] \
             || { echo "packaged island agent jar missing"; exit 1; }
-          [ -f "${lsPackage}/share/scala3-bsp-semantic-ls/zaozi-pcplugin.jar" ] \
-            || { echo "packaged zaozi plugin jar missing"; exit 1; }
           touch $out
         '';
 
@@ -225,7 +225,7 @@
       {
         devShells.default = import ./nix/dev-shell.nix {
           inherit pkgs jdk mill zaozi-src;
-          inherit pcHostAgentJar scalaLibraryJar scala3LibraryJar zaoziPcpluginJar;
+          inherit pcHostAgentJar scalaLibraryJar scala3LibraryJar pcNavTestPluginJar;
           inherit (pythonTools) pythonEnv;
         };
 
@@ -241,7 +241,7 @@
           pc-boundary = pc-boundary-check;
           pc-recovery = pc-recovery-check;
           pc-definition = pc-definition-check;
-          pc-zaozi = pc-zaozi-check;
+          pc-plugin-load = pc-plugin-load-check;
           pc-server-definition = pc-server-definition-check;
         };
 
@@ -259,8 +259,9 @@
           spike-agent-jar = spikeAgentJar;
           # The production presentation-compiler island host agent jar.
           pc-host-agent-jar = pcHostAgentJar;
-          # The zaozi presentation-compiler plugin jar (scalac -Xplugin).
-          zaozi-pcplugin-jar = zaoziPcpluginJar;
+          # The generic PC-navigation test-fixture plugin jar (scalac -Xplugin;
+          # the pc-plugin-load check input, not shipped in the package).
+          pc-navtest-plugin-jar = pcNavTestPluginJar;
         };
       }) // { inherit inputs; };
 }

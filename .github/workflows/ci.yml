@@ -20,7 +20,7 @@ jobs:
       - name: nix flake check
         run: nix flake check
 
-      # The retained JVM island (pc, pcHost, pcHostSpike, zaoziPcplugin).
+      # The retained JVM island (pc, pcHost, pcHostSpike, pcNavTestPlugin).
       - name: island compile
         run: nix develop -c mill __.compile
 

@@ -20,7 +20,6 @@
 , jdk
 , rustWorkspace
 , pcHostAgentJar
-, zaoziPcpluginJar
 , scalafmt
 , makeWrapper
 }:
@@ -39,8 +38,6 @@ stdenvNoCC.mkDerivation {
     mkdir -p $out/bin $out/share/scala3-bsp-semantic-ls
     cp ${pcHostAgentJar}/pc-host-agent.jar \
       $out/share/scala3-bsp-semantic-ls/pc-host-agent.jar
-    cp ${zaoziPcpluginJar}/zaozi-pcplugin.jar \
-      $out/share/scala3-bsp-semantic-ls/zaozi-pcplugin.jar
     cp ${../modules/ls-pc/resources/default-plugin-schema.json} \
       $out/share/scala3-bsp-semantic-ls/default-plugin-schema.json
 

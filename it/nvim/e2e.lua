@@ -274,13 +274,13 @@ pass("reindex: " .. reindexed)
 -- own dev shell (CIRCT toolchain). A zaozi dynamic bundle-field access
 -- `io.<field>` is a `transparent inline selectDynamic("<field>")` whose
 -- expansion drops the field name to a runtime string, so vanilla go-to lands
--- on `selectDynamic`; the shipped zaozi PC plugin (loaded through the
--- workspace pc-plugins.json) steers symbol-at-cursor to the real
--- `val <field> = Aligned/Flipped(...)`. Definition + hover at the access are
--- HARD gates (the PC-interactive path works today); references at the field
--- DEFINITION and workspace/symbol on the field name are INFO-only until the
--- index-side SemanticDB-enhancing zaozi compiler plugin raises them (then
--- they flip to hard gates).
+-- on `selectDynamic`; zaozi's own zaozi-compiler-plugin (its interactive
+-- navigation phase reaches the PC island through the build's -Xplugin
+-- scalacOptions — no pc-plugins.json involved) steers symbol-at-cursor to the
+-- real `val <field> = Aligned/Flipped(...)`. Definition + hover at the access
+-- are HARD gates, and so are references at the field DEFINITION (the plugin's
+-- batch phase injects the SemanticDB occurrences the inline expansion drops);
+-- workspace/symbol on the field name stays an INFO line.
 if full_mode then
   -- FULL-model doctor: the untrimmed model must carry every CIRCT module.
   local full_report = execute("scala3SemanticLs.doctor", 60000)

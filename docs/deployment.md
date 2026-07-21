@@ -8,9 +8,9 @@
 > path, and command below is quoted from the tree, not invented.
 
 The server is a **native Rust binary** (the cargo workspace under `crates/`,
-built with crane). The only JVM components in the product are the
-presentation-compiler island artifacts built by Mill: the PC-host agent jar (a
-`-javaagent` premain assembly) and the zaozi PC compiler-plugin jar. The JVM is
+built with crane). The only JVM component in the product is the
+presentation-compiler island artifact built by Mill: the PC-host agent jar (a
+`-javaagent` premain assembly). The JVM is
 embedded lazily — it boots in-process on the first presentation-compiler query,
 so an index-only session runs with **zero JVM in the process**. Per the v2
 decision record (plan-rust.md §0), the previous Scala/JVM core was replaced
@@ -55,7 +55,7 @@ refuses to bootstrap outside the dev shell. All commands below assume you
 either ran `nix develop` first or prefix with `nix develop -c`.
 
 The dev shell also exports the PC island boot inputs (`LS_LIBJVM`,
-`PC_HOST_AGENT_JAR`, `LS_PC_TARGET_CLASSPATH`, `ZAOZI_PCPLUGIN_JAR`), so a
+`PC_HOST_AGENT_JAR`, `LS_PC_TARGET_CLASSPATH`, `LS_PC_NAVTEST_JAR`), so a
 dev-built server and the live PC tests can boot the island without the packaged
 wrapper. See [nix-build.md §6](nix-build.md) for the full dev-shell contract.
 
@@ -76,7 +76,6 @@ the island artifacts alongside it:
 ```text
 result/bin/scala3-bsp-semantic-ls                                # makeWrapper launcher around the Rust ls-server binary
 result/share/scala3-bsp-semantic-ls/pc-host-agent.jar            # PC island host agent (-javaagent premain assembly; mill pcHost.assembly)
-result/share/scala3-bsp-semantic-ls/zaozi-pcplugin.jar           # shipped PC compiler plugin (scalac -Xplugin; zaozi bundle-field go-to/hover)
 result/share/scala3-bsp-semantic-ls/default-plugin-schema.json   # JSON schema for pc-plugins.json (data, not required to run)
 ```
 
@@ -123,7 +122,7 @@ references/rename/workspace-symbol never touch Java at all.
 |-----------------------------|-----------------------------------------------------------------------|
 | `.#rust-workspace`          | the crane-built cargo workspace (`bin/ls-server`, plus the spike/bench binaries) |
 | `.#pc-host-agent-jar`       | the island host agent assembly on its own                             |
-| `.#zaozi-pcplugin-jar`      | the zaozi PC compiler plugin jar on its own                           |
+| `.#pc-navtest-plugin-jar`   | the pc-plugins.json test-fixture compiler plugin jar (check input, not shipped) |
 | `.#spike-agent-jar`         | the embedded-JVM boundary-spike agent jar (dev/verification artifact) |
 | `.#mill`, `.#mill-ivy-fetcher` | the pinned Mill and `mif` used by the ivy-lock workflow            |
 | `.#zaozi-src`               | the pinned + patched zaozi source tree (real-repo validation input)   |
@@ -419,12 +418,17 @@ island error) — exercised for real by the `pc-recovery` flake check.
 ```
 
 Each `jars` entry becomes a `-Xplugin:<jar>` and each `options` entry a `-P:`
-option on the island's compiler instances. The packaged server ships one such
-plugin at `share/scala3-bsp-semantic-ls/zaozi-pcplugin.jar`: point a
-workspace's `compilerPlugins` at it to make go-to-definition and hover resolve
-zaozi's dynamic `io.field` bundle accesses to the real field declaration (see
-[plugin-spi.md §2.1](plugin-spi.md)). It keys strictly on the zaozi API and is
-inert on every other codebase.
+option on the island's compiler instances. The mechanism is proven end-to-end
+by the `pc-plugin-load` flake check: a generic test-fixture navigation plugin
+(`modules/ls-pc-navtestplugin`, built as `.#pc-navtest-plugin-jar`, never
+shipped) is loaded into the live island through a workspace `pc-plugins.json`
+and its go-to steering is observed over the vtable
+(`crates/ls-jvm/tests/live_pcplugin.rs`; see [plugin-spi.md §2.1](plugin-spi.md)).
+Use `compilerPlugins` for workspaces whose tooling plugin is NOT part of the
+build itself. A project whose build already passes its tooling plugin via
+`-Xplugin` scalacOptions (as zaozi does with its in-build
+`zaozi-compiler-plugin` — the navigation phase reaches the island through
+`buildTarget/scalacOptions`) needs no `pc-plugins.json` at all.
 
 ### 4.9 Formatting (the scalafmt command line)
 
@@ -541,7 +545,7 @@ framed LSP wire against a **real** Mill BSP server built from
 `it/sample-workspace` — production discovery → mill launch → model load →
 compile → diagnostics → rename-through-compile → teardown — plus the embedded
 presentation-compiler rows, the dispatch-generation recovery row, and the
-zaozi-plugin navigation row. It also asserts the **cold-start zero-JVM
+pc-plugins.json plugin-load row. It also asserts the **cold-start zero-JVM
 property** via `/proc/self/maps`: no libjvm is mapped until the first PC query.
 
 ```bash
@@ -576,8 +580,9 @@ packaged-CLI check (`--version`/`--doctor`/`dump` offline against the real
 island against a real JVM inside the sandbox: `pc-boundary` (register/open/
 completion/hover through the vtable), `pc-recovery` (watchdog recovery through
 a real wedged completion), `pc-definition` (cross-file go-to through the
-symbol-resolver round-trip), `pc-zaozi` (the shipped zaozi plugin steering
-go-to), and `pc-server-definition` (`textDocument/definition` through the real
+symbol-resolver round-trip), `pc-plugin-load` (the test-fixture compiler
+plugin loaded through a workspace `pc-plugins.json` steering go-to), and
+`pc-server-definition` (`textDocument/definition` through the real
 ls-server dispatch). The full list with one line each is in
 [nix-build.md §5](nix-build.md).
 
@@ -614,9 +619,12 @@ nix develop -c ./scripts/it-nvim-zaozi-full.sh
   shell (`CIRCT_INSTALL_PATH`/`MLIR_INSTALL_PATH`, its JDK, the `-Xss32m`
   `JAVA_TOOL_OPTIONS`); the first entry fetches the CIRCT toolchain from the
   org ci-cache.
-- **The shipped plugin is wired the deploy way**: the script writes
-  `.scala3-bsp-semantic-ls/pc-plugins.json` pointing `compilerPlugins` at the
-  package's `share/scala3-bsp-semantic-ls/zaozi-pcplugin.jar` (§4.8).
+- **No `pc-plugins.json` needed**: zaozi's own `zaozi-compiler-plugin` ships
+  BOTH tooling phases (batch SemanticDB enhancement + interactive
+  dynamic-field navigation) and reaches the PC island through the build's
+  `-Xplugin` scalacOptions over `buildTarget/scalacOptions` — the same route
+  every other editor gets it by. The `pc-plugins.json` mechanism (§4.8) stays
+  for workspaces whose tooling plugin is not part of the build.
 - **Hard gates (the PC-interactive path, working today)**: with the access
   file open in the editor, `textDocument/definition` and `textDocument/hover`
   at a real dynamic bundle-field access `io.<field>` land on the
@@ -625,12 +633,14 @@ nix develop -c ./scripts/it-nvim-zaozi-full.sh
   (`stdlib/src/dwbb/Queue.scala` → `stdlib/src/Queue.scala`,
   `QueueIO.empty`); expected lines are grep-computed from the bundle source
   at run time.
-- **INFO lines, deliberately not yet gated**: `textDocument/references` at
-  the field definition and `workspace/symbol` on the field name print
-  `E2E INFO: dynamic-field … = N` counts. Vanilla SemanticDB drops the
-  use-site occurrences inside the inline expansion; the zaozi-side
-  SemanticDB-enhancing compiler plugin raises these counts, at which point
-  the INFO lines flip to hard gates.
+- **Hard gate: references cover the dynamic-access sites**:
+  `textDocument/references` at each field DEFINITION must return ≥ 2 sites
+  including the access file. Vanilla SemanticDB drops the use-site
+  occurrences inside the inline expansion; the zaozi plugin's batch
+  SemanticDB-enhancing phase injects them, the BSP compile emits them, and
+  the index serves them.
+- **INFO line, deliberately not gated**: `workspace/symbol` on the field
+  name prints an `E2E INFO: dynamic-field … = N` count.
 - **Budgets are env knobs** (`LS_NVIM_COMPILE_TIMEOUT_MS`, default 60 min;
   `LS_NVIM_READY_TIMEOUT_S`, default 30 min; `LS_NVIM_REINDEX_TIMEOUT_MS`,
   default 10 min): the full-model session compile is a real many-minute
@@ -662,7 +672,7 @@ nix develop -c ./scripts/it-nvim-zaozi-full.sh
 | Bootstrap fails with `no workspace root in the initialize params`          | client sent no `rootUri`/`workspaceFolder`                          | send `initialize` with `rootUri` = workspace root (where `.bsp/` lives)                  |
 | `error: mill not found on PATH`                                            | ran `./mill` (or a script) outside the dev shell                    | run inside `nix develop`, or prefix commands with `nix develop -c`                       |
 | Offline island build / `check-ivy-lock.sh` fails after a dep change        | `nix/ivy-lock.nix` not regenerated                                  | `nix develop -c ./scripts/regen-ivy-lock.sh` and commit the lock                         |
-| Zaozi `io.field` go-to lands on `selectDynamic`                            | the zaozi PC plugin is not configured for the workspace              | point `pc-plugins.json` `compilerPlugins` at `share/…/zaozi-pcplugin.jar` (§4.8)        |
+| Zaozi `io.field` go-to lands on `selectDynamic`                            | the zaozi build's own `zaozi-compiler-plugin` is not active           | use a zaozi checkout whose build ships the plugin (its `-Xplugin` scalacOptions reach the island); for non-build tooling plugins use `pc-plugins.json` (§4.8) |
 | `no .scalafmt.conf in the workspace (scalafmt requires a pinned version)`  | the workspace root has no `.scalafmt.conf`                           | add one with `version = "<scalafmt --version>"` and `runner.dialect = scala3` (§4.9)    |
 | Formatting fails with `scalafmt failed …` naming a `scalafmt-core` version | `.scalafmt.conf` pins a version other than the shipped scalafmt; the offline stance never downloads it | pin the conf's `version` to the shipped scalafmt's, or point config `scalafmt` / `LS_SCALAFMT` at a matching binary (§4.9) |
 | `formatting: <uri> is not open`                                            | the client requested formatting for a file it never opened           | formatting serves the open buffer only — open the file in the editor first (§4.9)       |

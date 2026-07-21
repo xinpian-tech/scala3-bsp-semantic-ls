@@ -1,6 +1,6 @@
 { pkgs, jdk, mill, zaozi-src ? null
 , pcHostAgentJar ? null, scalaLibraryJar ? null, scala3LibraryJar ? null
-, zaoziPcpluginJar ? null, pythonEnv ? null }:
+, pcNavTestPluginJar ? null, pythonEnv ? null }:
 
 pkgs.mkShell {
   packages = with pkgs; [
@@ -53,11 +53,12 @@ pkgs.mkShell {
   LS_PC_TARGET_CLASSPATH =
     if scalaLibraryJar == null || scala3LibraryJar == null then ""
     else "${scalaLibraryJar}:${scala3LibraryJar}";
-  # The zaozi PC-navigation compiler plugin jar, so the live zaozi vtable-boundary
-  # test (`cargo test -p ls-jvm --test live_zaozi`) runs in the dev shell instead
-  # of skipping. Null when the flake is used without this input.
-  ZAOZI_PCPLUGIN_JAR =
-    if zaoziPcpluginJar == null then "" else "${zaoziPcpluginJar}/zaozi-pcplugin.jar";
+  # The generic PC-navigation test-fixture plugin jar, so the live
+  # pc-plugins.json plugin-load test (`cargo test -p ls-jvm --test
+  # live_pcplugin`) runs in the dev shell instead of skipping. Null when the
+  # flake is used without this input.
+  LS_PC_NAVTEST_JAR =
+    if pcNavTestPluginJar == null then "" else "${pcNavTestPluginJar}/pc-navtest-plugin.jar";
   # Pinned + patched zaozi source (real-repo real-BSP workspace for
   # manual real-repo validation). Null when the flake is used without the zaozi input.
   ZAOZI_SRC = if zaozi-src == null then "" else "${zaozi-src}";

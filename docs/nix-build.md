@@ -3,13 +3,14 @@
 > Normative contract for toolchain, dependency locking, packaging, and CI.
 > Derived from the real `flake.nix`, `nix/rust.nix`, `nix/package.nix`,
 > `nix/checks.nix`, `nix/dev-shell.nix`, `nix/pc-host-agent.nix`,
-> `nix/zaozi-pcplugin.nix`, `nix/spike-agent.nix`, `nix/ivy-lock.nix`, and the
+> `nix/pc-navtest-plugin.nix`, `nix/spike-agent.nix`, `nix/ivy-lock.nix`, and the
 > `scripts/` in this repository.
 
 The build is two-tier, mirroring the product (see the v2 decision record,
 plan-rust.md §0): the deployable server is the **crane-built Rust cargo
 workspace** under `crates/`, and Mill builds only the **JVM island artifacts**
-— the PC-host agent jar and the zaozi PC plugin jar — from a locked ivy cache.
+— the PC-host agent jar and the check-only test-fixture plugin jar — from a
+locked ivy cache.
 
 ## 1. Toolchain contract
 
@@ -48,7 +49,7 @@ workspace and supplies the fmt/clippy/test/build checks), `mill-ivy-fetcher`
 (hard requirement; its two overlays provide `pkgs.mill-ivy-fetcher` (the `mif`
 tool), `pkgs.millVersions.*`, and the packaging helpers `ivy-gather` +
 `configure-mill-env-hook`), and `zaozi` (a pinned non-flake source input; the
-real third-party Scala 3 project behind the zaozi plugin validation).
+real third-party Scala 3 project the editor-level e2e drives).
 
 Systems are **Linux only by decision**: `flake-utils.lib.eachSystem
 ["x86_64-linux" "aarch64-linux"]`. The embedded-libjvm boundary (dlopen +
@@ -62,10 +63,10 @@ Per-system outputs:
 | `devShells.default` | `nix/dev-shell.nix` (§6) |
 | `formatter` | `pkgs.nixpkgs-fmt` |
 | `checks.*` | `nix/checks.nix` + the crane checks + the boundary/package checks (§5) |
-| `packages.default` | `nix/package.nix` — the wrapped Rust server + island jars (§3.1) |
+| `packages.default` | `nix/package.nix` — the wrapped Rust server + the island agent jar (§3.1) |
 | `packages.rust-workspace` | the crane-built cargo workspace on its own |
 | `packages.pc-host-agent-jar` | the PC island host agent assembly (`mill pcHost.assembly`) |
-| `packages.zaozi-pcplugin-jar` | the zaozi PC compiler plugin jar (`mill zaoziPcplugin.jar`) |
+| `packages.pc-navtest-plugin-jar` | the pc-plugins.json test-fixture compiler plugin jar (`mill pcNavTestPlugin.jar`; check input, not shipped) |
 | `packages.spike-agent-jar` | the boundary-spike island agent jar (`mill pcHostSpike.assembly`) |
 | `packages.mill`, `packages.mill-ivy-fetcher` | the pinned Mill and `mif` (so `nix shell '.#mill' '.#mill-ivy-fetcher' -c mif run …` works) |
 | `packages.zaozi-src` | the pinned zaozi source with `nix/patches/zaozi-semanticdb.patch` applied |
@@ -88,7 +89,6 @@ the island boot env plus a scoped test filter on top.
 ```text
 bin/scala3-bsp-semantic-ls                              # makeWrapper launcher around the crane-built ls-server binary
 share/scala3-bsp-semantic-ls/pc-host-agent.jar          # the mill-built island host agent (-javaagent premain assembly)
-share/scala3-bsp-semantic-ls/zaozi-pcplugin.jar         # the mill-built zaozi PC plugin (scalac -Xplugin)
 share/scala3-bsp-semantic-ls/default-plugin-schema.json # from modules/ls-pc/resources/
 ```
 
@@ -103,11 +103,11 @@ first presentation-compiler query. `meta.platforms = lib.platforms.linux`.
 
 ## 4. The island jars & dependency locking
 
-`nix/pc-host-agent.nix`, `nix/zaozi-pcplugin.nix`, and `nix/spike-agent.nix`
+`nix/pc-host-agent.nix`, `nix/pc-navtest-plugin.nix`, and `nix/spike-agent.nix`
 build the three Mill artifacts offline: each takes only `build.mill` +
 `modules/` as source, consumes the fixed-output ivy cache built by
 `ivy-gather ./ivy-lock.nix`, and runs `mill --no-daemon
-pcHost.assembly` / `zaoziPcplugin.jar` / `pcHostSpike.assembly` (`--no-daemon`
+pcHost.assembly` / `pcNavTestPlugin.jar` / `pcHostSpike.assembly` (`--no-daemon`
 because the daemon path resolves its runner from the network, which the
 sandbox forbids).
 
@@ -164,16 +164,16 @@ guard actually rejects what the lock does not carry.
 | `rust-fmt` | `cargo fmt` cleanliness against the committed `rustfmt.toml` |
 | `spike-boundary` | boots the spike island through the crane-built `ls-jvm-spike` binary and drives every boundary scenario (echo / java-throw / rust-panic / timeout / bad-canary) |
 | `pc-host-agent` | the agent jar builds offline and its manifest declares `Premain-Class: ls.pc.host.PcHostAgent` (a valid `-javaagent`) |
-| `package-cli` | the packaged binary works offline: `--version` prints the identity, `--doctor` renders the Store section pre-bootstrap, `dump` reports an absent store gracefully, and both island jars are shipped under `share/` |
+| `package-cli` | the packaged binary works offline: `--version` prints the identity, `--doctor` renders the Store section pre-bootstrap, `dump` reports an absent store gracefully, and the island agent jar is shipped under `share/` |
 | `pc-boundary` | live `ls-jvm` test: boots the production island against a real JVM and drives register/open/completion/hover through the 22-slot vtable |
 | `pc-recovery` | live dispatch-generation recovery: a real wedged completion is recovered by the watchdog; the generation cap turns into a fatal |
 | `pc-definition` | live cross-file go-to: the full FFM round-trip through the symbol-resolver slot with a real snapshot-backed resolver |
-| `pc-zaozi` | live zaozi navigation: the shipped plugin, loaded through a workspace `pc-plugins.json`, steers go-to on a zaozi dynamic field access |
+| `pc-plugin-load` | live pc-plugins.json plugin loading: the test-fixture compiler plugin, loaded through a workspace `pc-plugins.json`, is reported loaded and steers go-to on the fixture Dynamic field access |
 | `pc-server-definition` | live `ls-server` test: `textDocument/definition` through the real `CoreHandlers` dispatch into the booted island |
 
 The live PC checks reuse the shared crane artifacts and are handed the boot
 inputs (`LS_LIBJVM`, `PC_HOST_AGENT_JAR`, `LS_PC_TARGET_CLASSPATH`, and for
-`pc-zaozi` also `ZAOZI_PCPLUGIN_JAR`) as derivation env; the target classpath
+`pc-plugin-load` also `LS_PC_NAVTEST_JAR`) as derivation env; the target classpath
 is the pinned Scala 3.8.4 standard-library jars, version-matched to the
 compiler bundled in the PC-host assembly.
 
@@ -204,7 +204,7 @@ Exported environment — contract, code and scripts rely on these:
 | `LS_LIBJVM` | `${jdk.home}/lib/server/libjvm.so` | the exact libjvm the embedded island dlopens (on nixpkgs jdk25 it lives under `jdk.home`, not `$JAVA_HOME/lib/server`) |
 | `PC_HOST_AGENT_JAR` | the mill-built agent jar | island boot input for the live PC tests and dev-shell servers |
 | `LS_PC_TARGET_CLASSPATH` | pinned scala-library + scala3-library jars | the classpath live-PC test targets register |
-| `ZAOZI_PCPLUGIN_JAR` | the zaozi plugin jar | lets the live zaozi row run instead of skipping |
+| `LS_PC_NAVTEST_JAR` | the test-fixture plugin jar | lets the live plugin-load row run instead of skipping |
 | `ZAOZI_SRC` | the patched zaozi tree | pinned real-repo workspace source for manual validation |
 
 With these set, `cargo test` in the dev shell runs the live embedded-JVM tests
@@ -215,7 +215,7 @@ none of them).
 
 ```bash
 nix flake check                                  # everything in §5
-nix develop -c mill __.compile                   # the retained island modules (pc, pcHost, pcHostSpike, zaoziPcplugin)
+nix develop -c mill __.compile                   # the retained island modules (pc, pcHost, pcHostSpike, pcNavTestPlugin)
 nix develop -c mill __.test                      # the island test suites
 nix develop -c cargo run -p ls-bench -- --smoke  # bench smoke over the Rust engine
 nix develop -c ./scripts/check-ivy-lock.sh       # lock freshness (rule 3, §4)
@@ -228,4 +228,4 @@ Expectations these commands must keep true: `nix flake check` passes;
 `nix develop` launches Java 25 and the Rust toolchain; the cargo workspace and
 the island modules compile under `nix develop`; the ivy-lock refresh check
 passes and no ivy dependency resolves outside the nix lock; the package wraps
-the native `ls-server` binary and ships both island jars.
+the native `ls-server` binary and ships the island agent jar.

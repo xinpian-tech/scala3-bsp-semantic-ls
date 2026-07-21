@@ -52,7 +52,7 @@ mill __.test                     # the retained JVM island
 Build the package:
 
 ```bash
-nix build .#default              # bin/scala3-bsp-semantic-ls + island jars
+nix build .#default              # bin/scala3-bsp-semantic-ls + the island agent jar
 ```
 
 Refresh the dependency lock after changing `build.mill`:
@@ -218,4 +218,4 @@ scala3-bsp-semantic-ls --doctor /path/to/workspace   # offline health report, no
 | `pc`            | `modules/ls-pc`            | presentation-compiler facade + plugin SPI |
 | `pcHost`        | `modules/ls-pc-host`       | island host `-javaagent` (FFM premain)    |
 | `pcHostSpike`   | `modules/ls-pc-host-spike` | boundary spike agent                      |
-| `zaoziPcplugin` | `modules/ls-zaozi-pcplugin`| zaozi PC navigation plugin (`-Xplugin`)   |
+| `pcNavTestPlugin` | `modules/ls-pc-navtestplugin` | pc-plugins.json test-fixture plugin (`-Xplugin`; check input, not shipped) |

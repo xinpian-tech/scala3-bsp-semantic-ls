@@ -74,7 +74,7 @@ Operational requirements (plan Phase 9):
   disabled plugins`). Plugin failure degrades PC features; it never degrades index
   correctness.
 
-### 2.1 Configuration file and the shipped `zaozi-pcplugin`
+### 2.1 Configuration file and the `pc-plugin-load` proof
 
 Compiler plugins are configured per workspace in
 `<workspaceRoot>/.scala3-bsp-semantic-ls/pc-plugins.json` under `compilerPlugins`:
@@ -91,22 +91,30 @@ Each `jars` entry becomes a `-Xplugin:<jar>` option and each `options` entry a
 `-P:<option>` on the island's compiler instances (the workspace `pc-plugins.json`
 is read by the island host at target registration).
 
-The packaged server ships one such plugin at
-`share/scala3-bsp-semantic-ls/zaozi-pcplugin.jar` (built by the `zaoziPcplugin` Mill
-module). It is a Scala 3 `StandardPlugin` that runs after `typer` in the presentation
-compiler and rewrites the `Inlined.call` of a zaozi `Referable` `scala.Dynamic`
-bundle-field access (`io.a`) to a typed reference to the resolved field symbol, so
-go-to-definition and hover resolve to the real `val a = Aligned(...)` declaration
-instead of the framework `selectDynamic` method. It keys strictly on the zaozi API
-(`me.jiuyang.zaozi.reftpe.Referable` / `me.jiuyang.zaozi.magic.DynamicSubfield`) and is
-inert on every other codebase. Point a workspace's `pc-plugins.json` `compilerPlugins`
-at that jar to enable zaozi bundle-field navigation.
+The mechanism is proven end-to-end by a GENERIC test fixture this repo owns: the
+`pcNavTestPlugin` Mill module (`modules/ls-pc-navtestplugin`, built standalone as
+`.#pc-navtest-plugin-jar`; never shipped in the package). It is a Scala 3
+`StandardPlugin` that runs after `typer` in the presentation compiler and rewrites
+the `Inlined.call` of a `scala.Dynamic` field access (`io.a`) on its own marker
+trait (`lstest.navfixture.NavProbe[T]`) to a typed reference to the resolved field
+symbol — inert on every other shape. The live test
+`crates/ls-jvm/tests/live_pcplugin.rs` (flake check `pc-plugin-load`) loads that
+jar into the embedded island through a workspace `pc-plugins.json` and observes
+the steered go-to (and the non-marker negative control) over the real vtable.
+
+Real-world navigation plugins ride the same path. A project whose BUILD already
+carries its tooling plugin — as zaozi does with its in-build
+`zaozi-compiler-plugin`, whose interactive navigation phase reaches the island
+via the build's `-Xplugin` scalacOptions over `buildTarget/scalacOptions` —
+needs no `pc-plugins.json` at all; the config file is for plugins that are not
+part of the build.
 
 > **Doctor-status caveat.** The manager validates a configured compiler plugin by jar
 > existence only, so the Doctor line `compiler plugins loaded: N of M` reports how many
 > configured jars exist — **not** that the presentation compiler actually loaded the
 > plugin class or ran its phase. To confirm a compiler plugin is working, exercise the
-> PC feature it affects (e.g. go-to on `io.a`), not the doctor status.
+> PC feature it affects (e.g. the steered go-to the `pc-plugin-load` check drives), not
+> the doctor status.
 
 ## 3. PC service plugin SPI (plan 14.3)
 

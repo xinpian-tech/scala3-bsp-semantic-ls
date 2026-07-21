@@ -6,9 +6,10 @@
 # FULL mode (LS_NVIM_FULL=1): the full-model health gates (ready / compile /
 # reindex / doctor over every CIRCT module) plus the dynamic-bundle-field
 # probes — go-to-definition and hover on a real `io.<field>` access resolve
-# the `val <field> = Aligned/Flipped(...)` declaration through the shipped
-# zaozi PC plugin (wired via the workspace pc-plugins.json), and the
-# references / workspace-symbol counts are recorded as E2E INFO lines.
+# the `val <field> = Aligned/Flipped(...)` declaration through zaozi's own
+# tooling compiler plugin (its interactive navigation phase reaches the PC
+# island via the build's -Xplugin scalacOptions), and references at each
+# field definition are hard-gated to include the dynamic-access sites.
 #
 # The zaozi build needs zaozi's OWN native toolchain (CIRCT/MLIR via Panama),
 # so every mill / server step runs inside ZAOZI'S dev shell
@@ -41,14 +42,12 @@ phase() { # <label>
 }
 
 # The packaged server: baked JAVA_HOME / PC_HOST_AGENT_JAR / LS_SCALAFMT
-# defaults, and the shipped zaozi PC plugin jar under share/.
+# defaults (deploy realism — what a flake consumer runs).
 pkg_link="$repo/tmp/it-nvim-zaozi-full-package"
 mkdir -p "$repo/tmp"
 nix build "$repo#default" -o "$pkg_link"
 server_bin="$pkg_link/bin/scala3-bsp-semantic-ls"
-plugin_jar="$(readlink -f "$pkg_link")/share/scala3-bsp-semantic-ls/zaozi-pcplugin.jar"
 [ -x "$server_bin" ] || { echo "packaged server missing at $server_bin" >&2; exit 1; }
-[ -f "$plugin_jar" ] || { echo "packaged zaozi plugin jar missing at $plugin_jar" >&2; exit 1; }
 phase "nix build .#default (packaged server)"
 
 ws="${LS_NVIM_PROJECT_DIR:-}"
@@ -79,12 +78,10 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Wire the shipped PC plugin into the workspace: the island reads
-# .scala3-bsp-semantic-ls/pc-plugins.json at boot (docs/deployment.md §4.8).
-mkdir -p "$ws/.scala3-bsp-semantic-ls"
-cat > "$ws/.scala3-bsp-semantic-ls/pc-plugins.json" <<EOF
-{"compilerPlugins":[{"jars":["$plugin_jar"],"options":[]}],"servicePluginJars":[]}
-EOF
+# No pc-plugins.json: zaozi's own zaozi-compiler-plugin ships BOTH tooling
+# phases (batch SemanticDB enhancement + interactive dynamic-field navigation)
+# and reaches the PC island through the build's -Xplugin scalacOptions over
+# buildTarget/scalacOptions — the same route every other editor gets it by.
 
 file="${LS_NVIM_FILE:-zaozi/tests/src/UIntSpec.scala}"
 token="${LS_NVIM_TOKEN:-UIntSpecIO}"

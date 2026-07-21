@@ -1,5 +1,20 @@
 # zaozi-pcplugin — Presentation-Compiler Go-To & Hover for zaozi's `Dynamic` Bundle-Field Macro
 
+> **STATUS: retired — the plugin now lives in zaozi.** This design was built,
+> shipped, and proven end-to-end in this repo, and then moved upstream:
+> zaozi's own `zaozi-compiler-plugin` ships the interactive PC navigation
+> phase in-build, reaching the embedded island through the build's `-Xplugin`
+> scalacOptions over `buildTarget/scalacOptions` — no `pc-plugins.json`
+> wiring needed (the FULL-workspace e2e `scripts/it-nvim-zaozi-full.sh` runs
+> without one). The `ls-zaozi-pcplugin` module, its shipped jar, and the
+> `live_zaozi` boundary test were removed; the `pc-plugins.json`
+> `compilerPlugins` mechanism this design rode stays a product feature,
+> proven by the generic check-only fixture `modules/ls-pc-navtestplugin` +
+> `crates/ls-jvm/tests/live_pcplugin.rs` (flake check `pc-plugin-load`; see
+> `docs/plugin-spi.md` §2.1 and the retirement notes in
+> `docs/traceability.md` / `docs/coverage-audit.md`). The document below is
+> the historical design record.
+
 ## Goal Description
 
 Add a new Mill build target `zaoziPcplugin`: a Scala 3 `StandardPlugin` compiler plugin that, loaded into this project's presentation compiler (PC) via the existing `pc-plugins.json` `compilerPlugins` mechanism, makes the PC resolve `textDocument/definition` (go-to) **and** `textDocument/hover` on zaozi's dynamic bundle-field access `io.a` to the real `val a = Aligned(...)` field declaration.
@@ -384,3 +399,17 @@ so it only ever rewrites zaozi dynamic accesses and is inert elsewhere.
   feasibility trace; confirm concretely at phase 1 before building the rewrite logic.
 
 --- Original Design Draft End ---
+
+## Postscript: now lives in zaozi
+
+Everything above was implemented and verified in this repo, then retired here
+when zaozi adopted the approach upstream: the rewrite phase became part of
+zaozi's own `zaozi-compiler-plugin` (alongside its batch SemanticDB
+enhancement phase), delivered to every editor through the build's `-Xplugin`
+scalacOptions instead of a per-workspace `pc-plugins.json`. This repo keeps
+the delivery mechanism the design introduced — `pc-plugins.json`
+`compilerPlugins` into the embedded island — as a product feature, proven by
+a generic fixture plugin (`modules/ls-pc-navtestplugin`,
+`crates/ls-jvm/tests/live_pcplugin.rs`, flake check `pc-plugin-load`), and
+keeps validating the zaozi navigation itself at the editor level
+(`scripts/it-nvim-zaozi.sh` / `scripts/it-nvim-zaozi-full.sh`).
