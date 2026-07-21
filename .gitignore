@@ -22,3 +22,6 @@ mill-java-opts
 # workspace); only build artifacts are ignored.
 /target/
 **/*.rs.bk
+
+# Repo-local scratch (e.g. the it-nvim-zaozi-full.sh package result link).
+/tmp/

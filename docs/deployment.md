@@ -593,6 +593,57 @@ nix develop -c ./scripts/check-ivy-lock.sh          # committed ivy lock matches
 
 The full CI command set is in [nix-build.md §7](nix-build.md).
 
+### 5.7 Real-repo macro-navigation e2e (`scripts/it-nvim-zaozi-full.sh`)
+
+The editor-level proof that the server solves zaozi's macro-navigation
+problem on the REAL, untrimmed repo. The trimmed `scripts/it-nvim-zaozi.sh`
+(CI job `nvim-zaozi-e2e`) keeps only zaozi's CIRCT-free modules for speed;
+this variant copies the pinned checkout WHOLE — every CIRCT/MLIR Panama
+module in the model — so the build side runs zaozi's own toolchain:
+
+```bash
+nix develop -c ./scripts/it-nvim-zaozi-full.sh
+```
+
+- **Two nested dev shells.** nvim and the packaged server come from THIS
+  repo (absolute store paths resolved up front; the server is the
+  `nix build .#default` wrapper running on its baked defaults); every
+  zaozi-side step — `mill mill.bsp.BSP/install`, the pre-warm compile, and
+  the nvim run whose child process tree spawns the mill BSP server and the
+  island JVM — executes inside `nix develop $ZAOZI_SRC`, zaozi's own dev
+  shell (`CIRCT_INSTALL_PATH`/`MLIR_INSTALL_PATH`, its JDK, the `-Xss32m`
+  `JAVA_TOOL_OPTIONS`); the first entry fetches the CIRCT toolchain from the
+  org ci-cache.
+- **The shipped plugin is wired the deploy way**: the script writes
+  `.scala3-bsp-semantic-ls/pc-plugins.json` pointing `compilerPlugins` at the
+  package's `share/scala3-bsp-semantic-ls/zaozi-pcplugin.jar` (§4.8).
+- **Hard gates (the PC-interactive path, working today)**: with the access
+  file open in the editor, `textDocument/definition` and `textDocument/hover`
+  at a real dynamic bundle-field access `io.<field>` land on the
+  `val <field> = Aligned/Flipped(...)` declaration — a same-file anchor
+  (`zaozi/tests/src/UIntSpec.scala`, `UIntSpecIO.a`) and a cross-file anchor
+  (`stdlib/src/dwbb/Queue.scala` → `stdlib/src/Queue.scala`,
+  `QueueIO.empty`); expected lines are grep-computed from the bundle source
+  at run time.
+- **INFO lines, deliberately not yet gated**: `textDocument/references` at
+  the field definition and `workspace/symbol` on the field name print
+  `E2E INFO: dynamic-field … = N` counts. Vanilla SemanticDB drops the
+  use-site occurrences inside the inline expansion; the zaozi-side
+  SemanticDB-enhancing compiler plugin raises these counts, at which point
+  the INFO lines flip to hard gates.
+- **Budgets are env knobs** (`LS_NVIM_COMPILE_TIMEOUT_MS`, default 60 min;
+  `LS_NVIM_READY_TIMEOUT_S`, default 30 min; `LS_NVIM_REINDEX_TIMEOUT_MS`,
+  default 10 min): the full-model session compile is a real many-minute
+  build. The harness pre-warms it with `mill __.compile` in zaozi's shell and
+  retries the session compile across the BSP client's fixed per-request bound
+  until the budget is spent. `LS_NVIM_PROJECT_DIR` reuses a prepared full
+  copy across runs.
+- **Known flake, handled in the harness**: zaozi's jextract codegen over the
+  95K-line MLIR CAPI headers runs on a default-size JVM main stack and can
+  SIGSEGV nondeterministically; the script widens it via `JDK_JAVA_OPTIONS
+  -Xss32m` (launcher JVMs only — never the server's JNI-created island) and
+  retries the pre-warm over mill's warm caches.
+
 ---
 
 ## 6. Troubleshooting

@@ -12,6 +12,14 @@
 --
 -- Usage: nvim --headless -l it/nvim/e2e.lua <workspace> <server_bin> <rel_file> <token>
 -- Exits 0 on success; prints "E2E FAIL: ..." and exits 1 on the first failure.
+--
+-- LS_NVIM_FULL=1 (scripts/it-nvim-zaozi-full.sh) switches to the FULL-
+-- workspace mode after the shared health gates (ready/compile/reindex): the
+-- dynamic-bundle-field probes over the UNTRIMMED zaozi workspace — hard
+-- definition/hover gates at real `io.<field>` accesses (the zaozi PC plugin
+-- path), INFO-only references / workspace-symbol counts — instead of the
+-- trimmed decoder probes. Budgets: LS_NVIM_READY_TIMEOUT_S,
+-- LS_NVIM_COMPILE_TIMEOUT_MS, LS_NVIM_REINDEX_TIMEOUT_MS.
 
 local ws = assert(arg[1], "arg1: workspace root")
 local bin = assert(arg[2], "arg2: ls-server binary")
@@ -158,12 +166,47 @@ local function execute(command, timeout)
   )
 end
 
+-- FULL-workspace mode (scripts/it-nvim-zaozi-full.sh): the UNTRIMMED zaozi
+-- workspace built inside zaozi's own dev shell. The trimmed probes below the
+-- FULL branch stay byte-identical for the default (CI) run.
+local full_mode = os.getenv("LS_NVIM_FULL") == "1"
+
+-- Shared buffer helpers (used by the FULL-mode dynamic-field probes and the
+-- trimmed definition/codeAction probes alike).
+local function open_attached(relpath)
+  vim.cmd.edit(ws .. "/" .. relpath)
+  local b = vim.api.nvim_get_current_buf()
+  vim.lsp.buf_attach_client(b, client_id)
+  return b
+end
+
+local function find_pos(b, tok, nth)
+  local want = nth or 1
+  local seen = 0
+  for i, line in ipairs(vim.api.nvim_buf_get_lines(b, 0, -1, false)) do
+    local from = 1
+    while true do
+      local col = line:find(tok, from, true)
+      if not col then
+        break
+      end
+      seen = seen + 1
+      if seen == want then
+        return { line = i - 1, character = col - 1 }
+      end
+      from = col + #tok
+    end
+  end
+  return nil
+end
+
 -- Readiness: poll the doctor until the bootstrap (mill BSP session + initial
 -- ingest) reaches ready. A failed bootstrap is terminal — surface its report
--- immediately instead of burning the deadline.
+-- immediately instead of burning the deadline. The deadline is env-tunable
+-- because the FULL zaozi model load evaluates every CIRCT module target.
 local ready = false
 local last_report = "(no doctor report)"
-local deadline = os.time() + 600
+local deadline = os.time() + (tonumber(os.getenv("LS_NVIM_READY_TIMEOUT_S")) or 600)
 while os.time() < deadline do
   local report = execute("scala3SemanticLs.doctor", 60000)
   if type(report) == "string" then
@@ -187,18 +230,246 @@ pass("doctor reports state: ready over the real project")
 -- the retained BSP session (the session's own out-dir view is authoritative —
 -- a CLI pre-compile writes elsewhere), then reindex to ingest the SemanticDB
 -- it produced. The ingest must actually carry documents.
-local compiled = execute("scala3SemanticLs.compile", 600000)
+local compile_timeout = tonumber(os.getenv("LS_NVIM_COMPILE_TIMEOUT_MS")) or 600000
+local compile_started = os.time()
+local compiled = execute("scala3SemanticLs.compile", compile_timeout)
+if full_mode then
+  -- The BSP session's fixed per-request bound can undercut a cold FULL-
+  -- workspace compile (mill keeps compiling after the client-side timeout),
+  -- so retrying inside the compile budget converges on the finished compile.
+  local budget = compile_started + math.floor(compile_timeout / 1000)
+  while
+    type(compiled) == "string"
+    and compiled:find("compile failed", 1, true)
+    and compiled:find("timed out", 1, true)
+    and os.time() < budget
+  do
+    vim.wait(10000)
+    compiled = execute("scala3SemanticLs.compile", compile_timeout)
+  end
+end
 if type(compiled) ~= "string" or not compiled:find("compile ok", 1, true) then
   fail("BSP-session compile failed: " .. vim.inspect(compiled))
 end
-pass("compile over the real BSP session: " .. compiled)
+pass(
+  "compile over the real BSP session: "
+    .. compiled
+    .. " ("
+    .. os.difftime(os.time(), compile_started)
+    .. "s)"
+)
 
-local reindexed = execute("scala3SemanticLs.reindex", 120000)
+local reindexed =
+  execute("scala3SemanticLs.reindex", tonumber(os.getenv("LS_NVIM_REINDEX_TIMEOUT_MS")) or 120000)
 local docs = type(reindexed) == "string" and reindexed:match("(%d+) docs")
 if not docs or tonumber(docs) == 0 then
   fail("reindex ingested no documents: " .. vim.inspect(reindexed))
 end
 pass("reindex: " .. reindexed)
+
+-- =========================================================================
+-- FULL-workspace dynamic-bundle-field mode (LS_NVIM_FULL=1): the editor-level
+-- proof that this LSP solves zaozi's macro-navigation problem, driven by
+-- scripts/it-nvim-zaozi-full.sh over the UNTRIMMED workspace inside zaozi's
+-- own dev shell (CIRCT toolchain). A zaozi dynamic bundle-field access
+-- `io.<field>` is a `transparent inline selectDynamic("<field>")` whose
+-- expansion drops the field name to a runtime string, so vanilla go-to lands
+-- on `selectDynamic`; the shipped zaozi PC plugin (loaded through the
+-- workspace pc-plugins.json) steers symbol-at-cursor to the real
+-- `val <field> = Aligned/Flipped(...)`. Definition + hover at the access are
+-- HARD gates (the PC-interactive path works today); references at the field
+-- DEFINITION and workspace/symbol on the field name are INFO-only until the
+-- index-side SemanticDB-enhancing zaozi compiler plugin raises them (then
+-- they flip to hard gates).
+if full_mode then
+  -- FULL-model doctor: the untrimmed model must carry every CIRCT module.
+  local full_report = execute("scala3SemanticLs.doctor", 60000)
+  local target_count = type(full_report) == "string" and full_report:match("targets:%s*(%d+)") or nil
+  io.stdout:write("E2E INFO: full-model targets = " .. tostring(target_count) .. "\n")
+
+  -- The dynamic-field anchor spec, pinned to sources on current zaozi master:
+  --  * same-file: zaozi/tests UIntSpec — `io.a` in a generator body; the
+  --    bundle `UIntSpecIO` declares `val a = Flipped(...)` in the SAME file
+  --    (the pure in-buffer PC + plugin path);
+  --  * cross-file: stdlib dwbb/Queue — `io.empty` on a `Wire[QueueIO[D]]`;
+  --    the bundle `QueueIO` declares `val empty = Aligned(...)` in ANOTHER
+  --    file (plugin steering + the index-backed symbol_definition resolver).
+  local anchors = {
+    {
+      desc = "same-file (UIntSpecIO.a)",
+      access_file = "zaozi/tests/src/UIntSpec.scala",
+      access_token = "io.a.asBits",
+      offset = 3, -- cursor on the `a`
+      bundle_file = "zaozi/tests/src/UIntSpec.scala",
+      field = "a",
+    },
+    {
+      desc = "cross-file (QueueIO.empty)",
+      access_file = "stdlib/src/dwbb/Queue.scala",
+      access_token = "io.empty := fifo.io.empty",
+      offset = 3, -- cursor on the `empty` of the QueueIO access
+      bundle_file = "stdlib/src/Queue.scala",
+      field = "empty",
+    },
+  }
+
+  for _, anchor in ipairs(anchors) do
+    -- The grep-computed expectation: the 0-based line and name column of the
+    -- `val <field> = Aligned/Flipped(...)` declaration in the bundle file.
+    local expected_line, expected_col
+    local lineno = 0
+    for bline in io.lines(ws .. "/" .. anchor.bundle_file) do
+      local s, _, name_pos = bline:find("val%s+()" .. anchor.field .. "%f[%W]")
+      if s and (bline:find("Aligned(", 1, true) or bline:find("Flipped(", 1, true)) then
+        expected_line = lineno
+        expected_col = name_pos - 1
+        break
+      end
+      lineno = lineno + 1
+    end
+    if not expected_line then
+      fail(
+        anchor.desc
+          .. ": no `val "
+          .. anchor.field
+          .. " = Aligned/Flipped(...)` declaration in "
+          .. anchor.bundle_file
+      )
+    end
+
+    -- Dirty-open the access file: the PC mirror must hold the buffer so the
+    -- definition/hover go through the PC-interactive (plugin) path.
+    local abuf = open_attached(anchor.access_file)
+    local pos = find_pos(abuf, anchor.access_token, 1)
+    if not pos then
+      fail(anchor.desc .. ": access token '" .. anchor.access_token .. "' not found in " .. anchor.access_file)
+    end
+    local access_doc = {
+      textDocument = { uri = vim.uri_from_bufnr(abuf) },
+      position = { line = pos.line, character = pos.character + anchor.offset },
+    }
+
+    -- (a) HARD: definition at the dynamic access lands on the val line.
+    local dresp, derr = client:request_sync("textDocument/definition", access_doc, 300000, abuf)
+    if derr or not dresp or dresp.err then
+      fail(anchor.desc .. ": definition request failed: " .. vim.inspect(derr or (dresp and dresp.err)))
+    end
+    local defs = dresp.result
+    if type(defs) ~= "table" or #defs == 0 then
+      fail(
+        anchor.desc
+          .. ": definition returned nothing at the dynamic access (line "
+          .. access_doc.position.line
+          .. ", col "
+          .. access_doc.position.character
+          .. ")"
+      )
+    end
+    local bundle_uri = vim.uri_from_fname(ws .. "/" .. anchor.bundle_file)
+    local hit
+    local got = {}
+    for _, d in ipairs(defs) do
+      local uri = d.uri or d.targetUri or ""
+      local range = d.range or d.targetSelectionRange
+      table.insert(got, (uri:gsub(".*/", "")) .. ":" .. tostring(range and range.start.line))
+      if uri == bundle_uri and range and range.start.line == expected_line then
+        hit = d
+      end
+    end
+    if not hit then
+      fail(
+        anchor.desc
+          .. ": definition must land on the `val "
+          .. anchor.field
+          .. " = ...` line "
+          .. expected_line
+          .. " of "
+          .. anchor.bundle_file
+          .. "; got "
+          .. table.concat(got, ", ")
+      )
+    end
+    pass(
+      "dynamic-field definition "
+        .. anchor.desc
+        .. ": io."
+        .. anchor.field
+        .. " -> "
+        .. anchor.bundle_file
+        .. ":"
+        .. (expected_line + 1)
+    )
+
+    -- (b) HARD: hover at the same position answers contents (the plugin makes
+    -- the dynamic access resolve to the field).
+    local hresp, herr = client:request_sync("textDocument/hover", access_doc, 300000, abuf)
+    if herr or not hresp or hresp.err then
+      fail(anchor.desc .. ": hover request failed: " .. vim.inspect(herr or (hresp and hresp.err)))
+    end
+    if type(hresp.result) ~= "table" or hresp.result.contents == nil then
+      fail(anchor.desc .. ": hover returned no contents at the dynamic access")
+    end
+    pass("dynamic-field hover " .. anchor.desc .. " answered contents")
+
+    -- (c) HARD GATE: references at the field DEFINITION must include the
+    -- dynamic-access use sites — the zaozi SemanticDB compiler plugin injects
+    -- the occurrences the inline expansion drops, the BSP compile emits them,
+    -- and the index serves them. Requires >= 2 sites (the definition plus at
+    -- least one dynamic access) AND the access file among the result uris.
+    local bbuf = open_attached(anchor.bundle_file)
+    local rresp, rerr = client:request_sync("textDocument/references", {
+      textDocument = { uri = vim.uri_from_bufnr(bbuf) },
+      position = { line = expected_line, character = expected_col },
+      context = { includeDeclaration = true },
+    }, 120000, bbuf)
+    if rerr or not rresp or rresp.err then
+      fail(anchor.desc .. ": references request failed: " .. vim.inspect(rerr or (rresp and rresp.err)))
+    end
+    if type(rresp.result) ~= "table" or #rresp.result < 2 then
+      fail(
+        anchor.desc
+          .. ": references must cover the dynamic-access sites (def + uses), got "
+          .. (type(rresp.result) == "table" and #rresp.result or "null")
+          .. " — is the zaozi SemanticDB compiler plugin active in the build?"
+      )
+    end
+    local access_seen = false
+    for _, loc in ipairs(rresp.result) do
+      local u = loc.uri or (loc.location and loc.location.uri) or ""
+      if u:sub(-#anchor.access_file) == anchor.access_file then
+        access_seen = true
+      end
+    end
+    if not access_seen then
+      fail(anchor.desc .. ": no reference site in the access file " .. anchor.access_file)
+    end
+    pass(
+      "dynamic-field references "
+        .. anchor.desc
+        .. " = "
+        .. #rresp.result
+        .. " sites incl. "
+        .. anchor.access_file
+    )
+
+    -- (c') INFO: workspace/symbol on the field name.
+    local sresp, serr = client:request_sync("workspace/symbol", { query = anchor.field }, 120000, buf)
+    local scount
+    if serr or not sresp or sresp.err then
+      scount = "error (" .. vim.inspect(serr or (sresp and sresp.err)) .. ")"
+    elseif type(sresp.result) == "table" then
+      scount = tostring(#sresp.result)
+    else
+      scount = "null"
+    end
+    io.stdout:write(
+      "E2E INFO: dynamic-field workspace/symbol '" .. anchor.field .. "' = " .. scount .. " hits\n"
+    )
+  end
+
+  pass("all FULL-workspace dynamic-bundle-field checks")
+  os.exit(0)
+end
 
 -- workspace/symbol resolves project symbols over the index.
 local symbols = request("workspace/symbol", { query = token })
@@ -425,33 +696,6 @@ pass("semanticTokens/full/delta round-trips (empty delta, then a stale-id full r
 -- PC span), cross-target (PC symbol -> index resolver, the shape the gated
 -- real-BSP suites prove), and same-target-cross-file (informational: its
 -- support status is exactly what a real-project e2e exists to observe).
-local function open_attached(relpath)
-  vim.cmd.edit(ws .. "/" .. relpath)
-  local b = vim.api.nvim_get_current_buf()
-  vim.lsp.buf_attach_client(b, client_id)
-  return b
-end
-
-local function find_pos(b, tok, nth)
-  local want = nth or 1
-  local seen = 0
-  for i, line in ipairs(vim.api.nvim_buf_get_lines(b, 0, -1, false)) do
-    local from = 1
-    while true do
-      local col = line:find(tok, from, true)
-      if not col then
-        break
-      end
-      seen = seen + 1
-      if seen == want then
-        return { line = i - 1, character = col - 1 }
-      end
-      from = col + #tok
-    end
-  end
-  return nil
-end
-
 local function probe_definition(desc, b, tok, nth)
   local pos = find_pos(b, tok, nth)
   if not pos then
