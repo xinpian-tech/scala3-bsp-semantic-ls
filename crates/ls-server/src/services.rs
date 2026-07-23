@@ -404,6 +404,16 @@ impl CoreServices {
             None => Vec::new(),
         };
         let compile_first = !targets.is_empty();
+        log::info!(
+            target: "index",
+            "didSave build job for {uri}: {} (debounce {}ms)",
+            if compile_first {
+                format!("compile {} target(s) then reingest", targets.len())
+            } else {
+                "reingest only (no owning target)".to_string()
+            },
+            self.scheduler.debounce().as_millis(),
+        );
         self.scheduler.schedule(targets, compile_first);
     }
 
@@ -590,33 +600,54 @@ impl Handlers<CoreServices> for CoreHandlers {
     /// scope by decision, restart the server to reconnect. Unmatched URIs (a
     /// client may batch unrelated events) do nothing.
     fn on_watched_files(&self, services: &CoreServices, changes: &[WatchedFileEvent]) {
-        let mut reindex = false;
-        let mut config_changed = false;
-        let mut bsp_changed = false;
+        let mut semanticdb_count = 0usize;
+        let mut config_count = 0usize;
+        let mut bsp_count = 0usize;
+        let mut unmatched_count = 0usize;
         for change in changes {
             let Ok(path) = uri_to_path(&change.uri) else {
+                unmatched_count += 1;
                 continue;
             };
-            for glob in watch_glob_set().matches(&path) {
+            let matches = watch_glob_set().matches(&path);
+            if matches.is_empty() {
+                unmatched_count += 1;
+            }
+            for glob in matches {
                 match glob {
-                    WATCH_GLOB_SEMANTICDB => reindex = true,
-                    WATCH_GLOB_CONFIG => config_changed = true,
-                    _ => bsp_changed = true,
+                    WATCH_GLOB_SEMANTICDB => semanticdb_count += 1,
+                    WATCH_GLOB_CONFIG => config_count += 1,
+                    _ => bsp_count += 1,
                 }
             }
         }
-        if reindex {
+        let mut actions: Vec<&str> = Vec::new();
+        if semanticdb_count > 0 {
+            actions.push("reindex scheduled");
             services.schedule_reindex();
         }
-        if config_changed {
+        if config_count > 0 {
+            actions.push("pc config re-read");
             services.pc.on_config_changed();
         }
-        if bsp_changed {
-            eprintln!(
-                "scala3-bsp-semantic-ls: build connection files (.bsp/*.json) changed; \
-                 restart the server to reconnect"
+        if bsp_count > 0 {
+            actions.push("bsp change logged");
+            log::warn!(
+                target: "watch",
+                "build connection files (.bsp/*.json) changed; restart the server to reconnect"
             );
         }
+        log::info!(
+            target: "watch",
+            "watched-files batch: {} event(s) ({semanticdb_count} semanticdb, \
+             {config_count} config, {bsp_count} bsp, {unmatched_count} unmatched) — {}",
+            changes.len(),
+            if actions.is_empty() {
+                "no action".to_string()
+            } else {
+                actions.join(", ")
+            },
+        );
     }
 
     fn doctor(
@@ -694,6 +725,13 @@ fn references(id: RequestId, services: &CoreServices, params: &Value) -> Respons
 /// on it and never varies with `needs_reindex`.
 fn references_ok(id: RequestId, services: &CoreServices, result: &ReferencesResult) -> Response {
     if result.needs_reindex {
+        // The inline write-through could not heal this resolution; the
+        // background reingest is the fallback heal.
+        log::debug!(
+            target: "index",
+            "references answered from a raw .semanticdb path (write-through unavailable) — \
+             scheduling the background reingest heal"
+        );
         services.schedule_reindex();
     }
     ok_json(
@@ -1426,9 +1464,9 @@ fn formatting(
             "no .scalafmt.conf in the workspace (scalafmt requires a pinned version)".to_string(),
         );
     };
-    let Some(bin) =
-        crate::formatting::resolve_scalafmt(workspace_root, &|key| std::env::var(key).ok())
-    else {
+    let Some((bin, tier)) = crate::formatting::resolve_scalafmt_with_tier(workspace_root, &|key| {
+        std::env::var(key).ok()
+    }) else {
         return formatting_failed(
             id,
             "no scalafmt binary: set scalafmt in .scala3-bsp-semantic-ls/config.json, or \
@@ -1436,6 +1474,13 @@ fn formatting(
                 .to_string(),
         );
     };
+    log::debug!(
+        target: "fmt",
+        "scalafmt spawn: {} (tier: {tier}) over {} ({} bytes)",
+        bin.display(),
+        uri,
+        text.len(),
+    );
     match crate::formatting::run_scalafmt(
         &bin,
         &conf,
@@ -1444,7 +1489,13 @@ fn formatting(
         crate::formatting::SCALAFMT_TIMEOUT,
     ) {
         Ok(formatted) => ok_json(id, &crate::formatting::minimal_edits(&text, &formatted)),
-        Err(detail) => formatting_failed(id, detail),
+        Err(detail) => {
+            // Non-zero exits and the kill-on-deadline both land here as typed
+            // errors; the warn line keeps them visible on the lifecycle stream
+            // even when the editor swallows the response error.
+            log::warn!(target: "fmt", "scalafmt failed for {uri}: {detail}");
+            formatting_failed(id, detail)
+        }
     }
 }
 
@@ -2216,16 +2267,32 @@ fn compile(services: &CoreServices) -> String {
 fn reindex(services: &CoreServices) -> String {
     let orchestrator = &services.orchestrator;
     match orchestrator.workspace() {
-        Some(workspace) if !workspace.targets.is_empty() => match orchestrator.ingest(workspace) {
-            Ok(report) => ingest_summary(&report),
-            Err(error) => format!("reindex failed: {error}"),
-        },
+        Some(workspace) if !workspace.targets.is_empty() => {
+            log::info!(
+                target: "index",
+                "reindex started ({} target(s))",
+                workspace.targets.len()
+            );
+            match orchestrator.ingest(workspace) {
+                Ok(report) => {
+                    let summary = ingest_summary(&report);
+                    log::info!(target: "index", "reindex complete — {summary}");
+                    summary
+                }
+                Err(error) => {
+                    log::error!(target: "index", "reindex failed: {error}");
+                    format!("reindex failed: {error}")
+                }
+            }
+        }
         _ => "reindex skipped: no target produces SemanticDB".to_string(),
     }
 }
 
 /// One-line ingest summary. Ports `Bootstrap.ingestSummary` byte-for-byte.
-fn ingest_summary(report: &IngestReport) -> String {
+/// `pub(crate)` so the bootstrap's initial-ingest log line and the background
+/// scheduler's reingest log line render the same shape.
+pub(crate) fn ingest_summary(report: &IngestReport) -> String {
     format!(
         "ingest: segment {}, {} docs ({} shared, {} stale, {} skipped), \
          {} symbols, {} ref groups, {} rename groups in {}ms",

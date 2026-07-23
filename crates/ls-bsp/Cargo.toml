@@ -13,6 +13,9 @@ workspace = true
 ls-index-model = { path = "../ls-index-model" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Facade only (library crate): session lifecycle + handshake-heartbeat lines
+# under the `bsp`/`bsp-err` targets; the sink lives in ls-server.
+log = { workspace = true }
 
 [dev-dependencies]
 ls-index-model = { path = "../ls-index-model" }

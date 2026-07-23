@@ -123,8 +123,26 @@ impl BuildScheduler {
         if !shared.scheduled {
             shared.scheduled = true;
             shared.due_at = Some(Instant::now() + self.debounce);
+            log::debug!(
+                target: "index",
+                "build job armed (debounce {:?}, compile_first={compile_first}, pending \
+                 targets={:?})",
+                self.debounce,
+                shared.pending_targets,
+            );
             cvar.notify_all();
+        } else {
+            log::debug!(
+                target: "index",
+                "build job request coalesced into the pending run \
+                 (compile_first={compile_first})"
+            );
         }
+    }
+
+    /// The debounce window (for the didSave log line naming uri + delay).
+    pub(crate) fn debounce(&self) -> Duration {
+        self.debounce
     }
 
     /// Enqueue a reindex-only background job (Scala `scheduleBuildJob(Vector.empty,
@@ -221,6 +239,20 @@ fn worker_loop(
         guard.due_at = None;
         drop(guard);
 
+        log::info!(
+            target: "index",
+            "build job running: {}{}",
+            if compile && !targets.is_empty() {
+                format!("compile {:?} then reingest", targets)
+            } else {
+                "reingest only".to_string()
+            },
+            if reindex && compile {
+                " (a reindex-only heal coalesced in)"
+            } else {
+                ""
+            },
+        );
         // Compile first when a compile-first job is pending; on failure log and
         // leave the previous snapshot serving. `compile_ok` is true when no compile
         // was attempted or the compile succeeded.
@@ -228,8 +260,9 @@ fn worker_loop(
             match compiler.compile(&targets) {
                 CompileOutcome::Ok => true,
                 CompileOutcome::Failed { reason } => {
-                    eprintln!(
-                        "scala3-bsp-semantic-ls: background compile of {} failed: {reason}",
+                    log::warn!(
+                        target: "index",
+                        "background compile of {} failed: {reason}",
                         targets.join(", ")
                     );
                     false
@@ -244,8 +277,16 @@ fn worker_loop(
         // compile-first run that carried no reindex-only intent.
         let should_reingest = compile_ok || reindex;
         if should_reingest {
-            if let Some(Err(error)) = orchestrator.reingest_current() {
-                eprintln!("scala3-bsp-semantic-ls: background reingest failed: {error}");
+            match orchestrator.reingest_current() {
+                Some(Err(error)) => {
+                    log::error!(target: "index", "background reingest failed: {error}");
+                }
+                Some(Ok(report)) => log::info!(
+                    target: "index",
+                    "background reingest complete — {}",
+                    crate::services::ingest_summary(&report)
+                ),
+                None => {}
             }
         }
 

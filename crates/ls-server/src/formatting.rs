@@ -77,17 +77,33 @@ fn workspace_config_scalafmt(workspace_root: &Path) -> Option<PathBuf> {
 /// first executable `scalafmt` on `PATH`. The nix-baked default arrives as
 /// the wrapper's `--set-default LS_SCALAFMT` (see the module doc). `None`
 /// when no tier resolves.
+/// Test-facing convenience over [`resolve_scalafmt_with_tier`] (the handler
+/// itself needs the tier for its spawn log line).
+#[cfg(test)]
 pub(crate) fn resolve_scalafmt(
     workspace_root: &Path,
     env: &dyn Fn(&str) -> Option<String>,
 ) -> Option<PathBuf> {
+    resolve_scalafmt_with_tier(workspace_root, env).map(|(path, _)| path)
+}
+
+/// [`resolve_scalafmt`] plus WHICH tier won, for the spawn's debug log line.
+/// The nix-baked default arrives as `LS_SCALAFMT` (`--set-default`), so that
+/// tier is either the caller's environment or the baked wrapper default.
+pub(crate) fn resolve_scalafmt_with_tier(
+    workspace_root: &Path,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Option<(PathBuf, &'static str)> {
     if let Some(path) = workspace_config_scalafmt(workspace_root) {
-        return Some(path);
+        return Some((path, "config scalafmt"));
     }
     if let Some(path) = env("LS_SCALAFMT") {
-        return Some(PathBuf::from(path));
+        return Some((
+            PathBuf::from(path),
+            "env LS_SCALAFMT (or the nix-baked default)",
+        ));
     }
-    scalafmt_on_path(env)
+    scalafmt_on_path(env).map(|path| (path, "PATH"))
 }
 
 /// The first `PATH` directory holding an executable regular file named

@@ -62,6 +62,11 @@ pub struct FakeBuildServer {
     /// [`FakeBuildServer::set_targetroot_base`], keeping the committed corpus
     /// read-only.
     targetroot_base: Mutex<PathBuf>,
+    /// An artificial delay before `build/initialize` is answered — the
+    /// "mill is compiling its build script / another build holds the workspace
+    /// lock" simulation the handshake-heartbeat test drives (the client's
+    /// waiting line fires while this sleep runs). Zero by default.
+    initialize_delay: Mutex<Duration>,
     pub initialize_received: AtomicBool,
     pub initialized_notified: AtomicBool,
     pub shutdown_requested: AtomicBool,
@@ -81,6 +86,7 @@ impl FakeBuildServer {
             sources_root: sources_root(),
             nosdb_source,
             targetroot_base: Mutex::new(fixtures_root()),
+            initialize_delay: Mutex::new(Duration::ZERO),
             initialize_received: AtomicBool::new(false),
             initialized_notified: AtomicBool::new(false),
             shutdown_requested: AtomicBool::new(false),
@@ -102,6 +108,12 @@ impl FakeBuildServer {
         *self.targetroot_base.lock().unwrap() = base;
     }
 
+    /// Delay the `build/initialize` answer by `delay` (simulates a build
+    /// server busy compiling its build script or waiting on a workspace lock).
+    pub fn set_initialize_delay(&self, delay: Duration) {
+        *self.initialize_delay.lock().unwrap() = delay;
+    }
+
     /// Queue the fake's reaction to the next compile.
     pub fn script_compile(&self, script: CompileScript) {
         self.compile_scripts.lock().unwrap().push_back(script);
@@ -118,6 +130,10 @@ impl FakeBuildServer {
         let params = msg.get("params").cloned().unwrap_or(Value::Null);
         match method {
             "build/initialize" => {
+                let delay = *self.initialize_delay.lock().unwrap();
+                if !delay.is_zero() {
+                    thread::sleep(delay);
+                }
                 self.initialize_received.store(true, Ordering::SeqCst);
                 reply(writer, id, self.initialize_result());
             }
@@ -355,8 +371,32 @@ impl<W: Write + Send + Sync + 'static> ModelSource for FakeBspModelSource<W> {
         let reload = Arc::clone(&self.reload_flag);
         let router = Arc::clone(&self.router);
         let layer = Arc::clone(&self.pc_diagnostics);
+        // The same handler wiring production's LiveBspModelSource installs —
+        // the didChange log line and the build/logMessage-showMessage
+        // re-emission included, so a captured test sink sees the production
+        // narrative.
         let handlers = BspClientHandlers::new()
-            .on_did_change_build_target(move |_| reload.store(true, Ordering::SeqCst))
+            .on_did_change_build_target(move |_| {
+                log::info!(
+                    target: "bsp",
+                    "buildTarget/didChange received — scheduling a build model reload"
+                );
+                reload.store(true, Ordering::SeqCst)
+            })
+            .on_log_message(|params| {
+                ls_server::bootstrap::log_build_message(
+                    "build/logMessage",
+                    params.message_type,
+                    &params.message,
+                )
+            })
+            .on_show_message(|params| {
+                ls_server::bootstrap::log_build_message(
+                    "build/showMessage",
+                    params.message_type,
+                    &params.message,
+                )
+            })
             .on_diagnostics(move |params: BspPublishDiagnosticsParams| {
                 if let Some(publish) = router.lock().unwrap().accept(&params) {
                     layer.bsp_published(publish);

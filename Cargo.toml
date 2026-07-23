@@ -20,3 +20,7 @@ name = "ls-workspace"
 
 [workspace.dependencies]
 proptest = "1"
+# The logging facade every crate that logs speaks (ls-server, ls-bsp, ls-jvm).
+# Library crates ONLY use the facade; ls-server installs the one tiny sink
+# (crates/ls-server/src/logging.rs) — no env_logger, no sink in libraries.
+log = { version = "0.4", features = ["std"] }

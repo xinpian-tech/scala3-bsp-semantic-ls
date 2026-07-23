@@ -22,7 +22,12 @@ use ls_server::{
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    match parse_args(&args) {
+    let action = parse_args(&args);
+    // The log sink (stderr + optional LS_LOG_FILE tee) is installed before any
+    // subsystem runs, and its banner line always prints — so a captured stderr
+    // stream identifies the process even when everything after it goes wrong.
+    ls_server::logging::init(mode_name(&action));
+    match action {
         CliAction::Version => {
             println!("{}", version_line());
             ExitCode::SUCCESS
@@ -55,6 +60,17 @@ fn main() -> ExitCode {
 /// `println(s"${ScalaLs.ServerName} ${ScalaLs.ServerVersion}")`.
 fn version_line() -> String {
     format!("{SERVER_NAME} {SERVER_VERSION}")
+}
+
+/// The argv mode named in the log banner.
+fn mode_name(action: &CliAction) -> &'static str {
+    match action {
+        CliAction::Version => "version",
+        CliAction::Doctor { .. } => "doctor",
+        CliAction::Dump { .. } => "dump",
+        CliAction::Serve => "serve",
+        CliAction::Usage { .. } => "usage",
+    }
 }
 
 /// `--doctor [dir]`: the offline report over the typed [`DoctorReport`] model.
@@ -127,7 +143,15 @@ fn serve_stdio() {
     ))
     .with_pc_diagnostics(pc_diagnostics);
     if let Err(error) = serve(&mut reader, &sink, &mut core, &CoreHandlers, bootstrap) {
-        eprintln!("{SERVER_NAME}: serve loop ended: {error}");
+        // The two error endings a stuck user must be able to tell apart: the
+        // write side broke (the editor process died while we answered) vs a
+        // stdin read error (the clean-EOF and exit endings are logged inside
+        // `serve` and return Ok).
+        if error.kind() == io::ErrorKind::BrokenPipe {
+            log::error!(target: "serve", "output pipe broken — client died: {error}");
+        } else {
+            log::error!(target: "serve", "serve loop ended on an I/O error: {error}");
+        }
     }
 }
 

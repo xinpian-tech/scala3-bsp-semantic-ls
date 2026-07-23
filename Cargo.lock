@@ -240,6 +240,7 @@ dependencies = [
 name = "ls-bsp"
 version = "0.1.0"
 dependencies = [
+ "log",
  "ls-index-model",
  "serde",
  "serde_json",
@@ -269,6 +270,7 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "libloading",
+ "log",
  "ls-engine",
  "ls-index-model",
  "ls-pc-abi",
@@ -305,6 +307,7 @@ dependencies = [
  "globset",
  "insta",
  "line-index",
+ "log",
  "ls-bsp",
  "ls-engine",
  "ls-index-model",
@@ -336,6 +339,7 @@ dependencies = [
 name = "ls-testkit"
 version = "0.1.0"
 dependencies = [
+ "log",
  "ls-bsp",
  "ls-pc-abi",
  "ls-server",

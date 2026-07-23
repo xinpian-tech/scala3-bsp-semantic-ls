@@ -29,6 +29,14 @@ pub struct BspSessionConfig {
     pub client_version: String,
     pub request_timeout: Duration,
     pub shutdown_timeout: Duration,
+    /// The waiting-heartbeat interval for the bootstrap-handshake requests
+    /// ([`HANDSHAKE_HEARTBEAT_METHODS`]): while such a request has no response
+    /// after this interval, one "still waiting for <method>" line is logged per
+    /// elapsed interval — the breadcrumb that distinguishes a busy build server
+    /// (compiling its build script, or blocked on another mill/sbt holding the
+    /// workspace lock) from a wedged one. Tests shrink it to observe the line
+    /// quickly; production keeps the 10s default.
+    pub handshake_heartbeat: Duration,
 }
 
 impl Default for BspSessionConfig {
@@ -38,9 +46,22 @@ impl Default for BspSessionConfig {
             client_version: "0.1.0".to_string(),
             request_timeout: Duration::from_secs(30),
             shutdown_timeout: Duration::from_secs(5),
+            handshake_heartbeat: Duration::from_secs(10),
         }
     }
 }
+
+/// The bootstrap-handshake requests that get the waiting heartbeat: the ones a
+/// restarted server blocks on while the build server starts up (or another
+/// build tool holds the workspace lock). `buildTarget/compile` is deliberately
+/// NOT here — a long compile is normal, its progress is visible through the
+/// forwarded `build/logMessage` lines, and its own begin/end lines bound it.
+const HANDSHAKE_HEARTBEAT_METHODS: [&str; 4] = [
+    "build/initialize",
+    "workspace/buildTargets",
+    "buildTarget/sources",
+    "buildTarget/scalacOptions",
+];
 
 /// Typed result of `buildTarget/compile`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -100,6 +121,12 @@ impl BspSession {
             server: name.clone(),
             detail: e.to_string(),
         })?;
+        log::info!(
+            target: "bsp",
+            "launched build server '{name}' (pid {}), cwd {}",
+            child.id(),
+            workspace_root.display(),
+        );
         let stdout = child.stdout.take().expect("piped stdout");
         let stdin = child.stdin.take().expect("piped stdin");
         let stderr = child.stderr.take().expect("piped stderr");
@@ -183,6 +210,13 @@ impl BspSession {
             },
         };
         let result: InitializeBuildResult = self.request("build/initialize", to_value(params))?;
+        log::info!(
+            target: "bsp",
+            "build/initialize ok: server '{}' {} (bsp {})",
+            result.display_name,
+            result.version,
+            result.bsp_version,
+        );
         *self.initialize_result.lock().unwrap() = Some(result.clone());
         self.notify("build/initialized", Value::Null)?;
         Ok(result)
@@ -221,19 +255,50 @@ impl BspSession {
         bsp_ids: &[String],
         origin_id: Option<String>,
     ) -> Result<BspCompileOutcome, BspError> {
+        log::info!(
+            target: "bsp",
+            "buildTarget/compile started ({} target(s): {:?})",
+            bsp_ids.len(),
+            bsp_ids,
+        );
+        let started = Instant::now();
         let params = CompileParams {
             targets: ids_of(bsp_ids),
             origin_id,
         };
-        let result: CompileResult = self.request("buildTarget/compile", to_value(params))?;
+        let result: Result<CompileResult, BspError> =
+            self.request("buildTarget/compile", to_value(params));
+        let elapsed = started.elapsed().as_secs_f64();
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => {
+                log::warn!(
+                    target: "bsp",
+                    "buildTarget/compile failed after {elapsed:.1}s: {error}"
+                );
+                return Err(error);
+            }
+        };
         match result.status_code {
-            Some(STATUS_OK) => Ok(BspCompileOutcome::Ok {
-                origin_id: result.origin_id,
-            }),
-            Some(other) => Ok(BspCompileOutcome::Failed {
-                status_code: other,
-                origin_id: result.origin_id,
-            }),
+            Some(STATUS_OK) => {
+                log::info!(
+                    target: "bsp",
+                    "buildTarget/compile finished: statusCode 1 (OK) in {elapsed:.1}s"
+                );
+                Ok(BspCompileOutcome::Ok {
+                    origin_id: result.origin_id,
+                })
+            }
+            Some(other) => {
+                log::warn!(
+                    target: "bsp",
+                    "buildTarget/compile finished: statusCode {other} in {elapsed:.1}s"
+                );
+                Ok(BspCompileOutcome::Failed {
+                    status_code: other,
+                    origin_id: result.origin_id,
+                })
+            }
             None => Err(BspError::InvalidResponse {
                 method: "buildTarget/compile".to_string(),
                 detail: "missing statusCode".to_string(),
@@ -329,6 +394,11 @@ impl BspSession {
         if self.closed.load(Ordering::SeqCst) {
             return;
         }
+        log::info!(
+            target: "bsp",
+            "session shutdown: sending build/shutdown (bounded {:?}) then build/exit",
+            self.config.shutdown_timeout,
+        );
         let _ = self.request_bounded("build/shutdown", Value::Null, self.config.shutdown_timeout);
         let _ = self.notify("build/exit", Value::Null);
         self.close();
@@ -350,10 +420,16 @@ impl BspSession {
 
     fn terminate(&self, child: &mut Child) {
         if wait_quietly(child, self.config.shutdown_timeout) {
+            log::info!(target: "bsp", "build server process exited cleanly");
             return;
         }
         // Rust's std only exposes SIGKILL, so the SIGTERM rung of the ladder
         // collapses into the forcible one.
+        log::warn!(
+            target: "bsp",
+            "build server did not exit within {:?} — killing it (SIGKILL)",
+            self.config.shutdown_timeout,
+        );
         let _ = child.kill();
         wait_quietly(child, Duration::from_millis(1000));
     }
@@ -377,8 +453,13 @@ impl BspSession {
                 method: method.to_string(),
             });
         }
+        // The bootstrap-handshake requests get the waiting heartbeat; the rest
+        // keep the single bounded wait.
+        let heartbeat = HANDSHAKE_HEARTBEAT_METHODS
+            .contains(&method)
+            .then_some(self.config.handshake_heartbeat);
         self.rpc
-            .request(method, params, timeout)
+            .request(method, params, timeout, heartbeat)
             .map_err(|e| match e {
                 RpcCallError::Timeout => BspError::RequestTimeout {
                     method: method.to_string(),
@@ -438,6 +519,11 @@ fn wait_quietly(child: &mut Child, timeout: Duration) -> bool {
     }
 }
 
+/// Pumps the launched build server's stderr: every line is re-emitted on the
+/// log stream under the `bsp-err` area (mill/sbt print their startup and
+/// build-script progress here — exactly what a user staring at a silent
+/// bootstrap needs to see) and then forwarded to the optional
+/// `on_server_stderr` handler (tests capture it there).
 fn pump_stderr(stderr: impl Read + Send + 'static, handlers: BspClientHandlers) {
     thread::Builder::new()
         .name("bsp-server-stderr".to_string())
@@ -445,7 +531,10 @@ fn pump_stderr(stderr: impl Read + Send + 'static, handlers: BspClientHandlers) 
             let reader = BufReader::new(stderr);
             for line in reader.lines() {
                 match line {
-                    Ok(line) => handlers.emit_stderr(line),
+                    Ok(line) => {
+                        log::info!(target: "bsp-err", "{line}");
+                        handlers.emit_stderr(line);
+                    }
                     Err(_) => break,
                 }
             }

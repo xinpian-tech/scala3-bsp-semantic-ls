@@ -361,7 +361,10 @@ impl<M: ModelSource> IndexBootstrap<M> {
             server_version,
         } =
             match self.model_source.load(workspace_root)? {
-                LoadOutcome::Model(ready) => ready,
+                LoadOutcome::Model(ready) => {
+                    log_model_summary(&ready.model);
+                    ready
+                }
                 // The no-BSP warm-restart mode over the recovered index is deferred
                 // (see the deferral note in the cutover docs): the server requires a
                 // build connection. Faithful recovered-index serving needs the target
@@ -397,7 +400,22 @@ impl<M: ModelSource> IndexBootstrap<M> {
         let mut doctor_targets = doctor_targets_of(&model);
         doctor_targets.server_name = server_name;
         doctor_targets.server_version = server_version;
-        let store = Store::open(&workspace_root.join(STORE_DIR)).map_err(|e| e.to_string())?;
+        let store_dir = workspace_root.join(STORE_DIR);
+        let store = Store::open(&store_dir).map_err(|e| e.to_string())?;
+        match store.current() {
+            Some(snapshot) => log::info!(
+                target: "boot",
+                "store opened at {}: recovered generation {} (segment {})",
+                store_dir.display(),
+                snapshot.generation(),
+                snapshot.segment_id(),
+            ),
+            None => log::info!(
+                target: "boot",
+                "store opened at {}: fresh (no prior index)",
+                store_dir.display(),
+            ),
+        }
         // `Arc` because the PC island's cross-file `symbol_definition` resolver
         // answers from this same query engine. `with_defaults` is the production
         // orchestrator: `sync_write_through = true`, so a RawSemanticDBPath
@@ -414,9 +432,14 @@ impl<M: ModelSource> IndexBootstrap<M> {
         let overlay = PcOverlay::new();
         let pc_overlay = overlay.handle();
         let orchestrator = Arc::new(QueryOrchestrator::new(store, Box::new(overlay), true));
-        orchestrator
+        let report = orchestrator
             .ingest(Arc::new(workspace))
             .map_err(|e| e.to_string())?;
+        log::info!(
+            target: "boot",
+            "initial ingest complete — {}",
+            crate::services::ingest_summary(&report)
+        );
         let uris = WorkspaceUris::new(&sourceroots);
         // The cross-file `symbol_definition` resolver the PC island calls when it
         // has no in-buffer source position for a symbol: it answers from the
@@ -471,16 +494,61 @@ impl<M: ModelSource> IndexBootstrap<M> {
     }
 }
 
+/// The one-line Scala 3 target summary the boot narrative prints once the
+/// model is loaded: how many targets, how many are indexable, and WHICH ones
+/// lack SemanticDB (the list a user needs to fix their scalacOptions).
+fn log_model_summary(model: &BspProjectModel) {
+    let indexable = model.indexable_targets().len();
+    let unavailable: Vec<String> = model
+        .unavailable_targets()
+        .iter()
+        .map(|t| t.bsp_id.clone())
+        .collect();
+    log::info!(
+        target: "boot",
+        "build model loaded: {} Scala 3 target(s), {} indexable, {} without SemanticDB{}",
+        indexable + unavailable.len(),
+        indexable,
+        unavailable.len(),
+        if unavailable.is_empty() {
+            String::new()
+        } else {
+            format!(" (no -Xsemanticdb: {})", unavailable.join(", "))
+        },
+    );
+}
+
 impl<M: ModelSource> Bootstrap<CoreServices> for IndexBootstrap<M> {
     fn build(&self, workspace_root: Option<PathBuf>) -> WorkspaceState<CoreServices> {
+        let started = std::time::Instant::now();
         let Some(root) = workspace_root else {
+            log::error!(
+                target: "boot",
+                "bootstrap failed: no workspace root in the initialize params — \
+                 run scala3SemanticLs.doctor"
+            );
             return WorkspaceState::Failed {
                 detail: "no workspace root in the initialize params".to_string(),
             };
         };
+        log::info!(target: "boot", "bootstrap started for workspace {}", root.display());
         match self.build_services(&root) {
-            Ok(services) => WorkspaceState::Ready(services),
-            Err(detail) => WorkspaceState::Failed { detail },
+            Ok(services) => {
+                log::info!(
+                    target: "boot",
+                    "READY in {:.1}s total",
+                    started.elapsed().as_secs_f64()
+                );
+                WorkspaceState::Ready(services)
+            }
+            Err(detail) => {
+                log::error!(
+                    target: "boot",
+                    "bootstrap failed after {:.1}s: {detail} — run scala3SemanticLs.doctor",
+                    started.elapsed().as_secs_f64()
+                );
+                WorkspaceState::Failed { detail }
+            }
         }
     }
 
@@ -513,10 +581,22 @@ pub fn reload_build_model(
     old: CoreServices,
     documents: &Arc<DocumentStore>,
 ) -> WorkspaceState<CoreServices> {
+    let old_target_count = old
+        .orchestrator
+        .workspace()
+        .map(|ws| ws.targets.len())
+        .unwrap_or(0);
+    log::info!(
+        target: "bsp",
+        "build model reload started (buildTarget/didChange): refetching over the retained session"
+    );
     let model = match old.compiler.refetch_model() {
         Ok(model) => model,
         Err(detail) => {
-            eprintln!("scala3-bsp-semantic-ls: build target model reload failed: {detail}");
+            log::warn!(
+                target: "bsp",
+                "build target model reload failed: {detail} — keeping the previous ready snapshot"
+            );
             return WorkspaceState::Ready(old);
         }
     };
@@ -547,9 +627,13 @@ pub fn reload_build_model(
     // empty segment that supersedes the prior index; the old segment is kept and
     // still answers the un-gated `workspace/symbol` (only the model-authoritative
     // `uri_to_target` ownership drops to the new empty set).
+    let new_target_count = workspace.targets.len();
     if !workspace.targets.is_empty() {
         if let Err(error) = old.orchestrator.ingest(Arc::new(workspace)) {
-            eprintln!("scala3-bsp-semantic-ls: build target model reingest failed: {error}");
+            log::warn!(
+                target: "bsp",
+                "build target model reingest failed: {error} — keeping the previous ready snapshot"
+            );
             return WorkspaceState::Ready(old);
         }
     }
@@ -575,6 +659,10 @@ pub fn reload_build_model(
     // sourceroots may have changed) before replaying the open buffers.
     updated.install_pc_overlay(Arc::clone(documents));
     replay_open_buffers(&updated, documents);
+    log::info!(
+        target: "bsp",
+        "build model reload complete: {old_target_count} -> {new_target_count} indexable target(s)"
+    );
     WorkspaceState::Ready(updated)
 }
 
@@ -634,15 +722,55 @@ impl ModelSource for LiveBspModelSource {
         // `defaultConnect` returning `None`). The bootstrap then declines it to a
         // failed state — the recovered-index warm restart is deferred (see
         // `IndexBootstrap::build`), so no build connection means no ready server.
-        let Some(connection) = BspDiscovery::pick(workspace_root) else {
+        let discovery = BspDiscovery::discover(workspace_root);
+        for invalid in &discovery.invalid {
+            log::warn!(target: "boot", ".bsp discovery: invalid connection file: {invalid}");
+        }
+        let Some(connection) = discovery.candidates.first() else {
+            log::warn!(
+                target: "boot",
+                ".bsp discovery: no usable connection file under {}/.bsp \
+                 ({} invalid) — install one (for mill: `mill mill.bsp.BSP/install`) and restart",
+                workspace_root.display(),
+                discovery.invalid.len(),
+            );
             return Ok(LoadOutcome::NoBsp);
         };
+        let names: Vec<&str> = discovery
+            .candidates
+            .iter()
+            .map(|c| c.details.name.as_str())
+            .collect();
+        log::info!(
+            target: "boot",
+            ".bsp discovery: {} candidate(s) {:?}, {} invalid; picked '{}' argv={:?}",
+            discovery.candidates.len(),
+            names,
+            discovery.invalid.len(),
+            connection.details.name,
+            connection.details.argv,
+        );
         // The build server drives reloads: a `buildTarget/didChange` notification
-        // (delivered on the session's reader thread) fires the reload hook.
+        // (delivered on the session's reader thread) fires the reload hook. The
+        // server's async `build/logMessage`/`build/showMessage` traffic — mill's
+        // compile progress — is re-emitted on the log stream so a user watching
+        // a long compile sees it move.
         let on_changed = self.on_build_targets_changed.clone();
         let on_diagnostics = self.on_diagnostics.clone();
         let handlers = BspClientHandlers::new()
-            .on_did_change_build_target(move |_| on_changed())
+            .on_did_change_build_target(move |_| {
+                log::info!(
+                    target: "bsp",
+                    "buildTarget/didChange received — scheduling a build model reload"
+                );
+                on_changed()
+            })
+            .on_log_message(|params| {
+                log_build_message("build/logMessage", params.message_type, &params.message)
+            })
+            .on_show_message(|params| {
+                log_build_message("build/showMessage", params.message_type, &params.message)
+            })
             .on_diagnostics(move |params| on_diagnostics(params));
         let session = BspSession::launch(
             workspace_root.to_path_buf(),
@@ -652,6 +780,17 @@ impl ModelSource for LiveBspModelSource {
         )
         .map_err(|e| e.to_string())?;
         ready_model_from_session(session).map(LoadOutcome::Model)
+    }
+}
+
+/// Re-emits one BSP `build/logMessage`/`build/showMessage` on the log stream.
+/// BSP `MessageType` 1 (error) and 2 (warning) map to WARN — they are the
+/// BUILD's problems, not this server's — and 3 (info) / 4 (log) to INFO.
+pub fn log_build_message(kind: &str, message_type: i32, message: &str) {
+    if message_type == 1 || message_type == 2 {
+        log::warn!(target: "bsp", "{kind}: {message}");
+    } else {
+        log::info!(target: "bsp", "{kind}: {message}");
     }
 }
 

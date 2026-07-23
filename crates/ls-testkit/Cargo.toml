@@ -15,3 +15,6 @@ ls-pc-abi = { path = "../ls-pc-abi" }
 ls-server = { path = "../ls-server" }
 serde_json = "1"
 tempfile = "3"
+# The capturing test logger (`logcap`) that suites install to assert lifecycle
+# log lines, plus the production-parity BSP message re-emission in `fake_bsp`.
+log = { workspace = true }

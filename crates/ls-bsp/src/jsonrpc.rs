@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
@@ -63,11 +63,20 @@ impl JsonRpcClient {
     }
 
     /// Sends a request and blocks up to `timeout` for its response.
+    ///
+    /// `heartbeat` hooks the existing timeout machinery for progress logging:
+    /// when `Some(interval)`, the receive is sliced into `interval`-sized
+    /// waits, and every elapsed slice WITHOUT a response logs one waiting line
+    /// — the "still waiting for build/initialize" breadcrumb that tells a user
+    /// whose bootstrap hangs that the build server is alive-but-busy (or
+    /// blocked on a workspace lock), not that this server is stuck. `None`
+    /// keeps the single bounded wait.
     pub fn request(
         &self,
         method: &str,
         params: Value,
         timeout: Duration,
+        heartbeat: Option<Duration>,
     ) -> Result<Value, RpcCallError> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = mpsc::channel();
@@ -77,18 +86,41 @@ impl JsonRpcClient {
             self.pending.lock().unwrap().remove(&id);
             return Err(RpcCallError::Failed(format!("write failed: {e}")));
         }
-        match rx.recv_timeout(timeout) {
-            Ok(Outcome::Result(v)) => Ok(v),
-            Ok(Outcome::Error(detail)) => Err(RpcCallError::Failed(detail)),
-            Err(RecvTimeoutError::Timeout) => {
+        let started = Instant::now();
+        let deadline = started + timeout;
+        loop {
+            let now = Instant::now();
+            let Some(remaining) = deadline.checked_duration_since(now) else {
                 self.pending.lock().unwrap().remove(&id);
-                Err(RpcCallError::Timeout)
-            }
-            Err(RecvTimeoutError::Disconnected) => {
-                self.pending.lock().unwrap().remove(&id);
-                Err(RpcCallError::Failed(
-                    "connection closed before response".to_string(),
-                ))
+                return Err(RpcCallError::Timeout);
+            };
+            let slice = heartbeat.map_or(remaining, |interval| interval.min(remaining));
+            match rx.recv_timeout(slice) {
+                Ok(Outcome::Result(v)) => return Ok(v),
+                Ok(Outcome::Error(detail)) => return Err(RpcCallError::Failed(detail)),
+                Err(RecvTimeoutError::Timeout) if Instant::now() < deadline => {
+                    // Only an armed heartbeat logs; a plain bounded wait that
+                    // woke a hair early just re-arms for the remainder.
+                    if heartbeat.is_some() {
+                        log::info!(
+                            target: "bsp",
+                            "still waiting for {method} ({}s) — the build server may be \
+                             compiling its build script or blocked on another mill/sbt \
+                             holding the workspace lock",
+                            started.elapsed().as_secs(),
+                        );
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    self.pending.lock().unwrap().remove(&id);
+                    return Err(RpcCallError::Timeout);
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    self.pending.lock().unwrap().remove(&id);
+                    return Err(RpcCallError::Failed(
+                        "connection closed before response".to_string(),
+                    ));
+                }
             }
         }
     }

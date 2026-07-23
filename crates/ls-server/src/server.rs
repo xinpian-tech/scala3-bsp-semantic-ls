@@ -46,12 +46,13 @@
 //! can end without waiting for the client to close the pipe (its `stdio.rs`)
 //! — and the −32800 answer for a cancelled pending request (its `req_queue.rs`).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -262,6 +263,12 @@ pub struct ServerCore<S> {
     bootstrap_rx: Option<mpsc::Receiver<WorkspaceState<S>>>,
     /// The worker thread handle, joined when its result is adopted.
     bootstrap_handle: Option<thread::JoinHandle<()>>,
+    /// Per-method count of requests answered with their pre-ready fallback,
+    /// purely for logging: the FIRST rejection of each method logs one info
+    /// line (so a user watching stderr knows their editor is being answered
+    /// with fallbacks until bootstrap completes); repeats log at debug with the
+    /// running count. Loop-thread only.
+    pre_ready_answered: HashMap<String, u64>,
 }
 
 impl<S> ServerCore<S> {
@@ -281,6 +288,7 @@ impl<S> ServerCore<S> {
             next_server_request_id: 0,
             bootstrap_rx: None,
             bootstrap_handle: None,
+            pre_ready_answered: HashMap::new(),
         }
     }
 
@@ -320,6 +328,16 @@ impl<S> ServerCore<S> {
         self.workspace_root = root_from_params(params);
         self.watched_files_dynamic_registration = watched_files_dynamic_registration(params);
         self.initialized = true;
+        log::info!(
+            target: "serve",
+            "initialize received: root={}, client={}, watched-files dynamic registration: {}",
+            self.workspace_root
+                .as_deref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "(none)".to_string()),
+            client_info(params),
+            if self.watched_files_dynamic_registration { "yes" } else { "no" },
+        );
         if !self.state.is_ready() {
             self.state = WorkspaceState::NotReady {
                 detail: "waiting for the initialized notification".to_string(),
@@ -333,6 +351,10 @@ impl<S> ServerCore<S> {
     /// bootstrap's inverse and is owned by the services.
     pub fn shutdown(&mut self) {
         if !self.shutting_down {
+            log::info!(
+                target: "serve",
+                "shutdown received — tearing down the ready services; waiting for exit"
+            );
             self.shutting_down = true;
             self.state = WorkspaceState::NotReady {
                 detail: "server is shut down".to_string(),
@@ -358,7 +380,10 @@ impl<S> ServerCore<S> {
             return;
         };
         let Some(changes) = content_changes(params) else {
-            eprintln!("ls-server: ignoring a didChange with unparseable contentChanges for {uri}");
+            log::warn!(
+                target: "serve",
+                "ignoring a didChange with unparseable contentChanges for {uri}"
+            );
             return;
         };
         if changes.is_empty() {
@@ -368,8 +393,9 @@ impl<S> ServerCore<S> {
             .docs
             .apply_changes(&uri, document_version(params), &changes)
         else {
-            eprintln!(
-                "ls-server: dropping a ranged didChange for {uri}: the buffer was never opened"
+            log::warn!(
+                target: "serve",
+                "dropping a ranged didChange for {uri}: the buffer was never opened"
             );
             return;
         };
@@ -439,6 +465,11 @@ enum Flow {
 /// cancel only means the request answers normally, which is spec-legal.
 const CANCEL_SET_CAP: usize = 1024;
 
+/// Steady-state requests are not logged by default; one that takes at least
+/// this long earns an info line (method + duration) so a stderr reader can see
+/// what the loop was doing while the editor showed "waiting…".
+const SLOW_REQUEST_THRESHOLD: Duration = Duration::from_secs(2);
+
 /// What the reader thread forwards to the dispatch loop: a parsed frame (or its
 /// parse error, answered with a null-id error frame) or the read error that
 /// ended the input.
@@ -485,13 +516,18 @@ fn read_loop(
 /// defensive cap. A cancel without a usable id is inert (logged).
 fn record_cancel(cancelled: &Mutex<HashSet<RequestId>>, params: &Value) {
     let Some(id) = cancel_request_id(params) else {
-        eprintln!("ls-server: ignoring a $/cancelRequest without a usable id: {params}");
+        log::warn!(
+            target: "serve",
+            "ignoring a $/cancelRequest without a usable id: {params}"
+        );
         return;
     };
+    log::debug!(target: "serve", "$/cancelRequest intercepted for id {id:?}");
     let mut set = cancelled.lock().unwrap();
     if set.len() >= CANCEL_SET_CAP {
-        eprintln!(
-            "ls-server: the cancel set reached {CANCEL_SET_CAP} stale entries; clearing it \
+        log::warn!(
+            target: "serve",
+            "the cancel set reached {CANCEL_SET_CAP} stale entries; clearing it \
              (a dropped cancel only means that request answers normally)"
         );
         set.clear();
@@ -540,9 +576,17 @@ where
             poll_reload(core, &*bootstrap);
             match inbound {
                 Inbound::Frame(Ok(Incoming::Request(request))) => {
+                    let method = request.method.clone();
+                    let request_id = request.id.clone();
+                    let started = Instant::now();
                     let response = if cancelled_before_dispatch(core, &request) {
                         // Cancelled while queued: answered without dispatching —
                         // the handlers never see the request.
+                        log::debug!(
+                            target: "serve",
+                            "request {method} (id {request_id:?}) was cancelled while queued — \
+                             answering REQUEST_CANCELLED without dispatching"
+                        );
                         Response::failure(
                             request.id,
                             ResponseError::new(error_codes::REQUEST_CANCELLED, "request cancelled"),
@@ -550,6 +594,22 @@ where
                     } else {
                         dispatch_request(core, handlers, request)
                     };
+                    let elapsed = started.elapsed();
+                    // Steady-state requests are silent by default; a slow one
+                    // surfaces at info so a "why is my editor hanging" stderr
+                    // read names the culprit. Every request logs at debug.
+                    if elapsed >= SLOW_REQUEST_THRESHOLD {
+                        log::info!(
+                            target: "serve",
+                            "slow request: {method} (id {request_id:?}) took {:.1}s",
+                            elapsed.as_secs_f64()
+                        );
+                    }
+                    log::debug!(
+                        target: "serve",
+                        "request {method} (id {request_id:?}) answered in {}ms",
+                        elapsed.as_millis()
+                    );
                     sink.send(&response)?;
                 }
                 Inbound::Frame(Ok(Incoming::Notification(note))) => {
@@ -572,15 +632,32 @@ where
                     // nothing to correlate: a success is consumed silently, an
                     // error is logged — never answered with an error frame.
                     if let Some(error) = &response.error {
-                        eprintln!(
-                            "ls-server: a client response reported an error (id: {:?}): {error}",
+                        log::warn!(
+                            target: "serve",
+                            "a client response reported an error (id: {:?}): {error}",
                             response.id
                         );
                     }
                 }
                 Inbound::Frame(Err(error)) => sink.send(&null_id_error(&error))?,
-                Inbound::ReadError(error) => return Err(error),
+                Inbound::ReadError(error) => {
+                    log::error!(
+                        target: "serve",
+                        "read error on the client connection (stdin): {error}"
+                    );
+                    return Err(error);
+                }
             }
+        }
+        // The channel closed without an `exit`: the client hung up. The
+        // distinct endings matter to a stderr reader: `exit` is the clean
+        // protocol ending (logged in its own arm), EOF means the editor closed
+        // our stdin without the shutdown/exit handshake.
+        if !exiting {
+            log::info!(
+                target: "serve",
+                "client closed the connection (EOF) — leaving the serve loop"
+            );
         }
         Ok(())
     })?;
@@ -625,6 +702,12 @@ fn register_watched_files<S, W: Write>(
         .iter()
         .map(|glob| json!({ "globPattern": glob }))
         .collect();
+    log::info!(
+        target: "serve",
+        "watched-files registration sent ({} globs: {:?})",
+        watchers.len(),
+        watch_globs::all(),
+    );
     sink.send(&json!({
         "jsonrpc": "2.0",
         "id": id,
@@ -681,8 +764,13 @@ where
     B: Bootstrap<S> + Send + Sync + 'static,
 {
     if core.bootstrap_rx.is_some() {
+        log::debug!(
+            target: "serve",
+            "initialized received again — a bootstrap worker is already in flight"
+        );
         return;
     }
+    log::info!(target: "serve", "initialized received — bootstrap spawned");
     let (tx, rx) = mpsc::channel();
     let worker = Arc::clone(bootstrap);
     let root = core.workspace_root.clone();
@@ -733,6 +821,10 @@ fn adopt_bootstrap<S, B: Bootstrap<S>>(
     result: Option<WorkspaceState<S>>,
 ) {
     if core.shutting_down {
+        log::debug!(
+            target: "serve",
+            "late bootstrap result discarded — the server is shutting down"
+        );
         detach_bootstrap(core);
         return;
     }
@@ -742,13 +834,31 @@ fn adopt_bootstrap<S, B: Bootstrap<S>>(
     }
     core.state = match result {
         Some(WorkspaceState::Ready(services)) => {
+            log::info!(
+                target: "serve",
+                "bootstrap result adopted: workspace READY — replaying {} open buffer(s)",
+                core.docs.open_uris().len()
+            );
             bootstrap.replay(&services, &core.docs);
             WorkspaceState::Ready(services)
         }
-        Some(other) => other,
-        None => WorkspaceState::Failed {
-            detail: "bootstrap worker terminated without a result".to_string(),
-        },
+        Some(other) => {
+            log::error!(
+                target: "serve",
+                "bootstrap result adopted: workspace is {}",
+                other.status_line()
+            );
+            other
+        }
+        None => {
+            log::error!(
+                target: "serve",
+                "bootstrap worker terminated without a result (panicked) — workspace failed"
+            );
+            WorkspaceState::Failed {
+                detail: "bootstrap worker terminated without a result".to_string(),
+            }
+        }
     };
 }
 
@@ -775,6 +885,10 @@ fn poll_reload<S>(core: &mut ServerCore<S>, bootstrap: &impl Bootstrap<S>) {
     if !core.reload_requested.swap(false, Ordering::SeqCst) {
         return;
     }
+    log::info!(
+        target: "serve",
+        "build targets changed — reloading the build model on the loop"
+    );
     let taken = std::mem::replace(
         &mut core.state,
         WorkspaceState::NotReady {
@@ -826,7 +940,10 @@ fn dispatch_request<S>(
         "workspace/executeCommand" => execute_command(core, handlers, &request),
         method => match readiness_method(method) {
             Some(_) if core.state.is_ready() => ready_handle(core, handlers, &request),
-            Some(kind) => pre_ready_response(request.id.clone(), kind, &core.state),
+            Some(kind) => {
+                note_pre_ready(core, method, kind);
+                pre_ready_response(request.id.clone(), kind, &core.state)
+            }
             None => Response::failure(
                 request.id.clone(),
                 ResponseError::new(
@@ -960,7 +1077,10 @@ where
 {
     match note.method.as_str() {
         "initialized" => spawn_bootstrap(core, bootstrap),
-        "exit" => return Flow::Stop,
+        "exit" => {
+            log::info!(target: "serve", "exit received — leaving the serve loop (clean exit)");
+            return Flow::Stop;
+        }
         "textDocument/didOpen" => core.did_open(handlers, &note.params),
         "textDocument/didChange" => core.did_change(handlers, &note.params),
         "textDocument/didClose" => core.did_close(handlers, &note.params),
@@ -981,6 +1101,34 @@ where
         _ => {}
     }
     Flow::Continue
+}
+
+/// Counts a pre-ready fallback answer for logging: the FIRST time each method
+/// is answered pre-ready one info line explains what the editor is seeing;
+/// repeats stay at debug with the running count.
+fn note_pre_ready<S>(core: &mut ServerCore<S>, method: &str, kind: Method) {
+    let count = core
+        .pre_ready_answered
+        .entry(method.to_string())
+        .and_modify(|n| *n += 1)
+        .or_insert(1);
+    let fallback = match pre_ready_outcome(kind) {
+        PreReadyOutcome::NotReadyError => "a not-ready error",
+        PreReadyOutcome::Null => "a null fallback",
+        PreReadyOutcome::Empty => "an empty-result fallback",
+    };
+    if *count == 1 {
+        log::info!(
+            target: "serve",
+            "answering '{method}' with {fallback} until bootstrap completes (workspace is {})",
+            core.state.status_line()
+        );
+    } else {
+        log::debug!(
+            target: "serve",
+            "answering '{method}' with {fallback} pre-ready (occurrence {count})"
+        );
+    }
 }
 
 /// The pre-ready response for a readiness-sensitive request: the fixed per-method
@@ -1051,6 +1199,19 @@ fn root_from_params(params: &Value) -> Option<PathBuf> {
             .and_then(Value::as_str)
     })?;
     uri_to_path(uri).ok().map(|path| normalize(&path))
+}
+
+/// The `clientInfo` of `initialize` params as `name version` (for the log
+/// line); `(unknown client)` when the optional field is absent.
+fn client_info(params: &Value) -> String {
+    let Some(info) = params.get("clientInfo") else {
+        return "(unknown client)".to_string();
+    };
+    let name = info.get("name").and_then(Value::as_str).unwrap_or("?");
+    match info.get("version").and_then(Value::as_str) {
+        Some(version) => format!("{name} {version}"),
+        None => name.to_string(),
+    }
 }
 
 fn document_uri(params: &Value) -> Option<String> {

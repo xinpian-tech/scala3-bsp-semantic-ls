@@ -16,8 +16,10 @@ from conftest import (
     DOCTOR,
     PC_PLUGIN_STATUS,
     REINDEX,
+    SERVER_BIN,
     await_ready,
     execute,
+    make_workspace,
 )
 
 
@@ -111,3 +113,82 @@ async def test_doctor_reports_the_cold_pc_plugins_reason(client):
     assert "PC Plugins:" in report
     assert "unavailable: PC island not booted (cold)" in report
     assert "reported after the first PC query boots it" in report
+
+
+def test_ls_log_file_captures_the_banner_and_the_ready_line():
+    """LS_LOG_FILE end-to-end: the binary spawned with the env var appends the
+    lifecycle stream to the file — the escape hatch for editors that swallow
+    LSP stderr. Raw subprocess + hand framing (no pytest-lsp) so the env var
+    reaches exactly this one server. Asserts the level-proof banner and the
+    boot narrative through READY, on stable substrings only."""
+    import json as _json
+    import os
+    import shutil
+    import subprocess
+    import time
+
+    ws = make_workspace(None)
+    log_path = ws / "ls-server.log"
+    env = dict(os.environ, LS_LOG="info", LS_LOG_FILE=str(log_path))
+    proc = subprocess.Popen(
+        [SERVER_BIN],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        env=env,
+    )
+
+    def send(body: dict):
+        payload = _json.dumps(body).encode()
+        proc.stdin.write(
+            b"Content-Length: %d\r\n\r\n%s" % (len(payload), payload)
+        )
+        proc.stdin.flush()
+
+    try:
+        send(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {"rootUri": ws.as_uri(), "capabilities": {}},
+            }
+        )
+        send({"jsonrpc": "2.0", "method": "initialized", "params": {}})
+        # The bootstrap narrative is written through to the file; poll it for
+        # the READY line rather than parsing the server's stdout responses.
+        deadline = time.monotonic() + 60.0
+        while time.monotonic() < deadline:
+            text = log_path.read_text() if log_path.exists() else ""
+            if "READY in" in text:
+                break
+            time.sleep(0.2)
+        else:
+            raise AssertionError(f"never saw READY in {log_path}:\n{text}")
+        send({"jsonrpc": "2.0", "id": 2, "method": "shutdown", "params": {}})
+        send({"jsonrpc": "2.0", "method": "exit", "params": {}})
+        proc.wait(timeout=30)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+
+    text = log_path.read_text()
+    # The always-printed banner identifies the process and its log config.
+    assert "scala3-bsp-semantic-ls 0.1.0 pid=" in text
+    assert "mode=serve" in text
+    assert "LS_LOG=info" in text
+    # The boot narrative phases, through READY and the clean exit.
+    for needle in [
+        "initialize received",
+        "bootstrap spawned",
+        ".bsp discovery",
+        "launched build server 'fake-bsp'",
+        "build/initialize ok",
+        "READY in",
+        "exit received",
+    ]:
+        assert needle in text, f"missing {needle!r} in:\n{text}"
+    # Every facade line carries the `[+SSS.mmm LEVEL area]` prefix.
+    assert "[+0.000 INFO serve]" in text
+    shutil.rmtree(ws, ignore_errors=True)

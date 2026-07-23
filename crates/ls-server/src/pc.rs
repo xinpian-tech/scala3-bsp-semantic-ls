@@ -791,7 +791,7 @@ impl PcQueryService for IslandPcService {
             }
         }
         if let Some(detail) = rejected {
-            state.boot_error = Some(detail);
+            latch_boot_error(state, detail);
         }
     }
 
@@ -915,16 +915,23 @@ impl PcQueryService for IslandPcService {
         // logged and ignored (a new `javaHome` applies from the next server
         // start).
         if state.driver.is_some() {
-            eprintln!(
-                "ls-server: workspace/didChangeConfiguration ignored: \
-                 the PC island is already booted"
+            log::warn!(
+                target: "pc",
+                "workspace/didChangeConfiguration ignored: the PC island is already booted \
+                 (a new javaHome applies from the next server start)"
             );
             return;
         }
         // Still cold: un-latch a recorded boot failure so the NEXT PC query
         // re-reads config.json and re-attempts the boot (the user may have just
         // fixed `javaHome`).
-        state.boot_error = None;
+        if state.boot_error.take().is_some() {
+            log::info!(
+                target: "pc",
+                "configuration changed — the latched island boot error is cleared; \
+                 the next PC query re-reads config.json and re-attempts the boot"
+            );
+        }
     }
 }
 
@@ -992,16 +999,22 @@ pub(crate) fn resolve_java_home(
 fn resolve_island_paths(
     workspace_root: &std::path::Path,
     env: &dyn Fn(&str) -> Option<String>,
-) -> Result<(PathBuf, PathBuf), String> {
-    let libjvm = if let Some(home) = workspace_config_java_home(workspace_root) {
-        home.join("lib/server/libjvm.so")
+) -> Result<(PathBuf, PathBuf, &'static str), String> {
+    let (libjvm, tier) = if let Some(home) = workspace_config_java_home(workspace_root) {
+        (home.join("lib/server/libjvm.so"), "config javaHome")
     } else if let Some(path) = env("LS_LIBJVM") {
-        PathBuf::from(path)
+        (PathBuf::from(path), "env LS_LIBJVM")
     } else if let Some(home) = env("JAVA_HOME") {
         // A nixpkgs JDK's JAVA_HOME is often the package ROOT, whose real home
         // (and libjvm) is nested at `lib/openjdk`; normalize so a bare
         // `JAVA_HOME=<nix package root>` boots without needing LS_LIBJVM.
-        normalize_java_home(PathBuf::from(home)).join("lib/server/libjvm.so")
+        (
+            normalize_java_home(PathBuf::from(home)).join("lib/server/libjvm.so"),
+            // The packaged wrapper bakes its default AS `JAVA_HOME`
+            // (`--set-default`), so this tier is either the caller's
+            // environment or the nix-baked default — indistinguishable here.
+            "env JAVA_HOME (or the nix-baked default)",
+        )
     } else {
         return Err("no Java home for the PC island: set javaHome in \
              .scala3-bsp-semantic-ls/config.json, or LS_LIBJVM / JAVA_HOME in the environment"
@@ -1011,7 +1024,7 @@ fn resolve_island_paths(
         "PC_HOST_AGENT_JAR must point at the island host agent jar to boot the PC island"
             .to_string()
     })?;
-    Ok((libjvm, agent_jar))
+    Ok((libjvm, agent_jar, tier))
 }
 
 /// Boots the island: installs the resolver (once), reads the JVM environment,
@@ -1022,14 +1035,27 @@ fn boot(state: &mut IslandState) -> bool {
     if state.boot_error.is_some() {
         return false;
     }
-    let (libjvm, agent_jar) =
+    let (libjvm, agent_jar, java_tier) =
         match resolve_island_paths(&state.workspace_root, &|k| std::env::var(k).ok()) {
             Ok(paths) => paths,
             Err(detail) => {
-                state.boot_error = Some(detail);
+                latch_boot_error(state, detail);
                 return false;
             }
         };
+    log::info!(
+        target: "pc",
+        "island boot begin: libjvm {} (tier: {java_tier}), agent jar {}",
+        libjvm.display(),
+        agent_jar.display(),
+    );
+    // The island JVM writes to the raw stderr fd (the stdout-guard dup2 is
+    // raw), so its lines carry no `[+SSS.mmm …]` prefix — say so once, before
+    // they can appear, so a log reader is not confused by the format break.
+    log::info!(
+        target: "pc",
+        "island JVM output appears unprefixed on stderr below"
+    );
     // The resolver slots are global and set-once; a second install (e.g. a
     // second workspace in the process) is ignored, which is correct — one
     // server, one process. Installed before boot so the premain sees them.
@@ -1069,14 +1095,32 @@ fn boot(state: &mut IslandState) -> bool {
         request_deadline,
         cancel_grace: Duration::from_millis(500),
     };
+    let boot_started = std::time::Instant::now();
     let sup = match boot_island(&config) {
         Ok(sup) => sup,
         Err(error) => {
-            state.boot_error = Some(error.to_string());
+            latch_boot_error(state, error.to_string());
             return false;
         }
     };
+    log::info!(
+        target: "pc",
+        "island boot ok: premain rendezvous in {:.1}s — registering {} target(s) and \
+         replaying {} buffer(s)",
+        boot_started.elapsed().as_secs_f64(),
+        state.targets.len(),
+        state.buffers.len(),
+    );
     install_driver(state, Box::new(sup))
+}
+
+/// Records a boot failure AND logs it at ERROR — once, at the moment of
+/// latching. Every later PC query short-circuits on the latch without
+/// re-logging, so a broken environment produces exactly one error line (until
+/// a config change un-latches it for a re-attempt).
+fn latch_boot_error(state: &mut IslandState, detail: String) {
+    log::error!(target: "pc", "island boot failed (latched): {detail}");
+    state.boot_error = Some(detail);
 }
 
 /// Registers the workspace targets and replays the mirrored open buffers into a
@@ -1096,26 +1140,34 @@ fn install_driver(state: &mut IslandState, mut driver: Box<dyn PcDriver>) -> boo
         .map(|(uri, buffered)| (uri.clone(), buffered.clone()))
         .collect();
     for target in &targets {
+        log::debug!(target: "pc", "register_target {}", target.bsp_id);
         let outcome = driver.request(PcRequest::RegisterTarget {
             id: target.bsp_id.clone(),
             config: target.clone(),
         });
         if !accepted(&outcome) {
-            state.boot_error = Some(format!(
-                "PC target '{}' registration rejected by the island",
-                target.bsp_id
-            ));
+            latch_boot_error(
+                state,
+                format!(
+                    "PC target '{}' registration rejected by the island",
+                    target.bsp_id
+                ),
+            );
             return false;
         }
     }
     for (uri, buffered) in &buffers {
+        log::debug!(target: "pc", "replaying open buffer {uri} into the island");
         let outcome = driver.request(PcRequest::DidOpen {
             target_id: buffered.target_id.clone(),
             uri: uri.clone(),
             text: buffered.text.clone(),
         });
         if !accepted(&outcome) {
-            state.boot_error = Some(format!("PC buffer '{uri}' replay rejected by the island"));
+            latch_boot_error(
+                state,
+                format!("PC buffer '{uri}' replay rejected by the island"),
+            );
             return false;
         }
     }
@@ -1221,9 +1273,10 @@ mod tests {
     fn island_paths_resolve_java_home_from_the_environment() {
         let ws = tempfile::tempdir().unwrap();
         let env = env_of(&[("JAVA_HOME", "/jdk"), ("PC_HOST_AGENT_JAR", "/a.jar")]);
-        let (libjvm, jar) = resolve_island_paths(ws.path(), &env).unwrap();
+        let (libjvm, jar, tier) = resolve_island_paths(ws.path(), &env).unwrap();
         assert_eq!(libjvm, PathBuf::from("/jdk/lib/server/libjvm.so"));
         assert_eq!(jar, PathBuf::from("/a.jar"));
+        assert_eq!(tier, "env JAVA_HOME (or the nix-baked default)");
     }
 
     #[test]
@@ -1234,8 +1287,9 @@ mod tests {
             ("JAVA_HOME", "/jdk"),
             ("PC_HOST_AGENT_JAR", "/a.jar"),
         ]);
-        let (libjvm, _) = resolve_island_paths(ws.path(), &env).unwrap();
+        let (libjvm, _, tier) = resolve_island_paths(ws.path(), &env).unwrap();
         assert_eq!(libjvm, PathBuf::from("/custom/libjvm.so"));
+        assert_eq!(tier, "env LS_LIBJVM");
     }
 
     #[test]
@@ -1253,8 +1307,9 @@ mod tests {
             ("JAVA_HOME", "/jdk"),
             ("PC_HOST_AGENT_JAR", "/a.jar"),
         ]);
-        let (libjvm, _) = resolve_island_paths(ws.path(), &env).unwrap();
+        let (libjvm, _, tier) = resolve_island_paths(ws.path(), &env).unwrap();
         assert_eq!(libjvm, PathBuf::from("/config/jdk/lib/server/libjvm.so"));
+        assert_eq!(tier, "config javaHome");
     }
 
     // The nixpkgs JDK package-root layout: `JAVA_HOME=<store path>` where the
@@ -1272,7 +1327,7 @@ mod tests {
             ("JAVA_HOME", jdk.path().to_str().unwrap()),
             ("PC_HOST_AGENT_JAR", "/a.jar"),
         ]);
-        let (libjvm, _) = resolve_island_paths(ws.path(), &env).unwrap();
+        let (libjvm, _, _) = resolve_island_paths(ws.path(), &env).unwrap();
         assert_eq!(libjvm, nested.join("lib/server/libjvm.so"));
     }
 
@@ -1283,7 +1338,7 @@ mod tests {
         std::fs::create_dir_all(&conf_dir).unwrap();
         std::fs::write(conf_dir.join("config.json"), "{ not json").unwrap();
         let env = env_of(&[("JAVA_HOME", "/jdk"), ("PC_HOST_AGENT_JAR", "/a.jar")]);
-        let (libjvm, _) = resolve_island_paths(ws.path(), &env).unwrap();
+        let (libjvm, _, _) = resolve_island_paths(ws.path(), &env).unwrap();
         assert_eq!(libjvm, PathBuf::from("/jdk/lib/server/libjvm.so"));
     }
 

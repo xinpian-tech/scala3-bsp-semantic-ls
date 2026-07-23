@@ -226,6 +226,37 @@ if not ready then
 end
 pass("doctor reports state: ready over the real project")
 
+-- Lifecycle log phases: the wrapper script tees the server's stderr into
+-- <ws>/ls-server.stderr.log; the boot narrative must appear there in phase
+-- order (discovery -> build-server spawn -> handshake -> READY), on stable
+-- substrings only. This is the editor-level proof of the analysis-grade
+-- stderr stream a stuck user reads (docs/deployment.md "Logs & diagnosing a
+-- stuck server").
+do
+  local log = io.open(ws .. "/ls-server.stderr.log", "r")
+  if not log then
+    fail("ls-server.stderr.log not found next to the workspace (wrapper tee missing)")
+  end
+  local text = log:read("*a") or ""
+  log:close()
+  local phases = {
+    "scala3-bsp-semantic-ls 0.1.0 pid=", -- the always-printed banner
+    ".bsp discovery",
+    "launched build server",
+    "build/initialize ok",
+    "READY in",
+  }
+  local from = 1
+  for _, phase in ipairs(phases) do
+    local _, at = text:find(phase, from, true)
+    if not at then
+      fail("stderr log is missing phase '" .. phase .. "' (in order); log tail:\n" .. text:sub(-4000))
+    end
+    from = at + 1
+  end
+  pass("stderr log carries the boot phase sequence (banner -> discovery -> spawn -> handshake -> READY)")
+end
+
 -- First-editor-session flow, exactly like the real-BSP suites: compile over
 -- the retained BSP session (the session's own out-dir view is authoritative —
 -- a CLI pre-compile writes elsewhere), then reindex to ingest the SemanticDB

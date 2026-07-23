@@ -543,7 +543,19 @@ pub fn boot_island(config: &IslandConfig) -> Result<Supervisor<VtableBackend>, B
         config.workspace_root,
         config.extra_jvm_options,
     );
+    log::debug!(
+        target: "pc",
+        "dlopen {} + JNI_CreateJavaVM with {} option(s): {:?}",
+        config.libjvm.display(),
+        options.len(),
+        options,
+    );
     boot::create_java_vm(config.libjvm, &options).map_err(BootError::Boot)?;
+    log::debug!(
+        target: "pc",
+        "JVM created — waiting for the premain rendezvous (deadline {:?})",
+        config.rendezvous_timeout,
+    );
     wait_for_registration(config.rendezvous_timeout)?;
 
     let backend = VtableBackend::new(Arc::clone(island_runtime()));

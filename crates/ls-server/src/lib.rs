@@ -15,6 +15,7 @@ pub mod documents;
 mod formatting;
 pub mod jsonrpc;
 pub mod lifecycle;
+pub mod logging;
 pub mod pc;
 mod pc_convert;
 pub mod pc_diagnostics;

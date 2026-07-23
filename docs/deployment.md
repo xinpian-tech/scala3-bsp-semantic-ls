@@ -23,7 +23,8 @@ Contents:
 3. [Server CLI](#3-server-cli)
 4. [BSP + language-server integration](#4-bsp--language-server-integration)
 5. [Manual testing / verification](#5-manual-testing--verification)
-6. [Troubleshooting](#6-troubleshooting)
+6. [Logs & diagnosing a stuck server](#6-logs--diagnosing-a-stuck-server)
+7. [Troubleshooting](#7-troubleshooting)
 
 ---
 
@@ -656,7 +657,120 @@ nix develop -c ./scripts/it-nvim-zaozi-full.sh
 
 ---
 
-## 6. Troubleshooting
+## 6. Logs & diagnosing a stuck server
+
+stderr is the log channel by design (stdout carries only protocol frames,
+§4.4). The lifecycle stream is **analysis-grade**: a user whose editor shows
+"waiting…" — or who just restarted the LSP — reads stderr top-to-bottom and
+can tell exactly which stage the server is in and what it is waiting on.
+
+### 6.1 Configuration (`LS_LOG`, `LS_LOG_FILE`) and the line format
+
+| Env var         | Effect                                                                                          |
+|-----------------|--------------------------------------------------------------------------------------------------|
+| `LS_LOG`        | level: `error` \| `warn` \| `info` \| `debug` (default `info`; unrecognized values fall back to `info`) |
+| `LS_LOG_FILE`   | **additionally** append every line to this file (write-through). The escape hatch for editors that swallow LSP stderr — Neovim does; the nvim e2e harness hit exactly this and tees stderr itself. File errors never hurt the server: one warning, then they are ignored. |
+
+Every line has one shape:
+
+```text
+[+SSS.mmm LEVEL area] message
+```
+
+`+SSS.mmm` is the **monotonic elapsed time since process start** — the
+analysis axis (gaps between stamps show where time went). The `area` names the
+subsystem:
+
+| Area      | What logs there                                                                       |
+|-----------|----------------------------------------------------------------------------------------|
+| `serve`   | the LSP loop: initialize/initialized, watched-files registration, ready adoption, pre-ready fallbacks, slow requests, shutdown/exit/EOF endings |
+| `boot`    | the async bootstrap narrative: `.bsp` discovery, model summary, store open, initial ingest, `READY in …` / failure |
+| `bsp`     | the build-server session: launch (pid), handshake, waiting heartbeats, forwarded `build/logMessage`/`build/showMessage` (mill's compile progress), compile begin/end + statusCode, `buildTarget/didChange` reloads, the shutdown ladder |
+| `bsp-err` | the build-server child's stderr, re-emitted line by line                              |
+| `pc`      | the embedded presentation-compiler island: boot begin (libjvm + winning tier, agent jar), rendezvous, latched boot errors, watchdog recovery ladder (WARN/ERROR) |
+| `index`   | reindex begin/end, the didSave debounced build job (scheduled/coalesced/ran), background compile+reingest outcomes |
+| `watch`   | watched-files batches: event counts, classification (semanticdb/config/bsp/unmatched), the action taken |
+| `fmt`     | scalafmt spawns (debug: binary + winning tier) and failures/timeouts (warn)           |
+
+One **banner line always prints** (even under `LS_LOG=error`), identifying the
+process: version, pid, wallclock UTC start (correlate the monotonic stamps
+with real time), argv mode, and the effective `LS_LOG`/`LS_LOG_FILE`:
+
+```text
+[+0.000 INFO serve] scala3-bsp-semantic-ls 0.1.0 pid=12345 started 2026-07-23T08:15:42Z mode=serve LS_LOG=info LS_LOG_FILE=(unset)
+```
+
+Steady-state requests are **not** logged by default. A request that takes ≥ 2 s
+earns one info line (`slow request: <method> took N.Ns`); `LS_LOG=debug` logs
+every request (method, id, duration), cancellations, and per-target PC
+registrations.
+
+### 6.2 The canonical healthy sequence
+
+A healthy start reads like this (elapsed stamps and details vary):
+
+```text
+[+0.000 INFO serve] scala3-bsp-semantic-ls 0.1.0 pid=… started … mode=serve LS_LOG=info LS_LOG_FILE=(unset)
+[+0.031 INFO serve] initialize received: root=/ws, client=Neovim 0.11.0, watched-files dynamic registration: yes
+[+0.033 INFO serve] initialized received — bootstrap spawned
+[+0.034 INFO serve] watched-files registration sent (3 globs: …)
+[+0.035 INFO boot] bootstrap started for workspace /ws
+[+0.036 INFO boot] .bsp discovery: 1 candidate(s) ["mill-bsp"], 0 invalid; picked 'mill-bsp' argv=["mill", "--bsp", …]
+[+0.041 INFO bsp] launched build server 'mill-bsp' (pid 12360), cwd /ws
+[+0.900 INFO bsp-err] …mill's own stderr lines…
+[+10.05 INFO bsp] still waiting for build/initialize (10s) — the build server may be compiling its build script or blocked on another mill/sbt holding the workspace lock
+[+14.20 INFO bsp] build/initialize ok: server 'mill-bsp' 1.1.2 (bsp 2.2.0)
+[+15.90 INFO boot] build model loaded: 5 Scala 3 target(s), 4 indexable, 1 without SemanticDB (no -Xsemanticdb: …mill-build)
+[+15.91 INFO boot] store opened at /ws/.scala3-bsp-semantic-ls: recovered generation 7 (segment 3)
+[+16.80 INFO boot] initial ingest complete — ingest: segment 4, 120 docs (…), … in 890ms
+[+16.80 INFO boot] READY in 16.8s total
+[+16.81 INFO serve] bootstrap result adopted: workspace READY — replaying 1 open buffer(s)
+```
+
+While the workspace is not ready, the first request of each method logs
+`answering '<method>' with a not-ready error until bootstrap completes` (once
+per method; repeats at debug). On the first PC-backed query (hover,
+completion, semantic tokens):
+
+```text
+[+42.00 INFO pc] island boot begin: libjvm …/lib/server/libjvm.so (tier: env JAVA_HOME (or the nix-baked default)), agent jar …/pc-host-agent.jar
+[+42.00 INFO pc] island JVM output appears unprefixed on stderr below
+[+44.85 INFO pc] island boot ok: premain rendezvous in 2.8s — registering 4 target(s) and replaying 1 buffer(s)
+```
+
+And on teardown, the three endings are spelled out distinctly:
+
+```text
+[+…  INFO serve] shutdown received — tearing down the ready services; waiting for exit
+[+…  INFO bsp]  session shutdown: sending build/shutdown (bounded 5s) then build/exit
+[+…  INFO serve] exit received — leaving the serve loop (clean exit)
+```
+
+versus `client closed the connection (EOF) — leaving the serve loop` (the
+editor hung up without the shutdown handshake) versus
+`output pipe broken — client died: …` (the editor process is gone).
+
+### 6.3 "Last line you see" → where it is stuck → what to check
+
+| Last line you see                                                        | Stuck where                              | What to check |
+|--------------------------------------------------------------------------|-------------------------------------------|---------------|
+| nothing after the banner                                                  | the client never sent `initialize`        | editor LSP config: wrong command/filetype/root, or the client attached to a different server instance. The server is fine — it is waiting for the first frame. |
+| `initialize received` but no `bootstrap spawned`                          | the client never sent `initialized`       | a non-conforming client; check its LSP log. |
+| stuck after `bootstrap spawned` with `still waiting for build/initialize` heartbeats every 10s | the build server is starting up — mill/sbt compiling its build script, or ANOTHER mill/sbt process holds the workspace lock (the classic restart-while-the-old-mill-is-alive case) | the `bsp-err` lines just above (mill prints its lock/startup state there); `ps` for another mill/sbt on the same workspace; kill it or wait. After 30 s the request times out and bootstrap fails typed (§4.3). |
+| `.bsp discovery: no usable connection file …`                             | no BSP connection installed               | run `mill mill.bsp.BSP/install` (§4.2), restart the session. |
+| stuck at `buildTarget/compile started …`                                  | a real build is running                   | the forwarded `build/logMessage` lines (mill's compile progress) and `bsp-err`; a first cold compile can exceed the 30 s request bound — pre-compile with `mill __.compile` (§4.3). |
+| `island boot begin` then nothing                                          | the embedded JVM is booting (or wedged in boot) | the `libjvm`/`tier` named on the boot-begin line (wrong `javaHome`?); unprefixed JVM output below it; a rendezvous timeout latches an ERROR line with the island log. |
+| repeated `pc` WARN lines (`PC request deadline hit`, `recovery: …`)       | a wedged PC query; the watchdog recovery ladder is running | let it run: `restart_instances` → `spawn_dispatch generation N` usually heals in-place. `recovery: … the island is FATAL` at ERROR means restart the server; run `scala3SemanticLs.doctor` and check `pcPluginStatus`. |
+| `bootstrap failed after …: <detail> — run scala3SemanticLs.doctor`        | bootstrap ended in the failed state       | the detail names the cause (no `.bsp`, model load error, ingest error); the doctor renders the full per-section report (§5.2). Requests answer typed `workspace is bootstrap failed: …` errors. |
+| `slow request: <method> took N.Ns`                                        | one slow request, loop otherwise healthy  | expected for a PC cold boot or an explicit format; investigate only if repeated. |
+
+The doctor (`scala3SemanticLs.doctor`, or offline `--doctor`, §5.2) is the
+complement to the log stream: the log says *where the lifecycle stopped*, the
+doctor says *what the world looks like now*.
+
+---
+
+## 7. Troubleshooting
 
 | Symptom                                                                    | Cause                                                                 | Fix                                                                                     |
 |----------------------------------------------------------------------------|----------------------------------------------------------------------|----------------------------------------------------------------------------------------|

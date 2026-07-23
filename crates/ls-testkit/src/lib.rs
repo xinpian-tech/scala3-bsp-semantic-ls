@@ -16,5 +16,6 @@ pub mod client;
 pub mod fake_bsp;
 pub mod fake_pc;
 pub mod fixtures;
+pub mod logcap;
 pub mod positions;
 pub mod wire;

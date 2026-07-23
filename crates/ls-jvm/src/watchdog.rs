@@ -195,6 +195,12 @@ impl<B: PcBackend> Supervisor<B> {
             // A normal PC error must not mutate the replay mirror.
             DispatchOutcome::Status(code) => Err(PcError::Backend(code)),
             DispatchOutcome::Wedged => {
+                log::warn!(
+                    target: "pc",
+                    "PC request deadline hit ({:?}) — the request fails typed and the \
+                     recovery ladder runs",
+                    self.request_deadline,
+                );
                 // The editor's notification is a fact regardless of the wedge, so
                 // mirror it before recovery replays state into the new generation.
                 self.observe(&request);
@@ -225,13 +231,29 @@ impl<B: PcBackend> Supervisor<B> {
     fn recover(&mut self) {
         // Rung 1: reset the PC instances (also cancels the in-flight op). A
         // failed control op means the island cannot be recovered.
-        if self.backend.restart_instances() != 0 {
+        log::warn!(
+            target: "pc",
+            "recovery: restart_instances issued (the cooperative cancel lever)"
+        );
+        let restart_status = self.backend.restart_instances();
+        if restart_status != 0 {
+            log::error!(
+                target: "pc",
+                "recovery: restart_instances failed (status {restart_status}) — \
+                 the island is FATAL"
+            );
             self.fatal.store(true, Ordering::SeqCst);
             return;
         }
         if self.wait_lane_idle() {
             // Cooperative wedge: the op returned once its facade was reset; keep
             // the generation.
+            log::warn!(
+                target: "pc",
+                "recovery: the wedged op returned after restart_instances — \
+                 keeping dispatch generation {}",
+                self.generations.current(),
+            );
             return;
         }
         // Non-cooperative wedge: abandon this generation for a fresh one and
@@ -239,12 +261,31 @@ impl<B: PcBackend> Supervisor<B> {
         // reopened by the editor.
         match self.generations.advance() {
             Advance::Spawned(generation) => {
+                log::warn!(
+                    target: "pc",
+                    "recovery: spawn_dispatch generation {generation} \
+                     (abandoned generations so far: {}) — replaying the mirrored \
+                     targets and buffers",
+                    self.generations.abandoned(),
+                );
                 let plan = self.mirror.replay_plan();
-                if self.backend.spawn_generation(generation, &plan) != 0 {
+                let spawn_status = self.backend.spawn_generation(generation, &plan);
+                if spawn_status != 0 {
+                    log::error!(
+                        target: "pc",
+                        "recovery: spawn_dispatch generation {generation} failed \
+                         (status {spawn_status}) — the island is FATAL"
+                    );
                     self.fatal.store(true, Ordering::SeqCst);
                 }
             }
-            Advance::Fatal => self.fatal.store(true, Ordering::SeqCst),
+            Advance::Fatal => {
+                log::error!(
+                    target: "pc",
+                    "recovery: abandoned-generation cap exceeded — the island is FATAL"
+                );
+                self.fatal.store(true, Ordering::SeqCst);
+            }
         }
     }
 

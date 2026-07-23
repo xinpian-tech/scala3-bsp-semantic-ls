@@ -185,8 +185,9 @@ impl DocumentStore {
             Some(buffer) => {
                 if let Some(version) = version {
                     if version <= buffer.version {
-                        eprintln!(
-                            "ls-server: didChange version {version} for {uri} is not newer than \
+                        log::warn!(
+                            target: "serve",
+                            "didChange version {version} for {uri} is not newer than \
                              the stored {}; applying the edits anyway",
                             buffer.version
                         );

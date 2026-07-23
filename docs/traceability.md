@@ -47,6 +47,7 @@ real-BSP rows) lives in `docs/coverage-audit.md`; this file maps the mandates.
 | Real-BSP e2e | E0–E8 equivalents over live mill on `it/sample-workspace`; cold-start zero-JVM hard assertion (`/proc/self/maps`) | `crates/ls-server/tests/real_bsp_e2e.rs`, `crates/ls-server/tests/real_bsp_pc.rs`, `crates/ls-server/tests/real_bsp_pc_recovery.rs` (`scripts/it-real-bsp-rs.sh`) |
 | Packaging | offline `nix build .#default` (Rust binary + island jars), packaged `--version`/offline `--doctor`/`dump`, Linux-only systems, ivy-lock hygiene | flake checks `package`, `package-cli`, `rust-build`, `rust-test`, `rust-clippy`, `rust-fmt`, `java25-toolchain`, `ivy-lock-present`, `pc-host-agent`; `scripts/check-ivy-lock.sh`, `scripts/check-offline-compile.sh` |
 | Bench | ingest + query measurements over the real storage layer, ground-truth cross-checked, CI smoke gate | `crates/ls-bench/tests/smoke.rs`, `crates/ls-bench/src/lib.rs` (`cargo run -p ls-bench -- --smoke`) |
+| Lifecycle logging | the analysis-grade stderr stream (`log` facade in ls-server/ls-bsp/ls-jvm, ONE sink in ls-server): the `[+SSS.mmm LEVEL area]` line format with the monotonic-elapsed axis, `LS_LOG` level + `LS_LOG_FILE` write-through tee (the nvim-swallows-stderr escape hatch), the always-printed banner (version/pid/UTC/mode/log config), the per-area coverage (serve lifecycle + distinct EOF/broken-pipe/exit endings, boot narrative through `READY in`, the 10s `still waiting for <method>` handshake heartbeat in the BSP request path, `build/logMessage`/`showMessage` + child-stderr re-emission, compile begin/end, PC island boot/tier/rendezvous + latched errors + watchdog WARN ladder, index build jobs, watched-files classification, scalafmt spawns), slow-request info at ≥ 2s with per-request debug, once-per-method pre-ready info; documented at `docs/deployment.md` §6 | sink units in `crates/ls-server/src/logging.rs`, the capturing test logger `crates/ls-testkit/src/logcap.rs`, heartbeat + in-order boot narrative in `crates/ls-server/tests/log_lifecycle.rs`, `LS_LOG_FILE` blackbox e2e in `it/lsp-blackbox/test_lifecycle.py`, the editor-level phase-sequence gate in `it/nvim/e2e.lua` |
 
 ## Case map (spot anchors)
 
@@ -67,6 +68,10 @@ Selected load-bearing cases, mechanically checked (`file` :: "case substring"):
 - `it/nvim/e2e.lua` :: "dynamic-field definition"
 - `it/nvim/e2e.lua` :: "references must cover the dynamic-access sites"
 - `crates/ls-server/src/server.rs` :: "a_cancelled_queued_request_answers_request_cancelled_without_dispatch"
+- `crates/ls-server/tests/log_lifecycle.rs` :: "a_delayed_build_initialize_emits_the_still_waiting_heartbeat"
+- `crates/ls-server/tests/log_lifecycle.rs` :: "the_boot_narrative_lines_occur_in_order_on_a_captured_sink"
+- `it/lsp-blackbox/test_lifecycle.py` :: "test_ls_log_file_captures_the_banner_and_the_ready_line"
+- `it/nvim/e2e.lua` :: "stderr log carries the boot phase sequence"
 - `crates/ls-server/tests/pc_wire.rs` :: "a_cancelled_queued_completion_answers_request_cancelled_over_the_wire"
 - `crates/ls-server/tests/pc_wire.rs` :: "payload_methods_gate_on_the_buffer_and_split_on_semanticdb"
 - `crates/ls-server/tests/pc_wire.rs` :: "the_code_action_wire_surface_assembles_and_drops_jvm_free"
