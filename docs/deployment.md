@@ -302,6 +302,31 @@ ships in this repo, so integrate it as you would any stdio LSP:
   workspace is `Ready`, requests return typed "workspace is …" errors — never
   crashes. Clients must tolerate this brief warm-up.
 
+Illustrative Zed (the first-class editor of the README recipe; per-user
+`~/.config/zed/settings.json` or per-project `.zed/settings.json`): install
+the Scala extension — it registers language server id `metals` for `scala`
+buffers — and override that server's binary, so Zed launches this server
+instead of downloading Metals:
+
+```json
+{
+  "lsp": {
+    "metals": {
+      "binary": {
+        "path": "/abs/path/to/scala3-bsp-semantic-ls",
+        "arguments": []
+      }
+    }
+  }
+}
+```
+
+The path must be absolute (Zed does not consult `$PATH` for overridden
+binaries). Metals-specific `initializationOptions` the extension sends are
+ignored — `initialize` reads only `rootUri`/`workspaceFolders`, `clientInfo`,
+and the capability bits it negotiates. Server stderr — the §6 log narrative —
+appears in Zed's `dev: open language server logs` panel.
+
 Illustrative Neovim (`nvim-lspconfig` custom config — adjust paths):
 
 ```lua
