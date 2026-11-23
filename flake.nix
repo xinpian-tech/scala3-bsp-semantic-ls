@@ -14,8 +14,7 @@
 
     # A real third-party Scala 3 project kept as a pinned real-repo workspace
     # for manual validation with any LSP client. Pinned source only: it is
-    # built with its OWN flake (native CIRCT/MLIR toolchain). Local modifications
-    # are maintained as patches under nix/patches/ (see zaozi-semanticdb.patch).
+    # built with its OWN flake (native CIRCT/MLIR toolchain).
     zaozi = {
       url = "github:xinpian-tech/zaozi";
       flake = false;
@@ -82,12 +81,12 @@
         # retained PC test harness uses; pinned by hash, versions matched to the
         # compiler bundled in the PC-host assembly (build.mill `Deps.scalaVer`).
         scalaLibraryJar = pkgs.fetchurl {
-          url = "https://repo1.maven.org/maven2/org/scala-lang/scala-library/3.8.4/scala-library-3.8.4.jar";
-          hash = "sha256-G4Mw3ld0wVh0Fz8Wi2dCVcqgDF7zZIqwtst2O7f9Lec=";
+          url = "https://repo1.maven.org/maven2/org/scala-lang/scala-library/3.10.1/scala-library-3.10.1.jar";
+          hash = "sha256-/wp3MYf4J+p7WW5PNwCYq8QX1qTeJIWP+Qe7tq+XuaU=";
         };
         scala3LibraryJar = pkgs.fetchurl {
-          url = "https://repo1.maven.org/maven2/org/scala-lang/scala3-library_3/3.8.4/scala3-library_3-3.8.4.jar";
-          hash = "sha256-j4LhyJdKho877rR1+pwyI50uCC6fgD6/w+65EhG4h9E=";
+          url = "https://repo1.maven.org/maven2/org/scala-lang/scala3-library_3/3.10.1/scala3-library_3-3.10.1.jar";
+          hash = "sha256-3m9df5F1/QwQQ7ssom80mVngDUydv9Gh8w9hRIQ6PRM=";
         };
 
         # End-to-end check that boots the PRODUCTION island (crane-built
@@ -212,15 +211,8 @@
           touch $out
         '';
 
-        # The pinned zaozi source with our patches applied (SemanticDB emission,
-        # which our SemanticDB-first server requires). Exposed to the dev shell
-        # as ZAOZI_SRC so manual real-repo validation builds a pinned,
-        # reproducible tree instead of an ad-hoc `git clone`.
-        zaozi-src = pkgs.applyPatches {
-          name = "zaozi-patched-src";
-          src = zaozi;
-          patches = [ ./nix/patches/zaozi-semanticdb.patch ];
-        };
+        # The editor integration tests use zaozi's own SemanticDB settings and compiler plugin.
+        zaozi-src = pkgs.srcOnly { name = "zaozi-src"; src = zaozi; };
       in
       {
         devShells.default = import ./nix/dev-shell.nix {
@@ -251,7 +243,7 @@
           # (plan section 15.3) works as documented.
           inherit mill;
           inherit (pkgs) mill-ivy-fetcher;
-          # The patched, pinned zaozi source (real-repo real-BSP workspace).
+          # The pinned zaozi source (real-repo real-BSP workspace).
           inherit zaozi-src;
           # The crane-built Rust cargo workspace (crates/).
           rust-workspace = rust.package;

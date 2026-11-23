@@ -52,6 +52,12 @@ object FoldingRangeProvider:
     */
   private val lock = new Object
 
+  private lazy val parserContext: Context =
+    val context = ContextBase().initialCtx.fresh
+    context.setSetting(context.settings.Yusejavacp, true)
+    context.initialize()(using context)
+    context
+
   def foldingRanges(uri: String, text: String): Vector[PcFoldingRange] = lock.synchronized {
     val lines = new LineIndex(text)
     val folds = mutable.ArrayBuffer.empty[(Int, Int, Int)] // (startOffset, endOffset, kind)
@@ -86,7 +92,7 @@ object FoldingRangeProvider:
     */
   private def syntaxFolds(uri: String, text: String): Vector[(Int, Int, Int)] =
     val source = SourceFile.virtual(uri, text)
-    given Context = ContextBase().initialCtx.fresh
+    given Context = parserContext.fresh
       .setReporter(new StoreReporter(null, fromTyperState = false))
       .setSource(source)
     val tree = new Parsers.Parser(source).parse()

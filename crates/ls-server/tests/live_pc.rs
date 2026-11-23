@@ -81,7 +81,7 @@ fn live_definition_over_an_open_buffer_routes_through_the_pc_island() {
             vec![BspTarget {
                 bsp_id: "live-target".to_string(),
                 display_name: "live-target".to_string(),
-                scala_version: "3.8.4".to_string(),
+                scala_version: "3.10.1".to_string(),
                 scalac_options: Vec::new(),
                 class_directory: sdb_root_m.clone(),
                 classpath: classpath.clone(),

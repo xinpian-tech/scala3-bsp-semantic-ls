@@ -45,7 +45,7 @@ Everything is provided by the flake (see [nix-build.md §1](nix-build.md)):
 ```text
 Rust (stable, nixpkgs)   crane-built cargo workspace; the deployable server binary
 Java 25                  island-only: runs the embedded presentation compiler
-Scala 3.8.4              pinned in build.mill (Deps.scalaVer); the bundled PC version
+Scala 3.10.1              pinned in build.mill (Deps.scalaVer); the bundled PC version
 Mill 1.1.2               builds the island jars (from mill-ivy-fetcher's mill-overlay)
 Nix >= 2.28              mill-ivy-fetcher requirement
 ```
@@ -126,7 +126,7 @@ references/rename/workspace-symbol never touch Java at all.
 | `.#pc-navtest-plugin-jar`   | the pc-plugins.json test-fixture compiler plugin jar (check input, not shipped) |
 | `.#spike-agent-jar`         | the embedded-JVM boundary-spike agent jar (dev/verification artifact) |
 | `.#mill`, `.#mill-ivy-fetcher` | the pinned Mill and `mif` used by the ivy-lock workflow            |
-| `.#zaozi-src`               | the pinned + patched zaozi source tree (real-repo validation input)   |
+| `.#zaozi-src`               | the pinned zaozi source tree (real-repo validation input)   |
 
 ### 2.4 Dev / raw-binary iteration
 
@@ -486,7 +486,7 @@ UTF-16 over the original text). Facts an operator needs:
 - **Offline stance: the shipped scalafmt is ONE fixed version and never
   downloads another.** The scalafmt CLI is the "dynamic" flavor that would
   fetch a `.scalafmt.conf`-pinned core version from Maven Central; the server
-  spawns it with `COURSIER_MODE=offline`, so a workspace pinning a different
+  spawns it with `COURSIER_MODE=offline`, so a workspace pinning an unavailable
   version fails **fast and typed** (the error's stderr tail names the
   unresolvable `scalafmt-core` artifact) instead of downloading jars behind
   the editor's back. Fix: set the conf's `version` to the shipped scalafmt's
@@ -626,11 +626,9 @@ The full CI command set is in [nix-build.md §7](nix-build.md).
 
 ### 5.7 Real-repo macro-navigation e2e (`scripts/it-nvim-zaozi-full.sh`)
 
-The editor-level proof that the server solves zaozi's macro-navigation
-problem on the REAL, untrimmed repo. The trimmed `scripts/it-nvim-zaozi.sh`
-(CI job `nvim-zaozi-e2e`) keeps only zaozi's CIRCT-free modules for speed;
-this variant copies the pinned checkout WHOLE — every CIRCT/MLIR Panama
-module in the model — so the build side runs zaozi's own toolchain:
+Both editor tests use the pinned zaozi workspace and its own toolchain. The CI script
+`scripts/it-nvim-zaozi.sh` checks the decoder. The full variant exercises
+the compiler plugin's same-file and cross-file navigation on dynamic bundle fields.
 
 ```bash
 nix develop -c ./scripts/it-nvim-zaozi-full.sh
@@ -656,7 +654,7 @@ nix develop -c ./scripts/it-nvim-zaozi-full.sh
   at a real dynamic bundle-field access `io.<field>` land on the
   `val <field> = Aligned/Flipped(...)` declaration — a same-file anchor
   (`zaozi/tests/src/UIntSpec.scala`, `UIntSpecIO.a`) and a cross-file anchor
-  (`stdlib/src/dwbb/Queue.scala` → `stdlib/src/Queue.scala`,
+  (`stdlib/src/dwbb/Queue.scala` → `stdlib/src/queue/Queue.scala`,
   `QueueIO.empty`); expected lines are grep-computed from the bundle source
   at run time.
 - **Hard gate: references cover the dynamic-access sites**:

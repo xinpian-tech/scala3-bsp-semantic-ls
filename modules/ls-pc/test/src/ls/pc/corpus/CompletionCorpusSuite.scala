@@ -271,8 +271,8 @@ class CompletionCorpusSuite extends CorpusCompletionHarness:
       |  extension [T: Orde@@]
       |}
       |""".stripMargin,
-    """Ordered[T] scala.math
-      |Ordering[T] scala.math
+    """Ordered scala.math
+      |Ordering scala.math
       |""".stripMargin,
     topLines = Some(2)
   )
@@ -284,8 +284,8 @@ class CompletionCorpusSuite extends CorpusCompletionHarness:
       |  extension [T: Ordering: Orde@@]
       |}
       |""".stripMargin,
-    """Ordered[T] scala.math
-      |Ordering[T] scala.math
+    """Ordered scala.math
+      |Ordering scala.math
       |""".stripMargin,
     topLines = Some(2)
   )

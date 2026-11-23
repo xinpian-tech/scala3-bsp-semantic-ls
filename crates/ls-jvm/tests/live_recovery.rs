@@ -108,7 +108,7 @@ fn live_dispatch_wedge_recovers_via_a_fresh_generation_and_caps_at_fatal() {
         id: TARGET_ID.to_string(),
         config: TargetConfig {
             bsp_id: TARGET_ID.to_string(),
-            scala_version: "3.8.4".to_string(),
+            scala_version: "3.10.1".to_string(),
             classpath: env.classpath.clone(),
             scalac_options: vec![],
             source_dirs: vec![],

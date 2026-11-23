@@ -23,6 +23,11 @@ class FoldingRangeProviderSuite extends munit.FunSuite:
   private val Imports = 2
   private val Region = 3
 
+  test("folds a method containing a deeply nested expression"):
+    val expression = (1 to 16).foldLeft("value")((arg, _) => s"f($arg)")
+    val text = s"object A:\n  def run =\n    $expression"
+    assert(folds(text).contains((1, 2, 2, 4 + expression.length, None_)))
+
   test("indentation syntax: object, def body, and block fold; single-line members do not"):
     val text =
       """object A:

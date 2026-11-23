@@ -26,7 +26,7 @@ use serde_json::Value;
 /// The semantic-tokens legend contract: the island's `Node.tokenType()` /
 /// `tokenModifier()` ints are INDICES into the PC-vendored
 /// `scala.meta.internal.pc.SemanticTokens.TokenTypes` / `TokenModifiers` lists
-/// (scala3-presentation-compiler 3.8.4, vendored in the island's PC jar), so
+/// (scala3-presentation-compiler 3.10.1, vendored in the island's PC jar), so
 /// the legend the server advertises must be EXACTLY those lists, in order.
 /// Pinned here as Rust constants; the island-side munit suite
 /// `modules/ls-pc/test/src/ls/pc/SemanticTokensLegendSuite.scala` pins the same
@@ -612,7 +612,7 @@ mod tests {
 
     // The legend is EXACTLY the PC-vendored
     // `scala.meta.internal.pc.SemanticTokens` lists (scala3-presentation-
-    // compiler 3.8.4), pinned verbatim; the island-side
+    // compiler 3.10.1), pinned verbatim; the island-side
     // SemanticTokensLegendSuite pins the same lists from the vendored object,
     // so drift breaks both sides.
     #[test]

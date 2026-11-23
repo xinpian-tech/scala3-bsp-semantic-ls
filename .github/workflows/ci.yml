@@ -68,7 +68,7 @@ jobs:
 
       # Project-level e2e with a REAL editor over a REAL third-party repo:
       # headless Neovim attaches the production server to the pinned zaozi
-      # checkout (CIRCT-free `decoder` module), driving readiness, reindex,
+      # checkout (`decoder` module), driving readiness, reindex,
       # workspace/symbol, definition, references, and PC-backed hover.
       - name: nvim zaozi e2e
         run: nix develop -c ./scripts/it-nvim-zaozi.sh

@@ -393,7 +393,7 @@ import mill.*
 import mill.scalalib.*
 
 trait SampleModule extends ScalaModule {
-  def scalaVersion = "3.8.4"
+  def scalaVersion = "3.10.1"
   def scalacOptions = Seq(
     "-Xsemanticdb",
     "-sourceroot",
@@ -417,7 +417,7 @@ object b extends SampleModule {
 }
 
 object c extends ScalaModule {
-  def scalaVersion = "3.8.4"
+  def scalaVersion = "3.10.1"
 }
 "#;
     let (tmp, ws) = prepare_workspace(&[(shared_rel, shared_source)], Some(shared_build));

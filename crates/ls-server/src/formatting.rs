@@ -30,9 +30,8 @@
 //!
 //! Offline stance: the spawn exports `COURSIER_MODE=offline` into the child,
 //! so the scalafmt-dynamic CLI can never download a `.scalafmt.conf`-pinned
-//! core version from Maven behind the editor's back — the nix-shipped
-//! scalafmt is ONE fixed version, and a workspace pinning any other fails
-//! fast with the typed non-zero-exit error whose stderr tail names the
+//! core version from Maven behind the editor's back. A core version unavailable
+//! locally triggers the typed non-zero-exit error whose stderr tail names the
 //! unresolvable artifact (documented in `docs/deployment.md`).
 //!
 //! Range formatting is deliberately NOT advertised: the CLI's hidden

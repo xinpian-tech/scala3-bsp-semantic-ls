@@ -17,8 +17,8 @@
 -- workspace mode after the shared health gates (ready/compile/reindex): the
 -- dynamic-bundle-field probes over the UNTRIMMED zaozi workspace — hard
 -- definition/hover gates at real `io.<field>` accesses (the zaozi PC plugin
--- path), INFO-only references / workspace-symbol counts — instead of the
--- trimmed decoder probes. Budgets: LS_NVIM_READY_TIMEOUT_S,
+-- path), references and workspace-symbol counts. The other mode exercises
+-- the decoder. Budgets: LS_NVIM_READY_TIMEOUT_S,
 -- LS_NVIM_COMPILE_TIMEOUT_MS, LS_NVIM_REINDEX_TIMEOUT_MS.
 
 local ws = assert(arg[1], "arg1: workspace root")
@@ -172,7 +172,7 @@ end
 local full_mode = os.getenv("LS_NVIM_FULL") == "1"
 
 -- Shared buffer helpers (used by the FULL-mode dynamic-field probes and the
--- trimmed definition/codeAction probes alike).
+-- decoder definition/codeAction probes alike).
 local function open_attached(relpath)
   vim.cmd.edit(ws .. "/" .. relpath)
   local b = vim.api.nvim_get_current_buf()
@@ -339,7 +339,7 @@ if full_mode then
       access_file = "stdlib/src/dwbb/Queue.scala",
       access_token = "io.empty := fifo.io.empty",
       offset = 3, -- cursor on the `empty` of the QueueIO access
-      bundle_file = "stdlib/src/Queue.scala",
+      bundle_file = "stdlib/src/queue/Queue.scala",
       field = "empty",
     },
   }
@@ -955,75 +955,50 @@ pass(
     .. ")"
 )
 
--- textDocument/formatting via the scalafmt COMMAND LINE. Capability first:
--- documentFormatting is advertised, rangeFormatting deliberately is not (the
--- CLI's hidden --range skips lines inside multi-line ranges). Then the probe
--- branches on whether the workspace .scalafmt.conf pins exactly the shipped
--- scalafmt version: matching → a real format round-trips a TextEdit list over
--- the open buffer; mismatching → the server's offline stance (the one fixed
--- nix scalafmt, COURSIER_MODE=offline — never a download) makes it a typed
--- RequestFailed error.
+-- Compare formatting against the same offline CLI and workspace config. A
+-- different core version can still be available in zaozi's pinned Maven repo.
 if client.server_capabilities.documentFormattingProvider ~= true then
   fail("documentFormattingProvider is not advertised")
 end
 if client.server_capabilities.documentRangeFormattingProvider ~= nil then
   fail("documentRangeFormattingProvider must not be advertised")
 end
-local conf_file = io.open(ws .. "/.scalafmt.conf", "r")
-if not conf_file then
-  fail("the zaozi workspace has no .scalafmt.conf (the pinned repo ships one)")
+local buffer_lines = vim.api.nvim_buf_get_lines(buf, 0, -1, true)
+local function buffer_text(lines)
+  return table.concat(lines, "\n") .. (vim.bo[buf].endofline and "\n" or "")
 end
-local conf_text = conf_file:read("*a")
-conf_file:close()
-local conf_version = conf_text:match('version%s*=%s*"([^"]+)"')
-local cli_version = tostring(vim.fn.system({ "scalafmt", "--version" })):match("scalafmt (%S+)")
+local input = buffer_text(buffer_lines)
+local cli = vim.system({ os.getenv("LS_SCALAFMT") or "scalafmt", "--stdin", "--config", ws .. "/.scalafmt.conf", "--non-interactive" }, {
+  cwd = ws, env = { COURSIER_MODE = "offline" }, stdin = input, text = true,
+}):wait(10000)
 local fmt_response, fmt_err = client:request_sync("textDocument/formatting", {
   textDocument = { uri = vim.uri_from_fname(file) },
   options = { tabSize = 2, insertSpaces = true },
 }, 120000, buf)
 if fmt_err or not fmt_response then
-  fail("formatting request did not complete: " .. vim.inspect(fmt_err))
+  fail("formatting transport failed: " .. tostring(fmt_err))
 end
-if conf_version ~= nil and conf_version == cli_version then
-  if fmt_response.err then
-    fail("formatting errored despite the matching scalafmt " .. cli_version .. ": " .. vim.inspect(fmt_response.err))
+if cli.code == 0 then
+  if fmt_response.err or type(fmt_response.result) ~= "table" then
+    fail("formatting failed despite a successful offline CLI run: " .. vim.inspect(fmt_response))
   end
-  if type(fmt_response.result) ~= "table" then
-    fail("formatting did not answer a TextEdit list: " .. vim.inspect(fmt_response.result))
+  local scratch = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_buf_set_lines(scratch, 0, -1, true, buffer_lines)
+  vim.lsp.util.apply_text_edits(fmt_response.result, scratch, client.offset_encoding)
+  local formatted = buffer_text(vim.api.nvim_buf_get_lines(scratch, 0, -1, true))
+  vim.api.nvim_buf_delete(scratch, { force = true })
+  -- A successful scalafmt --stdin can be silent when the input already matches.
+  local expected = cli.stdout == "" and input or cli.stdout
+  if formatted ~= expected then
+    fail("formatting differs from offline scalafmt: " .. vim.diff(formatted, expected, { result_type = "unified" }))
   end
-  pass(
-    "formatting round-trips over the real buffer ("
-      .. #fmt_response.result
-      .. " edits; conf "
-      .. conf_version
-      .. " == cli "
-      .. cli_version
-      .. ")"
-  )
+  pass("formatting edits reproduce the offline scalafmt output")
 else
-  if not fmt_response.err then
-    fail(
-      "formatting must fail typed on the version mismatch (conf "
-        .. tostring(conf_version)
-        .. " vs cli "
-        .. tostring(cli_version)
-        .. "); got: "
-        .. vim.inspect(fmt_response.result)
-    )
+  local err = fmt_response.err
+  if not err or err.code ~= -32803 or not tostring(err.message):find("scalafmt", 1, true) then
+    fail("expected a typed scalafmt failure: " .. vim.inspect(fmt_response))
   end
-  if fmt_response.err.code ~= -32803 then
-    fail("expected RequestFailed (-32803): " .. vim.inspect(fmt_response.err))
-  end
-  if not tostring(fmt_response.err.message):find("scalafmt", 1, true) then
-    fail("the typed error must name scalafmt: " .. vim.inspect(fmt_response.err))
-  end
-  pass(
-    "formatting answers the typed version-mismatch error (conf "
-      .. tostring(conf_version)
-      .. " vs cli "
-      .. tostring(cli_version)
-      .. ")"
-  )
+  pass("formatting reports the offline scalafmt failure")
 end
 
 -- Live-typing (PC) diagnostics: edit the real buffer to introduce a type
