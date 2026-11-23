@@ -6,7 +6,7 @@ import scala.meta.internal.pc.SemanticTokens
   *
   * The island's `Node.tokenType`/`tokenModifier` ints are INDICES into the
   * PC-vendored `scala.meta.internal.pc.SemanticTokens.TokenTypes` /
-  * `TokenModifiers` lists (scala3-presentation-compiler 3.8.4). The Rust
+  * `TokenModifiers` lists (scala3-presentation-compiler 3.10.1). The Rust
   * server advertises those lists verbatim as its `semanticTokensProvider`
   * legend, pinned as constants in `crates/ls-server/src/pc_lsp.rs`
   * (`legend::TOKEN_TYPES` / `legend::TOKEN_MODIFIERS`). This suite prints and

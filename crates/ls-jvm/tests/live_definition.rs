@@ -438,7 +438,7 @@ fn live_symbol_definition_prunes_and_round_trips_over_the_boundary() {
         id: TARGET_ID.to_string(),
         config: TargetConfig {
             bsp_id: TARGET_ID.to_string(),
-            scala_version: "3.8.4".to_string(),
+            scala_version: "3.10.1".to_string(),
             classpath: env.classpath.clone(),
             scalac_options: vec![],
             source_dirs: vec![],
@@ -498,7 +498,7 @@ fn live_symbol_definition_prunes_and_round_trips_over_the_boundary() {
         id: EXT_TARGET_ID.to_string(),
         config: TargetConfig {
             bsp_id: EXT_TARGET_ID.to_string(),
-            scala_version: "3.8.4".to_string(),
+            scala_version: "3.10.1".to_string(),
             classpath: env.classpath.clone(),
             scalac_options: vec![],
             source_dirs: vec![ext_src_dir.to_str().unwrap().to_string()],

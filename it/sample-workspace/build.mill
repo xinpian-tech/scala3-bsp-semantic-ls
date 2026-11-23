@@ -13,7 +13,7 @@ import mill.scalalib.*
   * can index them exactly like any user build that follows plan section 4.2.
   */
 trait SampleModule extends ScalaModule {
-  def scalaVersion = "3.8.4"
+  def scalaVersion = "3.10.1"
   def scalacOptions = Seq(
     "-Xsemanticdb",
     "-sourceroot",
@@ -36,5 +36,5 @@ object b extends SampleModule {
   * the mandatory-SemanticDB policy.
   */
 object c extends ScalaModule {
-  def scalaVersion = "3.8.4"
+  def scalaVersion = "3.10.1"
 }

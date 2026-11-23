@@ -140,7 +140,7 @@ wrapper="$ws/.ls-server-wrapper.sh"
 printf '#!/usr/bin/env bash\nexec "%s" 2>>"%s/ls-server.stderr.log"\n' "$server_bin" "$ws" > "$wrapper"
 chmod +x "$wrapper"
 
-export LS_NVIM_FULL=1
+export LS_NVIM_FULL="${LS_NVIM_FULL:-1}"
 export LS_NVIM_COMPILE_TIMEOUT_MS="${LS_NVIM_COMPILE_TIMEOUT_MS:-3600000}"
 export LS_NVIM_READY_TIMEOUT_S="${LS_NVIM_READY_TIMEOUT_S:-1800}"
 export LS_NVIM_REINDEX_TIMEOUT_MS="${LS_NVIM_REINDEX_TIMEOUT_MS:-600000}"

@@ -237,7 +237,7 @@ What this repo still owes — and proves — is the generic machinery:
 - the compiled-dependency `symbol_definition` resolver path:
   `crates/ls-jvm/tests/live_definition.rs` (flake check `pc-definition`);
 - the zaozi-specific navigation itself: the editor-level e2e rows
-  (`it/nvim/e2e.lua`, trimmed + FULL), now against zaozi's own plugin.
+  (`it/nvim/e2e.lua`, decoder and dynamic-field checks), now against zaozi's own plugin.
 
 ## Real gaps (found and closed)
 

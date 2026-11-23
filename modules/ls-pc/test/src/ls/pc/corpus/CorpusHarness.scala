@@ -912,7 +912,12 @@ abstract class CorpusDefinitionHarness extends CorpusSuiteBase:
                 ">>"
               )
             )
-          else List(new TextEdit(offsetRange, s"/*${location.getUri}*/"))
+          else
+            val target = location.getUri
+            val entry = target.lastIndexOf("!/") match
+              case -1 => target
+              case index => target.substring(index + 2)
+            List(new TextEdit(offsetRange, s"/*$entry*/"))
         }
         val obtained = applyEdits(cleanedCode, edits)
         assertCorpusNoDiff(obtained, original.removePos)

@@ -24,7 +24,7 @@ from conftest import (
     source_uri,
 )
 
-# The PC-vendored legend (scala3-presentation-compiler 3.8.4), pinned verbatim
+# The PC-vendored legend (scala3-presentation-compiler 3.10.1), pinned verbatim
 # on every side of the boundary: `legend::TOKEN_TYPES`/`TOKEN_MODIFIERS` in
 # crates/ls-server/src/pc_lsp.rs and the island-side munit pin in
 # modules/ls-pc/test/src/ls/pc/SemanticTokensLegendSuite.scala.

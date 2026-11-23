@@ -20,7 +20,7 @@ final case class PcTargetConfig(
     classpath: Vector[Path],
     scalacOptions: Vector[String],
     sourceDirs: Vector[Path] = Vector.empty,
-    scalaVersion: String = "3.8.4"
+    scalaVersion: String = "3.10.1"
 )
 
 /** Tunables for the PC layer. */

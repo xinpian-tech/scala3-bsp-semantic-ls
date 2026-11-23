@@ -204,7 +204,7 @@ fn live_pc_plugins_json_loads_the_fixture_plugin_and_steers_definition() {
         id: TARGET_ID.to_string(),
         config: TargetConfig {
             bsp_id: TARGET_ID.to_string(),
-            scala_version: "3.8.4".to_string(),
+            scala_version: "3.10.1".to_string(),
             classpath: env.classpath.clone(),
             scalac_options: vec![],
             source_dirs: vec![],

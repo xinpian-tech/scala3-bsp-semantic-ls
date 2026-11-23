@@ -59,7 +59,7 @@ pkgs.mkShell {
   # flake is used without this input.
   LS_PC_NAVTEST_JAR =
     if pcNavTestPluginJar == null then "" else "${pcNavTestPluginJar}/pc-navtest-plugin.jar";
-  # Pinned + patched zaozi source (real-repo real-BSP workspace for
+  # Pinned zaozi source (real-repo real-BSP workspace for
   # manual real-repo validation). Null when the flake is used without the zaozi input.
   ZAOZI_SRC = if zaozi-src == null then "" else "${zaozi-src}";
 }

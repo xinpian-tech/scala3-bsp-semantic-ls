@@ -17,7 +17,7 @@ locked ivy cache.
 ```text
 Rust (stable, nixpkgs)  crane-built cargo workspace (crates/); vendored offline from Cargo.lock
 Java 25                 (pkgs.jdk25; island-only — the embedded PC island runtime and the mill toolchain)
-Scala 3.8.4             (pinned in build.mill: Deps.scalaVer; the bundled PC version)
+Scala 3.10.1             (pinned in build.mill: Deps.scalaVer; the bundled PC version)
 Mill 1.1.2              (pkgs.millVersions.mill_1_1_2 via mill-ivy-fetcher's mill-overlay)
 Nix >= 2.28             (required by mill-ivy-fetcher)
 mill-ivy-fetcher input  (mandatory flake input, pinned in flake.lock)
@@ -69,7 +69,7 @@ Per-system outputs:
 | `packages.pc-navtest-plugin-jar` | the pc-plugins.json test-fixture compiler plugin jar (`mill pcNavTestPlugin.jar`; check input, not shipped) |
 | `packages.spike-agent-jar` | the boundary-spike island agent jar (`mill pcHostSpike.assembly`) |
 | `packages.mill`, `packages.mill-ivy-fetcher` | the pinned Mill and `mif` (so `nix shell '.#mill' '.#mill-ivy-fetcher' -c mif run …` works) |
-| `packages.zaozi-src` | the pinned zaozi source with `nix/patches/zaozi-semanticdb.patch` applied |
+| `packages.zaozi-src` | the pinned zaozi source with its SemanticDB configuration |
 
 ## 3. The Rust workspace build (`nix/rust.nix`)
 
@@ -174,7 +174,7 @@ guard actually rejects what the lock does not carry.
 The live PC checks reuse the shared crane artifacts and are handed the boot
 inputs (`LS_LIBJVM`, `PC_HOST_AGENT_JAR`, `LS_PC_TARGET_CLASSPATH`, and for
 `pc-plugin-load` also `LS_PC_NAVTEST_JAR`) as derivation env; the target classpath
-is the pinned Scala 3.8.4 standard-library jars, version-matched to the
+is the pinned Scala 3.10.1 standard-library jars, version-matched to the
 compiler bundled in the PC-host assembly.
 
 The hermetic checks never touch a `.bsp/` directory — real-BSP coverage lives
@@ -205,7 +205,7 @@ Exported environment — contract, code and scripts rely on these:
 | `PC_HOST_AGENT_JAR` | the mill-built agent jar | island boot input for the live PC tests and dev-shell servers |
 | `LS_PC_TARGET_CLASSPATH` | pinned scala-library + scala3-library jars | the classpath live-PC test targets register |
 | `LS_PC_NAVTEST_JAR` | the test-fixture plugin jar | lets the live plugin-load row run instead of skipping |
-| `ZAOZI_SRC` | the patched zaozi tree | pinned real-repo workspace source for manual validation |
+| `ZAOZI_SRC` | the pinned zaozi tree | pinned real-repo workspace source for manual validation |
 
 With these set, `cargo test` in the dev shell runs the live embedded-JVM tests
 for real (the same tests skip in the hermetic `rust-test` check, which sets
